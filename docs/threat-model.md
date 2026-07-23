@@ -40,9 +40,11 @@ Per-capability notes:
   so `new Cls()`, `(instance).constructor`, and `Cls.prototype.method.call(...)` are all
   covered (a construct-trap Proxy would not be). **Not covered:** `dns` lookups (a lookup
   moves no payload; DNS tunneling is a determined-attacker technique out of scope); reaching
-  the real prototype by climbing two levels past the guarded subclass
-  (`Object.getPrototypeOf(Object.getPrototypeOf(sock)).connect` — the same class as the
-  general shim un-patching residual); and a getter-based TOCTOU on `{host,port}` options for a
+  the real prototype by climbing past the guarded subclass (two levels from an instance,
+  `Object.getPrototypeOf(Object.getPrototypeOf(sock)).connect`, or equivalently one hop from
+  the class object, `net.Socket.prototype.__proto__.connect` — the same class as the general
+  shim un-patching residual, in-process code deliberately climbing above the guard); and a
+  getter-based TOCTOU on `{host,port}` options for a
   package that *already holds a narrow net grant* (the derived target is read separately from
   the value Node connects to — tracked as #26). These are documented residuals, not silent
   gaps.

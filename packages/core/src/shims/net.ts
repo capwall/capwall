@@ -132,6 +132,30 @@ function deriveHttpTarget(args: unknown[], defaultPort: number): { host: string;
   return { host: host ?? "localhost", port: port ?? defaultPort };
 }
 
+/**
+ * Derive `{host, port}` for `tls.connect`/`TLSSocket.connect`. Node accepts the net-style
+ * positional/options forms AND merges a trailing options object OVER the positionals
+ * (`normalizeConnectArgs` → `ObjectAssign(options, args[2])`). So we derive net-style first,
+ * then overlay `host`/`hostname`/`port` from ANY plain-object argument — otherwise
+ * `tls.connect(443, "granted.host", { host: "evil.host" })` would guard the granted target
+ * while Node connects to the evil one (a false-allow egress bypass a review found).
+ */
+function deriveTlsTarget(args: unknown[]): { host: string; port: number } {
+  const t = deriveNetTarget(args, 443);
+  for (const a of args) {
+    if (!isPlainObject(a) || a instanceof URL) continue;
+    if (typeof a["hostname"] === "string") t.host = a["hostname"];
+    else if (typeof a["host"] === "string") t.host = a["host"];
+    const rawPort = a["port"];
+    if (typeof rawPort === "number") t.port = rawPort;
+    else if (typeof rawPort === "string" && rawPort !== "") {
+      const n = Number(rawPort);
+      if (Number.isFinite(n)) t.port = n;
+    }
+  }
+  return t;
+}
+
 function wrapFn(orig: AnyFn, derive: (args: unknown[]) => { host: string; port: number }, ctx: ShimContext): AnyFn {
   const wrapped: AnyFn = function (this: unknown, ...args: unknown[]) {
     const { host, port } = derive(args);
@@ -261,14 +285,15 @@ export function createTlsShim(ctx: ShimContext): typeof import("node:tls") {
   for (const key of Object.keys(realTls)) {
     shim[key] = (realTls as unknown as Record<string, unknown>)[key];
   }
-  // tls.connect takes net-style args (positional (port, host) AND options) — use deriveNetTarget
-  // with a 443 default, NOT the http parser (which ignores positionals → false-allow).
-  shim["connect"] = wrapFn(realTls.connect as unknown as AnyFn, (a) => deriveNetTarget(a, 443), ctx);
+  // tls.connect takes net-style positional (port, host) AND a trailing options object that
+  // OVERRIDES the positionals — deriveTlsTarget handles the combined form (deriveNetTarget
+  // alone would ignore the override and false-allow).
+  shim["connect"] = wrapFn(realTls.connect as unknown as AnyFn, deriveTlsTarget, ctx);
   if (typeof realTls.TLSSocket === "function") {
     shim["TLSSocket"] = guardedSubclassMethod(
       realTls.TLSSocket as unknown as AnyCtor,
       "connect",
-      (a) => deriveNetTarget(a, 443),
+      deriveTlsTarget,
       ctx,
     );
   }
@@ -292,6 +317,17 @@ export function createHttp2Shim(ctx: ShimContext): typeof import("node:http2") {
       if (u.port !== "") port = Number(u.port);
     } catch {
       /* unparseable authority — deny-leaning localhost:443 */
+    }
+    // Node honors options.host/port over the authority (http2.connect(authority, options)).
+    const opts = args[1];
+    if (isPlainObject(opts)) {
+      if (typeof opts["host"] === "string") host = opts["host"];
+      const rawPort = opts["port"];
+      if (typeof rawPort === "number") port = rawPort;
+      else if (typeof rawPort === "string" && rawPort !== "") {
+        const n = Number(rawPort);
+        if (Number.isFinite(n)) port = n;
+      }
     }
     guard(ctx, { kind: "net", host, port });
     return realConnect.apply(this, args);

@@ -29,6 +29,8 @@ interface FixtureDep {
   sendViaDgramSocketClass(host: string, port: number): void;
   tlsConnectPositional(port: number, host: string): void;
   sendUdpUnbound(host: string, port: number, cb: (err: unknown) => void): void;
+  tlsConnectOverride(port: number, host: string, opts: Record<string, unknown>): void;
+  http2ConnectOverride(authority: string, opts: Record<string, unknown>): void;
 }
 
 function loadFixtureFresh(): FixtureDep {
@@ -157,6 +159,32 @@ describe("loader routing — M4 shims deny-by-default in enforce", () => {
       expect(() => dep.tlsConnectPositional(443, "192.0.2.1")).toThrowError(
         expect.objectContaining({ name: "CapabilityError" }),
       );
+    });
+  });
+
+  it("denies tls/http2 when an options object overrides the granted target (H1 false-allow)", () => {
+    // Grant only 127.0.0.1:443 and :8001; overriding to a different port/host must deny.
+    const policy = loadPolicyFromObject(
+      {
+        version: 1,
+        mode: "enforce",
+        packages: { "fixture-dep": { net: { hosts: ["127.0.0.1"], ports: [443, 8001] } } },
+      },
+      { projectRoot: here },
+    );
+    withCapwall(policy, "enforce", (dep) => {
+      // tls: positional 127.0.0.1:443 (granted) but options overrides port → 3002 (denied).
+      expect(() => dep.tlsConnectOverride(443, "127.0.0.1", { port: 3002 })).toThrowError(
+        expect.objectContaining({ name: "CapabilityError" }),
+      );
+      // tls: options overrides host → 192.0.2.1 (denied).
+      expect(() => dep.tlsConnectOverride(443, "127.0.0.1", { host: "192.0.2.1" })).toThrowError(
+        expect.objectContaining({ name: "CapabilityError" }),
+      );
+      // http2: authority 8001 (granted) but options overrides port → 8002 (denied).
+      expect(() =>
+        dep.http2ConnectOverride("http://127.0.0.1:8001", { port: 8002 }),
+      ).toThrowError(expect.objectContaining({ name: "CapabilityError" }));
     });
   });
 
