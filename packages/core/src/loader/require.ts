@@ -11,11 +11,15 @@
  * determined attacker can try to reach the original builtin via internal caches /
  * `process.binding`.
  *
- * CURRENT SCOPE (roadmap M1–M3): only the `fs` family is intercepted. The other entries in
- * {@link MEDIATED_MODULES} are listed for M4 and currently pass through un-shimmed.
+ * The specific shims are supplied by {@link buildShimRegistry}; this module just routes a
+ * required specifier to its registered shim (built lazily on first mediated require) and
+ * passes everything else through. Which specifiers are *candidates* is {@link MEDIATED_MODULES};
+ * which are *actually shimmed today* is whatever the registry contains (fs so far, roadmap M4
+ * adds the rest).
  */
 import Module from "node:module";
-import { createFsShim, type DecisionSink } from "../shims/fs.js";
+import { buildShimRegistry, type ShimRegistry } from "../shims/index.js";
+import type { DecisionSink } from "../shims/runtime.js";
 import type { Mode, Policy } from "@capwall/policy-schema";
 
 /** Core modules capwall mediates; requiring any of these returns a shim once installed. */
@@ -37,10 +41,6 @@ export const MEDIATED_MODULES = [
   "vm",
   "node:vm",
 ] as const;
-
-/** The subset of {@link MEDIATED_MODULES} actually shimmed today (fs vertical slice). */
-const FS_SPECIFIERS = new Set(["fs", "node:fs"]);
-const FS_PROMISES_SPECIFIERS = new Set(["fs/promises", "node:fs/promises"]);
 
 export interface RequirePatchOptions {
   onDecision: DecisionSink;
@@ -66,10 +66,11 @@ export function patchRequire(
   const moduleInternals = Module as unknown as ModuleInternals;
   const originalLoad = moduleInternals._load;
 
-  // Built lazily on first mediated require; one shim instance per install.
-  let fsShim: typeof import("node:fs") | null = null;
-  const getFsShim = (): typeof import("node:fs") =>
-    (fsShim ??= createFsShim({
+  // The registry is built lazily on the first mediated require so no shim (and thus no
+  // real-module capture) happens for a process that never touches a mediated specifier.
+  let registry: ShimRegistry | null = null;
+  const getRegistry = (): ShimRegistry =>
+    (registry ??= buildShimRegistry({
       policy,
       mode,
       onDecision: options.onDecision,
@@ -77,8 +78,12 @@ export function patchRequire(
     }));
 
   const patchedLoad: ModuleLoad = function (this: unknown, request, parent, isMain) {
-    if (FS_SPECIFIERS.has(request)) return getFsShim();
-    if (FS_PROMISES_SPECIFIERS.has(request)) return getFsShim().promises;
+    // Fast path: only the fixed candidate set can possibly be shimmed; everything else is a
+    // plain delegate with no registry work.
+    if ((MEDIATED_CANDIDATES as Set<string>).has(request)) {
+      const reg = getRegistry();
+      if (reg.has(request)) return reg.get(request);
+    }
     return originalLoad.call(this, request, parent, isMain);
   };
   moduleInternals._load = patchedLoad;
@@ -92,3 +97,5 @@ export function patchRequire(
     },
   };
 }
+
+const MEDIATED_CANDIDATES: ReadonlySet<string> = new Set(MEDIATED_MODULES);
