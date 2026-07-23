@@ -52,12 +52,35 @@ export function mergeTraceIntoPolicy(
     existing ?? parsePolicy({ version: 1, mode: "observe", default: {}, packages: {} });
 
   for (const { pkg, req } of entries) {
-    if (req.kind !== "fs") continue;
     const grant: PackagePolicy = (policy.packages[pkg] ??= {});
-    const fs = (grant.fs ??= { read: [], write: [] });
-    const target = relativize(req.path, projectRoot);
-    if (req.access === "read") fs.read.push(target);
-    else fs.write.push(target);
+    switch (req.kind) {
+      case "fs": {
+        const fs = (grant.fs ??= { read: [], write: [] });
+        const target = relativize(req.path, projectRoot);
+        if (req.access === "read") fs.read.push(target);
+        else fs.write.push(target);
+        break;
+      }
+      case "net": {
+        const net = (grant.net ??= { hosts: [], ports: [] });
+        net.hosts.push(req.host);
+        net.ports.push(req.port);
+        break;
+      }
+      case "env": {
+        (grant.env ??= []).push(req.key);
+        break;
+      }
+      case "child_process":
+        grant.child_process = true;
+        break;
+      case "worker_threads":
+        grant.worker_threads = true;
+        break;
+      case "vm":
+        grant.vm = true;
+        break;
+    }
   }
 
   for (const grant of Object.values(policy.packages)) {
@@ -65,6 +88,11 @@ export function mergeTraceIntoPolicy(
       grant.fs.read = sortedUnique(grant.fs.read);
       grant.fs.write = sortedUnique(grant.fs.write);
     }
+    if (grant.net) {
+      grant.net.hosts = sortedUnique(grant.net.hosts);
+      grant.net.ports = [...new Set(grant.net.ports)].sort((a, b) => a - b);
+    }
+    if (grant.env) grant.env = sortedUnique(grant.env);
   }
   // Deterministic package order for stable diffs.
   policy.packages = Object.fromEntries(

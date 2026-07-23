@@ -12,16 +12,59 @@ in-process attacker.
 
 ## Implementation status (keep in sync with the roadmap)
 
-As of roadmap **M3**, only the **`fs` capability is actually mediated**, and only on the
-**CJS `require` path**. The `net`/`http(s)`, `child_process`, `worker_threads`,
-`process.env`, and `vm` sections below describe the *designed* protection (roadmap M4);
-today those surfaces are **not intercepted at all** — a package can use them regardless of
-policy. ESM `import` of `fs` is also not yet intercepted (roadmap M5). Do not deploy capwall
-expecting protection this section says does not exist yet.
+As of roadmap **M4**, all core capability surfaces are mediated on the **CJS `require`
+path**: `fs`, `net`/`http`/`https`, `child_process`, `worker_threads`, `process.env`, and
+`vm`. **ESM `import` of these builtins is not yet intercepted (roadmap M5)** — an ESM target
+that does `import { readFile } from "node:fs"` bypasses mediation. Do not deploy capwall
+against ESM-first targets expecting enforcement yet.
 
-Within `fs`, the mediated surface is the path-taking read/write API families (sync,
-callback, and `fs.promises` variants). Purely fd-based operations (`fs.read`, `fs.write`,
-`ftruncate`, `fchmod`, …) are not mediated — consistent with the fd-escape exclusion below.
+Per-capability notes:
+
+- **`fs`** — path-taking read/write families (sync, callback, `fs.promises`) plus the
+  path-taking stream constructors (`ReadStream`/`WriteStream` and their `File*Stream`
+  aliases). Purely fd-based operations (`fs.read`, `fs.write`, `ftruncate`, …) are not
+  mediated — consistent with the fd-escape exclusion below.
+- **`net`/`http`/`https`/`tls`/`http2`/`dgram`** — **egress only**. Mediated: `net.connect`/
+  `createConnection` **and** `new net.Socket().connect()`; `http(s).request`/`get` **and**
+  `new http.ClientRequest()`; `tls.connect` and `new tls.TLSSocket().connect()`;
+  `http2.connect`; and `dgram` socket `send`/`connect` (UDP). Each core egress module is
+  shimmed separately on purpose: capwall's require patch only affects `Module._load`-routed
+  requires (user/dependency code); Node's own HTTP client loads `net` through the internal
+  bootstrap loader, which never hits `Module._load`, so one module's shim never covers
+  another — and a dependency could otherwise bypass the control simply by choosing `tls`
+  (or `dgram`) over `net`. Inbound `server.listen` is not gated (capwall mediates who a
+  package may *reach*, not that it may serve). IPC/unix-socket connects have no host:port and
+  are approximated coarsely as `{ host: "<ipc>", port: 0 }`. Capability-bearing classes
+  (`net.Socket`, `tls.TLSSocket`, `http.ClientRequest`, `http.Agent`, `dgram.Socket`) are
+  guarded via a **guarded subclass** whose prototype method (or constructor) runs the check,
+  so `new Cls()`, `(instance).constructor`, and `Cls.prototype.method.call(...)` are all
+  covered (a construct-trap Proxy would not be). **Not covered:** `dns` lookups (a lookup
+  moves no payload; DNS tunneling is a determined-attacker technique out of scope); reaching
+  the real prototype by climbing past the guarded subclass (two levels from an instance,
+  `Object.getPrototypeOf(Object.getPrototypeOf(sock)).connect`, or equivalently one hop from
+  the class object, `net.Socket.prototype.__proto__.connect` — the same class as the general
+  shim un-patching residual, in-process code deliberately climbing above the guard); and a
+  getter-based TOCTOU on `{host,port}` options for a
+  package that *already holds a narrow net grant* (the derived target is read separately from
+  the value Node connects to — tracked as #26). These are documented residuals, not silent
+  gaps.
+- **`child_process`, `worker_threads`, `vm`** — boolean **gates** (may this package spawn /
+  start a worker / use `vm` at all). Gating, not confinement: capwall does not constrain what
+  the subprocess/worker/vm-context does once started (see § gating vs confinement).
+- **`process.env`** — a read allowlist enforced via a `Proxy` on `process.env` (`get` **and**
+  `getOwnPropertyDescriptor` traps, so `Object.getOwnPropertyDescriptor(process.env, k).value`
+  cannot leak a value a direct read denies). Only reads attributed to a **dependency** are
+  gated; reads attributed to `<app>` (application code AND Node-internal frames, which
+  attribute to `<app>` because internal frames are skipped) pass through — gating them would
+  break Node startup for no gain, since the app is the trust root. `CAPWALL_*` keys (capwall's
+  own preload plumbing) are never gated or recorded. When a package **spawns a child**, Node
+  reads `process.env` to build the child's environment block; those reads are exempted (the
+  child_process shim suspends the env gate around the spawn) so an allowed spawn inherits a
+  real environment rather than an empty one. A denied env read is a **soft deny**: it returns
+  `undefined` (hiding the value) rather than throwing, so a benign dependency probing an
+  optional var is not crashed. The denial is still recorded and logged. **Key NAMES stay
+  enumerable** to a denied dependency (`Object.keys`, `in`, `for..in`); only VALUES are hidden
+  — names are not the secret, and hiding them would break feature-detection.
 
 **Behavior change vs. real `fs` (operational note).** In `enforce` mode a denied call throws
 synchronously — including for callback-style APIs (`fs.readFile(path, cb)`) that in stock

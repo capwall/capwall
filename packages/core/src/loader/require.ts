@@ -14,8 +14,9 @@
  * The specific shims are supplied by {@link buildShimRegistry}; this module just routes a
  * required specifier to its registered shim (built lazily on first mediated require) and
  * passes everything else through. Which specifiers are *candidates* is {@link MEDIATED_MODULES};
- * which are *actually shimmed today* is whatever the registry contains (fs so far, roadmap M4
- * adds the rest).
+ * which are *actually shimmed* is whatever the registry contains — as of M4 that is fs,
+ * net/http(s), child_process, worker_threads, and vm. (process.env is guarded separately, not
+ * via require — see shims/env.ts.)
  */
 import Module from "node:module";
 import { buildShimRegistry, type ShimRegistry } from "../shims/index.js";
@@ -34,6 +35,12 @@ export const MEDIATED_MODULES = [
   "node:http",
   "https",
   "node:https",
+  "tls",
+  "node:tls",
+  "http2",
+  "node:http2",
+  "dgram",
+  "node:dgram",
   "child_process",
   "node:child_process",
   "worker_threads",

@@ -8,13 +8,21 @@
  * un-shimmed until their shim lands.
  */
 import { registerFsShim } from "./fs.js";
+import { registerNetShim } from "./net.js";
+import { registerChildProcessShim } from "./child_process.js";
+import { registerWorkerThreadsShim } from "./worker_threads.js";
+import { registerVmShim } from "./vm.js";
 import type { ShimContext, ShimRegistry } from "./runtime.js";
 
 export function buildShimRegistry(ctx: ShimContext): ShimRegistry {
   const reg: ShimRegistry = new Map();
   registerFsShim(reg, ctx);
-  // M4 shims register here as they land: registerNetShim, registerChildProcessShim,
-  // registerWorkerThreadsShim, registerVmShim.
+  registerNetShim(reg, ctx);
+  registerChildProcessShim(reg, ctx);
+  registerWorkerThreadsShim(reg, ctx);
+  registerVmShim(reg, ctx);
+  // Note: the process.env read shim is NOT a require()-routed module — it is installed
+  // separately via installEnvGuard() in index.ts install().
   return reg;
 }
 

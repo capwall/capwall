@@ -69,4 +69,28 @@ describe("isGranted — pure gate checks", () => {
     expect(isGranted({ env: ["*"] }, { kind: "env", key: "ANYTHING" })).toBe(true);
     expect(isGranted({ env: ["NODE_ENV"] }, { kind: "env", key: "SECRET" })).toBe(false);
   });
+
+  it("all grant kinds ignore a polluted Object.prototype (own-property only)", () => {
+    // Regression: an empty grant {} must not inherit ANY grant from a polluted prototype —
+    // boolean gates, fs globs, net rules, and the env allowlist.
+    const proto = Object.prototype as unknown as Record<string, unknown>;
+    proto["child_process"] = true;
+    proto["vm"] = true;
+    proto["worker_threads"] = true;
+    proto["fs"] = { read: ["**"], write: ["**"] };
+    proto["net"] = { hosts: ["*"], ports: [443] };
+    proto["env"] = ["*"];
+    try {
+      expect(isGranted({}, { kind: "child_process" })).toBe(false);
+      expect(isGranted({}, { kind: "vm" })).toBe(false);
+      expect(isGranted({}, { kind: "worker_threads" })).toBe(false);
+      expect(isGranted({}, { kind: "fs", access: "read", path: "/etc/passwd" })).toBe(false);
+      expect(isGranted({}, { kind: "net", host: "evil.com", port: 443 })).toBe(false);
+      expect(isGranted({}, { kind: "env", key: "SECRET" })).toBe(false);
+    } finally {
+      for (const k of ["child_process", "vm", "worker_threads", "fs", "net", "env"]) {
+        delete proto[k];
+      }
+    }
+  });
 });

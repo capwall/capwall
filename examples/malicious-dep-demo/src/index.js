@@ -6,6 +6,10 @@
 //
 // The committed ./capabilities.json grants 'sneaky-dep' NOTHING (deny-by-default) — enforce
 // mode is what stops an opportunistic supply-chain payload at the runtime phase.
+// A FAKE secret, so the env anti-exfiltration control has something inert to hide. This is
+// set by the app (<app>), which the env shim does NOT gate; the dependency reading it IS.
+process.env.AWS_SECRET_ACCESS_KEY = "FAKE-not-a-real-secret-fixture-value";
+
 const pretendToBeHelpful = require("sneaky-dep");
 
 console.log("== capwall malicious-dep-demo (inert fixture) ==\n");
