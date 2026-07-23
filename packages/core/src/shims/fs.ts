@@ -22,21 +22,10 @@
 import realFs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { attributeCaller } from "../attribution/index.js";
-import { evaluate, type Decision } from "../policy/evaluate.js";
+import { guard, type ShimContext, type ShimRegistry } from "./runtime.js";
 import { CapabilityError } from "../errors.js";
-import type { Mode, Policy } from "@capwall/policy-schema";
 
-/** Callback capwall invokes on every decision (log sink in observe, collector for gen-policy). */
-export type DecisionSink = (pkg: string, decision: Decision) => void;
-
-export interface ShimContext {
-  policy: Policy;
-  mode: Mode;
-  onDecision: DecisionSink;
-  /** Absolute project root; used for attribution and policy-glob resolution. */
-  projectRoot?: string;
-}
+export type { DecisionSink, ShimContext } from "./runtime.js";
 
 type Access = "read" | "write";
 /** Which positional args of a method are paths, and what access each implies. */
@@ -197,26 +186,18 @@ type PathClass = abstract new (...a: never[]) => unknown;
  */
 export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
   /**
-   * Attribute + evaluate one path/access. Reports the decision to `onDecision` and returns
-   * whether it is allowed. Returns `true` (nothing to check) when `arg` is not a path (fd /
-   * FileHandle). Never throws — the caller decides how to signal a denial.
+   * Attribute + evaluate one path/access via the shared shim runtime. Skips non-path args
+   * (fd / FileHandle — out of scope). Throws `CapabilityError` on an enforce-mode denial;
+   * the caller decides whether to propagate, reject, or translate that into a return value.
    */
-  function check(access: Access, arg: unknown): boolean {
+  function check(access: Access, arg: unknown): void {
     const target = coercePath(arg);
-    if (target === null) return true;
-    const pkg = attributeCaller(
-      ctx.projectRoot !== undefined ? { projectRoot: ctx.projectRoot } : {},
-    );
-    const decision = evaluate(ctx.policy, ctx.mode, pkg, { kind: "fs", access, path: target });
-    ctx.onDecision(pkg, decision);
-    if (!decision.allowed) {
-      throw new CapabilityError(decision.reason, pkg);
-    }
-    return true;
+    if (target === null) return;
+    guard(ctx, { kind: "fs", access, path: target });
   }
 
   /** Attribute + evaluate each path of a call; throws CapabilityError on an enforce deny. */
-  function guard(args: unknown[], spec: MethodSpec): void {
+  function guardCall(args: unknown[], spec: MethodSpec): void {
     const specs = spec === "open" ? openSpecs(args) : spec;
     for (const { index, access } of specs) {
       check(access, args[index]);
@@ -259,12 +240,12 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
     const wrapped: AnyFn = function (this: unknown, ...args: unknown[]) {
       if (rejectOnDeny) {
         try {
-          guard(args, spec);
+          guardCall(args, spec);
         } catch (err) {
           return Promise.reject(err);
         }
       } else {
-        guard(args, spec);
+        guardCall(args, spec);
       }
       return orig.apply(this, args);
     };
@@ -336,4 +317,17 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
     true,
   );
   return shim;
+}
+
+/**
+ * Register the fs shim's specifiers into the loader registry. `fs`/`node:fs` return the
+ * shim; `fs/promises`/`node:fs/promises` return its `.promises` surface. The shim is built
+ * once and shared across specifiers.
+ */
+export function registerFsShim(reg: ShimRegistry, ctx: ShimContext): void {
+  const shim = createFsShim(ctx);
+  reg.set("fs", shim);
+  reg.set("node:fs", shim);
+  reg.set("fs/promises", shim.promises);
+  reg.set("node:fs/promises", shim.promises);
 }
