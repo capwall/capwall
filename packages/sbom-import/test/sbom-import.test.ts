@@ -56,7 +56,9 @@ describe("parseCycloneDx", () => {
     const warnings: string[] = [];
     const components = parseCycloneDx(fixtureSbom, warnings);
     expect(components.map((c) => c.name).sort()).toEqual(["express", "left-pad", "pino"]);
-    expect(warnings).toEqual([]);
+    // The fixture's express grants a wildcard host → one advisory; no parse-error warnings.
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toContain("WILDCARD net");
   });
 
   it("derives the expected grant from capwall:* properties", () => {
@@ -168,5 +170,70 @@ describe("sbomToPolicy", () => {
     expect(policy.packages).toEqual({});
     expect(() => parsePolicy(policy)).not.toThrow();
     expect(warnings.length).toBeGreaterThan(0);
+  });
+
+  it("handles reserved-name components safely (no pollution; __proto__ skipped w/ warning)", () => {
+    const before = ({} as Record<string, unknown>).polluted;
+    const warnings: string[] = [];
+    const policy = sbomToPolicy(
+      {
+        components: [
+          { name: "__proto__" },
+          { name: "constructor" },
+          { name: "prototype" },
+          { name: "normal" },
+        ],
+      },
+      { warnings },
+    );
+    // No global prototype pollution.
+    expect(({} as Record<string, unknown>).polluted).toBe(before);
+    // __proto__ can't be a policy key → skipped with a warning (not silently lost).
+    expect(warnings.some((w) => w.includes("__proto__"))).toBe(true);
+    // constructor/prototype/normal are ordinary keys and survive.
+    expect(Object.keys(policy.packages).sort()).toEqual(["constructor", "normal", "prototype"]);
+    expect(() => parsePolicy(policy)).not.toThrow();
+  });
+
+  it("rejects out-of-range and non-integer ports (no silent truncation)", () => {
+    const warnings: string[] = [];
+    const policy = sbomToPolicy(
+      {
+        components: [
+          {
+            name: "netdep",
+            properties: [
+              { name: "capwall:net:hosts", value: "api.example.com" },
+              { name: "capwall:net:ports", value: "443,80.5,0x50,99999,-1,abc" },
+            ],
+          },
+        ],
+      },
+      { warnings },
+    );
+    // Only the valid 443 survives; the rest are warned and dropped.
+    expect(policy.packages["netdep"]?.net?.ports).toEqual([443]);
+    expect(warnings.filter((w) => w.includes("net:ports")).length).toBe(5);
+    expect(() => parsePolicy(policy)).not.toThrow();
+  });
+
+  it("warns when a wildcard host/env grant is seeded from the SBOM", () => {
+    const warnings: string[] = [];
+    sbomToPolicy(
+      {
+        components: [
+          {
+            name: "greedy",
+            properties: [
+              { name: "capwall:net:hosts", value: "*" },
+              { name: "capwall:env", value: "*" },
+            ],
+          },
+        ],
+      },
+      { warnings },
+    );
+    expect(warnings.some((w) => w.includes("WILDCARD net"))).toBe(true);
+    expect(warnings.some((w) => w.includes("WILDCARD env"))).toBe(true);
   });
 });

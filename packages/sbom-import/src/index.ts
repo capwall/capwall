@@ -179,14 +179,22 @@ function grantFromProperties(
       case "capwall:net:ports": {
         sawNet = true;
         for (const portStr of splitList(value)) {
-          const port = Number.parseInt(portStr, 10);
-          if (Number.isInteger(port) && port >= 0) {
-            netPorts.push(port);
-          } else {
+          // Require a pure non-negative integer string (rejects floats "80.5", hex "0x50",
+          // negatives, trailing garbage "80x" — parseInt would silently truncate those).
+          if (!/^\d+$/.test(portStr)) {
             warnings.push(
               `${componentLabel}: ignoring non-numeric capwall:net:ports value "${portStr}"`,
             );
+            continue;
           }
+          const port = Number(portStr);
+          if (port > 65535) {
+            warnings.push(
+              `${componentLabel}: ignoring out-of-range capwall:net:ports value "${portStr}" (>65535)`,
+            );
+            continue;
+          }
+          netPorts.push(port);
         }
         break;
       }
@@ -238,9 +246,15 @@ function grantFromProperties(
   }
   if (sawNet) {
     grant.net = { hosts: netHosts, ports: netPorts };
+    if (netHosts.includes("*")) {
+      warnings.push(`${componentLabel}: WILDCARD net host "*" seeded from SBOM — review before enforce`);
+    }
   }
   if (sawEnv) {
     grant.env = envKeys;
+    if (envKeys.includes("*")) {
+      warnings.push(`${componentLabel}: WILDCARD env "*" seeded from SBOM — review before enforce`);
+    }
   }
   return grant;
 }
@@ -318,16 +332,25 @@ export function sbomToPolicy(sbom: unknown, opts: SbomToPolicyOptions = {}): Pol
   const components = parseCycloneDx(sbom, warnings);
 
   // Later components with a duplicate name win (last one wins), but ordering of the
-  // final packages map is sorted regardless — see below.
-  const packages: Record<string, PackagePolicy> = {};
+  // final packages map is sorted regardless — see below. Null-prototype maps so a component
+  // literally named `__proto__` becomes an OWN key instead of hitting the prototype setter
+  // (which would silently drop it) — untrusted SBOM input must not lose entries.
+  const packages: Record<string, PackagePolicy> = Object.create(null);
   for (const component of components) {
+    // `__proto__` cannot round-trip as a policy key (parsePolicy's object construction drops
+    // it), so skip it explicitly with a warning rather than silently losing the entry.
+    // `constructor`/`prototype` are ordinary own keys and pass through fine.
+    if (component.name === "__proto__") {
+      warnings.push(`component named "__proto__" cannot be a policy key — skipping`);
+      continue;
+    }
     if (Object.prototype.hasOwnProperty.call(packages, component.name)) {
       warnings.push(`duplicate component name "${component.name}" — later entry wins`);
     }
     packages[component.name] = component.grant;
   }
 
-  const sortedPackages: Record<string, PackagePolicy> = {};
+  const sortedPackages: Record<string, PackagePolicy> = Object.create(null);
   for (const [name, grant] of Object.entries(packages).sort(([a], [b]) =>
     a.localeCompare(b),
   )) {
