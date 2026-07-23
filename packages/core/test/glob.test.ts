@@ -24,6 +24,16 @@ describe("matchesGlob", () => {
     expect(matchesGlob("/app/a.txt", "/app/a.txt")).toBe(true);
     expect(matchesGlob("/app/a.txt", "/app/axtxt")).toBe(false);
   });
+
+  it("collapses adjacent ** segments (ReDoS hardening) without changing semantics", () => {
+    // `dir/**/**` must behave exactly like `dir/**` and not build adjacent unbounded groups.
+    expect(matchesGlob("/app/**/**", "/app/a/b.log")).toBe(true);
+    expect(matchesGlob("/app/**/**", "/app")).toBe(true);
+    expect(matchesGlob("/app/**/**", "/other")).toBe(false);
+    // A pathological pattern against a long non-matching path must return promptly, not hang.
+    const long = "/app/" + "a/".repeat(40) + "nope.txt";
+    expect(matchesGlob("/app/**/**/**/**/x", long)).toBe(false);
+  });
 });
 
 describe("policy glob normalization against projectRoot", () => {

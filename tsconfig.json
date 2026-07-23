@@ -1,0 +1,15 @@
+{
+  "//": "Root solution config for GENERIC tooling (e.g. `tsc --noEmit`, editors, the nexus quality gate). It type-checks every package's src + tests in one pass, mapping the workspace `@capwall/*` imports to source so no pre-build is required. The AUTHORITATIVE, per-package typecheck remains `pnpm -r typecheck` (each package's tsconfig.test.json); this exists so a bare `tsc` at the repo root also works. See issue #4.",
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "baseUrl": ".",
+    "types": ["node"],
+    "paths": {
+      "@capwall/policy-schema": ["packages/policy-schema/src/index.ts"],
+      "@capwall/core": ["packages/core/src/index.ts"],
+      "@capwall/core/preload": ["packages/core/src/preload.ts"]
+    }
+  },
+  "include": ["packages/*/src/**/*.ts", "packages/*/test/**/*.ts"]
+}
