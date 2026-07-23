@@ -88,9 +88,18 @@ exception it would never see from real `fs`:
   uncaught `'error'` (as it also would against real `fs` past a point). This is **fail-closed**
   — the read/write never happens — but it is a parity gap, tracked as a follow-up.
 - **`watch`/`watchFile`** and the `ReadStream`/`WriteStream` **class constructors**
-  (`new fs.ReadStream(deniedPath)`) still throw synchronously: real `fs.watch` and a real
-  stream constructor can both throw synchronously on a bad argument, so no behavior-shape
-  change was needed there.
+  (`new fs.ReadStream(deniedPath)`) throw synchronously on denial. `fs.watch` and a real
+  stream constructor also throw synchronously on a bad argument, so those match. `fs.watchFile`
+  is the exception: real `watchFile` does NOT throw (it calls its listener with zeroed stats),
+  so the shim's sync throw there is a deliberate loud-failure choice — `watchFile`'s listener
+  is `(curr, prev)`, not error-first, so there is no faithful channel to deliver the denial
+  through.
+- **Buffer path arguments** are decoded with `latin1` (byte-exact — fix #19) before the policy
+  check, so the checked path matches the bytes forwarded to real `fs` even for non-UTF-8
+  bytes. Trade-off: a **valid non-ASCII UTF-8 path passed as a Buffer** decodes to a different
+  (latin1) string than the UTF-8 string a policy glob is authored in, so it may **false-deny**
+  (fail-closed — never a false-allow). Uncommon (needs a non-ASCII filename supplied as a
+  Buffer); the encoding strategy is tracked for reconsideration (issue).
 - **`exists`/`existsSync`** remain the bespoke non-throwing existence probes: a denial reads
   as "does not exist" (`false` / `cb(false)`), never an error at all.
 

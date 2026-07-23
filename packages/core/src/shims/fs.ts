@@ -25,8 +25,11 @@
  *        `'error'` on `setImmediate` (approximating — not exactly reproducing — real Node's
  *        threadpool-timed async stream-error delivery; a handler attached on a much later
  *        macrotask can still miss it, same as real `fs`). Fail-closed: no read/write occurs.
- *      - `watch`/`watchFile` still throw synchronously: real `fs.watch` does too on a bad
- *        path, so no behavior-shape change is needed there.
+ *      - `watch`/`watchFile` throw synchronously on denial. `fs.watch` also throws
+ *        synchronously in real Node (same shape). `fs.watchFile` does NOT (it invokes its
+ *        listener with zeroed stats), so the throw there is a deliberate loud-failure choice —
+ *        its listener is `(curr, prev)`, not an error-first callback, so there is no faithful
+ *        channel to deliver a CapabilityError through. Documented in docs/threat-model.md.
  *    `exists`/`existsSync` remain bespoke non-throwing probes (see below) — untouched by
  *    the above; a denial there means "does not exist", not an error at all.
  *  - Path checks are lexical on the resolved path; symlink traversal is out of scope.
@@ -242,7 +245,7 @@ type Delivery = "throw" | "reject" | "callback" | "streamRead" | "streamWrite";
  */
 function fsDeliveryFor(name: string): Delivery {
   if (name.endsWith("Sync")) return "throw";
-  if (name === "watch" || name === "watchFile") return "throw"; // real fs.watch throws sync too
+  if (name === "watch" || name === "watchFile") return "throw"; // watch throws in Node too; watchFile is a deliberate loud-fail (listener isn't error-first)
   if (name === "createReadStream") return "streamRead";
   if (name === "createWriteStream") return "streamWrite";
   return "callback";
