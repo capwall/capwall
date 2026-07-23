@@ -22,7 +22,9 @@ export const FsCapabilitySchema = z
 export const NetCapabilitySchema = z
   .object({
     hosts: z.array(z.string()).default([]),
-    ports: z.array(z.number().int().nonnegative()).default([]),
+    ports: z
+      .array(z.union([z.number().int().nonnegative(), z.literal("*")]))
+      .default([]),
   })
   .strict();
 

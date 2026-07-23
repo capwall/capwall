@@ -90,7 +90,12 @@ export function mergeTraceIntoPolicy(
     }
     if (grant.net) {
       grant.net.hosts = sortedUnique(grant.net.hosts);
-      grant.net.ports = [...new Set(grant.net.ports)].sort((a, b) => a - b);
+      // Ports may include a hand-authored `"*"` wildcard (#27) alongside observed numbers.
+      const ports = grant.net.ports;
+      const nums = [...new Set(ports.filter((p): p is number => typeof p === "number"))].sort(
+        (a, b) => a - b,
+      );
+      grant.net.ports = ports.includes("*") ? ["*", ...nums] : nums;
     }
     if (grant.env) grant.env = sortedUnique(grant.env);
   }

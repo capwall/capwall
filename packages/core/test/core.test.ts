@@ -70,6 +70,18 @@ describe("isGranted — pure gate checks", () => {
     expect(isGranted({ env: ["NODE_ENV"] }, { kind: "env", key: "SECRET" })).toBe(false);
   });
 
+  it("honors a net port wildcard (dynamic/ephemeral ports, #27)", () => {
+    const grant = { net: { hosts: ["127.0.0.1"], ports: ["*" as const] } };
+    expect(isGranted(grant, { kind: "net", host: "127.0.0.1", port: 49152 })).toBe(true);
+    expect(isGranted(grant, { kind: "net", host: "127.0.0.1", port: 65000 })).toBe(true);
+    // Host still gated: wildcard port doesn't widen the host allowlist.
+    expect(isGranted(grant, { kind: "net", host: "evil.com", port: 49152 })).toBe(false);
+    // A concrete port list still denies an unlisted port.
+    expect(
+      isGranted({ net: { hosts: ["*"], ports: [443] } }, { kind: "net", host: "x", port: 8080 }),
+    ).toBe(false);
+  });
+
   it("all grant kinds ignore a polluted Object.prototype (own-property only)", () => {
     // Regression: an empty grant {} must not inherit ANY grant from a polluted prototype —
     // boolean gates, fs globs, net rules, and the env allowlist.
