@@ -13,15 +13,28 @@
  *    `WriteStream` (a dependency can `new fs.ReadStream(path)` instead of
  *    `createReadStream` — both must be mediated). Purely fd-based operations (`read`,
  *    `write`, `ftruncate`, `fchmod`, …) are NOT mediated — fd escapes are out-of-scope.
- *  - Denials throw synchronously (callback-style calls included) and reject for
- *    `fs.promises`. Loud failure is the point of enforce mode — EXCEPT `exists`/`existsSync`,
- *    which are contractually non-throwing: a denied existence probe returns "does not exist"
- *    (`false` / `cb(false)`) rather than throwing, which also avoids leaking existence.
+ *  - Denials are delivered via the SAME channel the real API would use, so idiomatic
+ *    (try/catch-free) callback code is not crashed by an uncaught synchronous throw:
+ *      - `*Sync` methods throw `CapabilityError` synchronously (matches real sync `fs`).
+ *      - `fs.promises` methods reject with `CapabilityError` (matches real promise API).
+ *      - callback-style async methods (`readFile`, `mkdir`, `access`, …) invoke the
+ *        caller's callback as `cb(err)` on `process.nextTick` — exactly how a real async
+ *        `fs` error would arrive — instead of throwing. If the call is missing its
+ *        callback (a mis-call), we fall back to throwing, same as real Node.
+ *      - `createReadStream`/`createWriteStream` return a minimal stream that emits
+ *        `'error'` on `setImmediate` (approximating — not exactly reproducing — real Node's
+ *        threadpool-timed async stream-error delivery; a handler attached on a much later
+ *        macrotask can still miss it, same as real `fs`). Fail-closed: no read/write occurs.
+ *      - `watch`/`watchFile` still throw synchronously: real `fs.watch` does too on a bad
+ *        path, so no behavior-shape change is needed there.
+ *    `exists`/`existsSync` remain bespoke non-throwing probes (see below) — untouched by
+ *    the above; a denial there means "does not exist", not an error at all.
  *  - Path checks are lexical on the resolved path; symlink traversal is out of scope.
  */
 import realFs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { Readable, Writable } from "node:stream";
 import { guard, type ShimContext, type ShimRegistry } from "./runtime.js";
 import { CapabilityError } from "../errors.js";
 
@@ -33,8 +46,11 @@ interface PathSpec {
   index: number;
   access: Access;
 }
-/** `"open"`-kind methods derive read/write from their flags argument. */
-type MethodSpec = PathSpec[] | "open";
+/**
+ * `"open"`-kind methods derive read/write from their flags argument; `"access"`-kind
+ * methods derive it from their mode bitmask (see {@link accessSpecs}, fix #20).
+ */
+type MethodSpec = PathSpec[] | "open" | "access";
 
 const R0: MethodSpec = [{ index: 0, access: "read" }];
 const W0: MethodSpec = [{ index: 0, access: "write" }];
@@ -65,8 +81,10 @@ const FS_METHODS: Record<string, MethodSpec> = {
   lstatSync: R0,
   statfs: R0,
   statfsSync: R0,
-  access: R0,
-  accessSync: R0,
+  // access / accessSync: read vs. write is derived from the mode bitmask (fix #20) —
+  // see `accessSpecs`. A W_OK probe needs a `write` grant, not `read`.
+  access: "access",
+  accessSync: "access",
   // exists / existsSync are handled bespoke (they must never throw — see createFsShim).
   opendir: R0,
   opendirSync: R0,
@@ -122,7 +140,7 @@ const PROMISES_METHODS: Record<string, MethodSpec> = {
   stat: R0,
   lstat: R0,
   statfs: R0,
-  access: R0,
+  access: "access",
   opendir: R0,
   watch: R0,
   writeFile: W0,
@@ -149,11 +167,19 @@ const PROMISES_METHODS: Record<string, MethodSpec> = {
 /**
  * Coerce a path-like argument to an absolute, `/`-separated path string, or null when the
  * argument is not a path (an fd number, a FileHandle, …) — those are out of scope.
+ *
+ * Fix #19: a Buffer path is decoded with `"latin1"`, not `"utf8"`. `latin1` maps every byte
+ * 1:1 to a code point (U+0000–U+00FF), so the decode round-trips exactly — including
+ * non-UTF-8 bytes, which a `utf8` decode would lossily collapse to U+FFFD. That lossiness
+ * previously meant the STRING checked against policy could differ from the bytes actually
+ * forwarded to real `fs` (the original Buffer is forwarded verbatim, unchanged by this
+ * function). `/` is 0x2F, which is the same code point in latin1 as in ASCII/UTF-8, so
+ * segment-splitting on `path.sep` below is unaffected.
  */
 function coercePath(arg: unknown): string | null {
   let p: string;
   if (typeof arg === "string") p = arg;
-  else if (Buffer.isBuffer(arg)) p = arg.toString("utf8");
+  else if (Buffer.isBuffer(arg)) p = arg.toString("latin1");
   else if (arg instanceof URL) {
     try {
       p = fileURLToPath(arg);
@@ -177,8 +203,76 @@ function openSpecs(args: unknown[]): PathSpec[] {
   return [{ index: 0, access }];
 }
 
+/**
+ * Derive the effective PathSpec for an `access`-kind call (`fs.access`/`fs.accessSync`,
+ * `fs.promises.access`) from its mode argument (fix #20). `fs.access(path[, mode][, cb])`
+ * defaults `mode` to `fs.constants.F_OK` (existence only) when omitted — a `read`-shaped
+ * probe. When the caller passes a mode with the `W_OK` bit set, they are probing
+ * writability, which should require a `write` grant instead.
+ */
+function accessSpecs(args: unknown[]): PathSpec[] {
+  const mode = args[1];
+  const W_OK = realFs.constants.W_OK;
+  const access: Access = typeof mode === "number" && (mode & W_OK) !== 0 ? "write" : "read";
+  return [{ index: 0, access }];
+}
+
 type AnyFn = (...args: unknown[]) => unknown;
 type PathClass = abstract new (...a: never[]) => unknown;
+
+/**
+ * How a denial is DELIVERED for a given method (fix #16). The guard DECISION is identical in
+ * every mode — this only changes how a denial surfaces, so it matches the real API's own
+ * error-delivery channel instead of always throwing synchronously:
+ *  - `"throw"`    — synchronous throw (real sync `fs`, and `watch`/`watchFile`, which throw
+ *                   synchronously on a bad path in real Node too).
+ *  - `"reject"`   — a rejected Promise (real `fs.promises`).
+ *  - `"callback"` — `cb(err)` on `process.nextTick` (real callback-style async `fs`, which
+ *                   never throws synchronously).
+ *  - `"streamRead"`/`"streamWrite"` — a stream that emits `error` on `setImmediate`
+ *                   (real `createReadStream`/`createWriteStream`, which never throw
+ *                   synchronously either).
+ */
+type Delivery = "throw" | "reject" | "callback" | "streamRead" | "streamWrite";
+
+/**
+ * Classify a `FS_METHODS` entry's denial-delivery mode by name (fix #16). `fs.promises`
+ * entries are uniformly `"reject"` (passed directly as `() => "reject"` at the call site) —
+ * this function only covers the sync/callback/stream `fs` surface.
+ */
+function fsDeliveryFor(name: string): Delivery {
+  if (name.endsWith("Sync")) return "throw";
+  if (name === "watch" || name === "watchFile") return "throw"; // real fs.watch throws sync too
+  if (name === "createReadStream") return "streamRead";
+  if (name === "createWriteStream") return "streamWrite";
+  return "callback";
+}
+
+/**
+ * Build a minimal stream that emits `'error'` with `err` asynchronously, mirroring how real
+ * `createReadStream`/`createWriteStream` deliver an async error (fix #16). Constructed but
+ * inert until the scheduled `destroy` fires, so `fs.createReadStream(p).on('error', h).on(...)`
+ * chains work exactly as they would against a real stream that fails after construction.
+ */
+// Deny streams emit 'error' on `setImmediate` (not `process.nextTick`): a real fs stream's
+// open failure arrives via the libuv threadpool, LATER than nextTick, so setImmediate widens
+// the window for a caller that attaches its 'error' handler in a microtask or nextTick before
+// the error fires (closer to real Node's timing). `.path` is set so error-logging libraries
+// that read `stream.path` see the requested path. Exact threadpool timing is not reproduced
+// (a handler attached on a later macrotask can still miss it — same as real fs past a point);
+// tracked as a follow-up. This is fail-closed: the read/write never happens regardless.
+function denyReadStream(err: CapabilityError, path: unknown): Readable {
+  const stream = new Readable({ read() {} }) as Readable & { path?: unknown };
+  stream.path = path;
+  setImmediate(() => stream.destroy(err));
+  return stream;
+}
+function denyWriteStream(err: CapabilityError, path: unknown): Writable {
+  const stream = new Writable({ write(_chunk, _enc, cb) { cb(); } }) as Writable & { path?: unknown };
+  stream.path = path;
+  setImmediate(() => stream.destroy(err));
+  return stream;
+}
 
 /**
  * Build a shimmed `fs` module: every method in the tables above is guarded; everything else
@@ -198,7 +292,7 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
 
   /** Attribute + evaluate each path of a call; throws CapabilityError on an enforce deny. */
   function guardCall(args: unknown[], spec: MethodSpec): void {
-    const specs = spec === "open" ? openSpecs(args) : spec;
+    const specs = spec === "open" ? openSpecs(args) : spec === "access" ? accessSpecs(args) : spec;
     for (const { index, access } of specs) {
       check(access, args[index]);
     }
@@ -236,24 +330,59 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
     });
   }
 
-  function wrapFn(orig: AnyFn, spec: MethodSpec, rejectOnDeny: boolean): AnyFn {
+  function wrapFn(orig: AnyFn, spec: MethodSpec, delivery: Delivery): AnyFn {
     const wrapped: AnyFn = function (this: unknown, ...args: unknown[]) {
-      if (rejectOnDeny) {
-        try {
+      switch (delivery) {
+        case "throw": {
+          // Real sync fs throws synchronously — matches, no translation needed.
           guardCall(args, spec);
-        } catch (err) {
-          return Promise.reject(err);
+          return orig.apply(this, args);
         }
-      } else {
-        guardCall(args, spec);
+        case "reject": {
+          // Real fs.promises rejects — matches, no translation needed.
+          try {
+            guardCall(args, spec);
+          } catch (err) {
+            return Promise.reject(err);
+          }
+          return orig.apply(this, args);
+        }
+        case "callback": {
+          // Real callback-style fs NEVER throws synchronously; it delivers errors via the
+          // callback. Translate a sync guard throw into an async `cb(err)` so idiomatic
+          // (try/catch-free) callback code isn't crashed by an uncaught exception (#16).
+          try {
+            guardCall(args, spec);
+          } catch (err) {
+            if (!(err instanceof CapabilityError)) throw err;
+            const cb = args[args.length - 1];
+            if (typeof cb !== "function") throw err; // mis-call (no cb) — match Node, throw.
+            process.nextTick(() => (cb as (e: unknown) => void)(err));
+            return undefined;
+          }
+          return orig.apply(this, args);
+        }
+        case "streamRead":
+        case "streamWrite": {
+          // Real createReadStream/createWriteStream never throw synchronously either — the
+          // returned stream emits 'error' asynchronously. Mirror that on denial (#16).
+          try {
+            guardCall(args, spec);
+          } catch (err) {
+            if (!(err instanceof CapabilityError)) throw err;
+            return delivery === "streamRead"
+              ? denyReadStream(err, args[0])
+              : denyWriteStream(err, args[0]);
+          }
+          return orig.apply(this, args);
+        }
       }
-      return orig.apply(this, args);
     };
     Object.defineProperty(wrapped, "name", { value: orig.name, configurable: true });
     // Preserve function-attached variants (realpath.native, realpathSync.native).
     const native = (orig as AnyFn & { native?: AnyFn }).native;
     if (typeof native === "function") {
-      (wrapped as AnyFn & { native?: AnyFn }).native = wrapFn(native, spec, rejectOnDeny);
+      (wrapped as AnyFn & { native?: AnyFn }).native = wrapFn(native, spec, delivery);
     }
     return wrapped;
   }
@@ -261,7 +390,7 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
   function wrapSurface<T extends object>(
     real: T,
     table: Record<string, MethodSpec>,
-    rejectOnDeny: boolean,
+    deliveryFor: (name: string) => Delivery,
   ): T {
     const shim: Record<string, unknown> = {};
     for (const key of Object.keys(real)) {
@@ -270,12 +399,12 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
     for (const [name, spec] of Object.entries(table)) {
       const orig = (real as Record<string, unknown>)[name];
       if (typeof orig !== "function") continue;
-      shim[name] = wrapFn(orig as AnyFn, spec, rejectOnDeny);
+      shim[name] = wrapFn(orig as AnyFn, spec, deliveryFor(name));
     }
     return shim as T;
   }
 
-  const shim = wrapSurface(realFs, FS_METHODS, false);
+  const shim = wrapSurface(realFs, FS_METHODS, fsDeliveryFor);
 
   // Path-taking stream constructors: `new fs.ReadStream(path)` must be mediated like
   // `createReadStream` (a dependency using the class directly must not bypass the policy).
@@ -314,7 +443,7 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
   (shim as { promises: unknown }).promises = wrapSurface(
     realFs.promises,
     PROMISES_METHODS,
-    true,
+    () => "reject",
   );
   return shim;
 }

@@ -10,6 +10,7 @@
  * uninstall) so the loader patch never affects vitest's own machinery.
  */
 import { createRequire } from "node:module";
+import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -19,6 +20,7 @@ import {
   type Decision,
   type Policy,
 } from "../src/index.js";
+import { createFsShim } from "../src/shims/fs.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const requireCjs = createRequire(import.meta.url);
@@ -186,5 +188,157 @@ describe("fs slice — uninstall restores the loader", () => {
     withCapwall(emptyEnforcePolicy(), "enforce", () => undefined); // install + uninstall
     const dep = loadFixtureFresh();
     expect(dep.readData()).toBe("fixture data\n"); // would throw if still shimmed+enforced
+  });
+});
+
+/** Build a shim directly against `createFsShim`, bypassing the require loader entirely. */
+function directShim(
+  policy: Policy,
+  mode: "observe" | "enforce",
+): { shim: ReturnType<typeof createFsShim>; decisions: Recorded[] } {
+  const decisions: Recorded[] = [];
+  const shim = createFsShim({
+    policy,
+    mode,
+    onDecision: (pkg, decision) => decisions.push({ pkg, decision }),
+    projectRoot: here,
+  });
+  return { shim, decisions };
+}
+
+describe("fs slice — denial delivery matches the real API's error channel (#16)", () => {
+  it("a denied callback-style method (readFile) delivers CapabilityError via the callback, not a synchronous throw", async () => {
+    const { shim } = directShim(emptyEnforcePolicy(), "enforce");
+    const target = path.join(FIXTURE, "data.txt");
+    let calledSync = false;
+    const errPromise = new Promise((resolve) => {
+      expect(() => {
+        shim.readFile(target, "utf8", (err: unknown) => {
+          calledSync = true;
+          resolve(err);
+        });
+      }).not.toThrow();
+    });
+    // Must not have fired before this synchronous call returns — it's process.nextTick'd.
+    expect(calledSync).toBe(false);
+    const err = await errPromise;
+    expect(err).toMatchObject({ name: "CapabilityError" });
+  });
+
+  it("falls back to a synchronous throw for a callback-style mis-call (no callback arg) — matches real Node", () => {
+    const { shim } = directShim(emptyEnforcePolicy(), "enforce");
+    const target = path.join(FIXTURE, "data.txt");
+    expect(() => (shim.readFile as unknown as (p: string, enc: string) => void)(target, "utf8")).toThrowError(
+      expect.objectContaining({ name: "CapabilityError" }),
+    );
+  });
+
+  it("a denied createReadStream emits 'error' asynchronously, not a synchronous throw", async () => {
+    const { shim } = directShim(emptyEnforcePolicy(), "enforce");
+    const target = path.join(FIXTURE, "data.txt");
+    let stream: nodeFs.ReadStream | undefined;
+    expect(() => {
+      stream = shim.createReadStream(target);
+    }).not.toThrow();
+    const err = await new Promise((resolve, reject) => {
+      stream!.on("data", () => reject(new Error("should not emit data on a denied stream")));
+      stream!.on("error", resolve);
+    });
+    expect(err).toMatchObject({ name: "CapabilityError" });
+  });
+
+  it("a denied createWriteStream emits 'error' asynchronously, not a synchronous throw", async () => {
+    const { shim } = directShim(emptyEnforcePolicy(), "enforce");
+    const target = path.join(here, "fixtures", "nope-write.txt");
+    let stream: nodeFs.WriteStream | undefined;
+    expect(() => {
+      stream = shim.createWriteStream(target);
+    }).not.toThrow();
+    const err = await new Promise((resolve, reject) => {
+      stream!.on("finish", () => reject(new Error("should not finish a denied stream")));
+      stream!.on("error", resolve);
+    });
+    expect(err).toMatchObject({ name: "CapabilityError" });
+    expect(nodeFs.existsSync(target)).toBe(false); // nothing was actually written
+  });
+
+  it("*Sync methods still throw synchronously on denial (unchanged)", () => {
+    const { shim } = directShim(emptyEnforcePolicy(), "enforce");
+    expect(() => shim.readFileSync(path.join(FIXTURE, "data.txt"))).toThrowError(
+      expect.objectContaining({ name: "CapabilityError" }),
+    );
+  });
+
+  it("fs.promises methods still reject on denial (unchanged)", async () => {
+    const { shim } = directShim(emptyEnforcePolicy(), "enforce");
+    await expect(shim.promises.readFile(path.join(FIXTURE, "data.txt"))).rejects.toMatchObject({
+      name: "CapabilityError",
+    });
+  });
+});
+
+describe("fs slice — Buffer path fidelity (#19)", () => {
+  it("decodes a non-UTF-8 Buffer path losslessly (latin1) for the policy check", () => {
+    const { shim, decisions } = directShim(emptyEnforcePolicy(), "observe");
+    // 0xFF is not a valid standalone UTF-8 byte; a "utf8" decode would collapse it to U+FFFD,
+    // making the checked path diverge from the bytes actually forwarded to real fs.
+    const weird = Buffer.from([0x2f, 0x66, 0x6f, 0x6f, 0xff, 0x2e, 0x74, 0x78, 0x74]); // "/foo\xFF.txt"
+    try {
+      shim.readFileSync(weird as unknown as string);
+    } catch {
+      // A real ENOENT from real fs is expected and irrelevant — observe mode never denies.
+    }
+    expect(decisions).toHaveLength(1);
+    const expected = path.resolve(weird.toString("latin1")).split(path.sep).join("/");
+    const observed = decisions[0]!.decision.observed as { kind: string; path: string };
+    expect(observed).toMatchObject({ kind: "fs", path: expected });
+    // The exact byte round-tripped — a lossy utf8 decode would have produced U+FFFD instead.
+    expect(observed.path).toContain("ÿ");
+    expect(observed.path).not.toContain("�");
+  });
+});
+
+describe("fs slice — fs.access W_OK classification (#20)", () => {
+  it("classifies a W_OK probe as write: denied by a read-only grant, allowed by a write grant", () => {
+    const target = path.join(FIXTURE, "data.txt");
+    const readOnly = loadPolicyFromObject(
+      {
+        version: 1,
+        mode: "enforce",
+        packages: { "<app>": { fs: { read: ["./fixtures/**"], write: [] } } },
+      },
+      { projectRoot: here },
+    );
+    const { shim: shimReadOnly, decisions } = directShim(readOnly, "enforce");
+    expect(() => shimReadOnly.accessSync(target, nodeFs.constants.W_OK)).toThrowError(
+      expect.objectContaining({ name: "CapabilityError" }),
+    );
+    expect(decisions[0]!.decision.observed).toMatchObject({ kind: "fs", access: "write" });
+
+    const withWrite = loadPolicyFromObject(
+      {
+        version: 1,
+        mode: "enforce",
+        packages: { "<app>": { fs: { read: [], write: ["./fixtures/**"] } } },
+      },
+      { projectRoot: here },
+    );
+    const { shim: shimWrite } = directShim(withWrite, "enforce");
+    expect(() => shimWrite.accessSync(target, nodeFs.constants.W_OK)).not.toThrow();
+  });
+
+  it("a plain existence probe (no mode arg) still classifies as read", () => {
+    const target = path.join(FIXTURE, "data.txt");
+    const readOnly = loadPolicyFromObject(
+      {
+        version: 1,
+        mode: "enforce",
+        packages: { "<app>": { fs: { read: ["./fixtures/**"], write: [] } } },
+      },
+      { projectRoot: here },
+    );
+    const { shim, decisions } = directShim(readOnly, "enforce");
+    expect(() => shim.accessSync(target)).not.toThrow();
+    expect(decisions[0]!.decision.observed).toMatchObject({ kind: "fs", access: "read" });
   });
 });

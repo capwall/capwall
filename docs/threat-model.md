@@ -66,15 +66,40 @@ Per-capability notes:
   enumerable** to a denied dependency (`Object.keys`, `in`, `for..in`); only VALUES are hidden
   — names are not the secret, and hiding them would break feature-detection.
 
-**Behavior change vs. real `fs` (operational note).** In `enforce` mode a denied call throws
-synchronously — including for callback-style APIs (`fs.readFile(path, cb)`) that in stock
-Node *never* throw synchronously (they deliver errors via the callback). Loud failure is the
-intended semantics, but it means a denied benign call in idiomatic callback code raises an
-uncaught exception rather than an `Error` in the callback, and can crash the process. This is
-most likely during the observe→tighten→enforce rollout while a policy is still incomplete;
-run `observe` until coverage is stable before flipping to `enforce`. `fs.promises` denials
-reject (they do not throw). Path matching is POSIX-oriented (`/`-separated); Windows
-drive-letter paths are not matched by relative grants yet.
+**Behavior change vs. real `fs` (operational note).** In `enforce` mode a denial is delivered
+via the SAME channel the real `fs` API would use for that call, not always a synchronous
+throw — chosen specifically so idiomatic (try/catch-free) code is not crashed by an uncaught
+exception it would never see from real `fs`:
+
+- **`*Sync` methods** (`readFileSync`, …) throw `CapabilityError` synchronously — matches
+  real sync `fs`.
+- **`fs.promises` methods** reject with `CapabilityError` — matches the real promise API.
+- **Callback-style async methods** (`readFile`, `mkdir`, `access`, `rm`, …) invoke the
+  caller's own callback as `cb(err)` on `process.nextTick`, exactly as a real async `fs`
+  error would arrive, instead of throwing. If the call is missing a callback (a mis-call),
+  the shim falls back to a synchronous throw, matching real Node's behavior for the same
+  mis-call.
+- **`createReadStream`/`createWriteStream`** return a minimal stream (with `.path` set) that
+  emits `'error'` with the `CapabilityError` on `setImmediate` — a sync throw here would be a
+  bypass-shaped surprise, since `fs.createReadStream(p).on('error', h)` is the idiomatic
+  pattern and never throws synchronously in real Node either. The timing **approximates**
+  real Node's threadpool-delivered open-error rather than reproducing it exactly: a caller
+  that attaches its `'error'` handler on a much later macrotask can miss the event and get an
+  uncaught `'error'` (as it also would against real `fs` past a point). This is **fail-closed**
+  — the read/write never happens — but it is a parity gap, tracked as a follow-up.
+- **`watch`/`watchFile`** and the `ReadStream`/`WriteStream` **class constructors**
+  (`new fs.ReadStream(deniedPath)`) still throw synchronously: real `fs.watch` and a real
+  stream constructor can both throw synchronously on a bad argument, so no behavior-shape
+  change was needed there.
+- **`exists`/`existsSync`** remain the bespoke non-throwing existence probes: a denial reads
+  as "does not exist" (`false` / `cb(false)`), never an error at all.
+
+This is unchanged in spirit from before — enforce mode still fails loudly and a policy gap
+still surfaces as a real error, not a silent allow — only the DELIVERY CHANNEL now matches
+what the real `fs` API would use for that call shape. This is most likely to matter during
+the observe→tighten→enforce rollout while a policy is still incomplete; run `observe` until
+coverage is stable before flipping to `enforce`. Path matching is POSIX-oriented
+(`/`-separated); Windows drive-letter paths are not matched by relative grants yet.
 
 ## Adversary we are designed to stop
 
