@@ -102,7 +102,9 @@ export function isGranted(grant: PackagePolicy, req: CapabilityRequest): boolean
       // Host matching is exact or the "*" wildcard. Host GLOBS (e.g. "*.internal") are a
       // follow-up (tracked separately); the net shim (M4) is wired against this exact/`*` gate.
       const hostOk = net.hosts.some((h) => h === "*" || h === req.host);
-      const portOk = net.ports.includes(req.port);
+      // A `"*"` port grants any port — needed for deps that connect to a dynamically-assigned
+      // (ephemeral) port, where a concrete observed port won't match on the next run (#27).
+      const portOk = net.ports.some((p) => p === "*" || p === req.port);
       return hostOk && portOk;
     }
   }

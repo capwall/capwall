@@ -65,8 +65,11 @@ Path globs, resolved relative to the project root. Grants are additive.
 ```
 
 - `hosts` matches hostnames (glob `*` supported); an empty list denies all hosts.
-- `ports` is an allowlist of numeric ports.
-- Covers `net`, `http`, and `https` (the latter build on `net`).
+- `ports` is an allowlist of numeric ports. A literal `"*"` entry grants **any** port —
+  use it for a dependency that connects to a dynamically-assigned (ephemeral) port, where a
+  concrete observed port would not match on the next run. `capwall observe` records concrete
+  ports; add the `"*"` by hand when you know a target is dynamic.
+- Covers `net`, `http`, `https`, `tls`, `http2`, and `dgram` (egress).
 
 ### `child_process`, `worker_threads`, `vm` — boolean gates
 

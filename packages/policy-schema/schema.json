@@ -44,7 +44,7 @@
           "additionalProperties": false,
           "properties": {
             "hosts": { "type": "array", "items": { "type": "string" } },
-            "ports": { "type": "array", "items": { "type": "integer", "minimum": 0 } }
+            "ports": { "type": "array", "items": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "const": "*" }] } }
           }
         },
         "child_process": {
