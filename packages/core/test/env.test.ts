@@ -45,9 +45,9 @@ function withCapwall<T>(
   }
 }
 
-const SECRET = "CAPWALL_TEST_SECRET";
+const SECRET = "FIXTURE_SECRET_XYZ";
 process.env[SECRET] = "s3cr3t";
-process.env["CAPWALL_TEST_OK"] = "fine";
+process.env["FIXTURE_OK"] = "fine";
 
 afterEach(() => {
   // Guard: process.env must be restored to the real object after each test.
@@ -70,8 +70,8 @@ describe("env shim — enforce (soft deny: hide value, never throw)", () => {
   });
 
   it("allows a granted key and hides a different one", () => {
-    const { decisions } = withCapwall(enforce(["CAPWALL_TEST_OK"]), "enforce", (dep) => {
-      expect(dep.readEnv("CAPWALL_TEST_OK")).toBe("fine");
+    const { decisions } = withCapwall(enforce(["FIXTURE_OK"]), "enforce", (dep) => {
+      expect(dep.readEnv("FIXTURE_OK")).toBe("fine");
       expect(dep.readEnv(SECRET)).toBeUndefined();
     });
     expect(decisions.some((d) => d.decision.allowed)).toBe(true);
@@ -89,6 +89,23 @@ describe("env shim — enforce (soft deny: hide value, never throw)", () => {
     withCapwall(enforce([]), "enforce", () => {
       expect(process.env[SECRET]).toBe("s3cr3t"); // not gated, not thrown
     });
+  });
+
+  it("closes the getOwnPropertyDescriptor(...).value exfiltration path", () => {
+    withCapwall(enforce([]), "enforce", (dep) => {
+      const dep2 = dep as unknown as { readEnvDescriptor(k: string): PropertyDescriptor | undefined };
+      const desc = dep2.readEnvDescriptor(SECRET);
+      expect(desc?.value).toBeUndefined(); // value hidden, not leaked
+    });
+  });
+
+  it("never gates or records CAPWALL_* plumbing keys", () => {
+    process.env["CAPWALL_FAKE_PLUMBING"] = "internal";
+    const { decisions } = withCapwall(enforce([]), "enforce", (dep) => {
+      expect(dep.readEnv("CAPWALL_FAKE_PLUMBING")).toBe("internal"); // passed through
+    });
+    expect(decisions.some((d) => d.decision.observed.kind === "env")).toBe(false);
+    delete process.env["CAPWALL_FAKE_PLUMBING"];
   });
 });
 

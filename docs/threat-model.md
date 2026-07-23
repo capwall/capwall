@@ -24,24 +24,39 @@ Per-capability notes:
   path-taking stream constructors (`ReadStream`/`WriteStream` and their `File*Stream`
   aliases). Purely fd-based operations (`fs.read`, `fs.write`, `ftruncate`, …) are not
   mediated — consistent with the fd-escape exclusion below.
-- **`net`/`http`/`https`** — **egress only**: outbound `connect`/`createConnection` and
-  `http(s).request`/`get`. Inbound `server.listen` is not gated (capwall mediates who a
-  package may *reach*, not that it may serve). `net`, `http`, and `https` are three separate
-  shims on purpose: capwall's require patch only affects `Module._load`-routed requires
-  (user/dependency code); Node's own HTTP client loads `net` through the internal bootstrap
-  loader, which never hits `Module._load` — so shimming `net` alone would leave HTTP/HTTPS
-  egress completely unmediated. IPC/unix-socket connects have no host:port and are
-  approximated coarsely as `{ host: "<ipc>", port: 0 }`.
+- **`net`/`http`/`https`/`tls`/`http2`/`dgram`** — **egress only**. Mediated: `net.connect`/
+  `createConnection` **and** `new net.Socket().connect()`; `http(s).request`/`get` **and**
+  `new http.ClientRequest()`; `tls.connect` and `new tls.TLSSocket().connect()`;
+  `http2.connect`; and `dgram` socket `send`/`connect` (UDP). Each core egress module is
+  shimmed separately on purpose: capwall's require patch only affects `Module._load`-routed
+  requires (user/dependency code); Node's own HTTP client loads `net` through the internal
+  bootstrap loader, which never hits `Module._load`, so one module's shim never covers
+  another — and a dependency could otherwise bypass the control simply by choosing `tls`
+  (or `dgram`) over `net`. Inbound `server.listen` is not gated (capwall mediates who a
+  package may *reach*, not that it may serve). IPC/unix-socket connects have no host:port and
+  are approximated coarsely as `{ host: "<ipc>", port: 0 }`. **Not covered:** `dns` lookups
+  (a lookup moves no payload; DNS tunneling is a determined-attacker technique out of scope),
+  borrowing an unwrapped prototype method (`net.Socket.prototype.connect.call(...)`), and a
+  getter-based TOCTOU on `{host,port}` options for a package that *already holds a narrow net
+  grant* (the derived target is read separately from the value Node connects to). These are
+  documented residuals, not silent gaps.
 - **`child_process`, `worker_threads`, `vm`** — boolean **gates** (may this package spawn /
   start a worker / use `vm` at all). Gating, not confinement: capwall does not constrain what
   the subprocess/worker/vm-context does once started (see § gating vs confinement).
-- **`process.env`** — a read allowlist enforced via a `Proxy` on `process.env`. Only reads
-  attributed to a **dependency** are gated; reads attributed to `<app>` (application code AND
-  Node-internal frames, which attribute to `<app>` because internal frames are skipped) pass
-  through — gating them would break Node startup for no gain, since the app is the trust root.
-  A denied env read is a **soft deny**: it returns `undefined` (hiding the value — the
-  anti-exfiltration goal) rather than throwing, so a benign dependency probing an optional var
-  is not crashed. The denial is still recorded and logged.
+- **`process.env`** — a read allowlist enforced via a `Proxy` on `process.env` (`get` **and**
+  `getOwnPropertyDescriptor` traps, so `Object.getOwnPropertyDescriptor(process.env, k).value`
+  cannot leak a value a direct read denies). Only reads attributed to a **dependency** are
+  gated; reads attributed to `<app>` (application code AND Node-internal frames, which
+  attribute to `<app>` because internal frames are skipped) pass through — gating them would
+  break Node startup for no gain, since the app is the trust root. `CAPWALL_*` keys (capwall's
+  own preload plumbing) are never gated or recorded. When a package **spawns a child**, Node
+  reads `process.env` to build the child's environment block; those reads are exempted (the
+  child_process shim suspends the env gate around the spawn) so an allowed spawn inherits a
+  real environment rather than an empty one. A denied env read is a **soft deny**: it returns
+  `undefined` (hiding the value) rather than throwing, so a benign dependency probing an
+  optional var is not crashed. The denial is still recorded and logged. **Key NAMES stay
+  enumerable** to a denied dependency (`Object.keys`, `in`, `for..in`); only VALUES are hidden
+  — names are not the secret, and hiding them would break feature-detection.
 
 **Behavior change vs. real `fs` (operational note).** In `enforce` mode a denied call throws
 synchronously — including for callback-style APIs (`fs.readFile(path, cb)`) that in stock

@@ -18,6 +18,10 @@ interface FixtureDep {
   connect(host: string, port: number): { destroy(): void };
   spawn(): unknown;
   runVm(code: string): unknown;
+  connectViaSocketClass(host: string, port: number): { destroy(): void };
+  connectViaTls(host: string, port: number): { destroy(): void };
+  spawnViaChildProcessClass(): unknown;
+  sendViaDgram(host: string, port: number): { close(): void };
 }
 
 function loadFixtureFresh(): FixtureDep {
@@ -57,6 +61,40 @@ describe("loader routing — M4 shims deny-by-default in enforce", () => {
   it("vm.runInNewContext is routed + denied", () => {
     withCapwall(denyAll(), "enforce", (dep) => {
       expect(() => dep.runVm("1 + 1")).toThrowError(
+        expect.objectContaining({ name: "CapabilityError" }),
+      );
+    });
+  });
+
+  // Regression: capability-bearing CLASSES / alternate egress modules must not bypass the
+  // guard (the fs.ReadStream-class defect, found again across net/cp/tls/dgram by review).
+  it("new net.Socket().connect() is denied (not just net.connect)", () => {
+    withCapwall(denyAll(), "enforce", (dep) => {
+      expect(() => dep.connectViaSocketClass("evil.example.com", 443)).toThrowError(
+        expect.objectContaining({ name: "CapabilityError" }),
+      );
+    });
+  });
+
+  it("tls.connect() is denied (egress not bypassable via tls)", () => {
+    withCapwall(denyAll(), "enforce", (dep) => {
+      expect(() => dep.connectViaTls("evil.example.com", 443)).toThrowError(
+        expect.objectContaining({ name: "CapabilityError" }),
+      );
+    });
+  });
+
+  it("new child_process.ChildProcess().spawn() is denied", () => {
+    withCapwall(denyAll(), "enforce", (dep) => {
+      expect(() => dep.spawnViaChildProcessClass()).toThrowError(
+        expect.objectContaining({ name: "CapabilityError" }),
+      );
+    });
+  });
+
+  it("dgram UDP send is denied", () => {
+    withCapwall(denyAll(), "enforce", (dep) => {
+      expect(() => dep.sendViaDgram("evil.example.com", 53)).toThrowError(
         expect.objectContaining({ name: "CapabilityError" }),
       );
     });

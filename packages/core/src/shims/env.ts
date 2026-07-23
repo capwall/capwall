@@ -2,10 +2,13 @@
  * `process.env` read shim — the anti-exfiltration control (roadmap M4, issue #8).
  *
  * Unlike the module shims, `process.env` is not obtained via `require`; it is a live object.
- * We replace it with a `Proxy` whose `get` trap attributes the reading package and evaluates
- * an `{ kind: "env", key }` request. A dependency reading `process.env.AWS_SECRET_ACCESS_KEY`
- * that its policy does not grant is a violation — logged in observe, denied (throw) in
- * enforce.
+ * We replace it with a `Proxy` whose `get` and `getOwnPropertyDescriptor` traps attribute the
+ * reading package and evaluate an `{ kind: "env", key }` request. A dependency reading
+ * `process.env.AWS_SECRET_ACCESS_KEY` that its policy does not grant is a violation — logged
+ * in observe, soft-denied (see below) in enforce. BOTH the direct-read trap (`get`) and the
+ * descriptor trap (`getOwnPropertyDescriptor`) are gated, because
+ * `Object.getOwnPropertyDescriptor(process.env, k).value` would otherwise hand back the value
+ * a `get` denies — a one-line exfiltration hole for an anti-exfiltration control.
  *
  * SCOPE DECISION (documented in docs/threat-model.md): only reads attributed to a **real
  * dependency package** are gated. Reads attributed to {@link APP_ROOT} — application code AND
@@ -25,12 +28,22 @@
  * there.)
  *
  * Only string-key reads are mediated. Symbol keys, and the write / `has` / `delete` /
- * enumeration traps, forward straight through so `process.env` keeps its normal semantics
+ * `ownKeys` traps, forward straight through so `process.env` keeps its normal semantics
  * (values coerced to strings, assignment reaching the real environment, `in`, `for..in`).
+ * Key NAMES therefore remain enumerable to a denied dependency (`Object.keys`, `in`); only
+ * VALUES are hidden — names are not the secret, and hiding them would break benign
+ * feature-detection. This is documented in docs/threat-model.md.
+ *
+ * `CAPWALL_*` keys (capwall's own preload plumbing) are never gated or recorded — they are
+ * implementation detail, not app secrets, and gating them would pollute generated policies
+ * and cause spurious mode-dependent denials (they differ between observe and enforce).
+ *
+ * When the env gate is suspended (see runtime.ts `suspendEnvGate` — used by the
+ * child_process shim so a spawned child inherits a real environment), all reads pass through.
  */
 import { APP_ROOT, attributeCaller } from "../attribution/index.js";
 import { evaluate } from "../policy/evaluate.js";
-import type { ShimContext } from "./runtime.js";
+import { isEnvGateSuspended, type ShimContext } from "./runtime.js";
 
 export interface EnvGuardHandle {
   /** Restore the original `process.env`. Best-effort: only if nobody replaced it after us. */
@@ -42,19 +55,40 @@ export function createEnvProxy(
   realEnv: NodeJS.ProcessEnv,
   ctx: ShimContext,
 ): NodeJS.ProcessEnv {
+  /**
+   * Shared gate for a single string key: returns true if the reading dependency is DENIED
+   * this key (caller then hides the value). Returns false (allow) for symbol keys, suspended
+   * gate, `CAPWALL_*` plumbing, `<app>`/internal reads, and granted keys. Records the
+   * decision for real dependency reads.
+   */
+  function denied(key: string | symbol): boolean {
+    if (typeof key !== "string") return false;
+    if (isEnvGateSuspended()) return false;
+    if (key.startsWith("CAPWALL_")) return false;
+    const pkg = attributeCaller(
+      ctx.projectRoot !== undefined ? { projectRoot: ctx.projectRoot } : {},
+    );
+    // App code and Node internals (both attribute to <app>) are not gated — see header.
+    if (pkg === APP_ROOT) return false;
+    const decision = evaluate(ctx.policy, ctx.mode, pkg, { kind: "env", key });
+    ctx.onDecision(pkg, decision);
+    return !decision.allowed; // soft deny — caller hides the value, never throws
+  }
+
   return new Proxy(realEnv, {
     get(target, key, receiver) {
-      if (typeof key !== "string") return Reflect.get(target, key, receiver);
-      const pkg = attributeCaller(
-        ctx.projectRoot !== undefined ? { projectRoot: ctx.projectRoot } : {},
-      );
-      // App code and Node internals (both attribute to <app>) are not gated — see header.
-      if (pkg === APP_ROOT) return Reflect.get(target, key, receiver);
-      const decision = evaluate(ctx.policy, ctx.mode, pkg, { kind: "env", key });
-      ctx.onDecision(pkg, decision);
-      // Soft deny: hide the value from an ungranted dependency, but never throw.
-      if (!decision.allowed) return undefined;
+      if (denied(key)) return undefined;
       return Reflect.get(target, key, receiver);
+    },
+    // Close the Object.getOwnPropertyDescriptor(process.env, k).value exfiltration path: a
+    // denied key's descriptor reports value: undefined (property still "present" and
+    // enumerable, but the value is hidden — matching the get trap).
+    getOwnPropertyDescriptor(target, key) {
+      const desc = Reflect.getOwnPropertyDescriptor(target, key);
+      if (desc && denied(key)) {
+        return { ...desc, value: undefined };
+      }
+      return desc;
     },
   });
 }

@@ -69,4 +69,18 @@ describe("isGranted — pure gate checks", () => {
     expect(isGranted({ env: ["*"] }, { kind: "env", key: "ANYTHING" })).toBe(true);
     expect(isGranted({ env: ["NODE_ENV"] }, { kind: "env", key: "SECRET" })).toBe(false);
   });
+
+  it("boolean gates ignore a polluted Object.prototype (own-property only)", () => {
+    // Regression: an empty grant {} must not inherit a gate from a polluted prototype.
+    const proto = Object.prototype as unknown as Record<string, unknown>;
+    proto["child_process"] = true;
+    proto["vm"] = true;
+    try {
+      expect(isGranted({}, { kind: "child_process" })).toBe(false);
+      expect(isGranted({}, { kind: "vm" })).toBe(false);
+    } finally {
+      delete proto["child_process"];
+      delete proto["vm"];
+    }
+  });
 });

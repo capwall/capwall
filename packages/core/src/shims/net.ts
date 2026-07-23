@@ -42,11 +42,15 @@
 import realNet from "node:net";
 import realHttp from "node:http";
 import realHttps from "node:https";
+import realTls from "node:tls";
+import realHttp2 from "node:http2";
+import realDgram from "node:dgram";
 import { guard, type ShimContext, type ShimRegistry } from "./runtime.js";
 
 export type { DecisionSink, ShimContext } from "./runtime.js";
 
 type AnyFn = (...args: unknown[]) => unknown;
+type AnyClass = new (...a: never[]) => unknown;
 
 /** Sentinel host for IPC/unix-domain-socket connects, which have no host:port pair. */
 const IPC_HOST = "<ipc>";
@@ -100,9 +104,45 @@ function wrapConnect(orig: AnyFn, ctx: ShimContext): AnyFn {
 }
 
 /**
- * Build a shimmed `net` module: `connect`/`createConnection` are guarded (they are aliases —
- * both wrapped identically, sharing one guarded closure); everything else (`Socket`, `Server`,
- * constants, …) is the real thing, passed through. `server.listen` is deliberately untouched.
+ * Guard the `connect` method of a freshly-constructed socket instance (net.Socket,
+ * tls.TLSSocket). `new net.Socket().connect(...)` is the low-level egress primitive
+ * `net.connect` is sugar over, so it must be gated too — otherwise it is a trivial bypass
+ * (the fs.ReadStream-class defect). We override the INSTANCE's `connect` (own property) so we
+ * never mutate the shared prototype (which internal, already-guarded sockets also use).
+ */
+function guardInstanceConnect(instance: Record<string, unknown>, ctx: ShimContext): void {
+  const realConnect = instance["connect"];
+  if (typeof realConnect !== "function") return;
+  Object.defineProperty(instance, "connect", {
+    value: function (this: unknown, ...cargs: unknown[]) {
+      const { host, port } = deriveNetTarget(cargs);
+      guard(ctx, { kind: "net", host, port });
+      return (realConnect as AnyFn).apply(this, cargs);
+    },
+    writable: true,
+    configurable: true,
+  });
+}
+
+/** Wrap a socket class (net.Socket / tls.TLSSocket) so `new Cls().connect()` is guarded. */
+function wrapSocketClass(RealClass: AnyClass, ctx: ShimContext): AnyClass {
+  return new Proxy(RealClass, {
+    construct(target, argArray, newTarget) {
+      const instance = Reflect.construct(target, argArray as never[], newTarget) as Record<
+        string,
+        unknown
+      >;
+      guardInstanceConnect(instance, ctx);
+      return instance;
+    },
+  });
+}
+
+/**
+ * Build a shimmed `net` module: `connect`/`createConnection` are guarded (aliases, one
+ * guarded closure), AND the `Socket` class is wrapped so `new net.Socket().connect()` is
+ * guarded too. Everything else (`Server`, constants, …) passes through. `server.listen` is
+ * deliberately untouched (egress, not binding).
  */
 export function createNetShim(ctx: ShimContext): typeof import("node:net") {
   const shim: Record<string, unknown> = {};
@@ -112,6 +152,9 @@ export function createNetShim(ctx: ShimContext): typeof import("node:net") {
   const wrapped = wrapConnect(realNet.connect as unknown as AnyFn, ctx);
   shim["connect"] = wrapped;
   shim["createConnection"] = wrapped;
+  if (typeof realNet.Socket === "function") {
+    shim["Socket"] = wrapSocketClass(realNet.Socket as unknown as AnyClass, ctx);
+  }
   return shim as unknown as typeof import("node:net");
 }
 
@@ -174,10 +217,22 @@ function wrapHttpFn(orig: AnyFn, ctx: ShimContext, defaultPort: number): AnyFn {
   return wrapped;
 }
 
+/** Wrap `ClientRequest` (its constructor initiates the connection) so `new http.ClientRequest(opts)` is guarded. */
+function wrapClientRequestClass(RealClass: AnyClass, ctx: ShimContext, defaultPort: number): AnyClass {
+  return new Proxy(RealClass, {
+    construct(target, argArray, newTarget) {
+      const { host, port } = deriveHttpTarget(argArray as unknown[], defaultPort);
+      guard(ctx, { kind: "net", host, port });
+      return Reflect.construct(target, argArray as never[], newTarget);
+    },
+  });
+}
+
 /**
- * Build a shimmed `http`/`https` module: `request`/`get` are guarded; everything else
- * (`Agent`, `Server`, constants, …) is the real thing, passed through. `server.listen` is
- * deliberately untouched (capwall mediates egress, not binding).
+ * Build a shimmed `http`/`https` module: `request`/`get` are guarded, AND the
+ * `ClientRequest` class is wrapped (a dependency can `new http.ClientRequest(opts)` directly,
+ * which initiates the connection in its constructor). Everything else (`Agent`, `Server`,
+ * constants, …) passes through. `server.listen` is deliberately untouched (egress, not binding).
  */
 function wrapHttpModule<T extends object>(real: T, ctx: ShimContext, defaultPort: number): T {
   const shim: Record<string, unknown> = {};
@@ -189,6 +244,13 @@ function wrapHttpModule<T extends object>(real: T, ctx: ShimContext, defaultPort
     const orig = realRecord[name];
     if (typeof orig !== "function") continue;
     shim[name] = wrapHttpFn(orig as AnyFn, ctx, defaultPort);
+  }
+  if (typeof realRecord["ClientRequest"] === "function") {
+    shim["ClientRequest"] = wrapClientRequestClass(
+      realRecord["ClientRequest"] as AnyClass,
+      ctx,
+      defaultPort,
+    );
   }
   return shim as unknown as T;
 }
@@ -202,19 +264,120 @@ export function createHttpsShim(ctx: ShimContext): typeof import("node:https") {
 }
 
 /**
- * Register the net/http/https shims' specifiers into the loader registry. Each module is
- * built once and shared across its specifier aliases.
+ * Build a shimmed `tls` module: `tls.connect` and `new tls.TLSSocket().connect()` are guarded
+ * (TLS egress is a first-class exfiltration/C2 path — a dependency must not reach it just by
+ * choosing `tls` over `net`). Default port 443. `tls.createServer` is untouched (egress, not
+ * binding).
+ */
+export function createTlsShim(ctx: ShimContext): typeof import("node:tls") {
+  const shim: Record<string, unknown> = {};
+  for (const key of Object.keys(realTls)) {
+    shim[key] = (realTls as unknown as Record<string, unknown>)[key];
+  }
+  const realConnect = realTls.connect as unknown as AnyFn;
+  shim["connect"] = wrapHttpFn(realConnect, ctx, 443); // same options/(port,host) derivation, 443 default
+  if (typeof realTls.TLSSocket === "function") {
+    shim["TLSSocket"] = wrapSocketClass(realTls.TLSSocket as unknown as AnyClass, ctx);
+  }
+  return shim as unknown as typeof import("node:tls");
+}
+
+/**
+ * Build a shimmed `http2` module: `http2.connect(authority)` opens a client session to
+ * `authority` — guarded (default port 443). `http2.createServer`/`createSecureServer` are
+ * untouched (egress, not binding).
+ */
+export function createHttp2Shim(ctx: ShimContext): typeof import("node:http2") {
+  const shim: Record<string, unknown> = {};
+  for (const key of Object.keys(realHttp2)) {
+    shim[key] = (realHttp2 as unknown as Record<string, unknown>)[key];
+  }
+  const realConnect = realHttp2.connect as unknown as AnyFn;
+  shim["connect"] = function (this: unknown, ...args: unknown[]): unknown {
+    // http2.connect(authority[, options][, listener]); authority is a URL string or URL.
+    const authority = args[0];
+    let host = "localhost";
+    let port = 443;
+    try {
+      const u = authority instanceof URL ? authority : new URL(String(authority));
+      host = u.hostname;
+      if (u.port !== "") port = Number(u.port);
+    } catch {
+      /* unparseable authority — fall back to deny-leaning localhost:443 */
+    }
+    guard(ctx, { kind: "net", host, port });
+    return realConnect.apply(this, args);
+  };
+  return shim as unknown as typeof import("node:http2");
+}
+
+/**
+ * Build a shimmed `dgram` module: sockets returned by `createSocket` have their `send` and
+ * `connect` guarded (UDP egress — DNS-tunnel / beacon exfiltration). Best-effort target
+ * derivation: for `send`, the port is the last numeric argument and the host the last string
+ * argument (covers both `send(msg, port, host)` and `send(msg, offset, length, port, host)`);
+ * for `connect(port[, address])`, the first number/string.
+ */
+export function createDgramShim(ctx: ShimContext): typeof import("node:dgram") {
+  const shim: Record<string, unknown> = {};
+  for (const key of Object.keys(realDgram)) {
+    shim[key] = (realDgram as unknown as Record<string, unknown>)[key];
+  }
+  const realCreate = realDgram.createSocket as unknown as AnyFn;
+  shim["createSocket"] = function (this: unknown, ...args: unknown[]): unknown {
+    const socket = realCreate.apply(this, args) as Record<string, unknown>;
+    const realSend = socket["send"];
+    const realConnect = socket["connect"];
+    if (typeof realSend === "function") {
+      Object.defineProperty(socket, "send", {
+        value: function (this: unknown, ...sargs: unknown[]) {
+          let port = 0;
+          let host = "localhost";
+          for (const a of sargs) {
+            if (typeof a === "number") port = a; // last number wins → the port
+            else if (typeof a === "string") host = a; // last string wins → the address
+          }
+          guard(ctx, { kind: "net", host, port });
+          return (realSend as AnyFn).apply(this, sargs);
+        },
+        writable: true,
+        configurable: true,
+      });
+    }
+    if (typeof realConnect === "function") {
+      Object.defineProperty(socket, "connect", {
+        value: function (this: unknown, ...cargs: unknown[]) {
+          const port = typeof cargs[0] === "number" ? cargs[0] : 0;
+          const host = typeof cargs[1] === "string" ? cargs[1] : "localhost";
+          guard(ctx, { kind: "net", host, port });
+          return (realConnect as AnyFn).apply(this, cargs);
+        },
+        writable: true,
+        configurable: true,
+      });
+    }
+    return socket;
+  };
+  return shim as unknown as typeof import("node:dgram");
+}
+
+/**
+ * Register the network egress shims' specifiers into the loader registry: net, http, https,
+ * tls, http2, and dgram. Each module is built once and shared across its specifier aliases.
+ * (dns is intentionally NOT shimmed — a lookup moves no payload; DNS tunneling is a
+ * determined-attacker technique out of scope, noted in docs/threat-model.md.)
  */
 export function registerNetShim(reg: ShimRegistry, ctx: ShimContext): void {
-  const netShim = createNetShim(ctx);
-  reg.set("net", netShim);
-  reg.set("node:net", netShim);
-
-  const httpShim = createHttpShim(ctx);
-  reg.set("http", httpShim);
-  reg.set("node:http", httpShim);
-
-  const httpsShim = createHttpsShim(ctx);
-  reg.set("https", httpsShim);
-  reg.set("node:https", httpsShim);
+  const pairs: Array<[string, unknown]> = [
+    ["net", createNetShim(ctx)],
+    ["http", createHttpShim(ctx)],
+    ["https", createHttpsShim(ctx)],
+    ["tls", createTlsShim(ctx)],
+    ["http2", createHttp2Shim(ctx)],
+    ["dgram", createDgramShim(ctx)],
+  ];
+  for (const [name, shim] of pairs) {
+    reg.set(name, shim);
+    reg.set(`node:${name}`, shim);
+  }
 }

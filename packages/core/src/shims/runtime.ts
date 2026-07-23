@@ -28,6 +28,25 @@ export interface ShimContext {
 export type ShimRegistry = Map<string, unknown>;
 
 /**
+ * Reentrancy guard for the env shim. When a shim performs a real operation that itself reads
+ * `process.env` as an implementation detail — chiefly `child_process` spawning, where Node
+ * enumerates `process.env` to build the child's environment block — those reads would
+ * otherwise be attributed to the spawning dependency and soft-denied, stripping the child's
+ * environment. The child_process shim brackets the real spawn with suspend/resume so the
+ * env shim passes those internal reads through untouched. Depth-counted for nesting.
+ */
+let envGateSuspendDepth = 0;
+export function suspendEnvGate(): void {
+  envGateSuspendDepth++;
+}
+export function resumeEnvGate(): void {
+  if (envGateSuspendDepth > 0) envGateSuspendDepth--;
+}
+export function isEnvGateSuspended(): boolean {
+  return envGateSuspendDepth > 0;
+}
+
+/**
  * Attribute the current caller, evaluate `req`, report the decision, and throw on an
  * enforce-mode denial. Returns the attributed package name (useful when a shim wants to log
  * or branch on it). Never throws in observe mode.

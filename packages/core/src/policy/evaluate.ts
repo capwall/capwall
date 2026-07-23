@@ -33,7 +33,11 @@ export interface Decision {
 
 /** Resolve the effective per-package policy: explicit entry, else the `default` fallback. */
 function policyFor(policy: Policy, pkg: string): PackagePolicy {
-  return policy.packages[pkg] ?? policy.default;
+  // Own-property check only: a package name like "__proto__"/"constructor", or a polluted
+  // Object.prototype, must not resolve a grant. Deny-by-default means the `default` fallback
+  // applies to any pkg without its OWN entry. (Defense-in-depth; prototype pollution remains
+  // a documented out-of-scope threat, but the policy lookup itself should not be a vector.)
+  return Object.hasOwn(policy.packages, pkg) ? policy.packages[pkg]! : policy.default;
 }
 
 /**
@@ -63,15 +67,20 @@ export function evaluate(
   };
 }
 
+/** True only if `grant` has its OWN boolean `key` set to true (ignores a polluted prototype). */
+function ownGate(grant: PackagePolicy, key: "child_process" | "worker_threads" | "vm"): boolean {
+  return Object.hasOwn(grant, key) && grant[key] === true;
+}
+
 /** Pure grant check (no mode). Exposed for `explain` and tests. */
 export function isGranted(grant: PackagePolicy, req: CapabilityRequest): boolean {
   switch (req.kind) {
     case "child_process":
-      return grant.child_process === true;
+      return ownGate(grant, "child_process");
     case "worker_threads":
-      return grant.worker_threads === true;
+      return ownGate(grant, "worker_threads");
     case "vm":
-      return grant.vm === true;
+      return ownGate(grant, "vm");
     case "env":
       return (grant.env ?? []).some((k) => k === "*" || k === req.key);
     case "fs": {
