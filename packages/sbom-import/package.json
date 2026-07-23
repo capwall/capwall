@@ -1,7 +1,7 @@
 {
   "name": "@capwall/sbom-import",
   "version": "0.0.0",
-  "description": "STRETCH (post-MVP): import CycloneDX SBOM / CBOM into a capwall capabilities.json policy.",
+  "description": "Import a CycloneDX SBOM / CBOM into a starter capwall capabilities.json policy.",
   "license": "MIT",
   "author": "William Zujkowski",
   "type": "module",
@@ -11,14 +11,15 @@
   "engines": { "node": ">=20" },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run --passWithNoTests",
-    "lint": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "lint": "tsc -p tsconfig.test.json"
   },
   "dependencies": {
     "@capwall/policy-schema": "workspace:*"
   },
   "devDependencies": {
+    "@types/node": "^20.14.0",
     "typescript": "^5.6.0",
     "vitest": "^3.2.6"
   }
