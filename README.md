@@ -4,8 +4,12 @@
 supply-chain malware — declare what each dependency is *allowed to do* (files, network,
 subprocesses, env, …), then enforce it at runtime.
 
-> Status: **scaffold / pre-MVP.** The design and docs are complete; the engine is stubbed.
-> See [`AGENTS.md`](./AGENTS.md) and [`docs/roadmap.md`](./docs/roadmap.md) for the build order.
+> Status: **fs vertical slice working (roadmap M1–M3).** The observe → policy → enforce loop
+> is live end-to-end for the `fs` capability on the CJS path: `capwall observe` emits a
+> starter policy from a real run, and `capwall enforce` denies-by-default with attributed
+> errors. The other shims (`net`, `child_process`, `worker_threads`, `env`, `vm`) and ESM
+> are not yet mediated — see [`docs/roadmap.md`](./docs/roadmap.md) (M4/M5) and the honest
+> scope note in [`docs/threat-model.md`](./docs/threat-model.md).
 
 ---
 
@@ -90,8 +94,8 @@ attribution; a CI observed-vs-declared diff report.
 
 ## Quickstart (the observe → enforce loop)
 
-> These commands describe the intended UX. The CLI currently prints "not yet implemented"
-> for each — this is a scaffold.
+> Working today for the `fs` capability (CJS). The `net`/`env`/`child_process` parts of the
+> flow land with roadmap M4.
 
 ```bash
 # 1. Install capwall in your project

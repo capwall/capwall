@@ -3,34 +3,41 @@
 The capwall interception engine and policy evaluator. This is where module-load
 interception, the capability shims, package attribution, and policy evaluation live.
 
-> **Scaffold.** Only the policy evaluator has real, tested logic (deny-by-default). Loaders,
-> shims, and attribution are stubs marked `// TODO(capwall):` with doc-comments on the
-> intended approach. See [`../../AGENTS.md`](../../AGENTS.md) and
+> **Status (roadmap M1–M3 done):** the CJS require patch, stack-walk attribution, the `fs`
+> shim, and policy load/evaluate are real and tested. The other shims (net, child_process,
+> worker_threads, env, vm) and the ESM hook are still stubs marked `// TODO(capwall):`.
+> See [`../../AGENTS.md`](../../AGENTS.md) and
 > [`../../docs/architecture.md`](../../docs/architecture.md).
 
-## Intended API
+## API
 
 ```ts
-import { install } from "@capwall/core";
-import { loadPolicy } from "@capwall/core/policy";
+import { install, loadPolicy } from "@capwall/core";
 
-const policy = await loadPolicy("./capabilities.json");
-install(policy, "observe"); // or "enforce"
+const policy = await loadPolicy("./capabilities.json", { projectRoot: process.cwd() });
+const handle = install(policy, "observe", {
+  projectRoot: process.cwd(),
+  onDecision: (pkg, decision) => console.log(pkg, decision.reason),
+}); // or "enforce"
+// handle.uninstall() restores the loader (tests/teardown).
 ```
 
-`install(policy, mode)` patches the loader and swaps capability-sensitive core modules for
-shimmed versions, so subsequent `require`/`import` of `fs`, `net`, etc. go through capwall.
+`install(policy, mode)` patches the CJS loader so subsequent `require("fs")` (and
+`fs/promises`) return capwall's shim, which attributes each call to its owning package and
+evaluates it against the policy. The CLI installs this automatically in child processes via
+`@capwall/core/preload` (a `NODE_OPTIONS --import` entry configured by `CAPWALL_*` env vars).
 
 ## Layout
 
 ```
 src/index.ts            install(policy, mode) entry point
-src/loader/require.ts   CJS require/loader patch
-src/loader/esm-hook.ts  ESM module.register loader hook
-src/shims/*.ts          fs, net, child_process, worker_threads, env, vm shims
-src/attribution/        stack-walk → owning package (THE core research risk)
-src/policy/*.ts         schema (re-export), load, evaluate (deny-by-default)
-test/core.test.ts       passing smoke tests (extend, don't delete)
+src/preload.ts          --import entry for child processes (CAPWALL_* env config)
+src/loader/require.ts   CJS require/loader patch (live; fs only so far)
+src/loader/esm-hook.ts  ESM module.register loader hook (stub, M5)
+src/shims/fs.ts         fs shim (live); net/child_process/worker/env/vm are stubs (M4)
+src/attribution/        stack-walk → owning package (nearest-package policy, memoized)
+src/policy/*.ts         schema (re-export), load (glob normalization), evaluate, glob
+test/                   evaluator, attribution, glob, and fixture-based e2e slice tests
 ```
 
 ## Build order

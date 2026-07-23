@@ -1,8 +1,7 @@
 # capwall architecture
 
-> Scaffold-stage design doc. The engine is stubbed; this describes the intended shape and
-> the hard problems the implementing agent must solve. Build order lives in
-> [`roadmap.md`](./roadmap.md).
+> Design doc. The CJS path with the `fs` shim (roadmap M1–M3) is implemented; the other
+> shims and the ESM hook are still stubs. Build order lives in [`roadmap.md`](./roadmap.md).
 
 ## Overview
 
@@ -57,9 +56,18 @@ correct code is unaffected.
 ### Attribution (`core/src/attribution`)
 
 Maps "the code currently executing a shimmed call" to the **owning npm package**. The
-approach: capture a stack trace, walk frames to the first frame whose file path resolves
-into a `node_modules/<package>` (or workspace package) directory, and return that package's
-name. Resolution of file-path → package is cached.
+implementation captures structured V8 CallSites (temporary `prepareStackTrace` swap, no
+string parsing), skips capwall's own frames and Node internals, and resolves the first
+remaining frame's file path via its last `node_modules/<package>` path segment (pnpm's
+`.pnpm` layout falls out for free). Resolution of file-path → package is memoized.
+
+**Chosen attribution policy: nearest-package.** The package owning the frame closest to the
+shimmed call is charged. Cheap (the walk stops at the first qualifying frame),
+deterministic, and it matches the NodeShield model. Known blind spot, accepted and
+documented in the threat model: calls funneled through a shared helper attribute to the
+helper, so a malicious package can launder operations through a broadly-granted helper —
+keep helper grants tight. Files not under any `node_modules` attribute to the app sentinel
+`<app>`.
 
 **This is THE core research risk.** See Risks below.
 

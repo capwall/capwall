@@ -1,4 +1,9 @@
 node_modules/
+# Vendored test/demo fixtures that must live under a node_modules dir so capwall's
+# attribution treats them as dependencies. These are committed on purpose.
+!examples/malicious-dep-demo/node_modules/
+!packages/core/test/fixtures/node_modules/
+!packages/cli/test/fixtures/app/node_modules/
 dist/
 *.log
 .DS_Store
@@ -7,3 +12,4 @@ coverage/
 *.tsbuildinfo
 .env
 .env.*
+.nexus-agents/

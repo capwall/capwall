@@ -6,24 +6,13 @@
  * capability-sensitive core modules return capwall's shims, which attribute each call to its
  * owning package and evaluate it against `policy` under `mode`.
  *
- * SCAFFOLD: `install` wires the (stubbed) loaders and returns a handle, but the loaders and
- * shims are not implemented yet — nothing is actually intercepted. The policy evaluator
- * (`evaluate`) and loader (`loadPolicy`) are real. See docs/roadmap.md for build order.
+ * CURRENT SCOPE (roadmap M1–M3): the CJS path with the `fs` shim is live; the other shims
+ * (net, child_process, worker_threads, env, vm) and the ESM hook are still stubs.
  */
 import { patchRequire, type RequirePatchHandle } from "./loader/require.js";
 import { registerEsmHook, type EsmHookHandle } from "./loader/esm-hook.js";
+import type { Decision } from "./policy/evaluate.js";
 import type { Mode, Policy } from "@capwall/policy-schema";
-
-/** Error thrown when a package attempts a capability it is not granted (enforce mode). */
-export class CapabilityError extends Error {
-  override readonly name = "CapabilityError";
-  constructor(
-    message: string,
-    readonly pkg: string,
-  ) {
-    super(message);
-  }
-}
 
 export interface InstallHandle {
   /** Remove capwall's interception (best-effort for ESM). Primarily for tests/teardown. */
@@ -33,10 +22,23 @@ export interface InstallHandle {
 export interface InstallOptions {
   /** Also register the ESM loader hook (roadmap M5). Off by default while CJS-first. */
   esm?: boolean;
+  /**
+   * Called on EVERY capability decision (allowed and denied, both modes). This is the log
+   * sink in observe mode and the trace source for `capwall gen-policy`. Defaults to a no-op.
+   */
+  onDecision?: (pkg: string, decision: Decision) => void;
+  /**
+   * Absolute project root. Used to resolve relative policy globs and to distinguish app
+   * code from dependencies during attribution. Defaults to `process.cwd()`.
+   */
+  projectRoot?: string;
 }
 
 /**
  * Install capwall into the current process.
+ *
+ * Call as early as possible (before dependencies are required) so no package captures a raw,
+ * un-shimmed builtin reference first. The CLI does this via a `--import` preload.
  *
  * @param policy validated policy (use {@link loadPolicy} to read a capabilities.json).
  * @param mode `"observe"` (log, never block) or `"enforce"` (deny-by-default, throw).
@@ -46,8 +48,10 @@ export function install(
   mode: Mode,
   options: InstallOptions = {},
 ): InstallHandle {
+  const onDecision = options.onDecision ?? (() => {});
+  const projectRoot = options.projectRoot ?? process.cwd();
   const handles: Array<RequirePatchHandle | EsmHookHandle> = [];
-  handles.push(patchRequire(policy, mode));
+  handles.push(patchRequire(policy, mode, { onDecision, projectRoot }));
   if (options.esm) {
     handles.push(registerEsmHook(policy, mode));
   }
@@ -59,9 +63,13 @@ export function install(
 }
 
 // Re-export the real, usable pieces so consumers have one import surface.
+export { CapabilityError } from "./errors.js";
 export { evaluate, isGranted } from "./policy/evaluate.js";
 export type { CapabilityRequest, Decision } from "./policy/evaluate.js";
 export { loadPolicy, loadPolicyFromObject } from "./policy/load.js";
+export type { LoadPolicyOptions } from "./policy/load.js";
+export { attributeCaller, packageForPath, APP_ROOT } from "./attribution/index.js";
+export type { DecisionSink } from "./shims/fs.js";
 export type {
   Policy,
   PackagePolicy,

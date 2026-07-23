@@ -1,0 +1,9 @@
+{
+  "name": "@capwall-fixture/app",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Test fixture app for CLI round-trip tests (observe → capabilities.json → enforce).",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "main.js"
+}

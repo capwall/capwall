@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "mode": "observe",
+  "default": {},
+  "packages": {
+    "<app>": {
+      "fs": {
+        "read": [],
+        "write": [
+          "./logs",
+          "./logs/requests.log"
+        ]
+      }
+    }
+  }
+}

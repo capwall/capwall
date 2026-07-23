@@ -2,8 +2,9 @@
 
 The `capwall` command-line interface — the primary way users drive the observe→enforce loop.
 
-> **Scaffold.** Each command parses its args and prints its intended behavior plus
-> "not yet implemented". See [`../../docs/roadmap.md`](../../docs/roadmap.md).
+> **Status (roadmap M1–M3 done):** all four commands work for the `fs` capability on the
+> CJS path. `observe`/`enforce` launch the target with `@capwall/core/preload` injected via
+> `NODE_OPTIONS --import`. See [`../../docs/roadmap.md`](../../docs/roadmap.md).
 
 ## Commands
 
@@ -23,5 +24,6 @@ capwall explain <package> <capability> [target]
                                 allowed or denied under the current policy.
 ```
 
-Common flags (intended): `-p, --policy <path>` (default `./capabilities.json`),
-`-o, --out <path>`, `--project-root <path>`.
+Common flags: `-p, --policy <path>` for `enforce`/`explain` and `-o, --out <path>` for
+`observe`/`gen-policy` (both default to `./capabilities.json`). The project root is the
+CLI's working directory.

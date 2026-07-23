@@ -10,6 +10,19 @@ capwall is **pragmatic, runtime, per-package defense-in-depth against opportunis
 supply-chain malware.** It is **not** a formal sandbox and does not withstand a determined
 in-process attacker.
 
+## Implementation status (keep in sync with the roadmap)
+
+As of roadmap **M3**, only the **`fs` capability is actually mediated**, and only on the
+**CJS `require` path**. The `net`/`http(s)`, `child_process`, `worker_threads`,
+`process.env`, and `vm` sections below describe the *designed* protection (roadmap M4);
+today those surfaces are **not intercepted at all** — a package can use them regardless of
+policy. ESM `import` of `fs` is also not yet intercepted (roadmap M5). Do not deploy capwall
+expecting protection this section says does not exist yet.
+
+Within `fs`, the mediated surface is the path-taking read/write API families (sync,
+callback, and `fs.promises` variants). Purely fd-based operations (`fs.read`, `fs.write`,
+`ftruncate`, `fchmod`, …) are not mediated — consistent with the fd-escape exclusion below.
+
 ## Adversary we are designed to stop
 
 **Opportunistic, worm-style supply-chain malware** delivered through a compromised npm
@@ -62,6 +75,11 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
   path outside the allowed globs.
 - **`vm` / `eval` / `node:sqlite`** and similar reflective or alternate-execution surfaces
   that can sidestep the shimmed API.
+- **Attribution laundering** — capwall attributes each call to the **nearest** package frame
+  on the stack (see `core/src/attribution`). A malicious package that arranges for its
+  operation to be *executed by* a trusted helper's code (passing a path to a logger that
+  writes it, scheduling work a broadly-granted package performs) is charged to the helper.
+  Keep helper grants tight; broad grants are laundering targets.
 - **Native `.node` addons** — arbitrary compiled code; capwall can gate *whether* an addon
   loads but cannot confine what it does once loaded.
 - **Subprocess internals** — capwall can gate *whether* a `child_process` spawn happens, but

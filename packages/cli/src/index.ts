@@ -2,10 +2,10 @@
 /**
  * capwall CLI entry point.
  *
- * SCAFFOLD: argument routing is real; each subcommand prints its intended behavior and
- * exits with a "not yet implemented" notice. Wire the commands to @capwall/core as the
- * engine lands (roadmap M1→M4). Kept dependency-light (no arg-parser lib) on purpose — add
- * one only with justification (AGENTS.md § 5).
+ * `observe` and `enforce` launch the target command with @capwall/core preloaded (via
+ * NODE_OPTIONS --import); `gen-policy` aggregates a recorded trace; `explain` answers
+ * policy questions with the same evaluate() the enforcer uses. Kept dependency-light (no
+ * arg-parser lib) on purpose — add one only with justification (AGENTS.md § 5).
  */
 import { runObserve } from "./commands/observe.js";
 import { runEnforce } from "./commands/enforce.js";
