@@ -81,30 +81,34 @@ export function createChildProcessShim(ctx: ShimContext): typeof import("node:ch
   }
 
   // Gate the ChildProcess class: `new ChildProcess().spawn(options)` is the low-level launch
-  // primitive. Construct-trap Proxy preserves instanceof/identity; on construct we override
-  // the instance's `spawn` with a guarded, env-suspended wrapper.
+  // primitive. A guarded SUBCLASS guards `ChildProcess.prototype.spawn` itself — a
+  // construct-trap Proxy would be bypassable via `(new ChildProcess()).constructor` and
+  // `ChildProcess.prototype.spawn.call(...)`. Symbol.hasInstance keeps `instanceof` working.
   const RealChildProcess = real["ChildProcess"];
   if (typeof RealChildProcess === "function") {
-    shim["ChildProcess"] = new Proxy(RealChildProcess as new (...a: never[]) => unknown, {
-      construct(target, argArray, newTarget) {
-        const instance = Reflect.construct(target, argArray as never[], newTarget) as Record<
-          string,
-          unknown
-        >;
-        const realSpawn = instance["spawn"];
-        if (typeof realSpawn === "function") {
-          Object.defineProperty(instance, "spawn", {
-            value: function (this: unknown, ...spawnArgs: unknown[]) {
-              guard(ctx, { kind: "child_process" });
-              return spawnWithEnv(() => (realSpawn as AnyFn).apply(this, spawnArgs));
-            },
-            writable: true,
-            configurable: true,
-          });
-        }
-        return instance;
-      },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const RealCP = RealChildProcess as new (...a: any[]) => object;
+    const realSpawn = (RealCP.prototype as Record<string, unknown>)["spawn"];
+    const Guarded = class extends RealCP {};
+    if (typeof realSpawn === "function") {
+      Object.defineProperty(Guarded.prototype, "spawn", {
+        value: function (this: unknown, ...spawnArgs: unknown[]) {
+          guard(ctx, { kind: "child_process" });
+          return spawnWithEnv(() => (realSpawn as AnyFn).apply(this, spawnArgs));
+        },
+        writable: true,
+        configurable: true,
+      });
+    }
+    Object.defineProperty(Guarded, Symbol.hasInstance, {
+      value: (x: unknown) => x instanceof RealCP,
+      configurable: true,
     });
+    Object.defineProperty(Guarded, "name", {
+      value: (RealCP as { name: string }).name,
+      configurable: true,
+    });
+    shim["ChildProcess"] = Guarded;
   }
 
   return shim as typeof import("node:child_process");

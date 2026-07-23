@@ -34,12 +34,18 @@ Per-capability notes:
   another — and a dependency could otherwise bypass the control simply by choosing `tls`
   (or `dgram`) over `net`. Inbound `server.listen` is not gated (capwall mediates who a
   package may *reach*, not that it may serve). IPC/unix-socket connects have no host:port and
-  are approximated coarsely as `{ host: "<ipc>", port: 0 }`. **Not covered:** `dns` lookups
-  (a lookup moves no payload; DNS tunneling is a determined-attacker technique out of scope),
-  borrowing an unwrapped prototype method (`net.Socket.prototype.connect.call(...)`), and a
-  getter-based TOCTOU on `{host,port}` options for a package that *already holds a narrow net
-  grant* (the derived target is read separately from the value Node connects to). These are
-  documented residuals, not silent gaps.
+  are approximated coarsely as `{ host: "<ipc>", port: 0 }`. Capability-bearing classes
+  (`net.Socket`, `tls.TLSSocket`, `http.ClientRequest`, `http.Agent`, `dgram.Socket`) are
+  guarded via a **guarded subclass** whose prototype method (or constructor) runs the check,
+  so `new Cls()`, `(instance).constructor`, and `Cls.prototype.method.call(...)` are all
+  covered (a construct-trap Proxy would not be). **Not covered:** `dns` lookups (a lookup
+  moves no payload; DNS tunneling is a determined-attacker technique out of scope); reaching
+  the real prototype by climbing two levels past the guarded subclass
+  (`Object.getPrototypeOf(Object.getPrototypeOf(sock)).connect` — the same class as the
+  general shim un-patching residual); and a getter-based TOCTOU on `{host,port}` options for a
+  package that *already holds a narrow net grant* (the derived target is read separately from
+  the value Node connects to — tracked as #26). These are documented residuals, not silent
+  gaps.
 - **`child_process`, `worker_threads`, `vm`** — boolean **gates** (may this package spawn /
   start a worker / use `vm` at all). Gating, not confinement: capwall does not constrain what
   the subprocess/worker/vm-context does once started (see § gating vs confinement).

@@ -67,31 +67,37 @@ export function evaluate(
   };
 }
 
-/** True only if `grant` has its OWN boolean `key` set to true (ignores a polluted prototype). */
-function ownGate(grant: PackagePolicy, key: "child_process" | "worker_threads" | "vm"): boolean {
-  return Object.hasOwn(grant, key) && grant[key] === true;
+/**
+ * Read `grant[key]` only if it is an OWN property, so a polluted `Object.prototype` cannot
+ * inject a grant into an empty `{}` (the deny-by-default fallback grant). All grant reads in
+ * `isGranted` go through this — defense-in-depth; prototype pollution is a documented
+ * out-of-scope threat, but the policy lookup itself must not be a vector.
+ */
+function own<K extends keyof PackagePolicy>(grant: PackagePolicy, key: K): PackagePolicy[K] | undefined {
+  return Object.hasOwn(grant, key) ? grant[key] : undefined;
 }
 
 /** Pure grant check (no mode). Exposed for `explain` and tests. */
 export function isGranted(grant: PackagePolicy, req: CapabilityRequest): boolean {
   switch (req.kind) {
     case "child_process":
-      return ownGate(grant, "child_process");
+      return own(grant, "child_process") === true;
     case "worker_threads":
-      return ownGate(grant, "worker_threads");
+      return own(grant, "worker_threads") === true;
     case "vm":
-      return ownGate(grant, "vm");
+      return own(grant, "vm") === true;
     case "env":
-      return (grant.env ?? []).some((k) => k === "*" || k === req.key);
+      return (own(grant, "env") ?? []).some((k) => k === "*" || k === req.key);
     case "fs": {
-      const globs = req.access === "read" ? grant.fs?.read : grant.fs?.write;
+      const fs = own(grant, "fs");
+      const globs = req.access === "read" ? fs?.read : fs?.write;
       // Globs are matched lexically against the request path. The policy loader normalizes
       // relative globs against the project root (loadPolicy `projectRoot` option); shims
       // resolve call-time paths to absolute, so absolute-vs-absolute is the common case.
       return (globs ?? []).some((g) => matchesGlob(g, req.path));
     }
     case "net": {
-      const net = grant.net;
+      const net = own(grant, "net");
       if (!net) return false;
       // Host matching is exact or the "*" wildcard. Host GLOBS (e.g. "*.internal") are a
       // follow-up (tracked separately); the net shim (M4) is wired against this exact/`*` gate.

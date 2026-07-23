@@ -22,6 +22,13 @@ interface FixtureDep {
   connectViaTls(host: string, port: number): { destroy(): void };
   spawnViaChildProcessClass(): unknown;
   sendViaDgram(host: string, port: number): { close(): void };
+  connectViaSocketConstructorEscape(host: string, port: number): void;
+  connectViaSocketPrototype(host: string, port: number): void;
+  spawnViaChildProcessConstructorEscape(): unknown;
+  connectViaHttpAgent(host: string, port: number): void;
+  sendViaDgramSocketClass(host: string, port: number): void;
+  tlsConnectPositional(port: number, host: string): void;
+  sendUdpUnbound(host: string, port: number, cb: (err: unknown) => void): void;
 }
 
 function loadFixtureFresh(): FixtureDep {
@@ -97,6 +104,79 @@ describe("loader routing — M4 shims deny-by-default in enforce", () => {
       expect(() => dep.sendViaDgram("evil.example.com", 53)).toThrowError(
         expect.objectContaining({ name: "CapabilityError" }),
       );
+    });
+  });
+
+  // Round-2 regressions: class-escape / alias vectors must NOT bypass the guard.
+  it("denies net.Socket via .constructor escape and prototype-method borrowing", () => {
+    withCapwall(denyAll(), "enforce", (dep) => {
+      expect(() => dep.connectViaSocketConstructorEscape("evil.example.com", 443)).toThrowError(
+        expect.objectContaining({ name: "CapabilityError" }),
+      );
+      expect(() => dep.connectViaSocketPrototype("evil.example.com", 443)).toThrowError(
+        expect.objectContaining({ name: "CapabilityError" }),
+      );
+    });
+  });
+
+  it("denies ChildProcess spawn via .constructor escape", () => {
+    withCapwall(denyAll(), "enforce", (dep) => {
+      expect(() => dep.spawnViaChildProcessConstructorEscape()).toThrowError(
+        expect.objectContaining({ name: "CapabilityError" }),
+      );
+    });
+  });
+
+  it("denies http.Agent.createConnection egress", () => {
+    withCapwall(denyAll(), "enforce", (dep) => {
+      expect(() => dep.connectViaHttpAgent("evil.example.com", 80)).toThrowError(
+        expect.objectContaining({ name: "CapabilityError" }),
+      );
+    });
+  });
+
+  it("denies direct new dgram.Socket().send()", () => {
+    withCapwall(denyAll(), "enforce", (dep) => {
+      expect(() => dep.sendViaDgramSocketClass("evil.example.com", 53)).toThrowError(
+        expect.objectContaining({ name: "CapabilityError" }),
+      );
+    });
+  });
+
+  it("denies tls.connect positional (port, host) — no false-allow via localhost default", () => {
+    // Grant only localhost:443; a positional connect to a different host must still deny.
+    const policy = loadPolicyFromObject(
+      {
+        version: 1,
+        mode: "enforce",
+        packages: { "fixture-dep": { net: { hosts: ["localhost"], ports: [443] } } },
+      },
+      { projectRoot: here },
+    );
+    withCapwall(policy, "enforce", (dep) => {
+      expect(() => dep.tlsConnectPositional(443, "192.0.2.1")).toThrowError(
+        expect.objectContaining({ name: "CapabilityError" }),
+      );
+    });
+  });
+
+  it("an allowed unbound UDP send does not crash on Node's auto-bind replay (DoS regression)", async () => {
+    const policy = loadPolicyFromObject(
+      {
+        version: 1,
+        mode: "enforce",
+        packages: { "fixture-dep": { net: { hosts: ["127.0.0.1"], ports: [12345] } } },
+      },
+      { projectRoot: here },
+    );
+    await new Promise<void>((resolve, reject) => {
+      withCapwall(policy, "enforce", (dep) => {
+        dep.sendUdpUnbound("127.0.0.1", 12345, (err) => {
+          // Delivered via callback (real send) — NOT an uncaught CapabilityError crash.
+          if (err && (err as { name?: string }).name === "CapabilityError") reject(err as Error);
+          else resolve();
+        });
+      });
     });
   });
 });
