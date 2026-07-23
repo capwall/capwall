@@ -79,11 +79,14 @@ exception it would never see from real `fs`:
   error would arrive, instead of throwing. If the call is missing a callback (a mis-call),
   the shim falls back to a synchronous throw, matching real Node's behavior for the same
   mis-call.
-- **`createReadStream`/`createWriteStream`** return a minimal stream that emits `'error'`
-  with the `CapabilityError` on `process.nextTick`, matching real Node's async
-  stream-error delivery — a sync throw here would be a bypass-shaped surprise, since
-  `fs.createReadStream(p).on('error', h)` is the idiomatic pattern and never throws
-  synchronously in real Node either.
+- **`createReadStream`/`createWriteStream`** return a minimal stream (with `.path` set) that
+  emits `'error'` with the `CapabilityError` on `setImmediate` — a sync throw here would be a
+  bypass-shaped surprise, since `fs.createReadStream(p).on('error', h)` is the idiomatic
+  pattern and never throws synchronously in real Node either. The timing **approximates**
+  real Node's threadpool-delivered open-error rather than reproducing it exactly: a caller
+  that attaches its `'error'` handler on a much later macrotask can miss the event and get an
+  uncaught `'error'` (as it also would against real `fs` past a point). This is **fail-closed**
+  — the read/write never happens — but it is a parity gap, tracked as a follow-up.
 - **`watch`/`watchFile`** and the `ReadStream`/`WriteStream` **class constructors**
   (`new fs.ReadStream(deniedPath)`) still throw synchronously: real `fs.watch` and a real
   stream constructor can both throw synchronously on a bad argument, so no behavior-shape

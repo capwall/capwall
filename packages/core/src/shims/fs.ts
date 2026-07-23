@@ -22,7 +22,9 @@
  *        `fs` error would arrive — instead of throwing. If the call is missing its
  *        callback (a mis-call), we fall back to throwing, same as real Node.
  *      - `createReadStream`/`createWriteStream` return a minimal stream that emits
- *        `'error'` on `process.nextTick`, matching real Node's async stream-error delivery.
+ *        `'error'` on `setImmediate` (approximating — not exactly reproducing — real Node's
+ *        threadpool-timed async stream-error delivery; a handler attached on a much later
+ *        macrotask can still miss it, same as real `fs`). Fail-closed: no read/write occurs.
  *      - `watch`/`watchFile` still throw synchronously: real `fs.watch` does too on a bad
  *        path, so no behavior-shape change is needed there.
  *    `exists`/`existsSync` remain bespoke non-throwing probes (see below) — untouched by
@@ -227,7 +229,7 @@ type PathClass = abstract new (...a: never[]) => unknown;
  *  - `"reject"`   — a rejected Promise (real `fs.promises`).
  *  - `"callback"` — `cb(err)` on `process.nextTick` (real callback-style async `fs`, which
  *                   never throws synchronously).
- *  - `"streamRead"`/`"streamWrite"` — a stream that emits `'error'` on `process.nextTick`
+ *  - `"streamRead"`/`"streamWrite"` — a stream that emits `error` on `setImmediate`
  *                   (real `createReadStream`/`createWriteStream`, which never throw
  *                   synchronously either).
  */
@@ -252,14 +254,23 @@ function fsDeliveryFor(name: string): Delivery {
  * inert until the scheduled `destroy` fires, so `fs.createReadStream(p).on('error', h).on(...)`
  * chains work exactly as they would against a real stream that fails after construction.
  */
-function denyReadStream(err: CapabilityError): Readable {
-  const stream = new Readable({ read() {} });
-  process.nextTick(() => stream.destroy(err));
+// Deny streams emit 'error' on `setImmediate` (not `process.nextTick`): a real fs stream's
+// open failure arrives via the libuv threadpool, LATER than nextTick, so setImmediate widens
+// the window for a caller that attaches its 'error' handler in a microtask or nextTick before
+// the error fires (closer to real Node's timing). `.path` is set so error-logging libraries
+// that read `stream.path` see the requested path. Exact threadpool timing is not reproduced
+// (a handler attached on a later macrotask can still miss it — same as real fs past a point);
+// tracked as a follow-up. This is fail-closed: the read/write never happens regardless.
+function denyReadStream(err: CapabilityError, path: unknown): Readable {
+  const stream = new Readable({ read() {} }) as Readable & { path?: unknown };
+  stream.path = path;
+  setImmediate(() => stream.destroy(err));
   return stream;
 }
-function denyWriteStream(err: CapabilityError): Writable {
-  const stream = new Writable({ write(_chunk, _enc, cb) { cb(); } });
-  process.nextTick(() => stream.destroy(err));
+function denyWriteStream(err: CapabilityError, path: unknown): Writable {
+  const stream = new Writable({ write(_chunk, _enc, cb) { cb(); } }) as Writable & { path?: unknown };
+  stream.path = path;
+  setImmediate(() => stream.destroy(err));
   return stream;
 }
 
@@ -359,7 +370,9 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
             guardCall(args, spec);
           } catch (err) {
             if (!(err instanceof CapabilityError)) throw err;
-            return delivery === "streamRead" ? denyReadStream(err) : denyWriteStream(err);
+            return delivery === "streamRead"
+              ? denyReadStream(err, args[0])
+              : denyWriteStream(err, args[0]);
           }
           return orig.apply(this, args);
         }
