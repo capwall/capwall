@@ -1,0 +1,70 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/williamzujkowski/capwall/schema.json",
+  "title": "capwall capabilities.json",
+  "description": "Per-package capability policy for the capwall runtime firewall. Authoritative field docs: docs/policy-format.md. Keep in sync with packages/policy-schema/src/index.ts.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "version": { "const": 1 },
+    "mode": {
+      "type": "string",
+      "enum": ["observe", "enforce"],
+      "default": "observe",
+      "description": "Default enforcement mode; the CLI flag overrides it."
+    },
+    "default": {
+      "$ref": "#/definitions/packagePolicy",
+      "description": "Applied to any package with no explicit entry in `packages`. Recommended: grant nothing (deny-by-default)."
+    },
+    "packages": {
+      "type": "object",
+      "description": "Map of package name to its capability grant.",
+      "additionalProperties": { "$ref": "#/definitions/packagePolicy" }
+    }
+  },
+  "definitions": {
+    "packagePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Per-package capability grant. Every field optional; omitted = not granted.",
+      "properties": {
+        "fs": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "read": { "type": "array", "items": { "type": "string" } },
+            "write": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "net": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "hosts": { "type": "array", "items": { "type": "string" } },
+            "ports": { "type": "array", "items": { "type": "integer", "minimum": 0 } }
+          }
+        },
+        "child_process": {
+          "type": "boolean",
+          "description": "Gate: may this package spawn subprocesses? (gating, not confinement)"
+        },
+        "worker_threads": {
+          "type": "boolean",
+          "description": "Gate: may this package start worker threads?"
+        },
+        "env": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Allowlist of process.env keys this package may read. [\"*\"] allows all."
+        },
+        "vm": {
+          "type": "boolean",
+          "description": "Gate: may this package use node:vm?"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "@capwall/cli",
+  "version": "0.0.0",
+  "description": "capwall command-line interface: observe | enforce | gen-policy | explain.",
+  "license": "MIT",
+  "author": "William Zujkowski",
+  "type": "module",
+  "bin": {
+    "capwall": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@capwall/core": "workspace:*",
+    "@capwall/policy-schema": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

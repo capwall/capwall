@@ -1,0 +1,15 @@
+{
+  "name": "@capwall-example/express-app",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Fixture: minimal Express server for the capwall observe→enforce walkthrough.",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

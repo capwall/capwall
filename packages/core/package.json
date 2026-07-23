@@ -1,0 +1,32 @@
+{
+  "name": "@capwall/core",
+  "version": "0.0.0",
+  "description": "capwall interception engine + policy evaluator: per-package runtime capability enforcement for Node.js.",
+  "license": "MIT",
+  "author": "William Zujkowski",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "lint": "tsc -p tsconfig.test.json"
+  },
+  "dependencies": {
+    "@capwall/policy-schema": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

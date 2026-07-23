@@ -1,0 +1,63 @@
+#!/usr/bin/env node
+/**
+ * capwall CLI entry point.
+ *
+ * SCAFFOLD: argument routing is real; each subcommand prints its intended behavior and
+ * exits with a "not yet implemented" notice. Wire the commands to @capwall/core as the
+ * engine lands (roadmap M1→M4). Kept dependency-light (no arg-parser lib) on purpose — add
+ * one only with justification (AGENTS.md § 5).
+ */
+import { runObserve } from "./commands/observe.js";
+import { runEnforce } from "./commands/enforce.js";
+import { runGenPolicy } from "./commands/gen-policy.js";
+import { runExplain } from "./commands/explain.js";
+
+const USAGE = `capwall — runtime per-package capability firewall for Node.js
+
+Usage:
+  capwall observe   -- <command...>          run in observe mode; emit a starter policy
+  capwall enforce   -- <command...>          run in enforce mode; deny-by-default
+  capwall gen-policy [--from <trace>]         (re)generate policy from a trace
+  capwall explain <package> <capability> [target]
+
+Run 'capwall <command> --help' for details. Docs: docs/roadmap.md, docs/policy-format.md.
+`;
+
+/** Split argv into capwall's own args and the target command after a `--` separator. */
+function splitArgs(argv: string[]): { own: string[]; target: string[] } {
+  const i = argv.indexOf("--");
+  if (i === -1) return { own: argv, target: [] };
+  return { own: argv.slice(0, i), target: argv.slice(i + 1) };
+}
+
+export async function main(argv = process.argv.slice(2)): Promise<number> {
+  const { own, target } = splitArgs(argv);
+  const [command, ...rest] = own;
+
+  switch (command) {
+    case undefined:
+    case "-h":
+    case "--help":
+    case "help":
+      process.stdout.write(USAGE);
+      return 0;
+    case "observe":
+      return runObserve(rest, target);
+    case "enforce":
+      return runEnforce(rest, target);
+    case "gen-policy":
+      return runGenPolicy(rest);
+    case "explain":
+      return runExplain(rest);
+    default:
+      process.stderr.write(`capwall: unknown command '${command}'\n\n${USAGE}`);
+      return 2;
+  }
+}
+
+main()
+  .then((code) => process.exit(code))
+  .catch((err: unknown) => {
+    process.stderr.write(`capwall: ${(err as Error).message}\n`);
+    process.exit(1);
+  });

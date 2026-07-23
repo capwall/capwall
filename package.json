@@ -1,0 +1,23 @@
+{
+  "name": "capwall-monorepo",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Runtime, per-package capability firewall for Node.js — defense-in-depth against supply-chain malware.",
+  "license": "MIT",
+  "author": "William Zujkowski",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "build": "pnpm -r --filter './packages/*' run build",
+    "typecheck": "pnpm -r run typecheck",
+    "test": "pnpm -r run test",
+    "lint": "pnpm -r run lint"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

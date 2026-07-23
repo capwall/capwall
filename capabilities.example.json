@@ -1,0 +1,28 @@
+{
+  "$schema": "./packages/policy-schema/schema.json",
+  "version": 1,
+  "mode": "enforce",
+  "default": {
+    "fs": { "read": [], "write": [] },
+    "net": { "hosts": [], "ports": [] },
+    "child_process": false,
+    "worker_threads": false,
+    "env": [],
+    "vm": false
+  },
+  "packages": {
+    "express": {
+      "net": { "hosts": ["*"], "ports": [3000, 8080] },
+      "fs": { "read": ["./views/**", "./public/**"], "write": [] },
+      "env": ["NODE_ENV", "PORT"]
+    },
+    "pino": {
+      "fs": { "read": [], "write": ["./logs/**"] },
+      "env": ["NODE_ENV"]
+    },
+    "dotenv": {
+      "fs": { "read": ["./.env", "./.env.*"], "write": [] },
+      "env": ["*"]
+    }
+  }
+}
