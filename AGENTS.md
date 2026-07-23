@@ -26,13 +26,15 @@ that — see § 8.
 
 ## 2. Current state
 
-**Roadmap M1–M3 are implemented (the `fs` vertical slice).** Working end-to-end on the CJS
-path: `Module._load` patch → stack-walk attribution (nearest-package policy, documented in
-`core/src/attribution`) → `fs` shim → policy evaluate, in both modes; `capwall observe`
-emits/merges a starter `capabilities.json` and `capwall enforce` denies-by-default
-(`malicious-dep-demo` is blocked; `express-app` runs clean under its generated policy).
-Still stubs: the `net`/`child_process`/`worker_threads`/`env`/`vm` shims (M4) and the ESM
-hook (M5). Build order is authoritative in `docs/roadmap.md` and mirrored in § 4 below.
+**Roadmap M1–M4 are implemented (all core shims, CJS path).** Working end-to-end:
+`Module._load` patch → stack-walk attribution (nearest-package policy) → shims → policy
+evaluate, in both modes. Shims: `fs`, `net`/`http`/`https` (egress), `child_process`,
+`worker_threads`, `vm` (via the require registry in `core/src/shims/index.ts`), and
+`process.env` (a read allowlist via a Proxy, installed in `install()`). `capwall observe`
+emits/merges a starter `capabilities.json` covering all capability kinds, and `capwall
+enforce` denies-by-default (`malicious-dep-demo` is blocked on both env and fs; `express-app`
+runs clean under its generated policy). Only the ESM hook (M5) remains a stub. Build order is
+authoritative in `docs/roadmap.md` and mirrored in § 4 below.
 
 ## 3. Architecture orientation
 

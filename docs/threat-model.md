@@ -12,16 +12,36 @@ in-process attacker.
 
 ## Implementation status (keep in sync with the roadmap)
 
-As of roadmap **M3**, only the **`fs` capability is actually mediated**, and only on the
-**CJS `require` path**. The `net`/`http(s)`, `child_process`, `worker_threads`,
-`process.env`, and `vm` sections below describe the *designed* protection (roadmap M4);
-today those surfaces are **not intercepted at all** — a package can use them regardless of
-policy. ESM `import` of `fs` is also not yet intercepted (roadmap M5). Do not deploy capwall
-expecting protection this section says does not exist yet.
+As of roadmap **M4**, all core capability surfaces are mediated on the **CJS `require`
+path**: `fs`, `net`/`http`/`https`, `child_process`, `worker_threads`, `process.env`, and
+`vm`. **ESM `import` of these builtins is not yet intercepted (roadmap M5)** — an ESM target
+that does `import { readFile } from "node:fs"` bypasses mediation. Do not deploy capwall
+against ESM-first targets expecting enforcement yet.
 
-Within `fs`, the mediated surface is the path-taking read/write API families (sync,
-callback, and `fs.promises` variants). Purely fd-based operations (`fs.read`, `fs.write`,
-`ftruncate`, `fchmod`, …) are not mediated — consistent with the fd-escape exclusion below.
+Per-capability notes:
+
+- **`fs`** — path-taking read/write families (sync, callback, `fs.promises`) plus the
+  path-taking stream constructors (`ReadStream`/`WriteStream` and their `File*Stream`
+  aliases). Purely fd-based operations (`fs.read`, `fs.write`, `ftruncate`, …) are not
+  mediated — consistent with the fd-escape exclusion below.
+- **`net`/`http`/`https`** — **egress only**: outbound `connect`/`createConnection` and
+  `http(s).request`/`get`. Inbound `server.listen` is not gated (capwall mediates who a
+  package may *reach*, not that it may serve). `net`, `http`, and `https` are three separate
+  shims on purpose: capwall's require patch only affects `Module._load`-routed requires
+  (user/dependency code); Node's own HTTP client loads `net` through the internal bootstrap
+  loader, which never hits `Module._load` — so shimming `net` alone would leave HTTP/HTTPS
+  egress completely unmediated. IPC/unix-socket connects have no host:port and are
+  approximated coarsely as `{ host: "<ipc>", port: 0 }`.
+- **`child_process`, `worker_threads`, `vm`** — boolean **gates** (may this package spawn /
+  start a worker / use `vm` at all). Gating, not confinement: capwall does not constrain what
+  the subprocess/worker/vm-context does once started (see § gating vs confinement).
+- **`process.env`** — a read allowlist enforced via a `Proxy` on `process.env`. Only reads
+  attributed to a **dependency** are gated; reads attributed to `<app>` (application code AND
+  Node-internal frames, which attribute to `<app>` because internal frames are skipped) pass
+  through — gating them would break Node startup for no gain, since the app is the trust root.
+  A denied env read is a **soft deny**: it returns `undefined` (hiding the value — the
+  anti-exfiltration goal) rather than throwing, so a benign dependency probing an optional var
+  is not crashed. The denial is still recorded and logged.
 
 **Behavior change vs. real `fs` (operational note).** In `enforce` mode a denied call throws
 synchronously — including for callback-style APIs (`fs.readFile(path, cb)`) that in stock

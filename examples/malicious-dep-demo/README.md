@@ -11,13 +11,20 @@
 
 ## What it demonstrates
 
-`sneaky-dep` "wants" to read a credentials file — a capability a helper library has no
-business using. The committed `capabilities.json` grants it **nothing** (deny-by-default):
+`sneaky-dep` "wants" to (1) read `process.env.AWS_SECRET_ACCESS_KEY` and (2) read a
+credentials file — capabilities a helper library has no business using. The committed
+`capabilities.json` grants it **nothing** (deny-by-default):
 
-| Mode | Result |
-|---|---|
-| `capwall observe -- node src/index.js` | the read is **logged and allowed** (on-ramp); exit 0 |
-| `capwall enforce -- node src/index.js` | the read is **denied (CapabilityError)** before any effect; exit 1 |
+| Mode | env read (`AWS_SECRET_ACCESS_KEY`) | fs read (`fake-secret.txt`) | exit |
+|---|---|---|---|
+| `capwall observe -- node src/index.js` | logged, returns the (fake) value | logged, allowed | 0 |
+| `capwall enforce -- node src/index.js` | **soft-denied → `undefined`** (value hidden), logged | **denied (CapabilityError)** before the read | 1 |
+
+The env read is **soft-denied**: capwall returns `undefined` so the value is never revealed
+to the dependency (the anti-exfiltration goal) without crashing it. The fs read is
+**hard-denied**: it throws before any bytes are read, which the runner reports as BLOCKED.
+Both denials are logged. The `AWS_SECRET_ACCESS_KEY` value is a fake placeholder set by the
+demo runner — there is no real secret (AGENTS.md § 8).
 
 That observe→enforce difference on this fixture is capwall's core value: it contains an
 opportunistic supply-chain payload at the runtime phase that install-time gates never see.

@@ -6,11 +6,14 @@
  * capability-sensitive core modules return capwall's shims, which attribute each call to its
  * owning package and evaluate it against `policy` under `mode`.
  *
- * CURRENT SCOPE (roadmap M1–M3): the CJS path with the `fs` shim is live; the other shims
- * (net, child_process, worker_threads, env, vm) and the ESM hook are still stubs.
+ * CURRENT SCOPE (roadmap M4): the CJS path mediates fs, net/http(s), child_process,
+ * worker_threads, vm (via the require registry) and process.env (via installEnvGuard). The
+ * ESM hook is still a stub (roadmap M5).
  */
 import { patchRequire, type RequirePatchHandle } from "./loader/require.js";
 import { registerEsmHook, type EsmHookHandle } from "./loader/esm-hook.js";
+import { installEnvGuard, type EnvGuardHandle } from "./shims/env.js";
+import type { ShimContext } from "./shims/runtime.js";
 import type { Decision } from "./policy/evaluate.js";
 import type { Mode, Policy } from "@capwall/policy-schema";
 
@@ -32,6 +35,12 @@ export interface InstallOptions {
    * code from dependencies during attribution. Defaults to `process.cwd()`.
    */
   projectRoot?: string;
+  /**
+   * Gate `process.env` reads by dependencies against the `env` allowlist (the
+   * anti-exfiltration control). On by default. Set `false` to leave `process.env` untouched
+   * (e.g. if the Proxy overhead is a concern for a workload that reads env in a hot loop).
+   */
+  env?: boolean;
 }
 
 /**
@@ -50,8 +59,12 @@ export function install(
 ): InstallHandle {
   const onDecision = options.onDecision ?? (() => {});
   const projectRoot = options.projectRoot ?? process.cwd();
-  const handles: Array<RequirePatchHandle | EsmHookHandle> = [];
+  const ctx: ShimContext = { policy, mode, onDecision, projectRoot };
+  const handles: Array<RequirePatchHandle | EsmHookHandle | EnvGuardHandle> = [];
   handles.push(patchRequire(policy, mode, { onDecision, projectRoot }));
+  if (options.env !== false) {
+    handles.push(installEnvGuard(ctx));
+  }
   if (options.esm) {
     handles.push(registerEsmHook(policy, mode));
   }

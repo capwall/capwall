@@ -84,7 +84,8 @@ export function isGranted(grant: PackagePolicy, req: CapabilityRequest): boolean
     case "net": {
       const net = grant.net;
       if (!net) return false;
-      // TODO(capwall): support host globs (e.g. "*.internal") in M4. For now "*" or exact.
+      // Host matching is exact or the "*" wildcard. Host GLOBS (e.g. "*.internal") are a
+      // follow-up (tracked separately); the net shim (M4) is wired against this exact/`*` gate.
       const hostOk = net.hosts.some((h) => h === "*" || h === req.host);
       const portOk = net.ports.includes(req.port);
       return hostOk && portOk;
