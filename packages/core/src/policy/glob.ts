@@ -30,7 +30,16 @@ function compile(pattern: string): RegExp {
   const cached = regexCache.get(pattern);
   if (cached) return cached;
 
-  const segments = pattern.split("/").filter((s) => s.length > 0);
+  // Collapse consecutive `**` segments so an author-written `dir/**/**` compiles to ONE
+  // `(?:/[^/]+)*` group rather than two adjacent ones — adjacent unbounded groups are a
+  // catastrophic-backtracking (ReDoS) shape, and the candidate path is attacker-adjacent
+  // (a dependency's fs argument) on the hot guard path. `**/**` and `**` are equivalent.
+  const raw = pattern.split("/").filter((s) => s.length > 0);
+  const segments: string[] = [];
+  for (const seg of raw) {
+    if (seg === "**" && segments[segments.length - 1] === "**") continue;
+    segments.push(seg);
+  }
   let out = "^";
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i]!;
