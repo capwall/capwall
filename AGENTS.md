@@ -33,7 +33,10 @@ evaluate, in both modes. Shims: `fs`, `net`/`http`/`https` (egress), `child_proc
 `process.env` (a read allowlist via a Proxy, installed in `install()`). `capwall observe`
 emits/merges a starter `capabilities.json` covering all capability kinds, and `capwall
 enforce` denies-by-default (`malicious-dep-demo` is blocked on both env and fs; `express-app`
-runs clean under its generated policy). Only the ESM hook (M5) remains a stub. Build order is
+runs clean under its generated policy). Two stretch items also landed: **S1** SBOM/CBOM →
+policy (`@capwall/sbom-import`) and **S4** the perf benchmark (`pnpm bench`; measured overhead
+is ~30x under the <1ms/req budget — see issue #34 on the cost model). The **ESM hook (M5) is
+the next milestone** and remains a stub. Build order is
 authoritative in `docs/roadmap.md` and mirrored in § 4 below.
 
 ## 3. Architecture orientation

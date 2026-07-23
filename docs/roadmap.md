@@ -69,4 +69,6 @@ Get the full **observe → policy → enforce** loop working end-to-end on **one
 | M3 | enforce mode | malicious-dep-demo blocked; deny-by-default test | ✅ done |
 | M4 | all core shims | net/cp/worker/env/vm enforced | ✅ done |
 | M5 | ESM parity | ESM path reaches CJS parity | next |
-| S1–S4 | stretch | as scheduled post-MVP | — |
+| S1 | SBOM/CBOM import | @capwall/sbom-import | ✅ done |
+| S4 | perf benchmark | pnpm bench, <1ms/req validated | ✅ done |
+| S2,S3 | stretch | native-addon attr; drift diff | — |
