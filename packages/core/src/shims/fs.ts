@@ -189,6 +189,7 @@ function openSpecs(args: unknown[]): PathSpec[] {
 }
 
 type AnyFn = (...args: unknown[]) => unknown;
+type PathClass = abstract new (...a: never[]) => unknown;
 
 /**
  * Build a shimmed `fs` module: every method in the tables above is guarded; everything else
@@ -298,11 +299,17 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
   // Path-taking stream constructors: `new fs.ReadStream(path)` must be mediated like
   // `createReadStream` (a dependency using the class directly must not bypass the policy).
   const shimRecord = shim as unknown as Record<string, unknown>;
-  if (typeof realFs.ReadStream === "function") {
-    shimRecord["ReadStream"] = wrapPathClass(realFs.ReadStream, "read");
+  const realRecord = realFs as unknown as Record<string, unknown>;
+  // ReadStream + its deprecated alias FileReadStream (identical class); same for write.
+  for (const name of ["ReadStream", "FileReadStream"]) {
+    if (typeof realRecord[name] === "function") {
+      shimRecord[name] = wrapPathClass(realRecord[name] as PathClass, "read");
+    }
   }
-  if (typeof realFs.WriteStream === "function") {
-    shimRecord["WriteStream"] = wrapPathClass(realFs.WriteStream, "write");
+  for (const name of ["WriteStream", "FileWriteStream"]) {
+    if (typeof realRecord[name] === "function") {
+      shimRecord[name] = wrapPathClass(realRecord[name] as PathClass, "write");
+    }
   }
 
   // Bespoke non-throwing existence probes (deny → "does not exist").
