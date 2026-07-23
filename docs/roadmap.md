@@ -62,11 +62,11 @@ Get the full **observe → policy → enforce** loop working end-to-end on **one
 
 ## Milestones summary
 
-| Milestone | Deliverable | Gate |
-|---|---|---|
-| M1 | fs observe slice + express-app | observe logs fs, tests green |
-| M2 | trace → capabilities.json | policy emitted from a run |
-| M3 | enforce mode | malicious-dep-demo blocked; deny-by-default test |
-| M4 | all core shims | net/cp/worker/env/vm enforced |
-| M5 | ESM parity | ESM path reaches CJS parity |
-| S1–S4 | stretch | as scheduled post-MVP |
+| Milestone | Deliverable | Gate | Status |
+|---|---|---|---|
+| M1 | fs observe slice + express-app | observe logs fs, tests green | ✅ done |
+| M2 | trace → capabilities.json | policy emitted from a run | ✅ done |
+| M3 | enforce mode | malicious-dep-demo blocked; deny-by-default test | ✅ done |
+| M4 | all core shims | net/cp/worker/env/vm enforced | next |
+| M5 | ESM parity | ESM path reaches CJS parity | — |
+| S1–S4 | stretch | as scheduled post-MVP | — |

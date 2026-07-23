@@ -1,23 +1,59 @@
 /**
  * `capwall enforce -- <cmd...>` (roadmap M3).
  *
- * Intended behavior: launch <cmd> with @capwall/core installed in `enforce` mode, loading
- * `capabilities.json`. Any capability a package uses that is not in its grant is denied
- * (deny-by-default) and throws a CapabilityError.
+ * Runs <cmd> with @capwall/core preloaded in `enforce` mode, loading the policy file.
+ * Any capability a package uses that is not in its grant is denied (deny-by-default) and
+ * throws a CapabilityError inside the target process.
  */
-export function runEnforce(_args: string[], target: string[]): number {
-  const cmd = target.length ? target.join(" ") : "<command>";
-  process.stdout.write(
-    [
-      "capwall enforce — not yet implemented (scaffold).",
-      "",
-      `Intended: run \`${cmd}\` with @capwall/core installed in ENFORCE mode,`,
-      "loading ./capabilities.json and denying (throwing on) any capability not granted",
-      "to the owning package. See docs/roadmap.md M3.",
-      "",
-    ].join("\n"),
-  );
-  // TODO(capwall): load policy, spawn target with a core-install preload in enforce mode,
-  // surface CapabilityError violations with the attributed package + capability.
-  return 0;
+import { existsSync } from "node:fs";
+import * as path from "node:path";
+import { runWithCapwall } from "../run.js";
+
+const HELP = `usage: capwall enforce [--policy <capabilities.json>] -- <command...>
+
+Runs <command> in enforce mode: deny-by-default against the policy file
+(default ./capabilities.json). Generate a starter policy first with 'capwall observe'.
+`;
+
+export async function runEnforce(args: string[], target: string[]): Promise<number> {
+  let policyFile = "capabilities.json";
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "-h" || arg === "--help") {
+      process.stdout.write(HELP);
+      return 0;
+    }
+    if (arg === "--policy" || arg === "-p") {
+      const value = args[++i];
+      if (!value) {
+        process.stderr.write(`capwall enforce: ${arg} requires a value\n`);
+        return 2;
+      }
+      policyFile = value;
+    } else {
+      process.stderr.write(`capwall enforce: unknown option '${arg}'\n${HELP}`);
+      return 2;
+    }
+  }
+  if (target.length === 0) {
+    process.stderr.write(HELP);
+    return 2;
+  }
+
+  const projectRoot = process.cwd();
+  const policyPath = path.resolve(projectRoot, policyFile);
+  if (!existsSync(policyPath)) {
+    process.stderr.write(
+      `capwall enforce: policy file not found: ${policyFile}\n` +
+        `Generate one first: capwall observe -- ${target.join(" ")}\n`,
+    );
+    return 2;
+  }
+
+  const result = await runWithCapwall(target, {
+    CAPWALL_MODE: "enforce",
+    CAPWALL_POLICY_FILE: policyPath,
+    CAPWALL_PROJECT_ROOT: projectRoot,
+  });
+  return result.exitCode;
 }

@@ -1,30 +1,95 @@
 /**
  * `capwall explain <package> <capability> [target]` (roadmap M3+).
  *
- * Intended behavior: load the current policy and report whether a given package would be
- * allowed the given capability against an optional target (path/host), plus the reason —
- * reusing @capwall/core's `evaluate`/`isGranted` so the answer matches enforcement exactly.
+ * Loads the current policy and reports whether the given package would be allowed the given
+ * capability against an optional target — using the same `evaluate()` the enforcer uses, so
+ * the answer matches enforcement exactly. Exit code: 0 allowed, 1 denied, 2 usage error.
  */
-export function runExplain(args: string[]): number {
-  const [pkg, capability, targetValue] = args;
+import * as path from "node:path";
+import { evaluate, loadPolicy, type CapabilityRequest } from "@capwall/core";
+
+const HELP = `usage: capwall explain [--policy <file>] <package> <capability> [target]
+
+Capabilities and their targets:
+  fs:read <path> | fs:write <path> | net <host:port> | env <KEY>
+  child_process | worker_threads | vm
+
+Examples:
+  capwall explain pino fs:write ./logs/app.log
+  capwall explain express net localhost:3000
+  capwall explain sneaky-dep env AWS_SECRET_ACCESS_KEY
+`;
+
+function buildRequest(
+  capability: string,
+  target: string | undefined,
+  projectRoot: string,
+): CapabilityRequest | string {
+  switch (capability) {
+    case "fs:read":
+    case "fs:write": {
+      if (!target) return `capability '${capability}' requires a <path> target`;
+      const abs = path.resolve(projectRoot, target).split(path.sep).join("/");
+      return { kind: "fs", access: capability === "fs:read" ? "read" : "write", path: abs };
+    }
+    case "net": {
+      const [host, portRaw] = (target ?? "").split(":");
+      const port = Number(portRaw);
+      if (!host || !Number.isInteger(port)) {
+        return "capability 'net' requires a <host:port> target";
+      }
+      return { kind: "net", host, port };
+    }
+    case "env": {
+      if (!target) return "capability 'env' requires a <KEY> target";
+      return { kind: "env", key: target };
+    }
+    case "child_process":
+      return { kind: "child_process" };
+    case "worker_threads":
+      return { kind: "worker_threads" };
+    case "vm":
+      return { kind: "vm" };
+    default:
+      return `unknown capability '${capability}' (see capwall explain --help)`;
+  }
+}
+
+export async function runExplain(args: string[]): Promise<number> {
+  let policyFile = "capabilities.json";
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "-h" || arg === "--help") {
+      process.stdout.write(HELP);
+      return 0;
+    }
+    if (arg === "--policy" || arg === "-p") {
+      const value = args[++i];
+      if (!value) {
+        process.stderr.write(`capwall explain: ${arg} requires a value\n`);
+        return 2;
+      }
+      policyFile = value;
+    } else if (arg !== undefined) {
+      positional.push(arg);
+    }
+  }
+  const [pkg, capability, target] = positional;
   if (!pkg || !capability) {
-    process.stderr.write(
-      "usage: capwall explain <package> <capability> [target]\n" +
-        "  e.g. capwall explain pino fs:write ./logs/app.log\n",
-    );
+    process.stderr.write(HELP);
     return 2;
   }
-  process.stdout.write(
-    [
-      "capwall explain — not yet implemented (scaffold).",
-      "",
-      `Intended: load ./capabilities.json and report whether '${pkg}' is granted`,
-      `'${capability}'${targetValue ? ` for '${targetValue}'` : ""}, and why, using the`,
-      "same evaluate()/isGranted() the enforcer uses. See docs/roadmap.md.",
-      "",
-    ].join("\n"),
-  );
-  // TODO(capwall): load policy, parse capability token (e.g. "fs:write"), build a
-  // CapabilityRequest, call evaluate() and print the Decision.reason.
-  return 0;
+
+  const projectRoot = process.cwd();
+  const request = buildRequest(capability, target, projectRoot);
+  if (typeof request === "string") {
+    process.stderr.write(`capwall explain: ${request}\n`);
+    return 2;
+  }
+
+  const policy = await loadPolicy(path.resolve(projectRoot, policyFile), { projectRoot });
+  const decision = evaluate(policy, "enforce", pkg, request);
+  process.stdout.write(`${decision.allowed ? "ALLOW" : "DENY"}: ${decision.reason}\n`);
+  return decision.allowed ? 0 : 1;
 }

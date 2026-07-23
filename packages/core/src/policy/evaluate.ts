@@ -2,10 +2,9 @@
  * Policy evaluation — the decision function at the heart of enforcement.
  *
  * Given a policy, the active mode, the attributed owning package, and a capability request,
- * decide whether the operation is allowed. This module has REAL, tested logic: the
- * deny-by-default semantics and the boolean/env gates are implemented. The path-glob and
- * host matching for `fs`/`net` are intentionally conservative stubs (see the TODO markers)
- * — extend them as the fs and net shims are built out (roadmap M1/M4).
+ * decide whether the operation is allowed. All logic here is REAL and tested: deny-by-default,
+ * the boolean/env gates, and `fs` path-glob matching (see `./glob.ts`). Host-glob matching for
+ * `net` is still a conservative exact/`*` check pending the net shim (roadmap M4).
  *
  * Semantics:
  *  - `enforce` mode: deny-by-default. A package with no matching grant is DENIED.
@@ -13,6 +12,7 @@
  *    `observed` carries what was seen so the CLI can synthesize a starter policy.
  */
 import type { Mode, PackagePolicy, Policy } from "@capwall/policy-schema";
+import { matchesGlob } from "./glob.js";
 
 /** A capability-sensitive operation, attributed to a package, awaiting a decision. */
 export type CapabilityRequest =
@@ -76,9 +76,10 @@ export function isGranted(grant: PackagePolicy, req: CapabilityRequest): boolean
       return (grant.env ?? []).some((k) => k === "*" || k === req.key);
     case "fs": {
       const globs = req.access === "read" ? grant.fs?.read : grant.fs?.write;
-      // TODO(capwall): replace exact/`*` matching with real glob matching resolved against
-      // the project root (roadmap M1). Until then only "*" and exact paths match.
-      return (globs ?? []).some((g) => g === "*" || g === req.path);
+      // Globs are matched lexically against the request path. The policy loader normalizes
+      // relative globs against the project root (loadPolicy `projectRoot` option); shims
+      // resolve call-time paths to absolute, so absolute-vs-absolute is the common case.
+      return (globs ?? []).some((g) => matchesGlob(g, req.path));
     }
     case "net": {
       const net = grant.net;

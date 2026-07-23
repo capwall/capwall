@@ -26,10 +26,13 @@ that — see § 8.
 
 ## 2. Current state
 
-**Scaffold only. Nothing is implemented yet.** Every source file under `packages/*/src` is a
-stub carrying a `// TODO(capwall):` marker and a doc-comment describing the intended
-approach. The only real, passing code is the smoke tests in `packages/core/test`. Build
-order is authoritative in `docs/roadmap.md` and mirrored in § 4 below.
+**Roadmap M1–M3 are implemented (the `fs` vertical slice).** Working end-to-end on the CJS
+path: `Module._load` patch → stack-walk attribution (nearest-package policy, documented in
+`core/src/attribution`) → `fs` shim → policy evaluate, in both modes; `capwall observe`
+emits/merges a starter `capabilities.json` and `capwall enforce` denies-by-default
+(`malicious-dep-demo` is blocked; `express-app` runs clean under its generated policy).
+Still stubs: the `net`/`child_process`/`worker_threads`/`env`/`vm` shims (M4) and the ESM
+hook (M5). Build order is authoritative in `docs/roadmap.md` and mirrored in § 4 below.
 
 ## 3. Architecture orientation
 

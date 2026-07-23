@@ -10,6 +10,29 @@ capwall is **pragmatic, runtime, per-package defense-in-depth against opportunis
 supply-chain malware.** It is **not** a formal sandbox and does not withstand a determined
 in-process attacker.
 
+## Implementation status (keep in sync with the roadmap)
+
+As of roadmap **M3**, only the **`fs` capability is actually mediated**, and only on the
+**CJS `require` path**. The `net`/`http(s)`, `child_process`, `worker_threads`,
+`process.env`, and `vm` sections below describe the *designed* protection (roadmap M4);
+today those surfaces are **not intercepted at all** — a package can use them regardless of
+policy. ESM `import` of `fs` is also not yet intercepted (roadmap M5). Do not deploy capwall
+expecting protection this section says does not exist yet.
+
+Within `fs`, the mediated surface is the path-taking read/write API families (sync,
+callback, and `fs.promises` variants). Purely fd-based operations (`fs.read`, `fs.write`,
+`ftruncate`, `fchmod`, …) are not mediated — consistent with the fd-escape exclusion below.
+
+**Behavior change vs. real `fs` (operational note).** In `enforce` mode a denied call throws
+synchronously — including for callback-style APIs (`fs.readFile(path, cb)`) that in stock
+Node *never* throw synchronously (they deliver errors via the callback). Loud failure is the
+intended semantics, but it means a denied benign call in idiomatic callback code raises an
+uncaught exception rather than an `Error` in the callback, and can crash the process. This is
+most likely during the observe→tighten→enforce rollout while a policy is still incomplete;
+run `observe` until coverage is stable before flipping to `enforce`. `fs.promises` denials
+reject (they do not throw). Path matching is POSIX-oriented (`/`-separated); Windows
+drive-letter paths are not matched by relative grants yet.
+
 ## Adversary we are designed to stop
 
 **Opportunistic, worm-style supply-chain malware** delivered through a compromised npm
@@ -55,13 +78,26 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
 - **Prototype pollution** and **shared mutable primordials** — mutating
   `Object.prototype`/`Array.prototype`/etc. to influence code in other packages, or to
   tamper with capwall's own bookkeeping.
-- **Un-patching the shims** — reaching for the original, un-wrapped core module reference
-  (e.g. via `process.binding`, internal module caches, or re-`require` tricks) and calling
-  it directly.
+- **Un-patching the shims** — reaching for the original, un-wrapped core module reference and
+  calling it directly. This is **cheap, not exotic**: capwall returns a plain, mutable shim
+  object (deliberately un-frozen, so legitimate `fs` monkey-patchers such as `graceful-fs`
+  keep working — the no-SES-tax tradeoff). A dependency can therefore reassign the shim's
+  methods, or — because the ESM `import` path is not yet mediated (roadmap M5) — obtain the
+  real module via `await import("node:fs")` and either call it directly or splice it back over
+  the shim. The shim is a **shared, process-wide singleton**, so a single dependency doing
+  this **silently disables `fs` enforcement for every other package and the app**, not just
+  for itself, with no log line. Treat capwall's mediation as effective only against packages
+  that do not go looking for the raw builtin. A future opt-in hardened mode (frozen shims,
+  accepting the `graceful-fs` breakage) is tracked as a follow-up.
 - **fd / symlink escapes** — using an already-open file descriptor, or a symlink, to reach a
   path outside the allowed globs.
 - **`vm` / `eval` / `node:sqlite`** and similar reflective or alternate-execution surfaces
   that can sidestep the shimmed API.
+- **Attribution laundering** — capwall attributes each call to the **nearest** package frame
+  on the stack (see `core/src/attribution`). A malicious package that arranges for its
+  operation to be *executed by* a trusted helper's code (passing a path to a logger that
+  writes it, scheduling work a broadly-granted package performs) is charged to the helper.
+  Keep helper grants tight; broad grants are laundering targets.
 - **Native `.node` addons** — arbitrary compiled code; capwall can gate *whether* an addon
   loads but cannot confine what it does once loaded.
 - **Subprocess internals** — capwall can gate *whether* a `child_process` spawn happens, but
