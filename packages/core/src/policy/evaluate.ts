@@ -2,10 +2,9 @@
  * Policy evaluation — the decision function at the heart of enforcement.
  *
  * Given a policy, the active mode, the attributed owning package, and a capability request,
- * decide whether the operation is allowed. This module has REAL, tested logic: the
- * deny-by-default semantics and the boolean/env gates are implemented. The path-glob and
- * host matching for `fs`/`net` are intentionally conservative stubs (see the TODO markers)
- * — extend them as the fs and net shims are built out (roadmap M1/M4).
+ * decide whether the operation is allowed. All logic here is REAL and tested: deny-by-default,
+ * the boolean/env gates, and `fs` path-glob matching (see `./glob.ts`). Host-glob matching for
+ * `net` is still a conservative exact/`*` check pending the net shim (roadmap M4).
  *
  * Semantics:
  *  - `enforce` mode: deny-by-default. A package with no matching grant is DENIED.

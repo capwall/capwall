@@ -28,6 +28,8 @@ interface FixtureDep {
   readData(): string;
   readDataAsync(): Promise<string>;
   writeFile(target: string): void;
+  readViaStreamClass(): Promise<string>;
+  probeExists(): boolean;
 }
 
 /** Require the fixture fresh (cache cleared) so its top-level require("fs") re-runs. */
@@ -119,6 +121,51 @@ describe("fs slice — observe mode never blocks", () => {
       kind: "fs",
       access: "read",
     });
+  });
+});
+
+describe("fs slice — stream-class + existence-probe surfaces (review findings)", () => {
+  it("mediates `new fs.ReadStream(path)` (not just createReadStream) in enforce", async () => {
+    // Regression: the stream CONSTRUCTOR was a full read bypass — it must be denied too.
+    const { result } = withCapwall(emptyEnforcePolicy(), "enforce", (dep) =>
+      dep.readViaStreamClass(),
+    );
+    await expect(result).rejects.toMatchObject({ name: "CapabilityError" });
+  });
+
+  it("allows `new fs.ReadStream(path)` when the read is granted", async () => {
+    const policy = loadPolicyFromObject(
+      {
+        version: 1,
+        mode: "enforce",
+        packages: { "fixture-dep": { fs: { read: ["./fixtures/**"], write: [] } } },
+      },
+      { projectRoot: here },
+    );
+    const { result } = withCapwall(policy, "enforce", (dep) => dep.readViaStreamClass());
+    await expect(result).resolves.toBe("fixture data\n");
+  });
+
+  it("existsSync returns false (never throws) for a denied probe in enforce", () => {
+    // Regression: existsSync is contractually non-throwing; a denial must return false.
+    const { result, decisions } = withCapwall(emptyEnforcePolicy(), "enforce", (dep) =>
+      dep.probeExists(),
+    );
+    expect(result).toBe(false);
+    expect(decisions[0]!.decision.allowed).toBe(false); // still recorded as a denial
+  });
+
+  it("existsSync returns the real answer when granted", () => {
+    const policy = loadPolicyFromObject(
+      {
+        version: 1,
+        mode: "enforce",
+        packages: { "fixture-dep": { fs: { read: ["./fixtures/**"], write: [] } } },
+      },
+      { projectRoot: here },
+    );
+    const { result } = withCapwall(policy, "enforce", (dep) => dep.probeExists());
+    expect(result).toBe(true);
   });
 });
 

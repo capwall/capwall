@@ -9,10 +9,14 @@
  *
  * Coverage & limits (kept in sync with docs/threat-model.md):
  *  - The path-taking read/write families below are wrapped (sync, callback, and
- *    `fs.promises` variants). Purely fd-based operations (`read`, `write`, `ftruncate`,
- *    `fchmod`, …) are NOT mediated — fd escapes are documented out-of-scope.
+ *    `fs.promises` variants), PLUS the path-taking stream constructors `ReadStream` /
+ *    `WriteStream` (a dependency can `new fs.ReadStream(path)` instead of
+ *    `createReadStream` — both must be mediated). Purely fd-based operations (`read`,
+ *    `write`, `ftruncate`, `fchmod`, …) are NOT mediated — fd escapes are out-of-scope.
  *  - Denials throw synchronously (callback-style calls included) and reject for
- *    `fs.promises`. Loud failure is the point of enforce mode.
+ *    `fs.promises`. Loud failure is the point of enforce mode — EXCEPT `exists`/`existsSync`,
+ *    which are contractually non-throwing: a denied existence probe returns "does not exist"
+ *    (`false` / `cb(false)`) rather than throwing, which also avoids leaking existence.
  *  - Path checks are lexical on the resolved path; symlink traversal is out of scope.
  */
 import realFs from "node:fs";
@@ -74,8 +78,7 @@ const FS_METHODS: Record<string, MethodSpec> = {
   statfsSync: R0,
   access: R0,
   accessSync: R0,
-  exists: R0,
-  existsSync: R0,
+  // exists / existsSync are handled bespoke (they must never throw — see createFsShim).
   opendir: R0,
   opendirSync: R0,
   watch: R0,
@@ -192,24 +195,63 @@ type AnyFn = (...args: unknown[]) => unknown;
  * (constants, fd-based ops, Stats, …) is the real thing, passed through.
  */
 export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
+  /**
+   * Attribute + evaluate one path/access. Reports the decision to `onDecision` and returns
+   * whether it is allowed. Returns `true` (nothing to check) when `arg` is not a path (fd /
+   * FileHandle). Never throws — the caller decides how to signal a denial.
+   */
+  function check(access: Access, arg: unknown): boolean {
+    const target = coercePath(arg);
+    if (target === null) return true;
+    const pkg = attributeCaller(
+      ctx.projectRoot !== undefined ? { projectRoot: ctx.projectRoot } : {},
+    );
+    const decision = evaluate(ctx.policy, ctx.mode, pkg, { kind: "fs", access, path: target });
+    ctx.onDecision(pkg, decision);
+    if (!decision.allowed) {
+      throw new CapabilityError(decision.reason, pkg);
+    }
+    return true;
+  }
+
   /** Attribute + evaluate each path of a call; throws CapabilityError on an enforce deny. */
   function guard(args: unknown[], spec: MethodSpec): void {
     const specs = spec === "open" ? openSpecs(args) : spec;
-    let pkg: string | null = null; // attribute at most once per call
     for (const { index, access } of specs) {
-      const target = coercePath(args[index]);
-      if (target === null) continue;
-      pkg ??= attributeCaller(
-        ctx.projectRoot !== undefined ? { projectRoot: ctx.projectRoot } : {},
-      );
-      const decision = evaluate(ctx.policy, ctx.mode, pkg, {
-        kind: "fs",
-        access,
-        path: target,
-      });
-      ctx.onDecision(pkg, decision);
-      if (!decision.allowed) throw new CapabilityError(decision.reason, pkg);
+      check(access, args[index]);
     }
+  }
+
+  /**
+   * Bespoke guard for `exists`/`existsSync`, which contractually never throw. On an
+   * enforce-mode denial we report "does not exist" instead of throwing: `existsSync` → false,
+   * `exists(path, cb)` → `cb(false)`. Observe mode allows and falls through to the real call.
+   */
+  function isDeniedExistence(pathArg: unknown): boolean {
+    try {
+      check("read", pathArg);
+      return false;
+    } catch (err) {
+      if (err instanceof CapabilityError) return true;
+      throw err;
+    }
+  }
+
+  /**
+   * Wrap a path-taking stream constructor (`ReadStream`/`WriteStream`) so
+   * `new fs.ReadStream(path)` is mediated exactly like `createReadStream(path)`. Uses a
+   * construct-trap Proxy so `instanceof` and the class identity are preserved.
+   */
+  function wrapPathClass<T extends abstract new (...a: never[]) => unknown>(
+    RealClass: T,
+    access: Access,
+  ): T {
+    return new Proxy(RealClass, {
+      construct(target, argArray, newTarget) {
+        check(access, argArray[0]); // throws on enforce-deny, before the stream exists
+        return Reflect.construct(target, argArray as never[], newTarget);
+      },
+    });
   }
 
   function wrapFn(orig: AnyFn, spec: MethodSpec, rejectOnDeny: boolean): AnyFn {
@@ -252,6 +294,35 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
   }
 
   const shim = wrapSurface(realFs, FS_METHODS, false);
+
+  // Path-taking stream constructors: `new fs.ReadStream(path)` must be mediated like
+  // `createReadStream` (a dependency using the class directly must not bypass the policy).
+  const shimRecord = shim as unknown as Record<string, unknown>;
+  if (typeof realFs.ReadStream === "function") {
+    shimRecord["ReadStream"] = wrapPathClass(realFs.ReadStream, "read");
+  }
+  if (typeof realFs.WriteStream === "function") {
+    shimRecord["WriteStream"] = wrapPathClass(realFs.WriteStream, "write");
+  }
+
+  // Bespoke non-throwing existence probes (deny → "does not exist").
+  shimRecord["existsSync"] = function existsSync(p: unknown): boolean {
+    if (isDeniedExistence(p)) return false;
+    return realFs.existsSync(p as Parameters<typeof realFs.existsSync>[0]);
+  };
+  shimRecord["exists"] = function exists(p: unknown, cb: unknown): void {
+    if (typeof cb !== "function") {
+      // Match Node: the callback is required; defer to the real impl for the deprecation path.
+      (realFs.exists as (...a: unknown[]) => void)(p, cb);
+      return;
+    }
+    if (isDeniedExistence(p)) {
+      (cb as (exists: boolean) => void)(false);
+      return;
+    }
+    (realFs.exists as (...a: unknown[]) => void)(p, cb);
+  };
+
   (shim as { promises: unknown }).promises = wrapSurface(
     realFs.promises,
     PROMISES_METHODS,
