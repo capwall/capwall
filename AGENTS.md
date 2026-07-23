@@ -91,8 +91,11 @@ Do not start step *n+1* until step *n* has passing tests and a clean typecheck.
 - **vitest** for tests; **`tsc --noEmit`** for typecheck (see § 6 — build alone is not
   enough).
 - **Performance.** Keep the hot path (attribution + policy lookup per intercepted call) with
-  the **<1ms/req** target in mind. Attribution stack-walking is the costly part; cache
-  module→package resolution.
+  the **<1ms/req** target in mind — the S4 benchmark (`pnpm bench`) measures ~30x headroom.
+  The cost splits roughly evenly between **attribution stack-walking (~40%)** and the **shim
+  wrapper's own dispatch (~55%)** — not attribution-dominant as originally assumed (see issue
+  #34); policy `evaluate()` is negligible. Cache module→package resolution (the path→package
+  cache gives ~20x cold-vs-warm); if you need more headroom, profile the shim wrapper too.
 - **License hygiene.** capwall is MIT. **Do NOT** pull in non-compete / source-available
   code (e.g. PolyForm-licensed Socket code). Prefer permissive (MIT/BSD/Apache-2.0) deps
   only.
