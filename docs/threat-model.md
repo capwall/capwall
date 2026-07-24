@@ -54,16 +54,21 @@ Per-capability notes:
   guarded via a **guarded subclass** whose prototype method (or constructor) runs the check,
   so `new Cls()`, `(instance).constructor`, `Cls.prototype.constructor`, and
   `Cls.prototype.method.call(...)` are all covered (a construct-trap Proxy would not be — see
-  "Capability-bearing classes" below). **Not covered:** `dns` lookups (a lookup
-  moves no payload; DNS tunneling is a determined-attacker technique out of scope); reaching
+  "Capability-bearing classes" below). The getter-based TOCTOU on `{host,port}`
+  tracked as #26 — a package with a narrow net grant supplying an options object (or a `URL`
+  instance) whose `host`/`hostname`/`port` were accessor properties returning the granted value
+  when capwall derived the guarded target and a different value when Node itself re-read them
+  — is **closed**: capwall reads every such field exactly once, then forwards a pinned
+  clone/synthesized replacement (never the caller's original object/URL) so Node can only ever
+  observe the value that was guarded. Covers both options objects (`net`/`http(s)`/`tls`/
+  `http2`) and `URL` instances (`http(s).request`/`get`/`new ClientRequest()`, and the
+  `http2.connect` authority). **Not covered:** `dns` lookups (a lookup
+  moves no payload; DNS tunneling is a determined-attacker technique out of scope); and reaching
   the real prototype by climbing past the guarded subclass (two levels from an instance,
   `Object.getPrototypeOf(Object.getPrototypeOf(sock)).connect`, or equivalently one hop from
   the class object, `net.Socket.prototype.__proto__.connect` — the same class as the general
-  shim un-patching residual, in-process code deliberately climbing above the guard); and a
-  getter-based TOCTOU on `{host,port}` options for a
-  package that *already holds a narrow net grant* (the derived target is read separately from
-  the value Node connects to — tracked as #26). These are documented residuals, not silent
-  gaps.
+  shim un-patching residual, in-process code deliberately climbing above the guard). This is a
+  documented residual, not a silent gap.
 - **`child_process`, `worker_threads`, `vm`** — boolean **gates** (may this package spawn /
   start a worker / use `vm` at all). Gating, not confinement: capwall does not constrain what
   the subprocess/worker/vm-context does once started (see § gating vs confinement). The

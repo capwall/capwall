@@ -11,7 +11,7 @@ import Module, { createRequire } from "node:module";
 import * as net from "node:net";
 import * as http from "node:http";
 import { describe, expect, it } from "vitest";
-import { createHttpShim, createHttpsShim, createNetShim, createTlsShim } from "../src/shims/net.js";
+import { createHttp2Shim, createHttpShim, createHttpsShim, createNetShim, createTlsShim } from "../src/shims/net.js";
 import { loadPolicyFromObject, type Decision, type Policy } from "../src/index.js";
 import type { ShimContext } from "../src/shims/runtime.js";
 
@@ -382,6 +382,147 @@ describe("net shim — getter TOCTOU (issue #26)", () => {
     });
     socket.destroy();
     expect(reads).toBe(1);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]!.decision.allowed).toBe(true);
+    expect(decisions[0]!.decision.observed).toMatchObject({ host: "127.0.0.1", port: grantedPort });
+  });
+
+  // URL-INSTANCE follow-up (2026-07-23 re-review, PR #46 blocking HIGH): the options-object
+  // pinning above does NOT protect a `URL` instance passed as the url argument. Node's
+  // `ClientRequest`/`http2` internals re-derive `hostname`/`port` off the SAME url object a
+  // second time; if the url instance carries an OWN shadowed `port` (or `host`/`hostname`)
+  // accessor — `Object.defineProperty(url, "port", { get(){...} })`, which JS lets any code do
+  // to any extensible object, and which Node's own property reads honor exactly like a native
+  // one — capwall's derivation-time read and Node's connect-time read can diverge exactly like
+  // the plain-options case above. Verified as a live PoC against the pre-fix code (manually,
+  // outside this suite): guarding `granted:PORT` while the real TCP connection landed on
+  // `evil:PORT`. Proven closed here with TWO independent loopback servers — the getter returns
+  // the granted port on read #1 and an unrelated (also-loopback) evil port on every read after
+  // — asserting the GRANTED server receives the connection and the EVIL server never does,
+  // regardless of the getter's later value, for both `http.get(url)` and `http2.connect(url)`.
+  it("http.get(url): a URL instance with an OWN shadowed port getter cannot desync guard-vs-connect", async () => {
+    const grantedPort = await closedLocalPort();
+    const evilPort = await closedLocalPort();
+    expect(grantedPort).not.toBe(evilPort);
+
+    const granted = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      granted.on("error", reject);
+      granted.listen(grantedPort, "127.0.0.1", () => resolve());
+    });
+    const acceptedGranted = new Promise<void>((resolve) => {
+      granted.once("connection", (sock) => {
+        sock.destroy();
+        resolve();
+      });
+    });
+
+    const evil = net.createServer();
+    let evilHit = false;
+    await new Promise<void>((resolve, reject) => {
+      evil.on("error", reject);
+      evil.listen(evilPort, "127.0.0.1", () => resolve());
+    });
+    evil.on("connection", (sock) => {
+      evilHit = true;
+      sock.destroy();
+    });
+
+    const url = new URL(`http://127.0.0.1:${grantedPort}/`);
+    let reads = 0;
+    Object.defineProperty(url, "port", {
+      configurable: true,
+      get() {
+        reads++;
+        return reads === 1 ? String(grantedPort) : String(evilPort); // granted first, evil after
+      },
+    });
+
+    const { ctx, decisions } = makeCtx(grantedPolicy(grantedPort), "enforce");
+    const httpShim = createHttpShim(ctx);
+
+    await new Promise<void>((resolve) => {
+      const req = httpShim.get(url);
+      // The granted mock server destroys the socket without ever responding — a socket-hang-up
+      // style error here is EXPECTED and fine. What this test verifies is which server's
+      // "connection" event fired, not whether the HTTP exchange itself completed.
+      req.once("response", () => resolve());
+      req.once("error", () => resolve());
+    });
+    await acceptedGranted; // the granted server actually saw the connection
+    await new Promise((r) => setTimeout(r, 20)); // settle window for a stray delayed connect
+    granted.close();
+    evil.close();
+
+    // The getter was read exactly once — by capwall's own derivation. Node's real request
+    // never consulted it again (it received the pinned/synthesized options object), so it
+    // could not have read the second (evil) value.
+    expect(reads).toBe(1);
+    expect(evilHit).toBe(false);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]!.decision.allowed).toBe(true);
+    expect(decisions[0]!.decision.observed).toMatchObject({ host: "127.0.0.1", port: grantedPort });
+  });
+
+  it("http2.connect(url): a URL instance with an OWN shadowed port getter cannot desync guard-vs-connect", async () => {
+    const grantedPort = await closedLocalPort();
+    const evilPort = await closedLocalPort();
+    expect(grantedPort).not.toBe(evilPort);
+
+    const granted = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      granted.on("error", reject);
+      granted.listen(grantedPort, "127.0.0.1", () => resolve());
+    });
+    const acceptedGranted = new Promise<void>((resolve) => {
+      granted.once("connection", (sock) => {
+        sock.destroy();
+        resolve();
+      });
+    });
+
+    const evil = net.createServer();
+    let evilHit = false;
+    await new Promise<void>((resolve, reject) => {
+      evil.on("error", reject);
+      evil.listen(evilPort, "127.0.0.1", () => resolve());
+    });
+    evil.on("connection", (sock) => {
+      evilHit = true;
+      sock.destroy();
+    });
+
+    const url = new URL(`http://127.0.0.1:${grantedPort}/`); // http: → plaintext h2c, no TLS needed
+    let reads = 0;
+    Object.defineProperty(url, "port", {
+      configurable: true,
+      get() {
+        reads++;
+        return reads === 1 ? String(grantedPort) : String(evilPort);
+      },
+    });
+
+    const { ctx, decisions } = makeCtx(grantedPolicy(grantedPort), "enforce");
+    const http2Shim = createHttp2Shim(ctx);
+
+    const session = http2Shim.connect(url);
+    session.on("error", () => {}); // the dummy server isn't a real http2 peer — errors expected
+    await new Promise<void>((resolve) => {
+      session.once("connect", () => resolve());
+      session.once("error", () => resolve());
+    });
+    try {
+      session.destroy();
+    } catch {
+      /* already destroyed */
+    }
+    await acceptedGranted; // the granted server actually saw the connection
+    await new Promise((r) => setTimeout(r, 20)); // settle window for a stray delayed connect
+    granted.close();
+    evil.close();
+
+    expect(reads).toBe(1);
+    expect(evilHit).toBe(false);
     expect(decisions).toHaveLength(1);
     expect(decisions[0]!.decision.allowed).toBe(true);
     expect(decisions[0]!.decision.observed).toMatchObject({ host: "127.0.0.1", port: grantedPort });

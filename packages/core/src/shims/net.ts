@@ -35,20 +35,29 @@
  *  - `dns` is NOT shimmed (a lookup moves no payload; DNS tunneling is out of scope).
  *
  * GETTER-TOCTOU CLOSED (issue #26). Every derive function above reads `host`/`hostname`/
- * `port` off the caller's options object to compute the guarded target, then — historically —
- * the SAME options object was forwarded to the real API. If those fields were accessor
- * (getter) properties, they could legally return a different value on Node's later internal
- * re-read than they did during capwall's derivation: capwall would guard `granted.host:443`
- * while Node opened a socket to `evil.host:443`. The fix (`pinTarget` + the `normalize*Args`
- * helpers below): after deriving the primitive `{host, port}` — reading each getter exactly
- * once — build a shallow clone of every options object in the call with `host`/`hostname`/
- * `port` overwritten by those PINNED primitives, and forward the CLONE, never the original.
- * Node then reads plain data properties equal to what was guarded; a getter has no chance to
- * diverge because it is never consulted again. Positional `(port, host)` forms already pass
- * primitives (no getter surface) and are left untouched. Applied at every options-taking
- * egress entry point: `net.connect`/`createConnection`/`Socket#connect`, `http(s).request`/
- * `get`/`new ClientRequest()`/`Agent#createConnection`, `tls.connect`/`TLSSocket#connect`, and
- * `http2.connect`.
+ * `port` off the caller's options object (or URL) to compute the guarded target, then —
+ * historically — the SAME object was forwarded to the real API. If those fields were accessor
+ * (getter) properties — including a caller-supplied `URL` instance with an OWN shadowed
+ * `hostname`/`port` accessor, which Node happily honors — they could legally return a
+ * different value on Node's later internal re-read than they did during capwall's derivation:
+ * capwall would guard `granted.host:443` while Node opened a socket to `evil.host:443`. Fixed
+ * two ways, applied together at every options/URL-taking egress entry point (`net.connect`/
+ * `createConnection`/`Socket#connect`, `http(s).request`/`get`/`new ClientRequest()`/
+ * `Agent#createConnection`, `tls.connect`/`TLSSocket#connect`, and `http2.connect`):
+ *  1. Plain options objects — `pinTarget` + the `normalize*Args` helpers: after deriving the
+ *     primitive `{host, port}` (reading each getter exactly once), forward a shallow clone with
+ *     `host`/`hostname`/`port` overwritten by those PINNED primitives, never the original
+ *     object. Positional `(port, host)` forms already pass primitives (no getter surface).
+ *  2. URL instances passed to `http(s).request`/`get`/`new ClientRequest()` or as an
+ *     `http2.connect` authority — `snapshotUrl` reads every field Node would otherwise
+ *     re-derive from the URL EXACTLY ONCE, and the URL itself is never forwarded: `http(s)`
+ *     gets a synthesized plain options object built from that one-time snapshot
+ *     (`resolveHttpCall`); `http2` gets a synthesized authority STRING (`resolveHttpCall`'s
+ *     http2 counterpart) — both immutable to Node's internal re-read. A string first-arg
+ *     (`http.get("https://...")`) is parsed into capwall's own fresh `URL` first (no external
+ *     getter surface) and goes through the same single-read snapshot for uniformity.
+ * In both cases Node ends up reading only plain data properties / immutable strings equal to
+ * what was guarded — a getter has no chance to diverge because it is never consulted again.
  */
 import realNet from "node:net";
 import realHttp from "node:http";
@@ -116,43 +125,145 @@ function deriveNetTarget(args: unknown[], defaultPort = 0): { host: string; port
 }
 
 /**
- * Derive `{host, port}` from `http(s).request`/`get` arguments:
+ * Fields Node's own `urlToHttpOptions` (and http2's authority parsing) derive from a URL,
+ * captured with EACH property read exactly once. A caller-supplied `URL` instance can carry an
+ * OWN shadowed accessor for any of these (e.g.
+ * `Object.defineProperty(url, "port", { get(){ return firstCall ? granted : evil; } })`) that
+ * legally returns a different value on a second read — reading twice (once to guard, once when
+ * building what gets forwarded) is exactly the TOCTOU this closes (issue #26, URL-argument
+ * follow-up). Every consumer below builds its guarded target AND its forwarded args from this
+ * ONE snapshot; the URL itself is never consulted again.
+ */
+interface UrlSnapshot {
+  protocol: string;
+  hostname: string;
+  port: string;
+  pathname: string;
+  search: string;
+  hash: string;
+  username: string;
+  password: string;
+}
+function snapshotUrl(u: URL): UrlSnapshot {
+  return {
+    protocol: u.protocol,
+    hostname: u.hostname,
+    port: u.port, // read once — reused for both the "has a port" check and Number(...) below
+    pathname: u.pathname,
+    search: u.search,
+    hash: u.hash,
+    username: u.username,
+    password: u.password,
+  };
+}
+
+/** Build a Node `urlToHttpOptions`-shaped plain options object from a single-read snapshot.
+ * `hostname`/`port` are ALWAYS present (defaulting `port` to `defaultPort` when the URL had
+ * none) so whatever forwards this object always carries an explicit, pinnable target. */
+function urlSnapshotToOptions(s: UrlSnapshot, defaultPort: number): Record<string, unknown> {
+  const options: Record<string, unknown> = {
+    protocol: s.protocol,
+    hostname: s.hostname,
+    port: s.port !== "" ? Number(s.port) : defaultPort,
+    hash: s.hash,
+    search: s.search,
+    pathname: s.pathname,
+    path: `${s.pathname || ""}${s.search || ""}`,
+  };
+  if (s.username || s.password) {
+    options["auth"] = `${decodeURIComponent(s.username)}:${decodeURIComponent(s.password)}`;
+  }
+  return options;
+}
+
+/**
+ * Resolve ONE `http(s).request`/`get`/`new ClientRequest()` call: derive the guarded
+ * `{host, port}` AND build the exact args to forward, IN A SINGLE PASS, so nothing that decided
+ * the guard is ever read a second time (issue #26 — closed for both plain options objects and
+ * `URL` instances). Accepted forms:
  *   - `(options[, cb])`
  *   - `(url[, options][, cb])` — url is a string or URL; options overrides url fields.
+ *
+ * When `args[0]` is a url/string, Node's own `ClientRequest` constructor converts it via its
+ * internal `urlToHttpOptions(url)` and merges any options object over the result — re-reading
+ * the SAME url a second time, on Node's side, is exactly what a shadowed accessor exploits. So
+ * whenever a url/string is present, this returns a synthesized, ALREADY-MERGED plain options
+ * object (built purely from the single-read snapshot plus the overlay's own fields) as the sole
+ * options arg, with `hostname`/`port` pinned — Node never touches the url again.
  */
-function deriveHttpTarget(args: unknown[], defaultPort: number): { host: string; port: number } {
+function resolveHttpCall(args: unknown[], defaultPort: number): { host: string; port: number; args: unknown[] } {
+  const first = args[0];
+  let urlOptions: Record<string, unknown> | undefined;
   let host: string | undefined;
   let port: number | undefined;
-  const applyUrl = (u: URL): void => {
-    host = u.hostname;
-    if (u.port !== "") port = Number(u.port);
+
+  const fromUrl = (u: URL): void => {
+    const snap = snapshotUrl(u); // the ONLY read of this URL's fields
+    const opts = urlSnapshotToOptions(snap, defaultPort);
+    urlOptions = opts;
+    host = opts["hostname"] as string;
+    port = opts["port"] as number;
   };
-  const applyOptions = (o: Record<string, unknown>): void => {
-    const rawHostname = o["hostname"]; // read once each — a getter must not see a second call
-    const rawHost = o["host"];
+
+  if (typeof first === "string") {
+    try {
+      fromUrl(new URL(first)); // capwall's own freshly-parsed URL — no external getter surface
+    } catch {
+      /* not an absolute URL */
+    }
+  } else if (first instanceof URL) {
+    fromUrl(first); // the caller's URL instance — read exactly once, via snapshotUrl
+  } else if (isPlainObject(first)) {
+    const rawHostname = first["hostname"]; // read once each — a getter must not see a 2nd call
+    const rawHost = first["host"];
     if (typeof rawHostname === "string") host = rawHostname;
     else if (typeof rawHost === "string") host = rawHost;
-    const rawPort = o["port"];
+    const rawPort = first["port"];
     if (typeof rawPort === "number") port = rawPort;
     else if (typeof rawPort === "string" && rawPort !== "") {
       const n = Number(rawPort);
       if (Number.isFinite(n)) port = n;
     }
-  };
-  const first = args[0];
-  if (typeof first === "string") {
-    try {
-      applyUrl(new URL(first));
-    } catch {
-      /* not an absolute URL */
-    }
-  } else if (first instanceof URL) {
-    applyUrl(first);
-  } else if (isPlainObject(first)) {
-    applyOptions(first);
   }
-  if (isPlainObject(args[1])) applyOptions(args[1] as Record<string, unknown>);
-  return { host: host ?? "localhost", port: port ?? defaultPort };
+
+  const overlay = isPinnableOptions(args[1]) ? args[1] : undefined;
+  if (overlay) {
+    const rawHostname = overlay["hostname"]; // read once each
+    const rawHost = overlay["host"];
+    if (typeof rawHostname === "string") host = rawHostname;
+    else if (typeof rawHost === "string") host = rawHost;
+    const rawPort = overlay["port"];
+    if (typeof rawPort === "number") port = rawPort;
+    else if (typeof rawPort === "string" && rawPort !== "") {
+      const n = Number(rawPort);
+      if (Number.isFinite(n)) port = n;
+    }
+  }
+
+  const finalHost = host ?? "localhost";
+  const finalPort = port ?? defaultPort;
+
+  let outArgs = args;
+  if (urlOptions) {
+    // A url/string was present: synthesize ONE merged, pinned options object and forward it as
+    // `(options, cb)` — the exact 2-slot shape Node's own `ClientRequest` constructor collapses
+    // a url(+options)(+cb) call into internally, so runtime behavior is unchanged except the
+    // url is never re-consulted.
+    const merged: Record<string, unknown> = {};
+    copyOwnFieldsExceptTarget(merged, urlOptions);
+    if (overlay) copyOwnFieldsExceptTarget(merged, overlay);
+    merged["hostname"] = finalHost; // always explicit — this call's target IS a url/string
+    merged["port"] = finalPort;
+    const cb = typeof args[1] === "function" ? args[1] : typeof args[2] === "function" ? args[2] : undefined;
+    outArgs = cb !== undefined ? [merged, cb] : [merged];
+  } else if (isPinnableOptions(first) || overlay) {
+    const out = args.slice();
+    if (isPinnableOptions(out[0])) out[0] = pinTarget(out[0], finalHost, finalPort);
+    if (overlay) out[1] = pinTarget(overlay, finalHost, finalPort);
+    outArgs = out;
+  }
+
+  return { host: finalHost, port: finalPort, args: outArgs };
 }
 
 /**
@@ -181,19 +292,31 @@ function deriveTlsTarget(args: unknown[]): { host: string; port: number } {
   return t;
 }
 
+/** Copy every OWN property of `src` onto `dst` — `Reflect.ownKeys` + descriptor-preserving
+ * `defineProperty`, so non-enumerable and symbol-keyed fields survive too (a plain
+ * enumerable-only, by-value copy silently drops those), skipping `host`/`hostname`/`port` (the
+ * caller pins those separately, to a primitive, never a copied accessor). Never reads a
+ * `host`/`hostname`/`port` accessor: those three keys are skipped before `getOwnPropertyDescriptor`
+ * would otherwise need to touch them, and every other field's descriptor is copied, not
+ * invoked, so no property is READ as part of this copy at all. */
+function copyOwnFieldsExceptTarget(dst: Record<string, unknown>, src: object): void {
+  for (const key of Reflect.ownKeys(src)) {
+    if (key === "host" || key === "hostname" || key === "port") continue;
+    const desc = Object.getOwnPropertyDescriptor(src, key);
+    if (desc) Object.defineProperty(dst, key, desc);
+  }
+}
+
 /**
  * Shallow-clone `obj`, pinning whichever of `host`/`hostname`/`port` it already carries to the
  * given PRIMITIVE values (issue #26 — see the module doc comment). Existence is checked with
- * `in`, which never invokes an accessor; other fields are copied by key via `Object.keys`
- * (own-enumerable names only, also getter-free to obtain). `host`/`hostname`/`port` are never
- * read off `obj` here — the caller already derived them, once, during guard evaluation.
+ * `in`, which never invokes an accessor; every other own field is preserved losslessly via
+ * {@link copyOwnFieldsExceptTarget}. `host`/`hostname`/`port` are never read off `obj` here —
+ * the caller already derived them, once, during guard evaluation.
  */
 function pinTarget(obj: Record<string, unknown>, host: string, port: number): Record<string, unknown> {
   const clone: Record<string, unknown> = {};
-  for (const key of Object.keys(obj)) {
-    if (key === "host" || key === "hostname" || key === "port") continue; // pinned below
-    clone[key] = obj[key];
-  }
+  copyOwnFieldsExceptTarget(clone, obj);
   if ("host" in obj) clone["host"] = host;
   if ("hostname" in obj) clone["hostname"] = host;
   if ("port" in obj) clone["port"] = port;
@@ -227,24 +350,9 @@ function normalizeTlsArgs(args: unknown[], host: string, port: number): unknown[
   return changed ? out : args;
 }
 
-/** `http(s).request`/`get`/`new ClientRequest()`: `args[0]` (options, or a URL/string left
- * untouched) and `args[1]` (an override options object) can each carry host/hostname/port. */
-function normalizeHttpArgs(args: unknown[], host: string, port: number): unknown[] {
-  const out = args.slice();
-  let changed = false;
-  if (isPinnableOptions(out[0])) {
-    out[0] = pinTarget(out[0], host, port);
-    changed = true;
-  }
-  if (isPinnableOptions(out[1])) {
-    out[1] = pinTarget(out[1], host, port);
-    changed = true;
-  }
-  return changed ? out : args;
-}
-
-/** `http2.connect(authority[, options])`: the authority (string/URL) is immutable and left
- * alone; only `args[1]`, if an options object, can carry a `host`/`port` override. */
+/** Pins `args[1]`'s `host`/`hostname`/`port` (the `http2.connect(authority, options)` overlay),
+ * if it is an options object — the authority itself is pinned separately, by
+ * {@link createHttp2Shim}, into an immutable STRING before this runs. */
 function normalizeHttp2Args(args: unknown[], host: string, port: number): unknown[] {
   if (!isPinnableOptions(args[1])) return args;
   const out = args.slice();
@@ -303,13 +411,25 @@ function guardedSubclassMethod(
   return Guarded;
 }
 
+/** Wrap an `http(s).request`/`get` function: resolves the call (guard target + normalized
+ * args) in one pass via {@link resolveHttpCall}, so a url/options-object/getter is read once. */
+function wrapHttpFn(orig: AnyFn, defaultPort: number, ctx: ShimContext): AnyFn {
+  const wrapped: AnyFn = function (this: unknown, ...args: unknown[]) {
+    const resolved = resolveHttpCall(args, defaultPort);
+    guard(ctx, { kind: "net", host: resolved.host, port: resolved.port }); // before any socket opens
+    return orig.apply(this, resolved.args); // pinned/synthesized args, never the original
+  };
+  Object.defineProperty(wrapped, "name", { value: orig.name, configurable: true });
+  return wrapped;
+}
+
 /** Guarded subclass of `http.ClientRequest`: the constructor initiates the connection. */
 function guardedClientRequestClass(RealClass: AnyCtor, ctx: ShimContext, defaultPort: number): AnyCtor {
   const Guarded = class extends RealClass {
     constructor(...args: unknown[]) {
-      const { host, port } = deriveHttpTarget(args, defaultPort);
-      guard(ctx, { kind: "net", host, port }); // before super() → before the connection
-      super(...normalizeHttpArgs(args, host, port)); // pinned clone, never the original
+      const resolved = resolveHttpCall(args, defaultPort);
+      guard(ctx, { kind: "net", host: resolved.host, port: resolved.port }); // before super()
+      super(...resolved.args); // pinned/synthesized args, never the original
     }
   };
   Object.defineProperty(Guarded, Symbol.hasInstance, {
@@ -357,7 +477,7 @@ function wrapHttpModule<T extends object>(real: T, ctx: ShimContext, defaultPort
   for (const name of ["request", "get"]) {
     const orig = realRecord[name];
     if (typeof orig !== "function") continue;
-    shim[name] = wrapFn(orig as AnyFn, (a) => deriveHttpTarget(a, defaultPort), ctx, normalizeHttpArgs);
+    shim[name] = wrapHttpFn(orig as AnyFn, defaultPort, ctx);
   }
   if (typeof realRecord["ClientRequest"] === "function") {
     shim["ClientRequest"] = guardedClientRequestClass(realRecord["ClientRequest"] as AnyCtor, ctx, defaultPort);
@@ -409,7 +529,15 @@ export function createTlsShim(ctx: ShimContext): typeof import("node:tls") {
   return shim as unknown as typeof import("node:tls");
 }
 
-/** Build a shimmed `http2` module: `http2.connect(authority)` is guarded (default port 443). */
+/**
+ * Build a shimmed `http2` module: `http2.connect(authority)` is guarded (default port 443).
+ * The authority (a url string OR a `URL` instance) is read via {@link snapshotUrl} — EACH
+ * field exactly once — then rebuilt as a pinned, immutable STRING and forwarded in place of
+ * the original: Node's own `connect` internally re-parses/re-reads the authority a second
+ * time, which is exactly what a `URL` instance with a shadowed `hostname`/`port` accessor could
+ * exploit (issue #26, URL-argument follow-up). A plain string authority is rebuilt too, for
+ * uniformity, though strings have no getter surface to begin with.
+ */
 export function createHttp2Shim(ctx: ShimContext): typeof import("node:http2") {
   const shim: Record<string, unknown> = {};
   for (const key of Object.keys(realHttp2)) {
@@ -420,12 +548,17 @@ export function createHttp2Shim(ctx: ShimContext): typeof import("node:http2") {
     const authority = args[0];
     let host = "localhost";
     let port = 443;
+    let pinnedAuthority: string | undefined;
     try {
       const u = authority instanceof URL ? authority : new URL(String(authority));
-      host = u.hostname;
-      if (u.port !== "") port = Number(u.port);
+      const snap = snapshotUrl(u); // the ONLY read of the authority's URL fields
+      const protocol = snap.protocol || "https:";
+      host = snap.hostname || "localhost";
+      port = snap.port !== "" ? Number(snap.port) : 443;
+      pinnedAuthority = `${protocol}//${host}:${port}`;
     } catch {
-      /* unparseable authority — deny-leaning localhost:443 */
+      /* unparseable authority — deny-leaning localhost:443; forwarded unchanged below, so Node
+       * raises the same parse error the un-shimmed API would */
     }
     // Node honors options.host/port over the authority (http2.connect(authority, options)).
     const opts = args[1];
@@ -440,7 +573,9 @@ export function createHttp2Shim(ctx: ShimContext): typeof import("node:http2") {
       }
     }
     guard(ctx, { kind: "net", host, port });
-    return realConnect.apply(this, normalizeHttp2Args(args, host, port)); // pinned clone
+    const out = args.slice();
+    if (pinnedAuthority !== undefined) out[0] = pinnedAuthority; // a STRING, never the original
+    return realConnect.apply(this, normalizeHttp2Args(out, host, port)); // + pinned options overlay
   };
   return shim as unknown as typeof import("node:http2");
 }
