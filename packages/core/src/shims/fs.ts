@@ -296,12 +296,17 @@ function armDenyStream(stream: Readable | Writable, err: CapabilityError): void 
     process.nextTick(deliver);
   };
   stream.on("newListener", onNewListener);
-  setImmediate(() => {
-    setTimeout(() => {
+  // Safety net if no 'error' listener is ever attached. `.unref()` so these timers never keep
+  // an otherwise-idle event loop alive (a program that would exit immediately shouldn't be held
+  // open by a denied stream's pending delivery).
+  const immediate = setImmediate(() => {
+    const timer = setTimeout(() => {
       stream.removeListener("newListener", onNewListener);
       deliver();
     }, 0);
+    timer.unref();
   });
+  immediate.unref();
 }
 
 function denyReadStream(err: CapabilityError, path: unknown): Readable {
