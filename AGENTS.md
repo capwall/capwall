@@ -35,8 +35,7 @@ emits/merges a starter `capabilities.json` covering all capability kinds, and `c
 enforce` denies-by-default (`malicious-dep-demo` is blocked on both env and fs; `express-app`
 runs clean under its generated policy). Two stretch items also landed: **S1** SBOM/CBOM →
 policy (`@capwall/sbom-import`) and **S4** the perf benchmark (`pnpm bench`; measured overhead
-is ~30x under the <1ms/req budget — see issue #34 on the cost model). The **ESM hook (M5) is
-the next milestone** and remains a stub. Build order is
+is ~30x under the <1ms/req budget — see issue #34 on the cost model). The **ESM hook (M5)** is implemented (both static and dynamic `import` of mediated builtins are intercepted via a `module.register` hook; on by default under the CLI, `CAPWALL_ESM=0` to disable). Build order is
 authoritative in `docs/roadmap.md` and mirrored in § 4 below.
 
 ## 3. Architecture orientation

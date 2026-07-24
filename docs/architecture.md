@@ -1,7 +1,7 @@
 # capwall architecture
 
 > Design doc. The CJS path with the `fs` shim (roadmap M1–M3) is implemented; the other
-> shims and the ESM hook are still stubs. Build order lives in [`roadmap.md`](./roadmap.md).
+> the full MVP + ESM (M1–M5) is implemented. Build order lives in [`roadmap.md`](./roadmap.md).
 
 ## Overview
 
@@ -39,10 +39,15 @@ package's slice of the policy.
   `Module.prototype.require`) so that when a package requires a capability-sensitive core
   module (`fs`, `net`, …), it receives capwall's **shimmed** version rather than the raw
   builtin. This is the primary, first-implemented path.
-- **ESM (`esm-hook.ts`)** — register a loader via `module.register()` and use `resolve`/
-  `load` hooks. **Hard part:** static `import` specifiers are resolved before user code runs,
-  and bindings are live/immutable, so the CJS "swap the returned module" trick does not
-  translate cleanly. ESM is a fast-follow after the CJS path is solid (roadmap step 5).
+- **ESM (`esm-hook.ts` + `esm-hooks.ts` + `esm-runtime.ts`)** — implemented (M5). A
+  `module.register()` hook on the loader thread (`esm-hooks.ts`) rewrites a mediated builtin
+  specifier to a synthetic `capwall-esm:` module; its `load` returns generated source that
+  re-exports the shim members from the main-thread bridge (`esm-runtime.ts`). The
+  "static bindings are immutable" concern is sidestepped: because the hook supplies the module
+  source up front, the binding is to the shim from the start — no post-hoc swap. Export names
+  are enumerated on the main thread at registration and passed to the hook, so the loader
+  thread never imports the real builtin (which would recurse). Covers static and dynamic
+  `import`; attribution and `onDecision` run on the main thread exactly as for CJS.
 
 ### Capability shims (`core/src/shims`)
 
