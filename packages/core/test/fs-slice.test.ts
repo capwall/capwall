@@ -277,6 +277,73 @@ describe("fs slice — denial delivery matches the real API's error channel (#16
   });
 });
 
+/** Attach-timing strategies for the #40 catch-window matrix: sync/microtask/macrotasks. */
+type Schedule = (attach: () => void) => void;
+const attachTimings: Array<[string, Schedule]> = [
+  ["synchronously", (attach: () => void): void => attach()],
+  ["on a microtask", (attach: () => void): void => void Promise.resolve().then(attach)],
+  ["on setImmediate", (attach: () => void): void => void setImmediate(attach)],
+  ["on setTimeout(0)", (attach: () => void): void => void setTimeout(attach, 0)],
+];
+
+describe("fs slice — deny-stream 'error' delivered whenever a handler attaches, not on a fixed timer (#40)", () => {
+  // The old fixed `setImmediate` delivery had a bounded catch window: a handler attached on
+  // a LATER macrotask (e.g. setTimeout(0)) could register after the timer already fired,
+  // missing the event → uncaught 'error' crash. The fix holds the error until a handler
+  // attaches (any time), so every attach timing below must catch it.
+  it.each(attachTimings)("createReadStream: a handler attached %s still catches the CapabilityError", async (_label, schedule) => {
+    const { shim } = directShim(emptyEnforcePolicy(), "enforce");
+    const target = path.join(FIXTURE, "data.txt");
+    const stream = shim.createReadStream(target);
+    const err = await new Promise((resolve) => {
+      schedule(() => stream.on("error", resolve));
+    });
+    expect(err).toMatchObject({ name: "CapabilityError" });
+    expect((stream as unknown as { path: string }).path).toBe(target); // stream.path preserved
+  });
+
+  it.each(attachTimings)("createWriteStream: a handler attached %s still catches the CapabilityError", async (_label, schedule) => {
+    const { shim } = directShim(emptyEnforcePolicy(), "enforce");
+    const target = path.join(here, "fixtures", "nope-write-40.txt");
+    const stream = shim.createWriteStream(target);
+    const err = await new Promise((resolve) => {
+      schedule(() => stream.on("error", resolve));
+    });
+    expect(err).toMatchObject({ name: "CapabilityError" });
+    expect((stream as unknown as { path: string }).path).toBe(target); // stream.path preserved
+    expect(nodeFs.existsSync(target)).toBe(false); // still fail-closed — nothing written
+  });
+
+  it("delivers exactly once even with multiple 'error' listeners attached (no duplicate delivery)", async () => {
+    const { shim } = directShim(emptyEnforcePolicy(), "enforce");
+    const target = path.join(FIXTURE, "data.txt");
+    const stream = shim.createReadStream(target);
+    let fireCount1 = 0;
+    let fireCount2 = 0;
+    const [err1, err2] = await Promise.all([
+      new Promise((resolve) => stream.on("error", (e) => (fireCount1++, resolve(e)))),
+      new Promise((resolve) => stream.on("error", (e) => (fireCount2++, resolve(e)))),
+    ]);
+    expect(err1).toMatchObject({ name: "CapabilityError" });
+    expect(err2).toMatchObject({ name: "CapabilityError" });
+    // Give any stray extra emission a chance to land before asserting exactly-once.
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fireCount1).toBe(1);
+    expect(fireCount2).toBe(1);
+  });
+
+  it("still surfaces (crashes) an unhandled denial when NO 'error' listener is ever attached — not silently swallowed", async () => {
+    const { shim } = directShim(emptyEnforcePolicy(), "enforce");
+    const target = path.join(FIXTURE, "data.txt");
+    const caught = await new Promise((resolve) => {
+      process.once("uncaughtException", resolve);
+      shim.createReadStream(target); // never attach an 'error' listener
+    });
+    expect(caught).toMatchObject({ name: "CapabilityError" });
+  });
+});
+
 describe("fs slice — Buffer path fidelity (#19)", () => {
   it("decodes a non-UTF-8 Buffer path losslessly (latin1) for the policy check", () => {
     const { shim, decisions } = directShim(emptyEnforcePolicy(), "observe");

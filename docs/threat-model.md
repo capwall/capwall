@@ -94,13 +94,17 @@ exception it would never see from real `fs`:
   the shim falls back to a synchronous throw, matching real Node's behavior for the same
   mis-call.
 - **`createReadStream`/`createWriteStream`** return a minimal stream (with `.path` set) that
-  emits `'error'` with the `CapabilityError` on `setImmediate` — a sync throw here would be a
-  bypass-shaped surprise, since `fs.createReadStream(p).on('error', h)` is the idiomatic
-  pattern and never throws synchronously in real Node either. The timing **approximates**
-  real Node's threadpool-delivered open-error rather than reproducing it exactly: a caller
-  that attaches its `'error'` handler on a much later macrotask can miss the event and get an
-  uncaught `'error'` (as it also would against real `fs` past a point). This is **fail-closed**
-  — the read/write never happens — but it is a parity gap, tracked as a follow-up.
+  holds the `CapabilityError` and emits `'error'` with it **as soon as an `'error'` listener
+  is attached** to the stream — not on a fixed timer — so a handler attached synchronously,
+  on a microtask, on `setImmediate`, or on `setTimeout(0)` is always caught (fix #40; this
+  closes the earlier parity gap, where a fixed `setImmediate` delivery could fire before a
+  handler attached on a later macrotask, producing an uncaught `'error'` even though the
+  consumer did handle errors). A sync throw here would still be a bypass-shaped surprise,
+  since `fs.createReadStream(p).on('error', h)` is the idiomatic pattern and never throws
+  synchronously in real Node either. If `'error'` is never listened for at all, a safety net
+  still delivers the denial after two event-loop phases, so an unhandled denial ultimately
+  crashes the process — same as real `fs` would for an unhandled async error — rather than
+  silently hanging forever. This is **fail-closed** either way — the read/write never happens.
 - **`watch`/`watchFile`** and the `ReadStream`/`WriteStream` **class constructors**
   (`new fs.ReadStream(deniedPath)`) throw synchronously on denial. `fs.watch` and a real
   stream constructor also throw synchronously on a bad argument, so those match. `fs.watchFile`
