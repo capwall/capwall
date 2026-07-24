@@ -15,7 +15,9 @@
     "typecheck": "pnpm -r run typecheck",
     "test": "pnpm -r run test",
     "lint": "pnpm -r run lint",
-    "bench": "node scripts/bench/bench.mjs"
+    "bench": "node scripts/bench/bench.mjs",
+    "ci:local": "bash scripts/ci-local.sh",
+    "ci:local:22": "bash scripts/ci-local.sh 22"
   },
   "devDependencies": {
     "typescript": "^5.6.0",

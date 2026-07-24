@@ -1,0 +1,22 @@
+{
+  "//": "Reproducible dev environment for capwall (VS Code / GitHub Codespaces / any Dev Containers client). Node 22 matches the primary CI target; use scripts/ci-local.sh to run the full Node 20+22 gate matrix in Docker. See docs/ci-local.md.",
+  "name": "capwall",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:22-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
+  },
+  "onCreateCommand": "corepack enable",
+  "postCreateCommand": "corepack prepare pnpm@10.33.0 --activate && pnpm install --frozen-lockfile=false && pnpm -r build",
+  "customizations": {
+    "vscode": {
+      "extensions": ["esbenp.prettier-vscode", "vitest.explorer"],
+      "settings": {
+        "typescript.tsdk": "node_modules/typescript/lib",
+        "editor.formatOnSave": false
+      }
+    }
+  },
+  "remoteEnv": {
+    "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"
+  }
+}

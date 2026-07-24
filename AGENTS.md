@@ -111,6 +111,12 @@ A feature is done only when **all** of:
 - Once `enforce` exists: the `malicious-dep-demo` fixture is **blocked in `enforce` mode**
   and **allowed (only logged) in `observe` mode**.
 
+**GitHub Actions is billing-blocked (issue #3), so there is no automated CI.** Reproduce the
+full `ci.yml` matrix (Node 20 **and** 22, clean install → build → typecheck → test → lint) in
+Docker with `pnpm ci:local` — a green run there is a green CI run. See
+[`docs/ci-local.md`](docs/ci-local.md). Until Actions billing is restored, treat `pnpm ci:local`
+as the gate.
+
 ## 7. Testing
 
 - vitest, colocated in each package's `test/`.
