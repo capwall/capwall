@@ -69,7 +69,7 @@ type NextLoad = (
 /** A valid, non-reserved ES identifier that can appear in `export const <name> = …`. */
 const RESERVED = new Set([
   "default",
-  "break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete",
+  "break", "case", "catch", "class", "const", "continue", "debugger", "delete",
   "do", "else", "export", "extends", "finally", "for", "function", "if", "import", "in",
   "instanceof", "new", "return", "super", "switch", "this", "throw", "try", "typeof", "var",
   "void", "while", "with", "yield", "let", "enum", "await", "null", "true", "false",
@@ -86,6 +86,13 @@ export async function load(
   if (!url.startsWith(PREFIX)) return nextLoad(url, context);
 
   const specifier = url.slice(PREFIX.length);
+  // Only serve `capwall-esm:` URLs whose specifier we actually registered — a dependency that
+  // hand-crafts `import("capwall-esm:…")` for an unregistered specifier gets a hard error, not
+  // a fabricated module. (Registered specifiers still resolve to the same guarded shim, so this
+  // is defense-in-depth, not a new gate.)
+  if (!Object.prototype.hasOwnProperty.call(exportsBySpecifier, specifier)) {
+    throw new Error(`capwall: refusing to load unregistered ESM specifier '${specifier}'`);
+  }
   const names = (exportsBySpecifier[specifier] ?? []).filter(isExportableName);
 
   // Generate an ES module that pulls the shim from the main-thread bridge and re-exports it.

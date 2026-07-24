@@ -173,10 +173,13 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
   calling it directly. This is **cheap, not exotic**: capwall returns a plain, mutable shim
   object (deliberately un-frozen, so legitimate `fs` monkey-patchers such as `graceful-fs`
   keep working — the no-SES-tax tradeoff). A dependency can reassign the shim's methods, or
-  reach the raw builtin through internal channels (`process.binding`, internal module caches,
-  `require("node:...")` from a context capwall hasn't patched). Both the CJS `require` and the
-  ESM `import` paths ARE mediated (M4/M5), so obtaining the raw module is no longer as simple
-  as `await import("node:fs")` — but capwall does not chase every reflective escape hatch. The
+  reach the raw builtin through channels capwall does not mediate. Both the CJS `require` and
+  the ESM `import` paths ARE mediated (M4/M5), so `require("node:fs")` and
+  `import … from "node:fs"` both return the shim — but capwall does not chase every reflective
+  escape hatch, and at least one is a **plain public API**: `process.getBuiltinModule("node:fs")`
+  (Node ≥22) returns the real, un-shimmed module, as does `process.binding`, internal module
+  caches, or a builtin loaded from a context capwall has not patched. `getBuiltinModule` is
+  path-independent (it defeats the CJS patch identically), so this is not specific to ESM. The
   shim is a **shared, process-wide singleton**, so a single dependency that does un-patch it
   **silently disables enforcement for every other package and the app**, not just for itself,
   with no log line. Treat capwall's mediation as effective only against packages that do not
