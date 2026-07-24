@@ -66,7 +66,7 @@ export function install(
     handles.push(installEnvGuard(ctx));
   }
   if (options.esm) {
-    handles.push(registerEsmHook(policy, mode));
+    handles.push(registerEsmHook(ctx));
   }
   return {
     uninstall() {

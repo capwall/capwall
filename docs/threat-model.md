@@ -12,11 +12,25 @@ in-process attacker.
 
 ## Implementation status (keep in sync with the roadmap)
 
-As of roadmap **M4**, all core capability surfaces are mediated on the **CJS `require`
-path**: `fs`, `net`/`http`/`https`, `child_process`, `worker_threads`, `process.env`, and
-`vm`. **ESM `import` of these builtins is not yet intercepted (roadmap M5)** — an ESM target
-that does `import { readFile } from "node:fs"` bypasses mediation. Do not deploy capwall
-against ESM-first targets expecting enforcement yet.
+As of roadmap **M5**, all core capability surfaces are mediated on **both the CJS `require`
+path and the ESM `import` path**: `fs`, `net`/`http`/`https`/`tls`/`http2`/`dgram`,
+`child_process`, `worker_threads`, `vm`, and `process.env`. ESM interception uses a
+`module.register()` loader hook (`loader/esm-hook.ts` + `esm-hooks.ts` + `esm-runtime.ts`)
+that rewrites mediated builtin specifiers to a synthetic module re-exporting the same shims
+the CJS path uses; it covers **static AND dynamic** `import` (`import { readFile } from
+"node:fs"` and `await import("node:fs")`), attributing to the importing package exactly like
+CJS. It is **on by default** under the CLI preload (disable with `CAPWALL_ESM=0`).
+
+**ESM known limits** (documented, not silent):
+- A module that captured a raw builtin **before** capwall installed is not re-bound (same as
+  CJS — install via the `--import` preload so capwall registers first).
+- The set of mediated specifiers is fixed at install time; a mediated builtin not in the shim
+  registry is not intercepted (the registry covers the capabilities above).
+- Unregistering the ESM hook is best-effort (Node cannot fully remove a registered hook);
+  after `uninstall()` a re-import of a mediated builtin throws a visible error rather than
+  silently returning the raw builtin (fail-closed).
+- `process.env` is not import-routed; its Proxy guard (installed by `install()`) covers both
+  module systems already.
 
 Per-capability notes:
 
@@ -158,14 +172,19 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
 - **Un-patching the shims** — reaching for the original, un-wrapped core module reference and
   calling it directly. This is **cheap, not exotic**: capwall returns a plain, mutable shim
   object (deliberately un-frozen, so legitimate `fs` monkey-patchers such as `graceful-fs`
-  keep working — the no-SES-tax tradeoff). A dependency can therefore reassign the shim's
-  methods, or — because the ESM `import` path is not yet mediated (roadmap M5) — obtain the
-  real module via `await import("node:fs")` and either call it directly or splice it back over
-  the shim. The shim is a **shared, process-wide singleton**, so a single dependency doing
-  this **silently disables `fs` enforcement for every other package and the app**, not just
-  for itself, with no log line. Treat capwall's mediation as effective only against packages
-  that do not go looking for the raw builtin. A future opt-in hardened mode (frozen shims,
-  accepting the `graceful-fs` breakage) is tracked as a follow-up.
+  keep working — the no-SES-tax tradeoff). A dependency can reassign the shim's methods, or
+  reach the raw builtin through channels capwall does not mediate. Both the CJS `require` and
+  the ESM `import` paths ARE mediated (M4/M5), so `require("node:fs")` and
+  `import … from "node:fs"` both return the shim — but capwall does not chase every reflective
+  escape hatch, and at least one is a **plain public API**: `process.getBuiltinModule("node:fs")`
+  (Node ≥22) returns the real, un-shimmed module, as does `process.binding`, internal module
+  caches, or a builtin loaded from a context capwall has not patched. `getBuiltinModule` is
+  path-independent (it defeats the CJS patch identically), so this is not specific to ESM. The
+  shim is a **shared, process-wide singleton**, so a single dependency that does un-patch it
+  **silently disables enforcement for every other package and the app**, not just for itself,
+  with no log line. Treat capwall's mediation as effective only against packages that do not
+  go looking for the raw builtin. A future opt-in hardened mode (frozen shims, accepting the
+  `graceful-fs` breakage) is tracked as a follow-up (#17).
 - **fd / symlink escapes** — using an already-open file descriptor, or a symlink, to reach a
   path outside the allowed globs.
 - **`vm` / `eval` / `node:sqlite`** and similar reflective or alternate-execution surfaces

@@ -3,6 +3,7 @@ node_modules/
 # attribution treats them as dependencies. These are committed on purpose.
 !examples/malicious-dep-demo/node_modules/
 !packages/core/test/fixtures/node_modules/
+!packages/core/test/fixtures/esm/node_modules/
 !packages/cli/test/fixtures/app/node_modules/
 !scripts/bench/fixtures/node_modules/
 dist/
