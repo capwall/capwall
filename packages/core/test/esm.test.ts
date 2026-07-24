@@ -11,7 +11,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -26,7 +26,7 @@ interface RunResult {
 }
 
 function runApp(env: Record<string, string>): Promise<RunResult> {
-  const nodeOptions = `--import ${new URL(`file://${PRELOAD}`).href}`;
+  const nodeOptions = `--import ${pathToFileURL(PRELOAD).href}`;
   return new Promise((resolve, reject) => {
     execFile(
       process.execPath,
