@@ -5,6 +5,15 @@
  * relative fs path globs (`./logs/**`, `logs/**`) are normalized to absolute globs against
  * it, so matching is consistent regardless of the process cwd at call time. Bare `*` and
  * already-absolute globs are stored as-is.
+ *
+ * Windows drive-absolute globs (`C:/…`, `C:\…`) are always treated as already-absolute and
+ * reshaped to the `C:/…` form the matcher expects (glob.ts), matching what the fs shim's
+ * `coercePath` (shims/fs.ts) produces for a real Windows call-time path. On an actual Windows
+ * host `path.isAbsolute`/`path.sep` already recognize and reshape these correctly, so this
+ * only changes behavior when `loadPolicy`/`loadPolicyFromObject` runs on a non-Windows host
+ * (e.g. linting/validating a Windows-targeted policy from Linux CI): without it, a POSIX
+ * `path.isAbsolute` doesn't recognize a drive letter as absolute and would wrongly resolve the
+ * glob AS IF relative, against `projectRoot` — producing garbage like `/proj/C:/logs/**`.
  */
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
@@ -15,8 +24,17 @@ export interface LoadPolicyOptions {
   projectRoot?: string;
 }
 
+/** A Windows absolute path: a drive letter followed by `\` or `/` (e.g. `C:\foo`, `C:/foo`). */
+const WINDOWS_ABSOLUTE = /^[A-Za-z]:[\\/]/;
+
 function normalizeGlob(glob: string, projectRoot: string): string {
   if (glob === "*" || glob === "**") return glob;
+  if (WINDOWS_ABSOLUTE.test(glob) && !path.isAbsolute(glob)) {
+    // Host `path` module doesn't recognize this as absolute (i.e. we're on a POSIX host and
+    // the glob is Windows-shaped) — see the file-level doc comment. Reshape directly instead
+    // of routing through the (POSIX) `path.resolve`, which doesn't understand drive letters.
+    return glob.replace(/\\/g, "/");
+  }
   const resolved = path.isAbsolute(glob) ? glob : path.resolve(projectRoot, glob);
   // The matcher works on `/`-separated paths.
   return resolved.split(path.sep).join("/");
