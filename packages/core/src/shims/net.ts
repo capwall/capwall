@@ -33,6 +33,22 @@
  *  - Inbound `server.listen` is deliberately NOT gated (egress, not binding).
  *  - IPC/unix-socket connects have no host:port and are approximated as `{ "<ipc>", 0 }`.
  *  - `dns` is NOT shimmed (a lookup moves no payload; DNS tunneling is out of scope).
+ *
+ * GETTER-TOCTOU CLOSED (issue #26). Every derive function above reads `host`/`hostname`/
+ * `port` off the caller's options object to compute the guarded target, then — historically —
+ * the SAME options object was forwarded to the real API. If those fields were accessor
+ * (getter) properties, they could legally return a different value on Node's later internal
+ * re-read than they did during capwall's derivation: capwall would guard `granted.host:443`
+ * while Node opened a socket to `evil.host:443`. The fix (`pinTarget` + the `normalize*Args`
+ * helpers below): after deriving the primitive `{host, port}` — reading each getter exactly
+ * once — build a shallow clone of every options object in the call with `host`/`hostname`/
+ * `port` overwritten by those PINNED primitives, and forward the CLONE, never the original.
+ * Node then reads plain data properties equal to what was guarded; a getter has no chance to
+ * diverge because it is never consulted again. Positional `(port, host)` forms already pass
+ * primitives (no getter surface) and are left untouched. Applied at every options-taking
+ * egress entry point: `net.connect`/`createConnection`/`Socket#connect`, `http(s).request`/
+ * `get`/`new ClientRequest()`/`Agent#createConnection`, `tls.connect`/`TLSSocket#connect`, and
+ * `http2.connect`.
  */
 import realNet from "node:net";
 import realHttp from "node:http";
@@ -58,6 +74,13 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null;
 }
 
+/** Like {@link isPlainObject} but excludes `URL` instances — URL args are immutable and
+ * carry their `hostname`/`port` on prototype accessors, not own properties; treating one as
+ * a pinnable options object would silently strip it down to an empty `{}` clone. */
+function isPinnableOptions(v: unknown): v is Record<string, unknown> {
+  return isPlainObject(v) && !(v instanceof URL);
+}
+
 /**
  * Derive `{host, port}` from `net.connect`/`net.createConnection`/`tls.connect` arguments:
  *   - `(options[, cb])` — TCP `{host?, port}`, or IPC `{path}`
@@ -75,13 +98,11 @@ function deriveNetTarget(args: unknown[], defaultPort = 0): { host: string; port
     return { host: IPC_HOST, port: 0 }; // positional path form — IPC
   }
   if (isPlainObject(first)) {
-    if (typeof first["path"] === "string") return { host: IPC_HOST, port: 0 };
-    const host =
-      typeof first["host"] === "string"
-        ? first["host"]
-        : typeof first["hostname"] === "string"
-          ? first["hostname"]
-          : "localhost";
+    const rawPath = first["path"]; // read once — reused below, never re-read off `first`
+    if (typeof rawPath === "string") return { host: IPC_HOST, port: 0 };
+    const rawHost = first["host"]; // each read once: a getter must not see a second call
+    const rawHostname = first["hostname"];
+    const host = typeof rawHost === "string" ? rawHost : typeof rawHostname === "string" ? rawHostname : "localhost";
     const rawPort = first["port"];
     let port = defaultPort;
     if (typeof rawPort === "number") port = rawPort;
@@ -107,8 +128,10 @@ function deriveHttpTarget(args: unknown[], defaultPort: number): { host: string;
     if (u.port !== "") port = Number(u.port);
   };
   const applyOptions = (o: Record<string, unknown>): void => {
-    if (typeof o["hostname"] === "string") host = o["hostname"];
-    else if (typeof o["host"] === "string") host = o["host"];
+    const rawHostname = o["hostname"]; // read once each — a getter must not see a second call
+    const rawHost = o["host"];
+    if (typeof rawHostname === "string") host = rawHostname;
+    else if (typeof rawHost === "string") host = rawHost;
     const rawPort = o["port"];
     if (typeof rawPort === "number") port = rawPort;
     else if (typeof rawPort === "string" && rawPort !== "") {
@@ -144,8 +167,10 @@ function deriveTlsTarget(args: unknown[]): { host: string; port: number } {
   const t = deriveNetTarget(args, 443);
   for (const a of args) {
     if (!isPlainObject(a) || a instanceof URL) continue;
-    if (typeof a["hostname"] === "string") t.host = a["hostname"];
-    else if (typeof a["host"] === "string") t.host = a["host"];
+    const rawHostname = a["hostname"]; // read once each — a getter must not see a second call
+    const rawHost = a["host"];
+    if (typeof rawHostname === "string") t.host = rawHostname;
+    else if (typeof rawHost === "string") t.host = rawHost;
     const rawPort = a["port"];
     if (typeof rawPort === "number") t.port = rawPort;
     else if (typeof rawPort === "string" && rawPort !== "") {
@@ -156,11 +181,87 @@ function deriveTlsTarget(args: unknown[]): { host: string; port: number } {
   return t;
 }
 
-function wrapFn(orig: AnyFn, derive: (args: unknown[]) => { host: string; port: number }, ctx: ShimContext): AnyFn {
+/**
+ * Shallow-clone `obj`, pinning whichever of `host`/`hostname`/`port` it already carries to the
+ * given PRIMITIVE values (issue #26 — see the module doc comment). Existence is checked with
+ * `in`, which never invokes an accessor; other fields are copied by key via `Object.keys`
+ * (own-enumerable names only, also getter-free to obtain). `host`/`hostname`/`port` are never
+ * read off `obj` here — the caller already derived them, once, during guard evaluation.
+ */
+function pinTarget(obj: Record<string, unknown>, host: string, port: number): Record<string, unknown> {
+  const clone: Record<string, unknown> = {};
+  for (const key of Object.keys(obj)) {
+    if (key === "host" || key === "hostname" || key === "port") continue; // pinned below
+    clone[key] = obj[key];
+  }
+  if ("host" in obj) clone["host"] = host;
+  if ("hostname" in obj) clone["hostname"] = host;
+  if ("port" in obj) clone["port"] = port;
+  return clone;
+}
+
+/** `net.connect`/`createConnection`/`Socket#connect`: only `args[0]` can be an options object
+ * (the positional `(port, host)` form is already primitives — no getter surface). */
+function normalizeNetArgs(args: unknown[], host: string, port: number): unknown[] {
+  if (!isPinnableOptions(args[0])) return args;
+  const out = args.slice();
+  out[0] = pinTarget(args[0], host, port);
+  return out;
+}
+
+/**
+ * `tls.connect`/`TLSSocket#connect`: pin EVERY plain-object argument, not just the first.
+ * `deriveTlsTarget` already resolves the net-style positional and any trailing options-object
+ * OVERLAY into a single final `{host, port}` (mirroring Node's own `normalizeConnectArgs`
+ * merge); pinning that same final value onto every object argument means whichever one Node's
+ * internal merge reads last, it reads the pinned value — no divergence regardless of merge
+ * order.
+ */
+function normalizeTlsArgs(args: unknown[], host: string, port: number): unknown[] {
+  let changed = false;
+  const out = args.map((a) => {
+    if (!isPinnableOptions(a)) return a;
+    changed = true;
+    return pinTarget(a, host, port);
+  });
+  return changed ? out : args;
+}
+
+/** `http(s).request`/`get`/`new ClientRequest()`: `args[0]` (options, or a URL/string left
+ * untouched) and `args[1]` (an override options object) can each carry host/hostname/port. */
+function normalizeHttpArgs(args: unknown[], host: string, port: number): unknown[] {
+  const out = args.slice();
+  let changed = false;
+  if (isPinnableOptions(out[0])) {
+    out[0] = pinTarget(out[0], host, port);
+    changed = true;
+  }
+  if (isPinnableOptions(out[1])) {
+    out[1] = pinTarget(out[1], host, port);
+    changed = true;
+  }
+  return changed ? out : args;
+}
+
+/** `http2.connect(authority[, options])`: the authority (string/URL) is immutable and left
+ * alone; only `args[1]`, if an options object, can carry a `host`/`port` override. */
+function normalizeHttp2Args(args: unknown[], host: string, port: number): unknown[] {
+  if (!isPinnableOptions(args[1])) return args;
+  const out = args.slice();
+  out[1] = pinTarget(args[1], host, port);
+  return out;
+}
+
+function wrapFn(
+  orig: AnyFn,
+  derive: (args: unknown[]) => { host: string; port: number },
+  ctx: ShimContext,
+  normalize: (args: unknown[], host: string, port: number) => unknown[],
+): AnyFn {
   const wrapped: AnyFn = function (this: unknown, ...args: unknown[]) {
     const { host, port } = derive(args);
     guard(ctx, { kind: "net", host, port }); // throws on enforce-deny, before any socket opens
-    return orig.apply(this, args);
+    return orig.apply(this, normalize(args, host, port)); // pinned clone, never the original
   };
   Object.defineProperty(wrapped, "name", { value: orig.name, configurable: true });
   return wrapped;
@@ -176,6 +277,7 @@ function guardedSubclassMethod(
   method: string,
   derive: (args: unknown[]) => { host: string; port: number } | null,
   ctx: ShimContext,
+  normalize?: (args: unknown[], host: string, port: number) => unknown[],
 ): AnyCtor {
   const realMethod = (RealClass.prototype as Record<string, unknown>)[method];
   if (typeof realMethod !== "function") return RealClass;
@@ -183,8 +285,12 @@ function guardedSubclassMethod(
   Object.defineProperty(Guarded.prototype, method, {
     value: function (this: unknown, ...args: unknown[]) {
       const target = derive(args);
-      if (target) guard(ctx, { kind: "net", host: target.host, port: target.port });
-      return (realMethod as AnyFn).apply(this, args);
+      let forwardArgs = args;
+      if (target) {
+        guard(ctx, { kind: "net", host: target.host, port: target.port });
+        if (normalize) forwardArgs = normalize(args, target.host, target.port); // pinned clone
+      }
+      return (realMethod as AnyFn).apply(this, forwardArgs);
     },
     writable: true,
     configurable: true,
@@ -203,7 +309,7 @@ function guardedClientRequestClass(RealClass: AnyCtor, ctx: ShimContext, default
     constructor(...args: unknown[]) {
       const { host, port } = deriveHttpTarget(args, defaultPort);
       guard(ctx, { kind: "net", host, port }); // before super() → before the connection
-      super(...args);
+      super(...normalizeHttpArgs(args, host, port)); // pinned clone, never the original
     }
   };
   Object.defineProperty(Guarded, Symbol.hasInstance, {
@@ -223,7 +329,7 @@ export function createNetShim(ctx: ShimContext): typeof import("node:net") {
   for (const key of Object.keys(realNet)) {
     shim[key] = (realNet as unknown as Record<string, unknown>)[key];
   }
-  const wrapped = wrapFn(realNet.connect as unknown as AnyFn, deriveNetTarget, ctx);
+  const wrapped = wrapFn(realNet.connect as unknown as AnyFn, deriveNetTarget, ctx, normalizeNetArgs);
   shim["connect"] = wrapped;
   shim["createConnection"] = wrapped;
   if (typeof realNet.Socket === "function") {
@@ -232,6 +338,7 @@ export function createNetShim(ctx: ShimContext): typeof import("node:net") {
       "connect",
       deriveNetTarget,
       ctx,
+      normalizeNetArgs,
     );
   }
   return shim as unknown as typeof import("node:net");
@@ -250,7 +357,7 @@ function wrapHttpModule<T extends object>(real: T, ctx: ShimContext, defaultPort
   for (const name of ["request", "get"]) {
     const orig = realRecord[name];
     if (typeof orig !== "function") continue;
-    shim[name] = wrapFn(orig as AnyFn, (a) => deriveHttpTarget(a, defaultPort), ctx);
+    shim[name] = wrapFn(orig as AnyFn, (a) => deriveHttpTarget(a, defaultPort), ctx, normalizeHttpArgs);
   }
   if (typeof realRecord["ClientRequest"] === "function") {
     shim["ClientRequest"] = guardedClientRequestClass(realRecord["ClientRequest"] as AnyCtor, ctx, defaultPort);
@@ -263,6 +370,7 @@ function wrapHttpModule<T extends object>(real: T, ctx: ShimContext, defaultPort
       "createConnection",
       (a) => deriveNetTarget(a, defaultPort),
       ctx,
+      normalizeNetArgs,
     );
   }
   return shim as unknown as T;
@@ -288,13 +396,14 @@ export function createTlsShim(ctx: ShimContext): typeof import("node:tls") {
   // tls.connect takes net-style positional (port, host) AND a trailing options object that
   // OVERRIDES the positionals — deriveTlsTarget handles the combined form (deriveNetTarget
   // alone would ignore the override and false-allow).
-  shim["connect"] = wrapFn(realTls.connect as unknown as AnyFn, deriveTlsTarget, ctx);
+  shim["connect"] = wrapFn(realTls.connect as unknown as AnyFn, deriveTlsTarget, ctx, normalizeTlsArgs);
   if (typeof realTls.TLSSocket === "function") {
     shim["TLSSocket"] = guardedSubclassMethod(
       realTls.TLSSocket as unknown as AnyCtor,
       "connect",
       deriveTlsTarget,
       ctx,
+      normalizeTlsArgs,
     );
   }
   return shim as unknown as typeof import("node:tls");
@@ -321,7 +430,8 @@ export function createHttp2Shim(ctx: ShimContext): typeof import("node:http2") {
     // Node honors options.host/port over the authority (http2.connect(authority, options)).
     const opts = args[1];
     if (isPlainObject(opts)) {
-      if (typeof opts["host"] === "string") host = opts["host"];
+      const rawHost = opts["host"]; // read once — a getter must not see a second call
+      if (typeof rawHost === "string") host = rawHost;
       const rawPort = opts["port"];
       if (typeof rawPort === "number") port = rawPort;
       else if (typeof rawPort === "string" && rawPort !== "") {
@@ -330,7 +440,7 @@ export function createHttp2Shim(ctx: ShimContext): typeof import("node:http2") {
       }
     }
     guard(ctx, { kind: "net", host, port });
-    return realConnect.apply(this, args);
+    return realConnect.apply(this, normalizeHttp2Args(args, host, port)); // pinned clone
   };
   return shim as unknown as typeof import("node:http2");
 }

@@ -11,7 +11,7 @@ import Module, { createRequire } from "node:module";
 import * as net from "node:net";
 import * as http from "node:http";
 import { describe, expect, it } from "vitest";
-import { createHttpShim, createHttpsShim, createNetShim } from "../src/shims/net.js";
+import { createHttpShim, createHttpsShim, createNetShim, createTlsShim } from "../src/shims/net.js";
 import { loadPolicyFromObject, type Decision, type Policy } from "../src/index.js";
 import type { ShimContext } from "../src/shims/runtime.js";
 
@@ -259,6 +259,132 @@ describe("net shim — shimming net's require does not also gate http", () => {
     } finally {
       moduleInternals._load = originalLoad;
     }
+  });
+});
+
+describe("net shim — getter TOCTOU (issue #26)", () => {
+  // A malicious/misbehaving dependency could pass an options object whose `host`/`port` are
+  // ACCESSOR (getter) properties that return the GRANTED value the first time (when capwall
+  // derives the target to guard) and a DIFFERENT, un-granted value on every subsequent read
+  // (when Node itself would normally re-read the options to open the socket). Before the fix,
+  // capwall forwarded the SAME options object to the real `net.connect`, so Node's internal
+  // re-read observed the second (evil) value — a false-allow egress. The fix pins the
+  // derived primitive onto a CLONE forwarded to the real API, so Node never consults the
+  // getter again: whatever Node connects to is provably the value capwall guarded.
+  //
+  // We prove this end-to-end without ever leaving loopback: grant only the port bound by
+  // `granted`, and give the options object a `port` getter that returns `granted` once and
+  // `evil` (a *closed* port) on every call after. If the connection actually attempted lands
+  // on `evil`, we'd observe THAT port's ECONNREFUSED/connect signature instead of `granted`'s
+  // listening server accepting the connection — so asserting the granted server's "connection"
+  // event fires (and the evil port's listener stays untouched) demonstrates guard target ==
+  // connect target, regardless of the getter's second-read value.
+  it("net.connect: a port getter returning a different value on re-read cannot desync guard-vs-connect", async () => {
+    const grantedPort = await closedLocalPort();
+    const evilPort = await closedLocalPort();
+    expect(grantedPort).not.toBe(evilPort);
+
+    // A listening server ONLY on the granted port — if capwall pinned correctly, Node connects
+    // here and the server sees the connection. If the getter's second read leaked through,
+    // Node would instead attempt evilPort, which has nothing listening (ECONNREFUSED) and this
+    // server would NEVER see a connection.
+    const granted = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      granted.on("error", reject);
+      granted.listen(grantedPort, "127.0.0.1", () => resolve());
+    });
+    const accepted = new Promise<void>((resolve) => {
+      granted.once("connection", (sock) => {
+        sock.destroy();
+        resolve();
+      });
+    });
+
+    let reads = 0;
+    const options = {
+      host: "127.0.0.1",
+      get port() {
+        reads++;
+        return reads === 1 ? grantedPort : evilPort; // capwall's derive is the ONLY reader
+      },
+    };
+
+    const { ctx, decisions } = makeCtx(grantedPolicy(grantedPort), "enforce");
+    const netShim = createNetShim(ctx);
+
+    const socket = netShim.connect(options);
+    const outcome = await new Promise<"connected" | "refused">((resolve, reject) => {
+      socket.once("connect", () => resolve("connected"));
+      socket.once("error", (err: NodeJS.ErrnoException) => {
+        if (err.code === "ECONNREFUSED") resolve("refused");
+        else reject(err);
+      });
+    });
+    socket.destroy();
+    granted.close();
+
+    // The getter was read exactly once — by capwall's own derivation. Node's real connect
+    // never consulted it again (it received the pinned clone), so it could not have read the
+    // second (evil) value.
+    expect(reads).toBe(1);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]!.decision.allowed).toBe(true);
+    expect(decisions[0]!.decision.observed).toMatchObject({ host: "127.0.0.1", port: grantedPort });
+    expect(outcome).toBe("connected");
+    await accepted; // the granted server actually saw the connection
+  });
+
+  it("net.connect: same getter-TOCTOU shape, but the FIRST (guarded) read is the denied value — deny wins, and Node never attempts the socket at all", () => {
+    const deniedPort = 1; // never granted below
+    const grantedPort = 2;
+    let reads = 0;
+    const options = {
+      host: "127.0.0.1",
+      get port() {
+        reads++;
+        return reads === 1 ? deniedPort : grantedPort;
+      },
+    };
+    const { ctx, decisions } = makeCtx(grantedPolicy(grantedPort), "enforce");
+    const netShim = createNetShim(ctx);
+    expect(() => netShim.connect(options)).toThrowError(
+      expect.objectContaining({ name: "CapabilityError" }),
+    );
+    // Denied on the FIRST read (the guarded value) — the real connect is never reached, so the
+    // getter is read exactly once, never resolving to the "granted" second value.
+    expect(reads).toBe(1);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]!.decision.allowed).toBe(false);
+    expect(decisions[0]!.decision.observed).toMatchObject({ host: "127.0.0.1", port: deniedPort });
+  });
+
+  it("tls.connect positional + options-object overlay: a host getter on the overlay is read once and pinned into the merged target", async () => {
+    const grantedPort = await closedLocalPort();
+    const evilHost = "192.0.2.1"; // TEST-NET-1, never dialed — proves the getter's 2nd read is unused
+    let reads = 0;
+    const overlay = {
+      get host() {
+        reads++;
+        return reads === 1 ? "127.0.0.1" : evilHost;
+      },
+    };
+    const { ctx, decisions } = makeCtx(grantedPolicy(grantedPort), "enforce");
+    const tlsShim = createTlsShim(ctx);
+    const socket = tlsShim.connect(grantedPort, "127.0.0.1", overlay);
+    await new Promise<void>((resolve, reject) => {
+      socket.once("error", (err: NodeJS.ErrnoException) => {
+        // Any resolvable error other than the OS actually trying evilHost is fine here — what
+        // matters is the getter was consulted exactly once and the guarded decision matches.
+        if (err.code === "ECONNREFUSED" || err.code === "ECONNRESET" || err.code === "EPROTO") resolve();
+        else reject(err);
+      });
+      socket.once("secureConnect", () => resolve());
+    });
+    socket.destroy();
+    expect(reads).toBe(1);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]!.decision.allowed).toBe(true);
+    expect(decisions[0]!.decision.observed).toMatchObject({ host: "127.0.0.1", port: grantedPort });
   });
 });
 
