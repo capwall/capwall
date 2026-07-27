@@ -91,13 +91,58 @@ export function hardenClass(ctx: ShimContext, Cls: unknown): void {
 }
 
 /**
- * Property descriptor flags for a guarded method capwall installs directly on an INSTANCE it
- * handed out (the `dgram` socket case). Freezing the whole instance is not an option — a
- * socket needs its mutable state — so the guarded own-properties are instead made
- * non-writable/non-configurable under hardened mode, which is the same escape (`socket.send =
- * evil`) closed at the only granularity available here.
+ * Install a guarded method on an object capwall hands out, as an **accessor** whose getter
+ * decides — per read — which function the caller sees. Used for the `dgram` socket `send`/
+ * `connect` guards, on both a `createSocket()` instance and the guarded subclass's prototype.
+ *
+ * WHY AN INSTANCE-LEVEL PIN AT ALL. Freezing a whole `dgram` socket is not an option — a
+ * socket needs its mutable state — so under hardened mode the guarded properties are pinned
+ * individually instead. That is the same escape (`socket.send = evil`) closed at the only
+ * granularity available here.
+ *
+ * WHY AN ACCESSOR AND NOT A PINNED DATA PROPERTY (issue #86). A data property forces the pin
+ * and the guard's own bookkeeping to compete for one descriptor. #17 pinned `send`
+ * non-writable/non-configurable; #60's auto-bind replay fix needed to control the value Node
+ * reads out of `send` for the duration of one authorized call, and did it by redefining that
+ * property — which a non-configurable property makes throw. The result was that under hardened
+ * mode every ALLOWED `dgram.createSocket().send()` failed with `Cannot redefine property:
+ * send`. An accessor is a property whose value capwall COMPUTES on each read without ever
+ * redefining it, so the two requirements stop colliding: the descriptor is installed exactly
+ * once, at guard-install time, and never touched again.
+ *
+ * The hardened-mode guarantee is unchanged by the switch:
+ *  - no setter under hardened ⇒ `socket.send = evil` throws a `TypeError` under `"use strict"`
+ *    and silently no-ops in sloppy mode — byte-for-byte the semantics of `writable: false`;
+ *  - `configurable: false` under hardened ⇒ `Object.defineProperty(socket, "send", …)` and
+ *    `delete socket.send` still fail.
+ * With hardened OFF the property stays configurable and the setter reproduces ordinary
+ * data-property assignment, so the documented "shims stay patchable by default" behavior
+ * (graceful-fs compatibility) is unchanged as well.
  */
-export function guardedPropFlags(ctx: ShimContext): { writable: boolean; configurable: boolean } {
+export function defineGuardedAccessor(
+  ctx: ShimContext,
+  target: object,
+  key: string,
+  read: (this: unknown) => unknown,
+): void {
   const mutable = ctx.hardened !== true;
-  return { writable: mutable, configurable: mutable };
+  const descriptor: PropertyDescriptor = { get: read, enumerable: false, configurable: mutable };
+  if (mutable) {
+    // Assignment to an accessor calls the setter, so with hardened off the setter has to do
+    // what assigning to the old writable DATA property did: install a plain data property on
+    // the RECEIVER. `this` is the receiver, which is the instance both when the accessor lives
+    // on the instance and when it lives on the guarded prototype — matching JS assignment
+    // semantics in both placements. The enumerability of a replaced own property is preserved;
+    // a newly created one is enumerable, as `CreateDataProperty` would make it.
+    descriptor.set = function (this: object, value: unknown): void {
+      const own = Object.getOwnPropertyDescriptor(this, key);
+      Object.defineProperty(this, key, {
+        value,
+        writable: true,
+        enumerable: own !== undefined ? own.enumerable === true : true,
+        configurable: true,
+      });
+    };
+  }
+  Object.defineProperty(target, key, descriptor);
 }

@@ -88,7 +88,10 @@ surfaces capwall created:
   `tls.TLSSocket`, `http(s).ClientRequest`, `http(s).Agent`, `dgram.Socket`,
   `child_process.ChildProcess`, `vm.Script`/`SourceTextModule`/`SyntheticModule`,
   `worker_threads.Worker`;
-- the guarded `send`/`connect` properties capwall installs on a `dgram` socket instance.
+- the guarded `send`/`connect` properties capwall installs for a `dgram` socket — pinned
+  individually (a socket cannot be frozen; it needs its state).
+
+All of it applies to `import` as well as `require`.
 
 Real builtins are never frozen — that would be a process-global side effect outliving
 `uninstall()`. Subclassing a guarded class (`class Mine extends fs.ReadStream {}`) still works.
