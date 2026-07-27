@@ -43,7 +43,7 @@
  */
 import { APP_ROOT, attributeCaller } from "../attribution/index.js";
 import { evaluate } from "../policy/evaluate.js";
-import { isEnvGateSuspended, type ShimContext } from "./runtime.js";
+import { attributionOptionsFor, isEnvGateSuspended, type ShimContext } from "./runtime.js";
 
 export interface EnvGuardHandle {
   /** Restore the original `process.env`. Best-effort: only if nobody replaced it after us. */
@@ -65,9 +65,7 @@ export function createEnvProxy(
     if (typeof key !== "string") return false;
     if (isEnvGateSuspended()) return false;
     if (key.startsWith("CAPWALL_")) return false;
-    const pkg = attributeCaller(
-      ctx.projectRoot !== undefined ? { projectRoot: ctx.projectRoot } : {},
-    );
+    const pkg = attributeCaller(attributionOptionsFor(ctx));
     // App code and Node internals (both attribute to <app>) are not gated — see header.
     if (pkg === APP_ROOT) return false;
     const decision = evaluate(ctx.policy, ctx.mode, pkg, { kind: "env", key });

@@ -52,6 +52,8 @@ export const MEDIATED_MODULES = [
 export interface RequirePatchOptions {
   onDecision: DecisionSink;
   projectRoot?: string;
+  /** Attribution frame budget (#15); already validated by `install()`. */
+  maxFrames?: number;
 }
 
 export interface RequirePatchHandle {
@@ -101,6 +103,7 @@ export function patchRequire(
       mode,
       onDecision: options.onDecision,
       ...(options.projectRoot !== undefined ? { projectRoot: options.projectRoot } : {}),
+      ...(options.maxFrames !== undefined ? { maxFrames: options.maxFrames } : {}),
     }));
 
   // `node` here is the mutable chain link this install owns; `patchedLoad` always delegates

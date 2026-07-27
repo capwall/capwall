@@ -8,7 +8,7 @@
  * sink), and — in enforce mode only — throws a {@link CapabilityError} on denial. In observe
  * mode `evaluate` always allows, so `guard` records and returns without throwing.
  */
-import { attributeCaller } from "../attribution/index.js";
+import { attributeCallerDetailed, type AttributionOptions } from "../attribution/index.js";
 import { evaluate, type CapabilityRequest, type Decision } from "../policy/evaluate.js";
 import { CapabilityError } from "../errors.js";
 import type { Mode, Policy } from "@capwall/policy-schema";
@@ -22,6 +22,24 @@ export interface ShimContext {
   onDecision: DecisionSink;
   /** Absolute project root; used for attribution and policy-glob resolution. */
   projectRoot?: string;
+  /**
+   * Frame budget for the attribution stack walk (issue #15). Already validated by `install()`
+   * / the preload; absent means "use the attribution default".
+   */
+  maxFrames?: number;
+}
+
+/**
+ * Build the attribution options for `ctx`. Centralized so every attribution site (this
+ * module, the env guard, the dgram path) walks with the SAME budget — a shim that quietly
+ * kept the default while the rest honored a raised cap would attribute the same call to a
+ * different package depending on which capability it touched.
+ */
+export function attributionOptionsFor(ctx: ShimContext): AttributionOptions {
+  return {
+    ...(ctx.projectRoot !== undefined ? { projectRoot: ctx.projectRoot } : {}),
+    ...(ctx.maxFrames !== undefined ? { maxFrames: ctx.maxFrames } : {}),
+  };
 }
 
 /** A shim contributes zero or more `specifier → module object` entries to the loader registry. */
@@ -52,11 +70,13 @@ export function isEnvGateSuspended(): boolean {
  * or branch on it). Never throws in observe mode.
  */
 export function guard(ctx: ShimContext, req: CapabilityRequest): string {
-  const pkg = attributeCaller(
-    ctx.projectRoot !== undefined ? { projectRoot: ctx.projectRoot } : {},
-  );
+  const { pkg, budgetExhausted } = attributeCallerDetailed(attributionOptionsFor(ctx));
   const decision = evaluate(ctx.policy, ctx.mode, pkg, req);
-  ctx.onDecision(pkg, decision);
+  // A budget-exhausted `<app>` attribution is a possible mis-attribution (#15): flag it for
+  // the sink so an operator can spot it and raise CAPWALL_MAX_FRAMES. The decision itself is
+  // untouched — enforcement behavior does not change, only its observability. The copy is
+  // taken only on the rare flagged path, so the hot path allocates nothing extra.
+  ctx.onDecision(pkg, budgetExhausted ? { ...decision, attributionTruncated: true } : decision);
   if (!decision.allowed) throw new CapabilityError(decision.reason, pkg);
   return pkg;
 }
