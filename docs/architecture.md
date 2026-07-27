@@ -316,7 +316,7 @@ The implementing agent should treat these as the real work, not incidentals:
   of the added latency for a call made from a realistic stack. The walk is where the headroom
   is. **(2) the per-call budget does not hold where one JS call is many interceptions** —
   `{...process.env}` costs ~2 attributions per environment variable and measured ~4.4 ms on an
-  81-key environment. Cache module→package resolution aggressively (the path→package cache is
+  81-key environment (issue #133). Cache module→package resolution aggressively (the path→package cache is
   worth ~50x cold-vs-warm); avoid allocations on the hot path; and read
   `scripts/bench/README.md` before quoting a headline figure.
 - **Monkey-patch robustness.** capwall's shims are JS-level patches. Malicious code may try

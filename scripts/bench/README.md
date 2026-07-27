@@ -57,11 +57,11 @@ has roughly doubled since the harness was written.
 | `Module._load` relink chain (#22) | yes | mediated and non-mediated specifiers |
 | ESM `import` path (M5, on by default) | yes | the same fixture file imported under two URLs, before and after install |
 | hardened mode (#17) | yes | a second, stacked hardened install; both arms mediated |
-| `Module.prototype._compile` gate (#93) | **no** | fires once per CJS module load, and the loader-called path is a 1-frame capture. Pairing it needs an install/uninstall per block. Tracked as an issue. |
-| `process.dlopen` native gate (S2) | **no** | once per `.node` addon load; no vendored addon in the bench tree. |
+| `Module.prototype._compile` gate (#93) | **no** | fires once per CJS module load, and the loader-called path is a 1-frame capture. Pairing it needs an install/uninstall per block — #134. |
+| `process.dlopen` native gate (S2) | **no** | once per `.node` addon load; no vendored addon in the bench tree — #134. |
 | `node:module` loader-hook registration gate (#61) | **no** | once per process. |
 | `vm` / `worker_threads` gates | **no** | one `guard()` each, identical in shape to the `child_process` deny row, and the allowed form is dominated by thread/context creation. |
-| ESM cold resolution (loader-thread hooks) | **no** | startup cost, not per-request. Tracked as an issue. |
+| ESM cold resolution (loader-thread hooks) | **no** | startup cost, not per-request — #134. |
 | observe mode | **no** | the sink here is a no-op; a real `observe` run writes a trace line per decision, and that cost is the embedder's, not capwall's. |
 | end-to-end request latency (express-app) | **no** | still the follow-up it always was: this harness measures the shim hot path in isolation. |
 
@@ -164,7 +164,8 @@ Consequences worth stating plainly:
   Proxy is an order of magnitude slower than the **shimmed** one. That is why both spawn arms in
   this harness pass an explicit env; see `SPAWN_OPTS` in `bench.mjs`.
 - `install(..., { env: false })` removes the whole class of cost, at the price of the
-  anti-exfiltration control.
+  anti-exfiltration control. Whether it can be made cheaper without weakening the gate is
+  issue #133.
 
 ## Resolution limits
 

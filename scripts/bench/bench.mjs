@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * capwall performance benchmark harness (roadmap S4, GitHub issues #14, #112).
+ * capwall performance benchmark harness (roadmap S4, GitHub issue #14; coverage audit #132).
  *
  * WHAT THIS IS FOR. capwall's design target is <1ms of ADDED latency per intercepted call.
  * `pnpm bench` is the only thing that checks that claim, so it has two jobs, and the second one

@@ -85,10 +85,10 @@ Get the full **observe → policy → enforce** loop working end-to-end on **one
 - **The budget holds per intercepted call, and only per intercepted call.** Measured added
   latency is ~30–90 µs per interception. But a single JS call is not always a single
   interception: `{...process.env}` runs the env Proxy twice per key and cost ~4.4 ms on an
-  81-key environment. `pnpm bench` prints those cases under `AMPLIFICATION` every run rather
-  than folding them into a healthy-looking average — see `scripts/bench/README.md` § Where the
-  budget does not hold. Any doc that states `<1ms/req` without the "per intercepted call"
-  qualifier is overclaiming.
+  81-key environment (issue #133). `pnpm bench` prints those cases under `AMPLIFICATION` every
+  run rather than folding them into a healthy-looking average — see `scripts/bench/README.md`
+  § Where the budget does not hold. Any doc that states `<1ms/req` without the "per intercepted
+  call" qualifier is overclaiming.
 - `pnpm bench:gate` is the reduced run wired into CI and `pnpm ci:local`. It gates on three
   things: the 1 ms per-interception budget, the harness's own self-checks, and a **ratio**
   against a CPU calibration co-sampled in the same loop — the ratio is what actually catches a

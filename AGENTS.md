@@ -148,7 +148,7 @@ Do not start step *n+1* until step *n* has passing tests and a clean typecheck.
   microseconds of added latency, comfortably inside the budget — but **one JS call is not
   always one interception**, and where it is not, the per-call budget does not hold:
   `{...process.env}` is ~2 interceptions per environment variable and costs **milliseconds**
-  (measured ~4.4ms on an 81-key environment). The harness prints those cases under
+  (measured ~4.4ms on an 81-key environment; issue #133). The harness prints those cases under
   `AMPLIFICATION` on every run; do not quote the headline without them. See
   `scripts/bench/README.md` § Where the budget does not hold.
   Two more things the benchmark now says that older notes here did not:
