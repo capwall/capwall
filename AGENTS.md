@@ -63,8 +63,8 @@ Where each concern lives:
 | ESM loader hook (`module.register`) | `packages/core/src/loader/esm-hook.ts` |
 | Core-API capability shims | `packages/core/src/shims/{fs,net,child_process,worker_threads,env,vm}.ts` |
 | Stack-walk → owning package | `packages/core/src/attribution/index.ts` |
-| Policy types / load / evaluate | `packages/core/src/policy/{schema,load,evaluate}.ts` |
-| Policy schema + shared TS types | `packages/policy-schema` |
+| Policy load / mode resolution / evaluate | `packages/core/src/policy/{load,mode,evaluate}.ts` |
+| Policy schema + shared TS types (imported directly, never restated in core) | `packages/policy-schema` |
 | CLI (`observe`/`enforce`/`run`/`diff`/`gen-policy`/`explain`) | `packages/cli/src/commands/*` |
 | SBOM → policy (stretch) | `packages/sbom-import` |
 

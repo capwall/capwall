@@ -89,9 +89,12 @@ budget-exhausted fallback is distinguishable from a genuine app-root call: the d
 
 ### Policy (`core/src/policy`)
 
-- `schema.ts` — the in-memory `Policy` / `PackagePolicy` / `Capability` types (re-exported
-  from `@capwall/policy-schema`).
+The `Policy` / `PackagePolicy` types and the Zod schema live in `@capwall/policy-schema` and
+are imported from there directly — core does not restate or re-export them.
+
 - `load.ts` — read and validate `capabilities.json` against the schema; normalize globs.
+- `mode.ts` — resolve the enforcement mode from `CAPWALL_MODE` and the policy's own `mode`
+  (see `docs/policy-format.md` § Enforcement mode).
 - `evaluate.ts` — the decision function: given `(package, capability, mode)`, return
   allow/deny (+ reason). **Deny-by-default** in `enforce`: absence of an entry means denied.
   In `observe`, nothing is denied; violations are recorded for policy generation.
