@@ -27,3 +27,7 @@ coverage/
 .env
 .env.*
 .nexus-agents/
+
+# Per-test scratch directories (created in beforeEach, removed in afterEach; only left
+# behind by a crashed run).
+packages/core/test/fixtures/scratch*/
