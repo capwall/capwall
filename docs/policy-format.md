@@ -151,7 +151,18 @@ Path globs, resolved relative to the project root. Grants are additive.
   use it for a dependency that connects to a dynamically-assigned (ephemeral) port, where a
   concrete observed port would not match on the next run. `capwall observe` records concrete
   ports; add the `"*"` by hand when you know a target is dynamic.
-- Covers `net`, `http`, `https`, `tls`, `http2`, and `dgram` (egress).
+- Covers the `net`, `http`, `https`, `tls`, `http2` and `dgram` **module** surfaces (egress), and
+  Node's **global** egress APIs — `fetch`, `WebSocket` and `EventSource` (#80). Deliberately ONE
+  grant for both: a dependency dialing `example.com:443` holds the same authority whether it got
+  there through `http.request` or through `fetch`, and a separate capability would let a policy
+  grant one and not the other by accident. A `fetch` with no explicit port is recorded at its
+  scheme default (443 for `https:`/`wss:`, 80 for `http:`/`ws:`).
+- **Redirects are guarded, but only after the request goes out.** `fetch` follows a 3xx inside
+  Node's HTTP stack, where capwall has no hook. The final origin is evaluated and recorded, and in
+  `enforce` a hop to a host the package is not granted rejects the call — but the request has
+  already been sent. If a granted host may redirect elsewhere, grant the redirect target too;
+  `capwall observe` records it for you. See `docs/threat-model.md` § global egress residuals.
+- `data:` and `blob:` URLs are not gated at all — they resolve in-process and move no bytes.
 
 ### `child_process`, `worker_threads`, `vm` — boolean gates
 

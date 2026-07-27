@@ -94,7 +94,9 @@ lands; capwall assumes one got through and *contains what it can do at runtime*.
    `node:http`, `node:https`, `node:tls`, `node:http2`, `node:dgram` (each shimmed
    separately — one does not cover another, see
    [`docs/architecture.md`](./docs/architecture.md) § Capability shims);
-   `node:child_process`, `node:worker_threads`, `process.env`, `node:vm`.
+   `node:child_process`, `node:worker_threads`, `process.env`, `node:vm`; plus Node's
+   **global** egress APIs (`fetch`, `WebSocket`, `EventSource`), which are not module exports
+   and so are guarded on `globalThis` against the same `net` grant.
 
 **Stretch (post-MVP):** SBOM/CBOM import (CycloneDX → policy, NodeShield-compatible) in
 `packages/sbom-import`; native-addon (`.node`) load attribution and gating; a CI

