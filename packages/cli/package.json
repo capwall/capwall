@@ -21,6 +21,7 @@
   "files": ["dist"],
   "engines": { "node": ">=20" },
   "scripts": {
+    "prepack": "node ../../scripts/assert-pnpm-pack.mjs",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "vitest run"

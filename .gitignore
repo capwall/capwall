@@ -31,3 +31,8 @@ coverage/
 # Per-test scratch directories (created in beforeEach, removed in afterEach; only left
 # behind by a crashed run).
 packages/core/test/fixtures/scratch*/
+
+# Release tarballs — built by `pnpm pack` during a release rehearsal (docs/releasing.md)
+# and by the Release workflow. Never committed; the published artifact is the one CI builds.
+dist-tarballs/
+*.tgz

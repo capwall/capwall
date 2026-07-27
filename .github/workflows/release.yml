@@ -1,0 +1,160 @@
+# Publish the four @capwall packages to npm.
+#
+# READ docs/releasing.md BEFORE TOUCHING THIS FILE. Two things about it are load-bearing in
+# ways that are not obvious from the YAML:
+#
+#  1. THE FILENAME IS PART OF THE TRUST CONFIGURATION. npm trusted publishing binds a package
+#     to a specific repository AND a specific workflow *filename*. Renaming this file, or
+#     moving the publish step into a different workflow, breaks publishing for all four
+#     packages until someone reconfigures each one by hand on npmjs.com.
+#
+#  2. THE TARBALLS ARE BUILT BY pnpm AND UPLOADED BY npm, ON PURPOSE. The packages depend on
+#     each other with pnpm's `workspace:*` protocol. Only pnpm rewrites that to a concrete
+#     version at pack time; `npm pack` copies it verbatim and produces a tarball no registry
+#     can resolve (issue #116). But `pnpm publish` has no `--provenance` flag and no OIDC
+#     support, so it cannot do trusted publishing. Packing with pnpm and then handing the
+#     finished tarball to `npm publish <tarball>` is what gets both — the tarball already has
+#     concrete versions inside, and npm attaches the provenance attestation. Do not
+#     "simplify" this into one command; each half is there for a reason the other cannot
+#     cover.
+#
+# npm publishes are effectively permanent (the unpublish window is 72 hours and narrow even
+# inside it). Rehearse with the `dry_run` input before tagging anything.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and validate everything, but do not publish"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  # The same gates as ci.yml. A release must not be able to skip them because the tag was
+  # pushed from a branch whose CI was red.
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+      # Stricter than ci.yml, which uses `--frozen-lockfile=false`. A release must install
+      # exactly what the committed lockfile says; "close enough" is not a property you want
+      # in the artifact that gets a provenance attestation attached to it.
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm lint
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    # Optional approval gate before an irreversible action. If the trusted publisher on
+    # npmjs.com is configured WITHOUT an environment name this still works; if it is
+    # configured WITH one, the name must match. See docs/releasing.md.
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write # required for npm trusted publishing (OIDC) and provenance
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # The npm bundled with Node 22 is 10.x, which predates trusted publishing entirely —
+      # without this step the publish falls back to looking for an auth token and fails.
+      # Installing @latest rather than pinning a minimum keeps this correct as npm's OIDC
+      # support moves; the printed version is there so a failed run says which npm ran.
+      - name: Upgrade npm for trusted publishing
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      # Stricter than ci.yml, which uses `--frozen-lockfile=false`. A release must install
+      # exactly what the committed lockfile says; "close enough" is not a property you want
+      # in the artifact that gets a provenance attestation attached to it.
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+      # Fail before touching the registry if the tag and the manifests disagree, or if the
+      # four packages are not in lockstep. Publishing three of four and then discovering the
+      # fourth is at a different version is not a recoverable state.
+      - name: Check versions are in lockstep and match the tag
+        run: node scripts/check-release-versions.mjs "${{ github.ref_type == 'tag' && github.ref_name || '' }}"
+
+      # pnpm rewrites `workspace:*` to a concrete version here. This is the step npm cannot do.
+      - name: "Pack with pnpm (rewrites the workspace: protocol)"
+        run: |
+          mkdir -p dist-tarballs
+          for p in policy-schema core sbom-import cli; do
+            (cd "packages/$p" && pnpm pack --pack-destination ../../dist-tarballs)
+          done
+          ls -l dist-tarballs
+
+      # Cheap, high-value assertion: if a `workspace:` string survived into any tarball, stop.
+      - name: "Assert no workspace: specifier survived into a tarball"
+        run: |
+          fail=0
+          for t in dist-tarballs/*.tgz; do
+            if tar xzOf "$t" package/package.json | grep -q '"workspace:'; then
+              echo "::error::$t still contains a workspace: dependency specifier"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Upload tarballs as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: capwall-tarballs
+          path: dist-tarballs/*.tgz
+
+      # Dependency order: policy-schema -> core -> sbom-import -> cli. npm does not require
+      # it (a version that does not exist yet is not checked at publish time), but it keeps
+      # the registry consistent at every intermediate moment if a later publish fails.
+      #
+      # THE LEADING `./` IS REQUIRED. `npm publish dist-tarballs/x.tgz` is parsed as the
+      # GitHub shorthand `<user>/<repo>` and fails with "Repository not found"; only a path
+      # starting with `./` (or an absolute one) is treated as a local tarball. Verified by
+      # running both forms — the bare form exits 128 on a `git ls-remote` of
+      # `ssh://git@github.com/dist-tarballs/....git`.
+      - name: Publish to npm (trusted publishing + provenance)
+        if: github.event_name == 'push' || inputs.dry_run == false
+        run: |
+          for p in policy-schema core sbom-import cli; do
+            echo "::group::publish @capwall/$p"
+            npm publish ./dist-tarballs/capwall-$p-*.tgz --provenance --access public
+            echo "::endgroup::"
+          done
+
+      - name: Dry run (no publish)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run == true
+        run: |
+          for p in policy-schema core sbom-import cli; do
+            npm publish ./dist-tarballs/capwall-$p-*.tgz --provenance --access public --dry-run
+          done
+          echo "Dry run complete — nothing was published."
