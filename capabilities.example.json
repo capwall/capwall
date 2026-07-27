@@ -10,7 +10,8 @@
     "worker_threads": false,
     "env": [],
     "vm": false,
-    "native": false
+    "native": false,
+    "compile": false
   },
   "packages": {
     "express": {

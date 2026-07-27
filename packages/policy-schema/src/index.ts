@@ -10,6 +10,7 @@
  */
 import { z } from "zod";
 import { validateHostPattern } from "./host.js";
+import { validatePackageKey } from "./package-key.js";
 
 /** File read/write capability: path globs resolved relative to the project root. */
 export const FsCapabilitySchema = z
@@ -106,6 +107,29 @@ export const PackagePolicySchema = z
      * nothing it does. See docs/threat-model.md § Native addons.
      */
     native: z.boolean().optional(),
+    /**
+     * Gate: may this package call `Module.prototype._compile(source, filename)` directly, with
+     * a filename that is not its own? (issue #93)
+     *
+     * **This is an IDENTITY-GRANTING capability — the strongest thing in this schema.** V8
+     * reports the caller-chosen `filename` as `getFileName()` on every frame of the compiled
+     * code, and capwall names packages from frame file names, so a package holding `compile`
+     * can execute code as ANY principal in the policy, including `<app>`. Granting it is
+     * granting every other grant in the file. Treat it the way you would treat handing out a
+     * signing key, and prefer to scope it to the one build/instrumentation tool that needs it.
+     *
+     * It exists because refusing outright would break the dominant legitimate use of
+     * `_compile`: the `require.extensions` transform hook, which is how `ts-node`, `tsx`,
+     * `@babel/register`, `@swc/register`, `pirates` (and thus `nyc`/`istanbul`) and
+     * `require-in-the-middle` (and thus `dd-trace`, `elastic-apm-node`) all work. Each of those
+     * compiles ANOTHER package's or the application's file by design, which is indistinguishable
+     * on its face from the attack.
+     *
+     * Not needed for: Node's own loading of any module (capwall recognizes its loader frames), a
+     * package compiling source under its OWN name (a template engine, `require-from-string`), or
+     * the application itself, which is the trust root.
+     */
+    compile: z.boolean().optional(),
   })
   .strict();
 
@@ -123,7 +147,24 @@ export const PolicySchema = z
     mode: z.enum(["observe", "enforce"]).optional(),
     /** Applied to any package with no explicit entry in `packages`. */
     default: PackagePolicySchema.default({}),
-    packages: z.record(z.string(), PackagePolicySchema).default({}),
+    /**
+     * Per-principal grants. A key is an install chain as attribution reports it — `lodash` for
+     * the top-level install, `webpack>lodash` for the copy nested under `webpack` (#92) — one of
+     * the sentinels `<app>`/`<unknown>`, or a wildcard (`*>lodash`, `**>lodash`).
+     *
+     * Keys are VALIDATED, for the reason #83 exists: a wildcard that silently matches nothing is
+     * worse than one that is refused. `"*"` on its own, `"evil>*"` and `"lod*"` are all load-time
+     * errors that say what to write instead. See `./package-key.ts` for the grammar.
+     */
+    packages: z
+      .record(z.string(), PackagePolicySchema)
+      .superRefine((packages, ctx) => {
+        for (const key of Object.keys(packages)) {
+          const problem = validatePackageKey(key);
+          if (problem !== null) ctx.addIssue({ code: z.ZodIssueCode.custom, message: problem, path: [key] });
+        }
+      })
+      .default({}),
   })
   .strict();
 
@@ -136,6 +177,7 @@ export type Policy = z.infer<typeof PolicySchema>;
 // The `net.hosts` grammar. Validation (above) and matching (@capwall/core's evaluator) come
 // from the same module on purpose — #83 was the two disagreeing. See ./host.ts.
 export { ANY_HOST, isIpLiteral, matchesHostPattern, validateHostPattern } from "./host.js";
+export { CHAIN_SEP, validatePackageKey, widenedPackageKeys } from "./package-key.js";
 
 /** Enforcement mode. `observe` logs violations; `enforce` denies-by-default and throws. */
 export type Mode = "observe" | "enforce";
@@ -149,7 +191,8 @@ export type CapabilityKind =
   | "worker_threads"
   | "env"
   | "vm"
-  | "native";
+  | "native"
+  | "compile";
 
 /**
  * Parse and validate an unknown value as a Policy. Throws a ZodError on invalid input.

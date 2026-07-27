@@ -40,6 +40,16 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CORE_DIST = path.join(here, "..", "..", "packages", "core", "dist", "index.js");
 const FIXTURE_DIR = path.join(here, "fixtures", "node_modules", "bench-dep");
+/**
+ * The "project" capwall is installed into: the directory whose `node_modules/` holds the
+ * fixture dependency. This used to be FIXTURE_DIR itself, which declared the DEPENDENCY to be
+ * the project root — harmless while `packageForPath` ignored the root, but wrong by the
+ * documented meaning of `projectRoot` ("distinguish app code from dependencies"), and since
+ * #92 it actually resolves bench-dep's own frames to `<app>` rather than to a package. The
+ * benchmark's whole premise in scenarios 1 and 2 is that attribution lands on a real package
+ * name, so the root has to be the app.
+ */
+const PROJECT_ROOT = path.join(here, "fixtures");
 
 const WARMUP = 5_000;
 const ITERATIONS = 60_000; // "50k+" per the issue, for stable percentiles
@@ -138,11 +148,11 @@ const policy = loadPolicyFromObject(
       // Deliberately no `net` grant for bench-dep — scenario 4 exercises the deny path.
     },
   },
-  { projectRoot: FIXTURE_DIR },
+  { projectRoot: PROJECT_ROOT },
 );
 
 const handle = install(policy, "enforce", {
-  projectRoot: FIXTURE_DIR,
+  projectRoot: PROJECT_ROOT,
   onDecision: () => {}, // same shape as production observe-mode logging; no-op cost only
 });
 
@@ -183,7 +193,7 @@ console.log();
 // --- scenario 2: attribution-only ---------------------------------------------------------
 
 console.log("[2] attribution only — attributeCaller() called from bench-dep's frame");
-const attrOpts = { projectRoot: FIXTURE_DIR };
+const attrOpts = { projectRoot: PROJECT_ROOT };
 for (let i = 0; i < WARMUP; i++) baselineDep.callAttribute(attributeCaller, attrOpts);
 const attrNs = new Array(ITERATIONS);
 for (let i = 0; i < ITERATIONS; i++) {

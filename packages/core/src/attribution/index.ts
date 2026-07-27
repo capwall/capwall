@@ -51,9 +51,24 @@
  * nested `eval` and let a dependency with zero grants impersonate any package (or `<app>`). It
  * is no longer consulted; every `eval`/`new Function` frame is {@link OPAQUE}. See
  * {@link frameSource} for the mechanism and the proof that no stricter parse recovers it.
+ *
+ * IDENTITY IS A POSITION IN THE TREE, NOT A NAME (issue #92). A frame's file name is a path,
+ * and until this commit the package it named was the LAST `node_modules/<name>` segment of that
+ * path — so `node_modules/evil/node_modules/lodash/x.js` was, flatly, `lodash`. A dependency
+ * that ships a directory named after a granted package inside its own tree (`bundledDependencies`
+ * puts one in a published tarball; a git/tarball dependency is unrestricted) therefore ran with
+ * that package's grants. No `eval`, no `vm`, no `fs` write, nothing self-reported: the frames
+ * are ordinary and the file is real. The rule was the defect, not the parse.
+ *
+ * The identity is now the whole INSTALL CHAIN from the project root — every `node_modules/<name>`
+ * segment, in order, joined by {@link CHAIN_SEP}. A top-level install is unchanged (`lodash`); a
+ * nested one is `evil>lodash`, a principal distinct from `lodash` and therefore holding none of
+ * its grants. See {@link packageForPath} for the derivation and for the two things this does and
+ * does not buy.
  */
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { CHAIN_SEP } from "@capwall/policy-schema";
 
 /**
  * Sentinel for the APPLICATION's own code — the trust root.
@@ -74,6 +89,24 @@ export const APP_ROOT = "<app>" as const;
  * setup genuinely produces path-less frames.
  */
 export const UNATTRIBUTED = "<unknown>" as const;
+
+/**
+ * Separator between the links of an INSTALL CHAIN (issue #92) — the principal name for a
+ * package that is not installed at the project's top level.
+ *
+ * `lodash` is the top-level install. `evil>lodash` is the copy of `lodash` installed *under*
+ * `evil`, whether npm put it there to resolve a version conflict or `evil` shipped it in its own
+ * tarball. capwall cannot tell those two apart from disk (see {@link packageForPath}), so it
+ * declines to conflate either of them with the top-level install: they are separate principals
+ * and each is granted separately.
+ *
+ * DEFINED IN `@capwall/policy-schema` and re-exported here, not the other way round: the
+ * separator is part of the POLICY grammar (it is what a `packages` key is spelled with, and what
+ * `*>name`/`**>name` widen over), and that grammar has to be validated at policy-load time — so
+ * it lives next to the host grammar in `package-key.ts`, for the reason #83 gives. Attribution is
+ * the producer of these names, not their owner.
+ */
+export { CHAIN_SEP };
 
 /**
  * Root of the capwall core package tree (…/packages/core/src or …/dist depending on how we
@@ -163,8 +196,16 @@ export function resolveMaxFrames(value: unknown, source = "attribution.maxFrames
   return DEFAULT_MAX_FRAMES;
 }
 
-/** file path → package name, memoized. Attribution is the hot path (<1ms/req target). */
-const pathToPackage = new Map<string, string>();
+/**
+ * project root → (file path → principal), memoized. Attribution is the hot path (<1ms/req).
+ *
+ * Keyed by project root as well as by path because the root is part of the derivation now
+ * (see {@link packageForPath}): the same file resolves to a different chain under a different
+ * root, and a single flat memo would let whichever `install()` ran first decide the answer for
+ * the rest of the process. In production there is exactly one root, so this is one extra
+ * `Map.get` on a hit and no extra allocation.
+ */
+const pathToPackage = new Map<string, Map<string, string>>();
 
 /** Capture the current stack as structured CallSites (no string formatting). */
 function captureCallSites(maxFrames: number): NodeJS.CallSite[] {
@@ -325,33 +366,132 @@ export function attributeCallerDetailed(options: AttributionOptions = {}): Attri
 }
 
 /**
- * Resolve a source file path to the npm package that contains it (or APP_ROOT).
+ * Package-manager VIRTUAL STORE directories: a `node_modules` child that holds one directory
+ * per resolved version, each of which contains its own `node_modules` with the real package.
  *
- * Implementation: take the LAST `node_modules/` segment in the path and read the package
- * name from the next one (or two, for `@scope/name`) segments. This handles pnpm's
- * `.pnpm/<pkg>@<v>/node_modules/<pkg>/…` layout for free and never touches the disk.
- * Memoized per file path.
+ *   pnpm         node_modules/.pnpm/lodash@4.17.21/node_modules/lodash/index.js
+ *   yarn berry   node_modules/.store/lodash-npm-4.17.21-<hash>/node_modules/lodash/index.js
+ *
+ * These are the package manager's own bookkeeping, not a containing package, so they do not
+ * become a link in the install chain — a store-installed `lodash` is `lodash`, exactly as a
+ * hoisted one is. The reset is applied ONLY at the first link (see {@link packageForPath});
+ * a `.pnpm` directory found deeper is inside somebody's tarball and is kept in the chain,
+ * because otherwise "ship a directory called `.pnpm`" would be the forgery primitive #92 is
+ * about, one rename away.
  */
-export function packageForPath(filePath: string, _projectRoot?: string): string {
-  const cached = pathToPackage.get(filePath);
-  if (cached !== undefined) return cached;
+const VIRTUAL_STORE_DIRS: ReadonlySet<string> = new Set([".pnpm", ".store"]);
 
-  const normalized = filePath.split(path.sep).join("/");
-  const marker = "/node_modules/";
-  const idx = normalized.lastIndexOf(marker);
-  let pkg: string = APP_ROOT;
-  if (idx !== -1) {
-    const rest = normalized.slice(idx + marker.length).split("/");
-    const first = rest[0];
-    if (first) {
-      if (first.startsWith("@")) {
-        const second = rest[1];
-        pkg = second ? `${first}/${second}` : APP_ROOT;
-      } else {
-        pkg = first;
-      }
-    }
+/**
+ * Normalize a path for segment scanning: back-slashes become forward slashes.
+ *
+ * Unconditionally, not just when `path.sep` is `\`. On POSIX a path such as
+ * `/proj/node_modules\lodash/x.js` contains no `/node_modules/` segment, so the old scan
+ * called it application code — i.e. a separator confusion resolved to the TRUST ROOT, the
+ * wrong direction to be wrong in. A real POSIX file whose name genuinely contains a backslash
+ * now attributes to a dependency instead of to `<app>`; that is both vanishingly rare and the
+ * conservative side of the trade.
+ */
+function normalizeSeparators(p: string): string {
+  return p.includes("\\") ? p.split("\\").join("/") : p;
+}
+
+/** Read the package name a `node_modules/` child directory denotes, or `null` if malformed. */
+function packageNameOf(segments: readonly string[]): string | null {
+  const first = segments[0];
+  if (first === undefined || first === "") return null;
+  if (!first.startsWith("@")) return first;
+  const second = segments[1];
+  // `@scope` with nothing after it is not a package directory.
+  return second === undefined || second === "" ? null : `${first}/${second}`;
+}
+
+/**
+ * Resolve a source file path to the PRINCIPAL that owns it: an install chain
+ * (`lodash`, `evil>lodash`), {@link APP_ROOT}, or {@link UNATTRIBUTED}.
+ *
+ * DERIVATION. Strip `projectRoot` if the path is under it, then read every `node_modules/<name>`
+ * segment left to right and join them with {@link CHAIN_SEP}. No `node_modules` segment at all
+ * means application code. A leading virtual-store directory ({@link VIRTUAL_STORE_DIRS}) is
+ * skipped. Nothing touches the disk; the whole derivation is string work, memoized per path.
+ *
+ * WHY THE CHAIN AND NOT THE LAST SEGMENT (issue #92). The last segment alone says
+ * `node_modules/evil/node_modules/lodash/x.js` **is** `lodash`, so a dependency that ships a
+ * directory named after a granted package inside its own tree collects that package's grants,
+ * with ordinary frames and a real file, under deny-by-default `enforce`, with no log line.
+ *
+ * WHAT MAKES #92 HARD, STATED PLAINLY: **legitimate nesting has exactly the same shape.** npm
+ * and yarn genuinely create `node_modules/a/node_modules/lodash/` to resolve a version
+ * conflict, and that really is lodash. Nothing on disk separates the two cases — not the
+ * nested `package.json` (the attacker writes it), not the parent's `dependencies` (likewise),
+ * not the directory layout (byte-identical). Only the lockfile records provenance, and capwall
+ * cannot depend on one being present, current, or in a format it can parse without a YAML
+ * dependency. So capwall does not try to tell them apart. It stops CONFLATING them: the nested
+ * copy is a principal of its own, `a>lodash`, and holds whatever the policy grants `a>lodash`.
+ *
+ * WHAT THIS BUYS. A package can no longer *acquire another principal's grants* by choosing a
+ * directory name, because the chain records where the directory actually is and an attacker
+ * cannot move its own files to the top level. That closes the #92 PoC.
+ *
+ * WHAT THIS DOES NOT BUY, AND MUST NOT BE READ AS. It is **not** provenance. `node_modules/lodash`
+ * is still whatever is on disk at that path: a typosquat, a compromised publish, or a hand-edited
+ * working copy all answer to `lodash`. And anything that can WRITE into the project's top-level
+ * `node_modules` — an `fs` grant that covers it, a postinstall script, a lifecycle hook — can
+ * still install itself as any name it likes. Verifying that is a different mechanism (see
+ * `docs/threat-model.md` § Package identity).
+ *
+ * COST, STATED HONESTLY: a legitimately nested install is a new principal name, so a
+ * hand-written `"lodash": {…}` no longer covers it. `observe`/`capwall gen-policy` emit the
+ * chain name automatically, and `"*>lodash"` grants every nested install of `lodash` in one
+ * line — see `policyFor` in `policy/evaluate.ts`, where that widening is deliberately explicit
+ * because it re-opens exactly this hole for that one package.
+ */
+export function packageForPath(filePath: string, projectRoot?: string): string {
+  const rootKey = projectRoot ?? "";
+  let byPath = pathToPackage.get(rootKey);
+  if (byPath === undefined) {
+    byPath = new Map<string, string>();
+    pathToPackage.set(rootKey, byPath);
   }
-  pathToPackage.set(filePath, pkg);
+  const cached = byPath.get(filePath);
+  if (cached !== undefined) return cached;
+  const pkg = installChainFor(filePath, projectRoot);
+  byPath.set(filePath, pkg);
   return pkg;
+}
+
+/** The uncached derivation behind {@link packageForPath}. */
+function installChainFor(filePath: string, projectRoot?: string): string {
+  const normalized = normalizeSeparators(filePath);
+
+  // Scan from the project root when the file is under it. Without this, a project that itself
+  // lives inside a `node_modules` (capwall applied to a library under test, a monorepo package
+  // consumed by a fixture app) would prepend its own containing package to every chain, so its
+  // top-level `lodash` would be `thatlib>lodash` and no ordinary policy would match. The root
+  // is trusted config, not attacker-controlled.
+  let scanFrom = 0;
+  if (projectRoot !== undefined && projectRoot !== "") {
+    let root = normalizeSeparators(projectRoot);
+    while (root.endsWith("/") && root.length > 1) root = root.slice(0, -1);
+    if (normalized.startsWith(root + "/")) scanFrom = root.length;
+  }
+
+  const marker = "/node_modules/";
+  const parts = normalized.slice(scanFrom).split(marker);
+  // parts[0] is whatever precedes the first `node_modules`; one part means there is none.
+  if (parts.length < 2) return APP_ROOT;
+
+  const chain: string[] = [];
+  for (let i = 1; i < parts.length; i++) {
+    const name = packageNameOf((parts[i] as string).split("/"));
+    // Under `node_modules` but not naming a package (`…/node_modules/`, `…/node_modules/@scope`).
+    // Deliberately NOT `<app>`: the old code fell back to the trust root here, which is the same
+    // fail-open shape as every other bug on this path. `<unknown>` is gated like any principal.
+    if (name === null) return UNATTRIBUTED;
+    // Only the FIRST link may be a virtual store. See VIRTUAL_STORE_DIRS.
+    if (i === 1 && VIRTUAL_STORE_DIRS.has(name)) continue;
+    chain.push(name);
+  }
+  // A file directly inside a virtual store but not inside any package in it.
+  if (chain.length === 0) return UNATTRIBUTED;
+  return chain.join(CHAIN_SEP);
 }

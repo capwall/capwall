@@ -1,5 +1,13 @@
 /**
- * `node:module` shim (issue #61) — gates the module-customization-hook registration API.
+ * `node:module` — two gates on the module system.
+ *
+ *   1. The module-customization-hook registration API (`register`/`registerHooks`, issue #61),
+ *      via a `Proxy` over the module object handed to `require("node:module")`.
+ *   2. Direct calls to `Module.prototype._compile` (issue #93), via a patch on the PROTOTYPE
+ *      itself — see {@link installCompileGate} for why the shim cannot do this one.
+ *
+ * ---------------------------------------------------------------------------------------------
+ * Gate 1 — loader-hook registration (#61).
  *
  * WHY THIS EXISTS. M5 makes Node's loader-hook chain part of capwall's enforcement path, and
  * that chain is deliberately composable: **Node runs the most recently registered hook first**,
@@ -43,10 +51,21 @@
  * loudly), for a tree where a dependency legitimately installs a loader. `CAPWALL_*` keys are
  * never gated or recorded by the env guard, so reading it here is safe from inside a shim.
  */
+import * as path from "node:path";
 import realModule from "node:module";
-import { APP_ROOT, attributeCaller } from "../attribution/index.js";
+import {
+  APP_ROOT,
+  attributeCaller,
+  attributeCallerDetailed,
+  packageForPath,
+} from "../attribution/index.js";
 import { CapabilityError } from "../errors.js";
-import { attributionOptionsFor, type ShimContext, type ShimRegistry } from "./runtime.js";
+import {
+  attributionOptionsFor,
+  guardAttributed,
+  type ShimContext,
+  type ShimRegistry,
+} from "./runtime.js";
 
 export type { DecisionSink, ShimContext, ShimRegistry } from "./runtime.js";
 
@@ -141,4 +160,206 @@ export function registerModuleShim(reg: ShimRegistry, ctx: ShimContext): void {
   const shim = createModuleShim(ctx);
   reg.set("module", shim);
   reg.set("node:module", shim);
+}
+
+/* ============================================================================================
+ * Gate 2 — `Module.prototype._compile` (issue #93).
+ * ========================================================================================== */
+
+/** Handle for {@link installCompileGate}; mirrors the other install-time guards. */
+export interface CompileGateHandle {
+  uninstall(): void;
+}
+
+/** `Module.prototype._compile`'s shape. Node passes exactly `(content, filename)`. */
+type CompileFn = (this: unknown, content: string, filename: string) => unknown;
+
+/**
+ * Frames belonging to Node's own CJS module machinery. `_compile` is called once per module
+ * Node loads, from `Module._extensions[…]` inside this file, so this prefix is what separates
+ * "the loader is doing its job" from "somebody called the primitive".
+ */
+const NODE_LOADER_FRAME_PREFIX = "node:internal/modules/";
+
+/**
+ * Is the immediate caller of the patched `_compile` Node's own module loader?
+ *
+ * `Error.captureStackTrace(holder, hideAbove)` drops every frame up to and INCLUDING
+ * `hideAbove`, so `sites[0]` is exactly `_compile`'s caller — one frame, no walk, no
+ * allocation beyond the holder. That matters: this runs once per CJS module the process loads.
+ *
+ * SECURITY — WHY THE FILE-NAME PREFIX IS SAFE TO TRUST HERE, when the whole issue is that file
+ * names are attacker-chosen. A `node:`-prefixed file name is not a filesystem path, and the only
+ * way for user code to acquire a frame reporting one is to have compiled itself under that name
+ * — i.e. to have already passed this gate. It cannot: {@link guardCompile} treats a non-absolute
+ * filename as never being the caller's own package, so `_compile(payload,
+ * "node:internal/modules/cjs/loader")` is evaluated against the policy exactly like any other
+ * foreign filename and is denied by default. The bootstrap is closed before the first frame
+ * exists. (Compiling under a `node:` name is also, separately, not something any real tool does.)
+ *
+ * FAILS CLOSED. No caller frame at all — a `_compile` invoked from native code or through a
+ * detached callback — is not the loader, so it is gated. The loader always has a frame.
+ */
+function calledByNodeLoader(hideAbove: CompileFn): boolean {
+  const origPrepare = Error.prepareStackTrace;
+  const origLimit = Error.stackTraceLimit;
+  Error.prepareStackTrace = (_err, sites) => sites;
+  Error.stackTraceLimit = 1;
+  const holder: { stack?: NodeJS.CallSite[] } = {};
+  Error.captureStackTrace(holder as object, hideAbove);
+  const sites = holder.stack ?? [];
+  Error.prepareStackTrace = origPrepare;
+  Error.stackTraceLimit = origLimit;
+  const caller = sites[0];
+  if (caller === undefined) return false;
+  // An `eval` frame can report a file name it inherited; it is never Node's loader.
+  if (caller.isEval()) return false;
+  const file = caller.getFileName();
+  return typeof file === "string" && file.startsWith(NODE_LOADER_FRAME_PREFIX);
+}
+
+/**
+ * Decide whether the calling package may compile source under `filename`. Returns normally
+ * when the compile may proceed; throws {@link CapabilityError} on an enforce-mode denial.
+ *
+ * Two calls are waved through before the policy is consulted, and both are cases where the
+ * compile GAINS THE CALLER NOTHING:
+ *
+ *  - **The application.** `<app>` is the trust root; every other gate in capwall treats it the
+ *    same way, and it already owns the process. Since #60 this is a POSITIVE identification (a
+ *    real application source file on the stack), so a compile capwall cannot attribute is
+ *    `<unknown>` and falls through to the policy rather than being waved past.
+ *  - **A package compiling under its own name.** A template engine, `require-from-string`, a
+ *    package materializing generated source — the compiled frames report a principal the caller
+ *    already is, so there is no identity to acquire. Compared as PRINCIPALS rather than as
+ *    directory prefixes so an install chain is handled the same way (`a>b` compiling into `a>b`
+ *    is self-compilation; `a>b` compiling into `b` is not, and must not be).
+ *
+ * A non-absolute `filename` is never self-compilation: `packageForPath` would resolve it to the
+ * trust root, which would turn "compile under a bare label" into a free `<app>` impersonation.
+ * `path.isAbsolute` is checked explicitly rather than relied on implicitly.
+ */
+function guardCompile(ctx: ShimContext, filename: string): void {
+  const attribution = attributeCallerDetailed(attributionOptionsFor(ctx));
+  if (attribution.pkg === APP_ROOT) return;
+  if (
+    typeof filename === "string" &&
+    path.isAbsolute(filename) &&
+    packageForPath(filename, ctx.projectRoot) === attribution.pkg
+  ) {
+    return;
+  }
+  // `filename` is recorded but not matched — see the `compile` variant of CapabilityRequest.
+  guardAttributed(ctx, attribution, {
+    kind: "compile",
+    filename: typeof filename === "string" ? filename : String(filename),
+  });
+}
+
+/**
+ * Patch `Module.prototype._compile` so a DIRECT call with a caller-chosen filename is a gated
+ * capability (issue #93).
+ *
+ * WHY A PROTOTYPE PATCH AND NOT THE SHIM. `createModuleShim` is a `Proxy` over the `Module`
+ * class, and its `get` trap fires for reads on the module object — `Module.register`,
+ * `Module._cache`. `m._compile` is read off `Module.prototype`, an object the proxy hands
+ * through untouched, so the trap never sees it. Worse, `process.getBuiltinModule("node:module")`
+ * (Node ≥22) returns the real module and defeats every shim-level gate outright. There is one
+ * object both routes converge on, and it is the prototype. Patching it also means the gate holds
+ * for `Object.getPrototypeOf(module)._compile` and any other spelling.
+ *
+ * WHY THIS IS NOT A CAPABILITY ON `node:module`'s SURFACE. `_compile` is not "a module system
+ * feature a package might want"; it is the one primitive that lets a caller CHOOSE what V8
+ * reports as `getFileName()` on the frames of the code it runs. Since capwall names principals
+ * from frame file names, that is the ability to execute as an arbitrary principal — the policy's
+ * root of trust, reachable with no grant at all before this. See #93 for the PoC: `forge-dep`,
+ * holding nothing, read a granted package's env and files with no log line, naming a path that
+ * did not need to exist.
+ *
+ * COST. One `Error.captureStackTrace` with a one-frame limit per CJS module compile, on the
+ * loader path — module loading is startup work, not per-request, and the per-request budget
+ * (<1ms) is untouched because nothing recompiles per request. The full attribution walk runs
+ * only for compiles that are NOT from Node's loader, which in a normal process is zero.
+ *
+ * RESIDUALS, not papered over:
+ *  - `Module.prototype._compile` is writable, so in-process code can overwrite it. Doing so
+ *    removes the gate — and also breaks `require` for the whole process, so it is loud rather
+ *    than silent. It is the same class of escape as un-patching any shim, which capwall does not
+ *    claim to stop (docs/threat-model.md § un-patching). Hardened mode does not freeze it,
+ *    deliberately: `require.extensions` tooling replaces methods on this prototype.
+ *  - The OTHER compile primitives are gated by the `vm` capability (`vm.Script`,
+ *    `vm.compileFunction`, `vm.runInNewContext`, all of which also take a `filename`), and a
+ *    `vm` grant therefore remains identity-granting in the same way `compile` is. Both are now
+ *    named as such in the schema and in docs/threat-model.md.
+ *  - `process.binding("contextify")` and other raw-internal routes are the pre-existing,
+ *    path-independent residual the threat model already names. A prototype patch survives
+ *    `getBuiltinModule`; it does not survive reaching past the module system entirely.
+ *
+ * EXACTLY ONE PATCH PER PROCESS, REFERENCE-COUNTED — unlike `process.dlopen` (loader/native.ts)
+ * and `process.env` (shims/env.ts), which let nested installs stack. That is not a style choice;
+ * stacking would BREAK this gate, and loudly:
+ *
+ *   Node loader -> P2 -> P1 -> real          (two installs, P2 patched second)
+ *
+ * P2 asks {@link calledByNodeLoader} who called it and sees `node:internal/modules/…`, correctly.
+ * P1 then asks the same question and sees *P2's frame*, which lives in capwall's own tree, not
+ * `node:internal/…` — so P1 concludes a user called it and gates EVERY module load in the
+ * process. A second `install()` would turn `require` itself into a denied capability. Since #87
+ * every guard reads {@link liveCtx}, whose identity never changes and whose fields the install
+ * stack re-points, a single patch already tracks whichever install is in force — so one patch is
+ * both necessary and sufficient, and the count only decides when to put the real method back.
+ *
+ * `index.ts` therefore hands this `liveCtx`, and the closure below captures the FIRST caller's
+ * context. Those are the same object by construction; a caller that passes a per-install `ctx`
+ * instead (a test constructing a gate directly) gets that context for the gate's whole lifetime,
+ * which is why the production call site must not.
+ */
+let compileGateInstalls = 0;
+/** The patch this process installed, so a repeat install can recognize its own work. */
+let compileGatePatch: CompileFn | null = null;
+/** What to put back when the last install goes. */
+let compileGateReal: CompileFn | null = null;
+
+export function installCompileGate(ctx: ShimContext): CompileGateHandle {
+  const proto = (realModule as unknown as { prototype?: Record<string, unknown> }).prototype;
+  const real = proto?.["_compile"];
+  // `_compile` is a Node internal, so treat its absence (a future Node, an exotic runtime) as
+  // "nothing to gate" rather than crashing the host process on install.
+  if (proto === undefined || typeof real !== "function") {
+    return { uninstall() {} };
+  }
+
+  if (compileGatePatch === null) {
+    const realCompile = real as CompileFn;
+    const patched: CompileFn = function (this: unknown, content: string, filename: string): unknown {
+      if (!calledByNodeLoader(patched)) guardCompile(ctx, filename);
+      return realCompile.call(this, content, filename);
+    };
+    // Keep `.name`/`.length` faithful: `require.extensions` tooling feature-detects on this
+    // prototype, and a wrapper that renamed the method would be a gratuitous behavior change.
+    Object.defineProperty(patched, "name", { value: "_compile", configurable: true });
+    Object.defineProperty(patched, "length", { value: realCompile.length, configurable: true });
+    compileGatePatch = patched;
+    compileGateReal = realCompile;
+    proto["_compile"] = patched;
+  }
+  compileGateInstalls++;
+
+  let uninstalled = false;
+  return {
+    uninstall() {
+      if (uninstalled) return; // idempotent, like every other handle here
+      uninstalled = true;
+      if (--compileGateInstalls > 0) return; // an outer install still wants the gate
+      // Only restore if nothing else has since replaced it — the same contract the require patch
+      // keeps. Clobbering a `require.extensions` tool's own patch would be worse than leaving
+      // ours in place, and leaving ours in place is safe: it reads `liveCtx`, which after the
+      // last uninstall is the deny-all torn-down policy that gates nothing Node itself does.
+      if (proto["_compile"] === compileGatePatch && compileGateReal !== null) {
+        proto["_compile"] = compileGateReal;
+      }
+      compileGatePatch = null;
+      compileGateReal = null;
+    },
+  };
 }

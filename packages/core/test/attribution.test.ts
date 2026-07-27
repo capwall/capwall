@@ -18,19 +18,83 @@ describe("packageForPath", () => {
     expect(packageForPath("/proj/node_modules/@scope/pkg/dist/i.js")).toBe("@scope/pkg");
   });
 
-  it("uses the LAST node_modules segment (pnpm layout, nested deps)", () => {
+  it("looks through a pnpm virtual store to the package it holds", () => {
+    // The store directory is the package manager's bookkeeping, not a containing package, so a
+    // store-installed package is named exactly as a hoisted one is.
     expect(
       packageForPath(
         "/proj/node_modules/.pnpm/express@4.19.2/node_modules/express/lib/a.js",
       ),
     ).toBe("express");
+    // Scoped packages are spelled `@scope+name@version` in the store directory; the chain must
+    // still come out as the real `@scope/name`.
     expect(
-      packageForPath("/proj/node_modules/a/node_modules/b/index.js"),
-    ).toBe("b");
+      packageForPath(
+        "/proj/node_modules/.pnpm/@scope+pkg@1.0.0/node_modules/@scope/pkg/i.js",
+      ),
+    ).toBe("@scope/pkg");
+    // Yarn Berry's node-modules linker uses `.store` for the same job.
+    expect(
+      packageForPath("/proj/node_modules/.store/lodash-npm-4.17.21-ab/node_modules/lodash/i.js"),
+    ).toBe("lodash");
+    // pnpm's hoisted-symlink directory inside the store.
+    expect(packageForPath("/proj/node_modules/.pnpm/node_modules/foo/index.js")).toBe("foo");
+  });
+
+  it("names a NESTED install by its install chain, not by its last segment (#92)", () => {
+    // THE FIX. `node_modules/a/node_modules/b` used to be flatly `b`, so a dependency that
+    // shipped a directory named after a granted package collected that package's grants.
+    expect(packageForPath("/proj/node_modules/a/node_modules/b/index.js")).toBe("a>b");
+    // Depth is not special-cased; every link is recorded.
+    expect(
+      packageForPath("/proj/node_modules/a/node_modules/b/node_modules/c/i.js"),
+    ).toBe("a>b>c");
+    // Scoped packages at either end.
+    expect(
+      packageForPath("/proj/node_modules/@s/a/node_modules/@t/b/i.js"),
+    ).toBe("@s/a>@t/b");
+  });
+
+  it("does not let a vendored `.pnpm` directory reset the chain (#92)", () => {
+    // The store-root skip is the one place the derivation ignores a path segment, so it is the
+    // one place a rename could become a forgery primitive: a dependency that ships
+    // `node_modules/.pnpm/lodash@4/node_modules/lodash/` inside its own tarball would be plain
+    // `lodash` if the skip applied at any depth. It applies only to the FIRST link.
+    expect(
+      packageForPath("/proj/node_modules/evil/node_modules/.pnpm/lodash@4/node_modules/lodash/i.js"),
+    ).toBe("evil>.pnpm>lodash");
   });
 
   it("attributes non-dependency paths to the app root", () => {
     expect(packageForPath("/proj/src/server.js")).toBe(APP_ROOT);
+  });
+
+  it("scans from the project root, so a project inside node_modules is still the app", () => {
+    // capwall applied to a library that itself lives under `node_modules` (a fixture app, a
+    // monorepo package consumed by another). Without the root-relative scan its own top-level
+    // `lodash` would be `mylib>lodash` and no ordinary policy would match it.
+    const root = "/proj/node_modules/mylib";
+    expect(packageForPath(`${root}/src/index.js`, root)).toBe(APP_ROOT);
+    expect(packageForPath(`${root}/node_modules/lodash/i.js`, root)).toBe("lodash");
+    expect(packageForPath(`${root}/node_modules/a/node_modules/lodash/i.js`, root)).toBe(
+      "a>lodash",
+    );
+  });
+
+  it("treats a backslash as a separator, so it cannot hide a node_modules segment", () => {
+    // On POSIX this path had no `/node_modules/` segment at all and therefore resolved to
+    // `<app>` — a separator confusion that failed open to the TRUST ROOT. `packageForPath` is
+    // also reachable with paths capwall did not construct (the native-addon gate), so this is
+    // normalized unconditionally rather than only when `path.sep` is a backslash.
+    expect(packageForPath("/proj/node_modules\\lodash/index.js")).toBe("lodash");
+  });
+
+  it("does not fall back to the trust root for a malformed node_modules path", () => {
+    // Under `node_modules` but naming no package. The old code returned `<app>` here, which is
+    // the same fail-open shape as every other bug on this path; `<unknown>` is gated normally.
+    expect(packageForPath("/proj/node_modules/")).toBe(UNATTRIBUTED);
+    expect(packageForPath("/proj/node_modules/@scope")).toBe(UNATTRIBUTED);
+    expect(packageForPath("/proj/node_modules/.pnpm/lodash@4.17.21/x.js")).toBe(UNATTRIBUTED);
   });
 });
 

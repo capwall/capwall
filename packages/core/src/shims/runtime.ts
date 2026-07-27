@@ -8,7 +8,11 @@
  * sink), and — in enforce mode only — throws a {@link CapabilityError} on denial. In observe
  * mode `evaluate` always allows, so `guard` records and returns without throwing.
  */
-import { attributeCallerDetailed, type AttributionOptions } from "../attribution/index.js";
+import {
+  attributeCallerDetailed,
+  type Attribution,
+  type AttributionOptions,
+} from "../attribution/index.js";
 import { evaluate, type CapabilityRequest, type Decision } from "../policy/evaluate.js";
 import { CapabilityError } from "../errors.js";
 import { hardenClass, isHardened } from "./harden.js";
@@ -504,7 +508,24 @@ export function guardedInstanceMethods<T extends object>(
  * or branch on it). Never throws in observe mode.
  */
 export function guard(ctx: ShimContext, req: CapabilityRequest): string {
-  const { pkg, budgetExhausted } = attributeCallerDetailed(attributionOptionsFor(ctx));
+  return guardAttributed(ctx, attributeCallerDetailed(attributionOptionsFor(ctx)), req);
+}
+
+/**
+ * The decide→report→(allow|throw) half of {@link guard}, for the rare gate that has ALREADY
+ * attributed the caller and needs the answer before it knows which request to raise.
+ *
+ * Exists for the `_compile` gate (#93), which must compare the attributed package against the
+ * filename being compiled to recognize a package compiling its own source. Walking the stack a
+ * second time inside `guard` would be wasted work and — worse — would make the decision rest on
+ * two independent walks that a reviewer then has to reason about agreeing. One walk, one answer.
+ */
+export function guardAttributed(
+  ctx: ShimContext,
+  attribution: Attribution,
+  req: CapabilityRequest,
+): string {
+  const { pkg, budgetExhausted } = attribution;
   const decision = evaluate(ctx.policy, ctx.mode, pkg, req);
   // A budget-exhausted `<unknown>` attribution is a possible mis-attribution (#15): flag it
   // for the sink so an operator can spot it and raise CAPWALL_MAX_FRAMES rather than reaching
