@@ -432,6 +432,52 @@ function frozenInSubprocess(env: Record<string, string>): Promise<SubprocessRepo
   });
 }
 
+/**
+ * The ESM half of the same override — the axis nothing in this file used to cross.
+ *
+ * The hardened-mode audit that followed #86 found hardened mode was a complete no-op on the ESM
+ * path: the single live `ShimContext` the ESM shims are built from mirrored each optional field
+ * per install, and `hardened` (#17) had never been added to that list, so `CAPWALL_HARDENED=1`
+ * froze NOTHING on the path `preload.ts` enables by DEFAULT. The namespace half of hardened mode
+ * is moot there (an ESM module-namespace object rejects `[[Set]]` on its own), but the half that
+ * matters was wide open: `net.Socket.prototype.connect = evil` and
+ * `dgram.Socket.prototype.send = evil` LANDED under hardened mode — the one-line, process-wide
+ * un-guard the whole feature exists to close.
+ *
+ * #87's live-context rework fixed it in passing, before this test could. That is exactly why the
+ * test is here: it arrived unnoticed and left unnoticed, because nothing crossed the two axes.
+ *
+ * `--input-type=module -e` is enough to exercise it: the eval'd module's `import` statements go
+ * through capwall's registered loader hooks exactly as a file's would.
+ */
+function esmFrozenInSubprocess(env: Record<string, string>): Promise<Record<string, boolean>> {
+  const code =
+    'import * as net from "node:net"; import * as dgram from "node:dgram";' +
+    "console.log(JSON.stringify({" +
+    "netSocketPrototype: Object.isFrozen(net.Socket.prototype)," +
+    "dgramSocketPrototype: Object.isFrozen(dgram.Socket.prototype)" +
+    "}));";
+  return new Promise((resolve, reject) => {
+    execFile(
+      process.execPath,
+      ["--input-type=module", "-e", code],
+      {
+        cwd: here,
+        env: {
+          ...process.env,
+          NODE_OPTIONS: `--import ${pathToFileURL(PRELOAD).href}`,
+          CAPWALL_PROJECT_ROOT: here,
+          ...env,
+        },
+      },
+      (err, stdout) => {
+        if (err) return reject(err);
+        resolve(JSON.parse(stdout.trim()) as Record<string, boolean>);
+      },
+    );
+  });
+}
+
 describe("CAPWALL_HARDENED env override (preload)", () => {
   it("CAPWALL_HARDENED=1 freezes the shims the preload installs", async () => {
     expect(existsSync(PRELOAD), `built preload not found at ${PRELOAD} — run 'pnpm build'`).toBe(true);
@@ -453,5 +499,17 @@ describe("CAPWALL_HARDENED env override (preload)", () => {
       promises: false,
       readStream: false,
     });
+  });
+
+  it("reaches the ESM path too — `import` gets the frozen guards, not just `require`", async () => {
+    await expect(
+      esmFrozenInSubprocess({ CAPWALL_MODE: "observe", CAPWALL_HARDENED: "1" }),
+    ).resolves.toEqual({ netSocketPrototype: true, dgramSocketPrototype: true });
+  });
+
+  it("and leaves the ESM path alone when hardened is off", async () => {
+    await expect(
+      esmFrozenInSubprocess({ CAPWALL_MODE: "observe" }),
+    ).resolves.toEqual({ netSocketPrototype: false, dgramSocketPrototype: false });
   });
 });
