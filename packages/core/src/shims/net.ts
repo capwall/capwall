@@ -16,6 +16,19 @@
  * (`Object.getPrototypeOf(Object.getPrototypeOf(sock)).connect`) reaches the real method —
  * determined-attacker territory, the same class as un-patching.
  *
+ * GUARDING INSTANCES, NOT ONLY CLASSES (issue #65). A builtin namespace also exposes pre-built
+ * INSTANCES that carry the same capability its classes do, and the copy loop in each `create*Shim`
+ * duplicates those onto the shim verbatim — real methods and all. `http.globalAgent` /
+ * `https.globalAgent` are live `Agent` instances, so `http.globalAgent.createConnection({host,
+ * port})` opened a socket with the guard never firing and NOTHING recorded, under a deny-all
+ * enforce policy. They are now wrapped by {@link guardedInstanceMethods} (a Proxy — see there for
+ * why an instance is the one place a Proxy is the right tool, and why patching the real agent is
+ * forbidden). The audit behind #65 covered every object-valued export of every shimmed namespace;
+ * `globalAgent` on `http`/`https` was the only capability-bearing one. The rest are inert data
+ * (`fs.constants`, `http.METHODS`/`STATUS_CODES`, `tls.rootCertificates`, `http2.constants`,
+ * `vm.constants`, `worker_threads.resourceLimits`) or an already-shimmed sub-namespace
+ * (`fs.promises`).
+ *
  * Under opt-in HARDENED MODE (#17) each guarded subclass and its prototype are frozen, so
  * `net.Socket.prototype.connect = evil` fails instead of silently removing the guard for the
  * whole process. The residual above is unaffected — freezing our subclass says nothing about
@@ -23,7 +36,8 @@
  *
  * Coverage & limits (kept in sync with docs/threat-model.md):
  *  - `net`: `connect`/`createConnection` and `new net.Socket().connect()`.
- *  - `http`/`https`: `request`/`get`, `new ClientRequest()`, and `Agent.createConnection`.
+ *  - `http`/`https`: `request`/`get`, `new ClientRequest()`, `Agent.createConnection`, and the
+ *    `globalAgent` instance's `createConnection`.
  *    Shimming `net` alone does NOT mediate HTTP: Node's own HTTP client loads `net` through
  *    the internal bootstrap loader, which never hits `Module._load`, so each egress module is
  *    shimmed separately (a dependency could otherwise bypass the control by choosing another).
@@ -94,12 +108,18 @@ import realDgram from "node:dgram";
 import { APP_ROOT, attributeCaller } from "../attribution/index.js";
 import { evaluate } from "../policy/evaluate.js";
 import { CapabilityError } from "../errors.js";
-import { attributionOptionsFor, guard, type ShimContext, type ShimRegistry } from "./runtime.js";
+import {
+  attributionOptionsFor,
+  guard,
+  guardedInstanceMethods,
+  type AnyFn,
+  type ShimContext,
+  type ShimRegistry,
+} from "./runtime.js";
 import { guardedPropFlags, harden, hardenClass } from "./harden.js";
 
 export type { DecisionSink, ShimContext } from "./runtime.js";
 
-type AnyFn = (...args: unknown[]) => unknown;
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type AnyCtor = new (...args: any[]) => any;
 
@@ -727,8 +747,22 @@ export function createNetShim(ctx: ShimContext): typeof import("node:net") {
 }
 
 /**
- * Build a shimmed `http`/`https` module: `request`/`get`, `new ClientRequest()`, and
- * `Agent.createConnection` are guarded. `server.listen` is untouched.
+ * Resolver for `Agent#createConnection`, shared by the guarded `Agent` SUBCLASS (a dependency
+ * building its own agent) and the guarded `globalAgent` INSTANCE (#65) so both gate identically —
+ * a divergence between the two would be a bypass that reads as a refactor.
+ *
+ * It resolves through the NET flavor, not the http one: by the time Node calls
+ * `agent.createConnection` it has already rewritten http's `socketPath` into `path` and blanked
+ * the request `path`, so what arrives is a net-style options bag.
+ */
+function agentConnectionResolver(defaultPort: number): (args: unknown[]) => ResolvedCall {
+  return (args) => resolveNetCall(args, defaultPort);
+}
+
+/**
+ * Build a shimmed `http`/`https` module: `request`/`get`, `new ClientRequest()`,
+ * `Agent.createConnection`, and the `globalAgent` INSTANCE are guarded. `server.listen` is
+ * untouched.
  */
 function wrapHttpModule<T extends object>(real: T, ctx: ShimContext, defaultPort: number): T {
   const shim: Record<string, unknown> = {};
@@ -747,16 +781,31 @@ function wrapHttpModule<T extends object>(real: T, ctx: ShimContext, defaultPort
   // Agent.createConnection is Node's internal net.createConnection, captured at bootstrap —
   // it never routes through Module._load, so a bare Agent's createConnection is un-gated egress.
   if (typeof realRecord["Agent"] === "function") {
-    // `Agent#createConnection` receives NET-style options (Node has already rewritten http's
-    // `socketPath` into `path` and blanked the request `path` by this point), so it resolves
-    // through the net flavor.
     shim["Agent"] = guardedSubclassMethod(
       realRecord["Agent"] as AnyCtor,
       "createConnection",
-      (a) => resolveNetCall(a, defaultPort),
+      agentConnectionResolver(defaultPort),
       ctx,
     );
   }
+  // ISSUE #65 — the CLASS guard above was not enough. `globalAgent` is a live `Agent` INSTANCE,
+  // which the copy loop above duplicated onto the shim verbatim, REAL `createConnection` and
+  // all: `http.globalAgent.createConnection({host, port})` connected with no guard and no log
+  // line, under a deny-all enforce policy, from any dependency. Guard the exposed instance;
+  // never the process-global one it wraps (see `guardedInstanceMethods` for why a Proxy, and
+  // why patching the real agent is off the table).
+  const realGlobalAgent = realRecord["globalAgent"];
+  if (typeof realGlobalAgent === "object" && realGlobalAgent !== null) {
+    shim["globalAgent"] = guardedInstanceMethods(
+      realGlobalAgent,
+      new Map([
+        ["createConnection", (realMethod: AnyFn) => wrapFn(realMethod, agentConnectionResolver(defaultPort), ctx)],
+      ]),
+    );
+  }
+  // Freeze AFTER installing the guarded instance, so the frozen namespace pins it: a dep
+  // cannot swap `http.globalAgent` for a raw Agent. `Object.freeze` here freezes the shim
+  // NAMESPACE only — never the Proxy value, whose target is the real process-global agent.
   return harden(ctx, shim) as unknown as T;
 }
 

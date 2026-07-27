@@ -76,6 +76,9 @@ export function isEnvGateSuspended(): boolean {
 /** Any constructor. `any` is required here: a mixin base must be `new (...a: any[]) => any`. */
 export type AnyCtor = new (...args: any[]) => any;
 
+/** Any function. Shims receive raw builtin arguments, so they stay `unknown[]` end to end. */
+export type AnyFn = (...args: unknown[]) => unknown;
+
 /**
  * ECMA-262 `OrdinaryHasInstance` in userland: does `x`'s prototype chain contain
  * `C.prototype`? Used as the fallback inside a guarded subclass's `Symbol.hasInstance`
@@ -162,6 +165,77 @@ export function guardedConstructorSubclass<T extends AnyCtor>(
   return Guarded as unknown as T;
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
+
+/**
+ * Expose a guarded VIEW of a pre-built builtin INSTANCE — the instance-shaped counterpart of
+ * {@link guardedConstructorSubclass} (issue #65).
+ *
+ * WHY THIS EXISTS. Each shim guards the capability-bearing FUNCTIONS and CLASSES on a builtin
+ * namespace and copies the rest of the namespace through by value. But a namespace can also
+ * export a live, pre-built INSTANCE that already carries the capability, and a copied-through
+ * instance carries the REAL, unguarded method:
+ *
+ *     http.globalAgent.createConnection({ host, port })   // connects; no guard, no log line
+ *
+ * `http.globalAgent`/`https.globalAgent` were exactly that (#65): un-gated AND unlogged egress
+ * reachable from any dependency, so `observe` and `capwall diff` never saw it either. Egress is
+ * the payload step of the supply-chain attacks capwall exists to stop, which is what made an
+ * *unlogged* egress path the worst shape this class of bug can take.
+ *
+ * WHY A `Proxy` HERE, when a CLASS is always guarded with a subclass and never a Proxy. The
+ * objection to a construct-trap Proxy (#64) is specific to classes — a Proxy forwards `get`, so
+ * `Wrapped.prototype.constructor` is the real, unguarded class. An instance has no `.prototype`
+ * to leak through, and every non-Proxy alternative breaks the property that makes `globalAgent`
+ * special: it is a SHARED, MUTABLE, PROCESS-GLOBAL connection pool.
+ *   - Handing out a freshly constructed guarded `Agent` gives the caller a DIFFERENT pool, so
+ *     the ubiquitous `http.globalAgent.maxSockets = 100` would silently stop affecting the
+ *     requests it is meant to tune, and pooled sockets would stop being shared.
+ *   - `Object.create(realAgent)` reads through but shadows every WRITE onto the derived object —
+ *     same silent breakage, plus half-updated agent bookkeeping.
+ *   - Patching the method on the real instance mutates a process-global that outlives
+ *     `uninstall()`. That is the constraint that kept real builtins unfrozen in #63; not an
+ *     option.
+ * A `Proxy` forwards reads AND writes to the one real agent, so pool state, `maxSockets`,
+ * keep-alive, `agent.sockets`/`freeSockets` and `instanceof` all stay live and shared; only the
+ * named methods are replaced.
+ *
+ * `guards` is a `Map`, deliberately NOT a plain object: an object lookup would resolve
+ * inherited keys, so `agent.constructor` would find `Object.prototype.constructor` and be
+ * "wrapped" with it. Prototype pollution is already listed as out of scope in the threat model;
+ * that is a reason not to hand it a fresh lever, not a reason to shrug.
+ *
+ * RESIDUAL (documented in docs/threat-model.md, the same class as every other guard here):
+ * `Object.getPrototypeOf(agent).createConnection.call(agent, opts)` reaches the real method.
+ * That is in-process code deliberately climbing above the guard, which capwall does not claim
+ * to stop.
+ */
+export function guardedInstanceMethods<T extends object>(
+  instance: T,
+  guards: ReadonlyMap<string, (realMethod: AnyFn) => AnyFn>,
+): T {
+  // Memoized per UNDERLYING function so `agent.createConnection === agent.createConnection`
+  // (a fresh wrapper per read would break identity comparisons and defeat inline caches),
+  // while still honoring a later legitimate replacement of the underlying method.
+  const wrappers = new WeakMap<AnyFn, AnyFn>();
+  return new Proxy(instance, {
+    get(target, prop, receiver): unknown {
+      // Exactly ONE read of the underlying property. Reading it twice (once to test, once to
+      // wrap) would re-invoke a caller-installed accessor and reopen the very TOCTOU shape the
+      // net shim's option pinning closes — in the one place that must not create a new one.
+      const value: unknown = Reflect.get(target, prop, receiver);
+      if (typeof prop !== "string" || typeof value !== "function") return value;
+      const make = guards.get(prop);
+      if (make === undefined) return value;
+      const real = value as AnyFn;
+      let wrapped = wrappers.get(real);
+      if (wrapped === undefined) {
+        wrapped = make(real);
+        wrappers.set(real, wrapped);
+      }
+      return wrapped;
+    },
+  });
+}
 
 /**
  * Attribute the current caller, evaluate `req`, report the decision, and throw on an

@@ -1,5 +1,6 @@
 /**
- * Regression suite for issue #64 — the `.prototype.constructor` class escape.
+ * Regression suite for the capability-holder escapes: #64 (`.prototype.constructor`) and #65
+ * (pre-built INSTANCES on a shimmed namespace).
  *
  * A construct-trap `Proxy` forwards `get` to its target, so a proxied class's `.prototype` IS
  * the real prototype and its `.constructor` IS the real, unguarded class:
@@ -20,6 +21,10 @@
  *    NOT the real class, and its `.prototype.constructor` points back at the guarded class.
  *    A construct-trap Proxy fails the second assertion by construction.
  *  - compatibility tests: the ordinary, non-adversarial shapes still work under a grant.
+ *
+ * #65 extends the same idea from classes to INSTANCES. A shimmed namespace also exposes
+ * pre-built objects that carry the capability — `http.globalAgent`/`https.globalAgent` — which
+ * the shims copied through verbatim, real `createConnection` and all.
  */
 import { createRequire } from "node:module";
 import * as path from "node:path";
@@ -54,6 +59,8 @@ interface FixtureDep {
   connectViaHttpAgentConstructorEscape(host: string, port: number): void;
   sendViaDgramSocketConstructorEscape(host: string, port: number): void;
   spawnViaChildProcessPrototypeConstructorEscape(): unknown;
+  connectViaHttpGlobalAgent(host: string, port: number): void;
+  connectViaHttpsGlobalAgent(host: string, port: number): void;
   readViaStreamClass(): Promise<string>;
   writeViaStreamClass(target: string): Promise<boolean>;
   readViaOwnReadStreamSubclass(target: string): Promise<string>;
@@ -249,6 +256,81 @@ describe("#64 — structural invariant over EVERY guarded class", () => {
     }
     // Guard against the table silently going empty (a rename would otherwise pass vacuously).
     expect(checked).toBeGreaterThanOrEqual(11);
+  });
+});
+
+/**
+ * ISSUE #65 — the same escape one shape over: a shimmed namespace exposes pre-built INSTANCES
+ * that carry the capability, and the shims' copy loops duplicated them through with their REAL
+ * methods intact. `http.globalAgent.createConnection({host, port})` connected under a deny-all
+ * enforce policy with no guard and, worse, no log line — invisible to `observe` and `capwall
+ * diff` too.
+ *
+ * The audit behind the fix walked every object-valued export of every shimmed namespace. The
+ * table below is that inventory, so a newly-exported instance cannot slip in unexamined.
+ */
+const INSTANCE_HOLDERS: ReadonlyArray<{ specifier: string; real: Record<string, unknown>; names: readonly string[] }> = [
+  { specifier: "http", real: realHttp as unknown as Record<string, unknown>, names: ["globalAgent"] },
+  { specifier: "https", real: realHttps as unknown as Record<string, unknown>, names: ["globalAgent"] },
+];
+
+describe("#65 — pre-built capability-bearing INSTANCES are guarded, not copied through", () => {
+  it("http.globalAgent.createConnection cannot connect (deny-all enforce)", () => {
+    withCapwall(denyAll(), "enforce", (dep) => {
+      expect(() => dep.connectViaHttpGlobalAgent("evil.example.com", 80)).toThrowError(capabilityError);
+    });
+  });
+
+  it("https.globalAgent.createConnection cannot connect (deny-all enforce)", () => {
+    withCapwall(denyAll(), "enforce", (dep) => {
+      expect(() => dep.connectViaHttpsGlobalAgent("evil.example.com", 443)).toThrowError(capabilityError);
+    });
+  });
+
+  it("the escape is RECORDED, so observe and capwall diff can see it", () => {
+    // The half of #65 that made it worse than an ordinary gap: nothing was logged either, so the
+    // trace-to-policy workflow could not surface the egress even in observe mode.
+    const seen: string[] = [];
+    const handle = install(denyAll(), "observe", {
+      projectRoot: here,
+      onDecision: (pkg, d) => seen.push(`${pkg}:${d.observed?.kind ?? "?"}`),
+    });
+    try {
+      loadFixtureFresh().connectViaHttpGlobalAgent("127.0.0.1", 9);
+    } finally {
+      handle.uninstall();
+    }
+    expect(seen).toContain("fixture-dep:net");
+  });
+
+  it("the exposed instance is capwall's guarded view, never the real process-global agent", () => {
+    const reg = buildShimRegistry({
+      policy: denyAll(),
+      mode: "enforce",
+      onDecision: () => {},
+      projectRoot: here,
+    });
+    let checked = 0;
+    for (const { specifier, real, names } of INSTANCE_HOLDERS) {
+      const shim = reg.get(specifier) as Record<string, unknown> | undefined;
+      expect(shim, `${specifier} shim is registered`).toBeDefined();
+      for (const name of names) {
+        const realInstance = real[name];
+        const shimInstance = shim![name];
+        // 1. Not the real object — a verbatim copy is exactly what #65 was.
+        expect(shimInstance, `${specifier}.${name} is not the real instance`).not.toBe(realInstance);
+        // 2. Stable identity: a fresh wrapper per read would break `===` and WeakMap keying.
+        expect(shim![name], `${specifier}.${name} identity is stable`).toBe(shimInstance);
+        // 3. Still an Agent as far as any consumer can tell — reads, prototype and `instanceof`
+        //    all pass through, which is what keeps the default request path working.
+        expect(shimInstance instanceof realHttp.Agent, `${specifier}.${name} instanceof Agent`).toBe(true);
+        expect(Object.getPrototypeOf(shimInstance as object)).toBe(
+          Object.getPrototypeOf(realInstance as object),
+        );
+        checked++;
+      }
+    }
+    expect(checked).toBe(2);
   });
 });
 
