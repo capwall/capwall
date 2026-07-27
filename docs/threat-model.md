@@ -423,9 +423,13 @@ not a boundary.
 of three principals. A frame under `node_modules/<pkg>` charges that package. A real source
 file **not** under `node_modules` charges `<app>`, the trust root, which the `process.env` and
 `dgram` gates exempt. Everything else — no qualifying frame on the stack at all, or app code
-reached only *through* code with no filesystem identity (a `data:`/`blob:` module, `eval`
-output with no trustworthy origin, a bundler `//# sourceURL=`, `node -e`/stdin) — charges
+reached only *through* code with no filesystem identity (a `data:`/`blob:` module, any
+`eval`/`new Function` frame, a bundler `//# sourceURL=`, `node -e`/stdin) — charges
 `<unknown>`.
+
+Only a frame's `getFileName()` is used to name a package, because that is the one thing V8
+reports from how the code was **loaded** rather than from what the code **says about itself**.
+See § `eval` and `new Function` below for the one place capwall got that wrong.
 
 `<unknown>` is an ordinary principal, not an exemption: deny-by-default in `enforce`, recorded
 in `observe`, and grantable with an explicit `"<unknown>"` entry in `capabilities.json`. That
@@ -568,11 +572,11 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
 - **fd / symlink escapes** — using an already-open file descriptor, or a symlink, to reach a
   path outside the allowed globs.
 - **`vm` / `eval` / `node:sqlite`** and similar reflective or alternate-execution surfaces
-  that can sidestep the shimmed API. Note the narrower claim since #60: code compiled with
-  `eval`/`new Function` no longer escapes *attribution* — V8 reports where it was compiled, so
-  it is charged to the compiling package, and code capwall cannot place is `<unknown>` rather
-  than `<app>`. What these surfaces still buy an attacker is reaching APIs capwall does not
-  mediate at all, and (with a `vm` grant) choosing the filename its frames report.
+  that can sidestep the shimmed API. What these surfaces buy an attacker is reaching APIs
+  capwall does not mediate at all, and (with a `vm` grant) choosing the filename its frames
+  report. For what `eval`'d code is charged to, see § `eval` and `new Function` below — the
+  claim made here after #60, that V8 tells us where such code was compiled, was **wrong**, and
+  the correction is #84.
 - **Attribution laundering** — capwall attributes each call to the **nearest** package frame
   on the stack (see `core/src/attribution`). A malicious package that arranges for its
   operation to be *executed by* a trusted helper's code (passing a path to a logger that
@@ -607,6 +611,78 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
   policy restores an exemption for every unattributable call by hand. These are the
   determined-in-process-attacker class, same as un-patching the shims — real, and not papered
   over.
+- **`eval` and `new Function` — what they are charged to (issue #84).** An `eval`/`new Function`
+  frame has no `getFileName()`. Between #60 and #84 capwall recovered a name for it by parsing
+  V8's `getEvalOrigin()`, which for code V8 compiled itself reads `eval at <fn> (<file>:L:C)`.
+  A `//# sourceURL=` replaces that string wholesale, so only V8's own form was accepted, on the
+  reasoning that the `"eval at "` prefix could not be forged because **a `sourceURL` may not
+  contain whitespace**.
+
+  **That reasoning was wrong, and the resulting hole was critical.** The whitespace claim itself
+  holds — V8 rejects a `sourceURL` containing a space and reports the genuine origin — but it
+  only ever covered a *single* `eval`. For a **nested** `eval`, V8 synthesizes the `eval at <fn>
+  (…)` wrapper itself, around the outer script's name, and the outer script's name is exactly
+  what its own `sourceURL` set. The attacker never writes the prefix; V8 writes it for them:
+
+  ```js
+  const inner = "<payload>";
+  const outer = `eval(${JSON.stringify(inner)})\n//# sourceURL=/proj/node_modules/lodash/index.js:1:1`;
+  eval(outer); // getEvalOrigin() === "eval at <anonymous> (/proj/node_modules/lodash/index.js:1:1)"
+  ```
+
+  No whitespace anywhere, and the `:1:1` the attacker appended completes the shape. A dependency
+  with **zero grants** thereby ran with any granted package's capabilities — every capability,
+  not just `env` — or with `<app>`'s, whose `process.env` reads are exempted *before* the
+  decision is recorded, so that variant needed no granted package in the policy and produced no
+  log line at all. The forged path did not have to exist; attribution never touches the disk.
+
+  **No stricter parse recovers it.** V8's depth-1 origin is `eval at <fn> (<script>:L:C)`; its
+  depth-N origin is `eval at <fn> (` + the outer script's origin + `)`. When the outer script
+  carries a `sourceURL`, its origin *is* that bare `sourceURL`, so a forged depth-2 origin is
+  character-for-character the shape of a genuine depth-1 one. Counting `eval at ` tokens, taking
+  the outermost match, or requiring a trailing `:L:C` all fail on the same input. V8 exposes the
+  origin only as a formatted string — there is no structured accessor — so there is nothing else
+  to consult.
+
+  **What capwall does now.** `getEvalOrigin()` is not read. An eval frame is treated like every
+  other frame with no filesystem identity: opaque, skipped, and the walk continues to the nearest
+  frame that has a real file name. Concretely:
+
+  - A dependency that compiles and **synchronously runs** its own code — a template engine,
+    `ajv`, anything using `new Function` for speed — still has its own frame directly beneath,
+    so it is still charged **by name** and keeps exactly its own grants. This is the common
+    legitimate case and it is unchanged.
+  - **Detached** eval'd code (`eval("setTimeout(payload)")`) leaves no real frame behind and is
+    `<unknown>`. #60's fail-closed half survives — it is gated and recorded, never `<app>` — but
+    #60's by-name precision for this case does not, because it rested on a forgeable string.
+  - The **application's own** `eval` is `<unknown>`, not `<app>`. The trust root carries
+    exemptions, so it may not be inferred through code with no identity; otherwise a dependency
+    that persuades the app to `eval` a string it supplied inherits the app's authority.
+
+  Grant `"<unknown>"` explicitly if a real tree needs the last two — narrowly, and knowing that
+  grant is shared with every other unattributable caller.
+
+  **What remains.** Eval'd code is now laundered exactly as a `data:` module already could be:
+  if a **granted** package invokes an attacker-supplied closure that has no file identity, the
+  granted package's frame is the nearest one and is charged. That is the nearest-package residual
+  in the bullet above, reachable on any released capwall via `data:` and not new here — but the
+  fix does bring `eval` into the same residual, where before the (forgeable) origin string
+  happened to name the compiling package instead.
+- **Package identity is a path, not a verified fact.** `packageForPath` reads the name from the
+  last `node_modules/<name>` segment and never touches the disk, so **any code running from such
+  a path is that package**. Two consequences worth stating plainly, both distinct from #84 and
+  neither closed by it:
+  - A dependency that ships a directory named after a granted package inside its own tree
+    (`node_modules/evil/node_modules/lodash/…`, e.g. via `bundledDependencies`) and runs code
+    from it is charged to that name. No `eval`, no `vm`, no `fs` write.
+  - `new (require("node:module"))(…)._compile(src, "…/node_modules/lodash/x.js")` compiles code
+    with a caller-chosen filename, and the resulting frames report it. The `node:module` shim
+    gates hook registration, not compilation.
+
+  Both let a dependency **name** a granted package. They are tracked separately from #84 because
+  the fix is different in kind — verifying package identity against the installed tree, rather
+  than declining to read a self-reported string — and a partial fix here would look like a fix
+  without being one.
 - **Deep stacks past the attribution frame budget** — the walk inspects at most `maxFrames`
   frames (default 25). When the owning dependency's frame is deeper (long promise chains,
   dynamically-compiled or deeply-nested wrappers, `async_hooks`-heavy frameworks), the walk

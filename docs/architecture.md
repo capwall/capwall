@@ -132,13 +132,19 @@ the signal to raise the budget. See
 | `<unknown>` | no qualifying frame at all, or app code reached only through opaque code | an ordinary untrusted principal — deny-by-default in enforce, recorded in observe, grantable by an explicit `"<unknown>"` policy entry |
 
 An **opaque** frame is user-controlled code with no filesystem identity: a `data:`/`blob:`
-module, `eval`/`new Function` output whose origin cannot be trusted, a bundler `sourceURL`,
-`node -e`/stdin. `node:*` internals and native frames are *neutral* — skipped, as before.
-`<app>` is never inferred by falling off the end of the walk, because `<app>` carries
-exemptions and "we could not tell" must not inherit them. For `eval`/`new Function` V8 still
-reports where the code was compiled, so those are charged to the compiling package by name;
-only V8's own `eval at … (path:line:col)` form is trusted, since `//# sourceURL=` is
-attacker-controlled.
+module, any `eval`/`new Function` frame, a bundler `sourceURL`, `node -e`/stdin. `node:*`
+internals and native frames are *neutral* — skipped, as before. `<app>` is never inferred by
+falling off the end of the walk, because `<app>` carries exemptions and "we could not tell"
+must not inherit them.
+
+Only a frame's `getFileName()` names a package — it is the one thing V8 reports from how the
+code was **loaded** rather than from what the code **says about itself**. `eval`/`new Function`
+frames were an exception between #60 and #84, resolved by parsing V8's `getEvalOrigin()`; a
+nested `eval` turned out to put an attacker's `//# sourceURL=` inside the `eval at …` wrapper V8
+synthesizes, letting a dependency name any package (see `docs/threat-model.md` § `eval` and
+`new Function`). The origin is no longer read. A dependency's own synchronous `eval` is still
+charged to it by name, via the ordinary frame beneath; detached eval'd code, and the app's own
+`eval`, are `<unknown>`.
 
 **This is THE core research risk.** See Risks below.
 

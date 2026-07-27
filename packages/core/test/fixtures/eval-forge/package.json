@@ -1,0 +1,6 @@
+{
+  "name": "eval-forge-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Fixture app for issue #84 — attribution forgery via nested eval + //# sourceURL="
+}
