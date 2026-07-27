@@ -244,6 +244,15 @@ built by the real builtin's own factories. That covers `fs.ReadStream`/`WriteStr
 `worker_threads.Worker`, `net.Socket`, `tls.TLSSocket`, `http(s).ClientRequest`,
 `http(s).Agent`, `dgram.Socket`, and `child_process.ChildProcess`.
 
+That `Symbol.hasInstance` override checks its **receiver** before answering permissively (#71).
+The method is inherited down the static chain, so a dependency writing the entirely ordinary
+`class Mine extends net.Socket {}` used to get a subclass that reported `someUnrelatedRealSocket
+instanceof Mine === true`, where un-shimmed Node says `false`. That was a correctness deviation
+rather than a bypass, but silently inverting a package's type dispatch is not a thing a security
+tool should do; the override now falls back to ordinary prototype-chain semantics for any
+receiver that is not the guarded class itself, and one shared implementation
+(`shims/runtime.ts`) serves every guarded class.
+
 **Capability-bearing instances are guarded views (#65).** A builtin namespace does not only
 export functions and classes — it can export a live, pre-built **instance** that already carries
 the capability, and each shim's namespace-copy loop duplicated those through with their real

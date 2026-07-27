@@ -10,9 +10,11 @@
  * subclass** whose prototype method (or constructor) runs the guard, NOT a construct-trap
  * Proxy. A Proxy only wraps the class object, so `(new net.Socket()).constructor` and
  * `net.Socket.prototype.connect` reach the real, unguarded class/method — a trivial bypass a
- * review demonstrated. A subclass guards the prototype method itself and, via a
- * `Symbol.hasInstance` override, keeps `instanceof` working for BOTH real and guarded
- * instances. Residual (documented in threat-model.md): climbing two prototype levels
+ * review demonstrated. A subclass guards the prototype method itself and, via the shared
+ * {@link defineGuardedClassIdentity}, keeps `instanceof` working for BOTH real and guarded
+ * instances WITHOUT leaking that answer down the static chain to a dependency's own
+ * `class Mine extends net.Socket {}` (#71). Residual (documented in threat-model.md): climbing
+ * two prototype levels
  * (`Object.getPrototypeOf(Object.getPrototypeOf(sock)).connect`) reaches the real method —
  * determined-attacker territory, the same class as un-patching.
  *
@@ -110,6 +112,7 @@ import { evaluate } from "../policy/evaluate.js";
 import { CapabilityError } from "../errors.js";
 import {
   attributionOptionsFor,
+  defineGuardedClassIdentity,
   guard,
   guardedInstanceMethods,
   type AnyFn,
@@ -654,8 +657,10 @@ function wrapFn(orig: AnyFn, resolve: (args: unknown[]) => ResolvedCall, ctx: Sh
 
 /**
  * Expose a guarded SUBCLASS of `RealClass` whose prototype `method` runs `resolve`+guard
- * before delegating to the real method with the PINNED args. `Symbol.hasInstance` is
- * overridden so `instanceof` matches any instance of the real class (guarded or not).
+ * before delegating to the real method with the PINNED args. Class identity (`name` and the
+ * receiver-checking `Symbol.hasInstance`) comes from the shared
+ * {@link defineGuardedClassIdentity} — see there for why the receiver check is load-bearing
+ * (#71).
  */
 function guardedSubclassMethod(
   RealClass: AnyCtor,
@@ -681,11 +686,7 @@ function guardedSubclassMethod(
     writable: true,
     configurable: true,
   });
-  Object.defineProperty(Guarded, Symbol.hasInstance, {
-    value: (x: unknown) => x instanceof RealClass,
-    configurable: true,
-  });
-  Object.defineProperty(Guarded, "name", { value: RealClass.name, configurable: true });
+  defineGuardedClassIdentity(Guarded, RealClass);
   // Hardened mode (#17): freeze the SUBCLASS's prototype, closing
   // `net.Socket.prototype.connect = evil` — otherwise a one-line removal of the guard for
   // every caller in the process. No-op by default.
@@ -714,11 +715,7 @@ function guardedClientRequestClass(RealClass: AnyCtor, ctx: ShimContext, default
       super(...resolved.args); // pinned/synthesized args, never the original
     }
   };
-  Object.defineProperty(Guarded, Symbol.hasInstance, {
-    value: (x: unknown) => x instanceof RealClass,
-    configurable: true,
-  });
-  Object.defineProperty(Guarded, "name", { value: RealClass.name, configurable: true });
+  defineGuardedClassIdentity(Guarded, RealClass);
   hardenClass(ctx, Guarded); // hardened mode only (#17) — see harden.ts
   return Guarded;
 }
@@ -1033,14 +1030,7 @@ export function createDgramShim(ctx: ShimContext): typeof import("node:dgram") {
         configurable: true,
       });
     }
-    Object.defineProperty(Guarded, Symbol.hasInstance, {
-      value: (x: unknown) => x instanceof (RealDgramSocket as AnyCtor),
-      configurable: true,
-    });
-    Object.defineProperty(Guarded, "name", {
-      value: (RealDgramSocket as { name: string }).name,
-      configurable: true,
-    });
+    defineGuardedClassIdentity(Guarded, RealDgramSocket as AnyCtor);
     hardenClass(ctx, Guarded); // hardened mode only (#17) — see harden.ts
     shim["Socket"] = Guarded;
   }

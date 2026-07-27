@@ -1,6 +1,7 @@
 /**
- * Regression suite for the capability-holder escapes: #64 (`.prototype.constructor`) and #65
- * (pre-built INSTANCES on a shimmed namespace).
+ * Regression suite for the capability-holder escapes: #64 (`.prototype.constructor`), #65
+ * (pre-built INSTANCES on a shimmed namespace), and #71 (`Symbol.hasInstance` leaking down the
+ * static chain).
  *
  * A construct-trap `Proxy` forwards `get` to its target, so a proxied class's `.prototype` IS
  * the real prototype and its `.constructor` IS the real, unguarded class:
@@ -21,6 +22,12 @@
  *    NOT the real class, and its `.prototype.constructor` points back at the guarded class.
  *    A construct-trap Proxy fails the second assertion by construction.
  *  - compatibility tests: the ordinary, non-adversarial shapes still work under a grant.
+ *
+ * #71 rides on the same structural table: a guarded class overrides `Symbol.hasInstance` so
+ * `instanceof` still answers true for instances the real builtin's own factories produce, and
+ * that override is INHERITED down the static chain. A dependency writing `class Mine extends
+ * net.Socket {}` therefore made `anyRealSocket instanceof Mine` true, where un-shimmed Node says
+ * false. The table asserts the corrected semantics over EVERY guarded class at once.
  *
  * #65 extends the same idea from classes to INSTANCES. A shimmed namespace also exposes
  * pre-built objects that carry the capability — `http.globalAgent`/`https.globalAgent` — which
@@ -214,6 +221,10 @@ const GUARDED_CLASSES: ReadonlyArray<{
   },
 ];
 
+/** Just enough of a constructor type to `extend` and to sit on the right of `instanceof`.
+ * Deliberately not `any` — `typescript/no-explicit-any` is an error in this repo. */
+type GuardedCtor = new (...args: unknown[]) => object;
+
 describe("#64 — structural invariant over EVERY guarded class", () => {
   it("no guarded class leaks the real class through .prototype.constructor", () => {
     const reg = buildShimRegistry({
@@ -255,6 +266,53 @@ describe("#64 — structural invariant over EVERY guarded class", () => {
       }
     }
     // Guard against the table silently going empty (a rename would otherwise pass vacuously).
+    expect(checked).toBeGreaterThanOrEqual(11);
+  });
+});
+
+describe("#71 — Symbol.hasInstance does not leak down the static chain, for EVERY guarded class", () => {
+  it("a real instance is NOT instanceof a dependency's own subclass", () => {
+    // A guarded class must answer `true` for instances the real builtin's factories produce
+    // (`fs.createReadStream()` builds a REAL ReadStream), which is why it overrides
+    // `Symbol.hasInstance` at all. But that method is INHERITED down the static chain, so the
+    // naive body — "is x an instance of the real class?" — also answered for a dependency's
+    // `class Mine extends net.Socket {}`, making `anyRealSocket instanceof Mine` true where
+    // un-shimmed Node says false. Silently inverting a package's type dispatch.
+    //
+    // Instances are built with `Object.create(Cls.prototype)` rather than `new Cls()`: the
+    // question is purely about prototype-chain membership, and constructing the real thing for
+    // eleven classes would open fds, compile code and spawn an OS thread to prove nothing extra.
+    const reg = buildShimRegistry({
+      policy: denyAll(),
+      mode: "enforce",
+      onDecision: () => {},
+      projectRoot: here,
+    });
+    let checked = 0;
+    for (const { specifier, real, names } of GUARDED_CLASSES) {
+      const shim = reg.get(specifier) as Record<string, unknown> | undefined;
+      for (const name of names) {
+        const RealClass = real[name];
+        if (typeof RealClass !== "function") continue; // not present on this Node — fine
+        const ShimClass = shim![name] as GuardedCtor;
+        const Sub = class extends ShimClass {}; // what a dependency writes
+        const realShaped = Object.create((RealClass as { prototype: object }).prototype) as object;
+        const subShaped = Object.create(Sub.prototype) as object;
+
+        // Unchanged: a factory-built real instance still satisfies the guarded class.
+        expect(realShaped instanceof ShimClass, `real ${specifier}.${name} instanceof guarded`).toBe(true);
+        // THE #71 assertion: it must NOT satisfy the dependency's subclass.
+        expect(realShaped instanceof Sub, `real ${specifier}.${name} NOT instanceof user subclass`).toBe(false);
+        // ...and the fallback must be real `OrdinaryHasInstance`, not a blanket `false`:
+        // the subclass's own instances still match it, and also match the guarded class.
+        expect(subShaped instanceof Sub, `${specifier}.${name} subclass instance instanceof subclass`).toBe(true);
+        expect(subShaped instanceof ShimClass, `${specifier}.${name} subclass instance instanceof guarded`).toBe(true);
+        // An unrelated object matches neither — guards against a hasInstance that says true.
+        expect({} instanceof ShimClass, `plain object NOT instanceof ${specifier}.${name}`).toBe(false);
+        expect({} instanceof Sub, `plain object NOT instanceof ${specifier}.${name} subclass`).toBe(false);
+        checked++;
+      }
+    }
     expect(checked).toBeGreaterThanOrEqual(11);
   });
 });

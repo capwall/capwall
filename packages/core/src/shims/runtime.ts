@@ -98,6 +98,46 @@ function ordinaryHasInstance(C: unknown, x: unknown): boolean {
 }
 
 /**
+ * Give a guarded class the identity a dependency observes: `RealClass`'s `name`, and the ONE
+ * correct `Symbol.hasInstance` (issue #71). Every guarded class in every shim goes through
+ * here, so there is a single implementation of this reasoning rather than one per site.
+ *
+ * WHY AN OVERRIDE AT ALL. `instanceof` must keep answering correctly for instances the real
+ * builtin's own factories produce: `fs.createReadStream()` and `http.request()` build REAL
+ * instances that never touch capwall's subclass, yet `stream instanceof fs.ReadStream` and
+ * `req instanceof http.ClientRequest` have to stay true against the class capwall hands out.
+ * Ordinary prototype-chain semantics would say false, because the guarded class's prototype is
+ * one level BELOW the real one.
+ *
+ * WHY THE RECEIVER CHECK (this is #71). `Symbol.hasInstance` is inherited down the STATIC
+ * chain. A dependency writing the perfectly ordinary
+ *
+ *     class Mine extends net.Socket {}
+ *
+ * inherits this method on `Mine`, so a naive body — one that only asks "is `x` an instance of
+ * the real class?" — makes `someUnrelatedRealSocket instanceof Mine` return TRUE. Un-shimmed
+ * Node returns false, and silently inverting a package's type dispatch is the kind of
+ * correctness deviation that gets blamed on anything but the capability firewall. So: answer
+ * the permissive way ONLY when the receiver is the guarded class itself, and fall back to
+ * ordinary prototype-chain semantics for any further subclass.
+ */
+export function defineGuardedClassIdentity(Guarded: AnyCtor, RealClass: AnyCtor): void {
+  Object.defineProperty(Guarded, Symbol.hasInstance, {
+    // `this` is the constructor on the RIGHT of `instanceof` — the guarded class for
+    // `x instanceof net.Socket`, but a dependency's subclass for `x instanceof Mine`.
+    value: function (this: unknown, x: unknown): boolean {
+      if (this !== Guarded) return ordinaryHasInstance(this, x);
+      return x instanceof RealClass;
+    },
+    configurable: true,
+  });
+  Object.defineProperty(Guarded, "name", {
+    value: (RealClass as { name: string }).name,
+    configurable: true,
+  });
+}
+
+/**
  * Expose a guarded SUBCLASS of `RealClass` whose CONSTRUCTOR runs `check(args)` before
  * delegating to the real constructor (issue #64).
  *
@@ -142,24 +182,7 @@ export function guardedConstructorSubclass<T extends AnyCtor>(
       super(...args);
     }
   };
-  Object.defineProperty(Guarded, Symbol.hasInstance, {
-    // `this` is the constructor on the RIGHT of `instanceof`. For the guarded class itself,
-    // accept every instance of the real class — instances made by an internal factory
-    // (`fs.createReadStream`, which builds a REAL ReadStream) must still satisfy
-    // `x instanceof fs.ReadStream`. For a FURTHER subclass written by a dependency
-    // (`class Mine extends fs.ReadStream {}`), this method is inherited down the static chain
-    // and would otherwise make `anyRealStream instanceof Mine` true — so fall back to ordinary
-    // prototype-chain semantics whenever the receiver is not the guarded class itself.
-    value: function (this: unknown, x: unknown): boolean {
-      if (this !== Guarded) return ordinaryHasInstance(this, x);
-      return x instanceof RealClass;
-    },
-    configurable: true,
-  });
-  Object.defineProperty(Guarded, "name", {
-    value: (RealClass as { name: string }).name,
-    configurable: true,
-  });
+  defineGuardedClassIdentity(Guarded, RealClass);
   // Hardened mode only (#17): freeze the subclass + its own prototype. No-op by default.
   hardenClass(ctx, Guarded);
   return Guarded as unknown as T;
