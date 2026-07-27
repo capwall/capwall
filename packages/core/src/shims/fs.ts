@@ -21,10 +21,11 @@
  *        caller's callback as `cb(err)` on `process.nextTick` — exactly how a real async
  *        `fs` error would arrive — instead of throwing. If the call is missing its
  *        callback (a mis-call), we fall back to throwing, same as real Node.
- *      - `createReadStream`/`createWriteStream` return a minimal stream that emits
- *        `'error'` on `setImmediate` (approximating — not exactly reproducing — real Node's
- *        threadpool-timed async stream-error delivery; a handler attached on a much later
- *        macrotask can still miss it, same as real `fs`). Fail-closed: no read/write occurs.
+ *      - `createReadStream`/`createWriteStream` return a minimal stream that holds the
+ *        denial and emits `'error'` as soon as an `'error'` listener is attached — sync,
+ *        microtask, `setImmediate`, or `setTimeout(0)` are all caught (fix #40) — with a
+ *        safety net that still surfaces (crashes, like real fs) an unhandled denial if no
+ *        listener is ever attached. Fail-closed: no read/write occurs either way.
  *      - `watch`/`watchFile` throw synchronously on denial. `fs.watch` also throws
  *        synchronously in real Node (same shape). `fs.watchFile` does NOT (it invokes its
  *        listener with zeroed stats), so the throw there is a deliberate loud-failure choice —
@@ -232,9 +233,9 @@ type PathClass = abstract new (...a: never[]) => unknown;
  *  - `"reject"`   — a rejected Promise (real `fs.promises`).
  *  - `"callback"` — `cb(err)` on `process.nextTick` (real callback-style async `fs`, which
  *                   never throws synchronously).
- *  - `"streamRead"`/`"streamWrite"` — a stream that emits `error` on `setImmediate`
- *                   (real `createReadStream`/`createWriteStream`, which never throw
- *                   synchronously either).
+ *  - `"streamRead"`/`"streamWrite"` — a stream that emits `error` once an `'error'` listener
+ *                   is attached to it (real `createReadStream`/`createWriteStream`, which
+ *                   never throw synchronously either — see {@link armDenyStream}, fix #40).
  */
 type Delivery = "throw" | "reject" | "callback" | "streamRead" | "streamWrite";
 
@@ -252,28 +253,72 @@ function fsDeliveryFor(name: string): Delivery {
 }
 
 /**
- * Build a minimal stream that emits `'error'` with `err` asynchronously, mirroring how real
- * `createReadStream`/`createWriteStream` deliver an async error (fix #16). Constructed but
- * inert until the scheduled `destroy` fires, so `fs.createReadStream(p).on('error', h).on(...)`
- * chains work exactly as they would against a real stream that fails after construction.
+ * Arm a deny stream to deliver `err` via `'error'` as soon as a handler is attached to catch
+ * it — rather than on a fixed timer (fix #40). A fixed-timer delivery (the previous
+ * `setImmediate` approach) has a bounded catch window: a consumer that attaches its `'error'`
+ * listener on a LATER macrotask (e.g. `setTimeout(() => s.on('error', h), 0)`) can register
+ * after the timer already fired, missing the event entirely — an uncaught `'error'` crash,
+ * even though the consumer *did* handle errors, just not fast enough for our arbitrary
+ * timer. Real Node doesn't have this problem in practice because its open-failure arrives
+ * from the libuv threadpool, a naturally wide window.
+ *
+ * Fix: hold the error and watch for an `'error'` listener via the stream's own `'newListener'`
+ * event; the moment one is attached, deliver on `process.nextTick` (the listener is already
+ * registered by then — `EventEmitter#on` emits `'newListener'` *before* pushing to its
+ * listener array, but synchronously within the same call, so it has been pushed by the next
+ * tick). This catches a handler attached synchronously, on a microtask, on `setImmediate`, or
+ * on `setTimeout(0)` — verified empirically; only a listener attached even later than our
+ * safety net below (rare, arbitrary) can still miss it, same residual as real `fs` past a
+ * point.
+ *
+ * Safety net: if `'error'` is NEVER listened for, the denial must still surface — silently
+ * discarding it would hide a security-relevant denial behind a stream that just hangs forever
+ * instead of erroring like real `fs` eventually would. Deliver after `setImmediate` then
+ * `setTimeout(0)` (two full loop phases later): empirically this always lands after a single
+ * first-round `setImmediate`- or `setTimeout(0)`-scheduled listener attach (Node does not
+ * guarantee relative ordering between those two from outside an I/O callback), so it never
+ * preempts a legitimate late attach in the timing matrix above, while still guaranteeing an
+ * eventual unhandled-`'error'` crash (matching real fs) when nobody ever listens.
+ *
+ * `.path` is set so error-logging libraries that read `stream.path` see the requested path.
+ * Fail-closed regardless of delivery timing: the read/write never happens.
  */
-// Deny streams emit 'error' on `setImmediate` (not `process.nextTick`): a real fs stream's
-// open failure arrives via the libuv threadpool, LATER than nextTick, so setImmediate widens
-// the window for a caller that attaches its 'error' handler in a microtask or nextTick before
-// the error fires (closer to real Node's timing). `.path` is set so error-logging libraries
-// that read `stream.path` see the requested path. Exact threadpool timing is not reproduced
-// (a handler attached on a later macrotask can still miss it — same as real fs past a point);
-// tracked as a follow-up. This is fail-closed: the read/write never happens regardless.
+function armDenyStream(stream: Readable | Writable, err: CapabilityError): void {
+  let delivered = false;
+  const deliver = () => {
+    if (delivered) return;
+    delivered = true;
+    stream.destroy(err);
+  };
+  const onNewListener = (event: string | symbol) => {
+    if (event !== "error") return;
+    stream.removeListener("newListener", onNewListener);
+    process.nextTick(deliver);
+  };
+  stream.on("newListener", onNewListener);
+  // Safety net if no 'error' listener is ever attached. `.unref()` so these timers never keep
+  // an otherwise-idle event loop alive (a program that would exit immediately shouldn't be held
+  // open by a denied stream's pending delivery).
+  const immediate = setImmediate(() => {
+    const timer = setTimeout(() => {
+      stream.removeListener("newListener", onNewListener);
+      deliver();
+    }, 0);
+    timer.unref();
+  });
+  immediate.unref();
+}
+
 function denyReadStream(err: CapabilityError, path: unknown): Readable {
   const stream = new Readable({ read() {} }) as Readable & { path?: unknown };
   stream.path = path;
-  setImmediate(() => stream.destroy(err));
+  armDenyStream(stream, err);
   return stream;
 }
 function denyWriteStream(err: CapabilityError, path: unknown): Writable {
   const stream = new Writable({ write(_chunk, _enc, cb) { cb(); } }) as Writable & { path?: unknown };
   stream.path = path;
-  setImmediate(() => stream.destroy(err));
+  armDenyStream(stream, err);
   return stream;
 }
 
