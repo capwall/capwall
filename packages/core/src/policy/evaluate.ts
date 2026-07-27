@@ -3,17 +3,16 @@
  *
  * Given a policy, the active mode, the attributed owning package, and a capability request,
  * decide whether the operation is allowed. All logic here is REAL and tested: deny-by-default,
- * the boolean/env gates, and `fs` path-glob matching (see `./glob.ts`). NOTE the asymmetry:
- * `fs` paths match by glob, but `net` HOSTS match by exact equality or the single literal
- * `"*"` — partial host globs (`"*.internal"`) are NOT implemented and are documented as
- * unimplemented in docs/policy-format.md § net. Do not describe them as supported.
+ * the boolean/env gates, `fs` path-glob matching (see `./glob.ts`), `net` host matching (the
+ * grammar lives in `@capwall/policy-schema` `host.ts`, which also VALIDATES it at policy-load
+ * time — issue #83).
  *
  * Semantics:
  *  - `enforce` mode: deny-by-default. A package with no matching grant is DENIED.
  *  - `observe` mode: never denies. Every request returns { allowed: true }, but
  *    `observed` carries what was seen so the CLI can synthesize a starter policy.
  */
-import type { Mode, PackagePolicy, Policy } from "@capwall/policy-schema";
+import { matchesHostPattern, type Mode, type PackagePolicy, type Policy } from "@capwall/policy-schema";
 import { matchesGlob } from "./glob.js";
 
 /** A capability-sensitive operation, attributed to a package, awaiting a decision. */
@@ -122,10 +121,10 @@ export function isGranted(grant: PackagePolicy, req: CapabilityRequest): boolean
     case "net": {
       const net = own(grant, "net");
       if (!net) return false;
-      // Host matching is exact, or the single literal "*". Partial host GLOBS (e.g.
-      // "*.internal") are a possible follow-up and are NOT implemented — docs/policy-format.md
-      // § net says so explicitly, so keep the two in step if this ever changes.
-      const hostOk = net.hosts.some((h) => h === "*" || h === req.host);
+      // Exact hostname, the single literal "*", or a wildcard pattern ("*.internal",
+      // "**.internal") — one grammar, validated at load time and applied here (#83). See
+      // `@capwall/policy-schema` host.ts and docs/policy-format.md § net.
+      const hostOk = net.hosts.some((h) => matchesHostPattern(h, req.host));
       // A `"*"` port grants any port — needed for deps that connect to a dynamically-assigned
       // (ephemeral) port, where a concrete observed port won't match on the next run (#27).
       const portOk = net.ports.some((p) => p === "*" || p === req.port);

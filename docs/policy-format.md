@@ -98,7 +98,7 @@ Every field is optional; an omitted capability means **not granted**.
 ```jsonc
 {
   "fs":  { "read": ["<glob>", ...], "write": ["<glob>", ...] },
-  "net": { "hosts": ["<exact-host>" | "*", ...], "ports": [<number> | "*", ...] },
+  "net": { "hosts": ["<host-pattern>", ...], "ports": [<number> | "*", ...] },
   "child_process": false,     // boolean gate: may this package spawn subprocesses?
   "worker_threads": false,    // boolean gate: may this package start worker threads?
   "env": ["<KEY>", "<KEY>", ...],   // allowlist of process.env keys it may read
@@ -127,26 +127,65 @@ Path globs, resolved relative to the project root. Grants are additive.
 
 ```jsonc
 "net": {
-  "hosts": ["api.example.com", "*"],   // exact hostname, or the single literal "*" = any host
-  "ports": [443, 3000]                 // empty/omitted = no port allowed
+  "hosts": ["api.example.com", "*.internal"],   // see the pattern table below
+  "ports": [443, 3000]                          // empty/omitted = no port allowed
 }
 ```
 
-- `hosts` matching is **exact string equality, or the single literal `"*"`**. There are no
-  partial globs: `"*.internal"` matches a host literally named `*.internal`, and nothing
-  else — it does **not** match `api.internal`. (`packages/core/src/policy/evaluate.ts`
-  implements exactly this; partial host globs are a possible follow-up, not a shipped
-  feature.) An empty list denies all hosts. The failure mode is over-restriction — a
-  `"*.internal"` entry denies rather than over-grants — but a policy written expecting glob
-  semantics will surface as unexplained denials in `enforce`.
-- An IPv6 literal is written **unbracketed** — `"::1"`, not `"[::1]"` — because that is the
-  form Node actually dials (it strips the brackets a URL keeps on `.hostname` before handing
-  the address to `net`/`dns`), and therefore the form capwall observes and matches. A URL like
-  `http://[::1]:8080/` matches a `"::1"` host entry.
-- A unix-domain-socket / named-pipe connect (`net.connect({path})`, `http.request({socketPath})`,
-  `http2` over a pipe) has no host:port pair and is recorded coarsely as the pseudo-target
-  `<ipc>` on port `0`. Granting `{"hosts": ["<ipc>"], "ports": [0]}` therefore grants **every**
-  local socket, not one — see the IPC note in `docs/threat-model.md`.
+#### `hosts` patterns
+
+An entry is an **exact hostname**, the single literal **`"*"`** (any host), or a **wildcard
+pattern**. An empty list denies all hosts.
+
+| entry | meaning |
+|---|---|
+| `api.example.com` | that host, exactly |
+| `*` | any host at all, IP literals included |
+| `*.internal` | exactly **one** label in front of `.internal` |
+| `**.internal` | **one or more** labels in front of `.internal` |
+| `api-*.internal` | `*` may sit inside a label |
+
+The rules the table implies, spelled out because a host allowlist is worth predicting exactly:
+
+- **`*` never crosses a dot**, the same way the `fs` matcher's `*` never crosses a `/`. So
+  `*.internal` matches `api.internal` and `db.internal`, but **not** `a.b.internal` (that is
+  two labels) and **not** `evil-internal` (the dot is part of the pattern). This is the
+  wildcard-certificate rule from RFC 6125 — deliberately the rule you already know from TLS
+  certificates and DNS, rather than a new one.
+- **Neither wildcard matches the apex.** `*.internal` and `**.internal` both leave `internal`
+  itself ungranted; list it separately if you mean it. (`fs`'s `dir/**` *does* match `dir`,
+  because `mkdirSync("./logs")` needs it. Hostnames read right-to-left and the ergonomics do
+  not transfer, so the two differ on purpose.)
+- **A wildcard never matches an IP address.** `*.1.1` does not match `1.1.1.1`; an address's
+  dots are not name boundaries. Patterns that look like an attempt at one — an all-numeric
+  rightmost label, or any `:` — are **rejected at load time** rather than accepted and left
+  never to fire. List addresses exactly.
+- **Matching is case-insensitive over ASCII A–Z only.** `API.Example.com` and
+  `api.example.com` are the same host, so they match interchangeably. Non-ASCII case is *not*
+  folded: full Unicode folding maps distinct characters onto ASCII ones (U+212A KELVIN SIGN
+  lowercases to `k`), which would let a non-ASCII host satisfy an ASCII grant.
+- **No IDNA/punycode conversion.** Node's URL-based egress (`fetch`, `http.request(url)`,
+  `http2.connect`) hands capwall an already-punycoded hostname, so that is what a policy must
+  list — `xn--mnchen-3ya.de`, which is also what `capwall observe` records. A raw
+  `net.connect({host: "münchen.de"})` is not converted by Node either, and capwall matches it
+  literally. capwall matches what Node dials.
+- **A malformed pattern is a load-time error**, not an entry that quietly matches nothing:
+  an empty label (`*.internal.`, `*..internal`), a `**` that is not the whole first label
+  (`a.**.b`, `**foo.internal`), or a wildcard inside an IP literal. This is the actual defect
+  behind issue #83 — the docs advertised `"*.internal"`, the evaluator did exact equality, and
+  the mismatch surfaced as unexplained `enforce` denials some distance from the policy line.
+- Exact entries are **unchanged** by all of the above: a policy that only lists concrete
+  hostnames matches exactly what it did before, and no previously-accepted exact entry is now
+  rejected.
+
+An IPv6 literal is written **unbracketed** — `"::1"`, not `"[::1]"` — because that is the
+form Node actually dials (it strips the brackets a URL keeps on `.hostname` before handing
+the address to `net`/`dns`), and therefore the form capwall observes and matches. A URL like
+`http://[::1]:8080/` matches a `"::1"` host entry.
+
+`capwall observe` always records **concrete** hostnames; wildcards are a hand-tightening step.
+
+#### other `net` notes
 - `ports` is an allowlist of numeric ports. A literal `"*"` entry grants **any** port —
   use it for a dependency that connects to a dynamically-assigned (ephemeral) port, where a
   concrete observed port would not match on the next run. `capwall observe` records concrete
@@ -163,7 +202,6 @@ Path globs, resolved relative to the project root. Grants are additive.
   already been sent. If a granted host may redirect elsewhere, grant the redirect target too;
   `capwall observe` records it for you. See `docs/threat-model.md` § global egress residuals.
 - `data:` and `blob:` URLs are not gated at all — they resolve in-process and move no bytes.
-
 ### `child_process`, `worker_threads`, `vm` — boolean gates
 
 ```jsonc
@@ -298,7 +336,10 @@ Scope, precisely:
   reads, and that policy is the same on every machine (#67).
 
 Matching is **exact string equality**, or the single literal `"*"`. There are no prefix or
-glob forms — `"DEBUG_*"` matches a key literally named `DEBUG_*`, nothing else.
+glob forms — `"DEBUG_*"` matches a key literally named `DEBUG_*`, nothing else. (`fs.read`/
+`fs.write` and `net.hosts` *do* glob; `env` does not. An environment variable name
+is not a hierarchy, so there is no separator for a wildcard to respect and no shape of grant a
+prefix would express safely.)
 
 A denied env read is still logged and still shows up in `capwall diff`. See
 `docs/threat-model.md`.
@@ -381,6 +422,9 @@ indistinguishable from a careless one.
     "pino": {
       "fs":  { "read": [], "write": ["./logs/**"] },
       "env": ["NODE_ENV"]
+    },
+    "internal-client": {
+      "net": { "hosts": ["*.internal"], "ports": [443] }
     }
   }
 }
@@ -405,6 +449,10 @@ The output of `observe` is a **starting point, not the answer.** It records what
   shell. Replace them with `"*"` (see `net.ports` above and `env` above) or delete them.
 - **Incidental code paths** — a capability used once during a code path you happened to
   exercise. Keep it only if it is a real requirement.
+
+Host names (`net.hosts`) are recorded concretely; if a dependency legitimately talks to a whole
+internal domain, replace the observed hosts with `"*.internal"` / `"**.internal"` by hand rather
+than reaching for `"*"`.
 
 Because the merge is additive, a re-run will happily append fresh host-specific noise on top
 of grants you deliberately widened (a `"*"` env grant does not stop concrete keys from being

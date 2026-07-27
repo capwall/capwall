@@ -82,7 +82,7 @@ lands; capwall assumes one got through and *contains what it can do at runtime*.
    loader hooks. Attribute every capability-sensitive call to the **owning package** via
    call-stack / module path.
 2. **Declarative per-package capability policy** — `capabilities.json` mapping each package
-   to allowed `fs` (read/write path globs), `net` (hosts/ports), `child_process`,
+   to allowed `fs` (read/write path globs), `net` (host patterns/ports), `child_process`,
    `worker_threads`, `env` (key allowlist), `vm`, `native` (may it load a `.node` addon —
    a load-time gate, never confinement). Compact, a handful of entries per dep.
 3. **Two modes: `observe` and `enforce`** — observe logs violations without blocking (the

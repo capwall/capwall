@@ -219,7 +219,10 @@ Per-capability notes:
   to dial is itself capwall-mediated — the same class as the pre-install capture residual below.
   (c) `dns` lookups are not mediated (a lookup moves no payload; DNS tunneling is a
   determined-attacker technique out of scope), so a granted host name resolving to an attacker's
-  address is not caught here. (d) Reaching the real prototype by climbing past the guard — two
+  address is not caught here. A wildcard host grant (`*.internal`, #83) inherits that: it names
+  a set of *names*, and capwall does not check where those names point. Prefer the narrowest
+  pattern that covers the real need, and remember that `*.example.com` is only as trustworthy as
+  whoever can create records under `example.com`. (d) Reaching the real prototype by climbing past the guard — two
   levels from an instance of a guarded class
   (`Object.getPrototypeOf(Object.getPrototypeOf(sock)).connect`), equivalently one hop from the
   class object (`net.Socket.prototype.__proto__.connect`), or one hop from a guarded *instance*

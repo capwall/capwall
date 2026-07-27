@@ -9,6 +9,7 @@
  * `docs/policy-format.md`. See docs/policy-format.md for the authoritative field docs.
  */
 import { z } from "zod";
+import { validateHostPattern } from "./host.js";
 
 /** File read/write capability: path globs resolved relative to the project root. */
 export const FsCapabilitySchema = z
@@ -19,13 +20,24 @@ export const FsCapabilitySchema = z
   .strict();
 
 /**
- * Network egress capability. `hosts` entries match by EXACT string equality or the single
- * literal `"*"` (any host) — there are no partial globs, so `"*.internal"` does not match
- * `api.internal`. `ports` are numeric, or the literal `"*"` for any port (#27).
+ * Network egress capability.
+ *
+ * `hosts` entries are either an EXACT hostname, the single literal `"*"` (any host), or a
+ * wildcard pattern — `"*.internal"` (one label) / `"**.internal"` (one or more). `*` never
+ * crosses a dot and a wildcard never matches an IP literal. `./host.ts` owns the grammar and
+ * `docs/policy-format.md` § net documents it; a MALFORMED pattern is rejected here, at
+ * policy-load time, rather than silently matching nothing (issue #83).
+ *
+ * `ports` are numeric, or the literal `"*"` for any port (#27).
  */
 export const NetCapabilitySchema = z
   .object({
-    hosts: z.array(z.string()).default([]),
+    hosts: z.array(z.string()).superRefine((hosts, ctx) => {
+      for (let i = 0; i < hosts.length; i++) {
+        const problem = validateHostPattern(hosts[i]!);
+        if (problem !== null) ctx.addIssue({ code: z.ZodIssueCode.custom, message: problem, path: [i] });
+      }
+    }).default([]),
     ports: z
       .array(z.union([z.number().int().nonnegative(), z.literal("*")]))
       .default([]),
@@ -92,6 +104,10 @@ export type FsCapability = z.infer<typeof FsCapabilitySchema>;
 export type NetCapability = z.infer<typeof NetCapabilitySchema>;
 export type PackagePolicy = z.infer<typeof PackagePolicySchema>;
 export type Policy = z.infer<typeof PolicySchema>;
+
+// The `net.hosts` grammar. Validation (above) and matching (@capwall/core's evaluator) come
+// from the same module on purpose — #83 was the two disagreeing. See ./host.ts.
+export { ANY_HOST, isIpLiteral, matchesHostPattern, validateHostPattern } from "./host.js";
 
 /** Enforcement mode. `observe` logs violations; `enforce` denies-by-default and throws. */
 export type Mode = "observe" | "enforce";
