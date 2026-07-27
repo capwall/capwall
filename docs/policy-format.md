@@ -57,6 +57,65 @@ Consequences worth knowing:
 - An unrecognized `CAPWALL_MODE` (a typo) is inert rather than falling back to the file.
   `capwall run` refuses to launch in that case instead of running the target unmediated.
 
+### Package keys are install positions, not just names
+
+A key in `packages` names the principal attribution reports, and since issue #92 that is the
+package's **install chain** from the project root — every `node_modules/<name>` segment, joined
+by `>`:
+
+| On disk | Key |
+|---|---|
+| `node_modules/lodash/index.js` | `"lodash"` |
+| `node_modules/.pnpm/lodash@4.17.21/node_modules/lodash/index.js` | `"lodash"` — a pnpm/yarn virtual store is looked through |
+| `node_modules/webpack/node_modules/lodash/index.js` | `"webpack>lodash"` |
+
+**A bare name grants the top-level install only.** That is the fix for #92: before it, a
+dependency that shipped a directory named after a granted package inside its own tree collected
+that package's grants, with no `eval`, no `vm` and no `fs` write. A nested copy is now a
+principal of its own and starts with nothing.
+
+**The cost.** npm and yarn genuinely nest a second copy of a package to resolve a version
+conflict, and that copy needs its own key. capwall cannot tell a genuine nested install from a
+vendored one — nothing on disk distinguishes them — so it keeps the positions apart rather than
+guessing. Two ways to cover a nested install:
+
+```jsonc
+"packages": {
+  "webpack>lodash": { "fs": { "read": ["./src/**"] } },  // this one nested copy
+  "*>lodash":       { "fs": { "read": ["./src/**"] } },  // nested one level under anything
+  "**>lodash":      { "fs": { "read": ["./src/**"] } }   // nested at ANY depth
+}
+```
+
+**This is the same wildcard grammar `net.hosts` uses** (§ net), over `>` instead of `.` — one
+grammar to learn, not two:
+
+| | `net.hosts` | `packages` |
+|---|---|---|
+| one leading component | `"*.internal"` matches `api.internal` | `"*>lodash"` matches `webpack>lodash` |
+| one or more | `"**.internal"` also matches `a.b.internal` | `"**>lodash"` also matches `a>b>lodash` |
+| wildcard only in the first component | yes | yes |
+| matches the bare right-hand side | no (`internal`) | no (top-level `lodash`) |
+
+So "lodash everywhere" is the two keys `"lodash"` and `"**>lodash"`. The wildcard is deliberately
+explicit rather than an automatic fallback, because writing it says *any package in the tree may
+ship a directory called `lodash` and receive these grants*. For an `fs.read` glob that is usually
+acceptable; for `child_process` it is a bypass with extra steps.
+
+Unlike the host grammar, a `*` **inside** a name is not allowed (`"lod*"` would silently cover a
+typosquat named `lodasch`), and there is no `"evil>*"` subtree form — granting everything a
+package vendors is the attacker's key, not an author's. Both are **load-time errors** with a
+message saying what to write instead, as is a bare `"*"` (the key that applies to every package is
+the top-level `default` block). A wildcard that silently matches nothing is the defect issue #83
+was about, and package keys get the same treatment.
+
+**Upgrading a policy written before this.** Re-run `capwall observe` (or `capwall diff` to see
+the difference first): the trace records chain names, so `capwall gen-policy` writes the right
+keys. Trees installed with yarn 1, which nests far more than npm 3+, will see the most churn.
+See [`threat-model.md`](threat-model.md) § Package identity for exactly what this does and does
+not verify — it stops one package impersonating another's *position*, and verifies nothing about
+what is actually installed at that position.
+
 ### Two sentinel keys
 
 Besides real package names, `packages` accepts two sentinels:
@@ -104,7 +163,8 @@ Every field is optional; an omitted capability means **not granted**.
   "worker_threads": false,    // boolean gate: may this package start worker threads?
   "env": ["<KEY>", "<KEY>", ...],   // allowlist of process.env keys it may read
   "vm": false,                // boolean gate: may this package use node:vm?
-  "native": false             // boolean gate: may this package load a .node addon?
+  "native": false,            // boolean gate: may this package load a .node addon?
+  "compile": false            // boolean gate: may it compile code under another package's name?
 }
 ```
 
@@ -356,6 +416,42 @@ before will start failing at startup. Re-run `capwall observe`, or `capwall diff
 packages need the grant before flipping back to `enforce`. This is the same upgrade step every
 new capability has required (compare the `env` shim landing in M4 — issue #57).
 
+### `compile` — the identity-granting gate (issue #93)
+
+```jsonc
+"compile": true   // may this package compile code under a filename that is not its own?
+```
+
+A boolean gate on direct calls to `Module.prototype._compile(source, filename)`. V8 reports the
+caller-chosen `filename` as `getFileName()` on every frame of the compiled code, and capwall
+names principals from frame file names — so this is the ability to **execute as any principal in
+the policy, including `<app>`**.
+
+**Read it as the strongest grant in the file.** Granting `compile` to a package grants, in
+effect, every other grant in the file to that package. It is the same power a `vm` grant carries
+(`vm.Script`, `vm.compileFunction` and `vm.runInNewContext` all take a `filename`), stated
+explicitly because `_compile` needed no grant at all before this.
+
+**When it is needed.** Only by `require.extensions` transform hooks — the shape used by
+`ts-node`, `tsx`'s CJS half, `@babel/register`, `@swc/register`, `pirates` (and therefore
+`nyc`/`istanbul`), `require-in-the-middle` (and therefore `dd-trace` and `elastic-apm-node`), and
+`source-map-support`'s install path. Every one of them compiles another package's or the
+application's file by design, which is why capwall cannot simply refuse the call. Grant it to the
+one tool that needs it, never with a `*>` wildcard.
+
+**When it is not needed**, and no grant is required:
+
+- Node loading any module normally. capwall recognizes its loader's own calls and never gates
+  them, so `require` is not a capability.
+- A package compiling source under **its own** name — a template engine, `require-from-string`,
+  a package materializing generated code. It acquires no identity it does not already have.
+- The application itself, which is the trust root.
+
+A denied compile throws `CapabilityError` synchronously, from inside whatever `require` triggered
+the hook. `capwall observe` records it and `capwall gen-policy` writes the grant — **review that
+line before keeping it**, because it is the one generated grant that can silently widen every
+other one.
+
 ### `env` — environment-variable read allowlist
 
 ```jsonc
@@ -456,7 +552,8 @@ indistinguishable from a careless one.
     "worker_threads": false,
     "env": [],
     "vm": false,
-    "native": false
+    "native": false,
+    "compile": false
   },
   "packages": {
     "express": {
@@ -471,15 +568,25 @@ indistinguishable from a careless one.
     "internal-client": {
       "net": { "hosts": ["*.internal"], "ports": [443] },
       "ipc": { "paths": ["/var/run/myapp/api.sock"] }
+    },
+    "express>debug": {
+      "env": ["DEBUG"]
     }
   }
 }
 ```
 
-Here every package other than `express` and `pino` inherits `default` (nothing). `pino` may
-write logs but not read arbitrary files or reach the network; `express` may serve on two
-ports and read its view/static dirs. See [`../capabilities.example.json`](../capabilities.example.json)
-for the committed example.
+Here every package other than the four listed inherits `default` (nothing). `pino` may write logs
+but not read arbitrary files or reach the network; `express` may serve on two ports and read its
+view/static dirs; `internal-client` may reach any single-label host under `.internal` on 443 and
+one named socket.
+
+`express>debug` is the copy of `debug` npm installed *under* `express` to resolve a version
+conflict — a principal of its own, so the top-level `debug` (if any) is not covered by this entry
+and vice versa. Note the two wildcard grammars in this one document are the same grammar over
+different separators: `"*.internal"` is one leading **label** of a hostname, `"*>debug"` would be
+one leading **link** of an install chain, and `**` means "one or more" in both. See
+[`../capabilities.example.json`](../capabilities.example.json) for the committed example.
 
 ## Generating a policy
 

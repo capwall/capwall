@@ -806,22 +806,93 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
   in the bullet above, reachable on any released capwall via `data:` and not new here — but the
   fix does bring `eval` into the same residual, where before the (forgeable) origin string
   happened to name the compiling package instead.
-- **Package identity is a path, not a verified fact.** `packageForPath` reads the name from the
-  last `node_modules/<name>` segment and never touches the disk, so **any code running from such
-  a path is that package**. Two consequences worth stating plainly, both distinct from #84 and
-  neither closed by it:
-  - A dependency that ships a directory named after a granted package inside its own tree
-    (`node_modules/evil/node_modules/lodash/…`, e.g. via `bundledDependencies`) and runs code
-    from it is charged to that name. No `eval`, no `vm`, no `fs` write. **Issue #92.**
-  - `new (require("node:module"))(…)._compile(src, "…/node_modules/lodash/x.js")` compiles code
-    with a caller-chosen filename, and the resulting frames report it. The `node:module` shim
-    gates hook registration, not compilation. **Issue #93.**
+- **Package identity is a path, not a verified fact.** A principal's name comes from a frame's
+  file path. Two forgeries fell out of that (#92, #93); both are closed, and what is closed is
+  narrower than "identity is now verified", so the residual is spelled out below rather than
+  removed.
 
-  Both let a dependency **name** a granted package, under deny-by-default `enforce`, with no log
-  line. They are tracked separately from #84 because the fix is different in kind — verifying
-  package identity against the installed tree, rather than declining to read a self-reported
-  string — and a partial fix here would look like a fix without being one. Until they are
-  closed, treat a package name in a policy as identifying *a path*, not a verified publisher.
+  **What was wrong.** `packageForPath` read the name from the *last* `node_modules/<name>`
+  segment and never touched the disk, so any code running from such a path *was* that package:
+
+  - A dependency that ships a directory named after a granted package inside its own tree
+    (`node_modules/evil/node_modules/lodash/…`, e.g. via `bundledDependencies`, or any
+    git/tarball dependency) and runs code from it was charged to that name. No `eval`, no `vm`,
+    no `fs` write — ordinary frames, a real file. **Issue #92.**
+  - `new (require("node:module"))(…)._compile(src, "…/node_modules/lodash/x.js")` compiles code
+    with a caller-chosen filename, and V8 reports it as `getFileName()` on every resulting
+    frame. `isEval()` is false and the path need not exist. The `node:module` shim gated hook
+    registration, not compilation. **Issue #93.**
+
+  Both let a dependency holding **no grant at all** run with a granted package's capabilities —
+  or with `<app>`'s, whose `env` reads are exempted before the decision is recorded, so that
+  variant produced no log line for `observe` or `capwall diff` either.
+
+  **What capwall does now — #93.** A direct call to `Module.prototype._compile` with a filename
+  that is not the caller's own is a gated capability, `compile`. The gate is a patch on
+  `Module.prototype` rather than on the `node:module` shim, because `_compile` is read off the
+  prototype (the shim's `get` trap never sees it) and because
+  `process.getBuiltinModule("node:module")` returns the un-shimmed module on Node ≥22 — a
+  prototype patch survives that, a shim gate does not. Node's own loader calls are recognized by
+  their caller frame and never gated; a package compiling under its **own** name (a template
+  engine, `require-from-string`) is not gated either, because it acquires no identity it lacks.
+
+  `compile` is **identity-granting**: a package holding it can execute as any principal in the
+  policy, including `<app>`. It exists because refusing outright would break the dominant
+  legitimate use of `_compile` — the `require.extensions` transform hook, which is how `ts-node`,
+  `tsx`, `@babel/register`, `@swc/register`, `pirates` (and thus `nyc`/`istanbul`) and
+  `require-in-the-middle` (and thus `dd-trace`, `elastic-apm-node`) all work, each compiling
+  another package's or the application's file by design. Grant it to the one build or
+  instrumentation tool that needs it and to nothing else. A `vm` grant has always carried the
+  same power (`vm.Script`, `vm.compileFunction` and `vm.runInNewContext` all take a `filename`);
+  it is now named as such here and in the schema rather than only in the `vm` bullet.
+
+  **What capwall does now — #92.** A principal is the whole **install chain** from the project
+  root, not the last segment: `lodash` for a top-level install, `evil>lodash` for a copy
+  installed under `evil`. A vendored directory is therefore a principal of its own and holds
+  whatever the policy grants *it*, which by default is nothing. A package-manager virtual store
+  (`node_modules/.pnpm/…`, yarn's `.store`) is looked through, but only at the first link — a
+  `.pnpm` directory shipped deeper is inside somebody's tarball and stays in the chain, or the
+  skip would be the same forgery one rename away.
+
+  This **stops the conflation; it does not verify provenance.** capwall cannot tell an
+  attacker-vendored `node_modules/evil/node_modules/lodash/` from the copy npm or yarn genuinely
+  installs to resolve a version conflict, because *nothing on disk distinguishes them* — not the
+  nested `package.json` (the attacker writes it), not the parent's `dependencies` (likewise), not
+  the layout (byte-identical). Only a lockfile records provenance, and capwall cannot assume one
+  is present, current, or parseable without adding a dependency. So it declines to guess and
+  keeps the two positions apart instead.
+
+  **The compatibility cost, stated.** A legitimately nested install is a new principal name, so a
+  hand-written `"lodash": {…}` no longer covers `webpack>lodash`. `observe` and
+  `capwall gen-policy` emit chain names automatically and `capwall diff` reports the difference,
+  so the upgrade path is to re-observe. `"*>lodash"` grants every *nested* install of `lodash` in
+  one line; it does not cover the top-level one, so "everywhere" is two keys. That widening is
+  deliberately explicit, because writing it means *any* package in the tree may ship a directory
+  called `lodash` and receive those grants — which for an `fs.read` glob is usually fine and for
+  `child_process` is a bypass with extra steps. Trees installed with yarn 1, which nests far more
+  aggressively than npm 3+, will see the most churn.
+
+  **What remains forgeable.**
+  - **Identity is still position, not publisher.** `node_modules/lodash` is whatever is on disk
+    at that path. A typosquat, a compromised publish, or a hand-edited working copy all answer to
+    `lodash`. capwall verifies nothing about the artifact; that is a job for a lockfile-integrity
+    or provenance-attestation check at install time, and capwall does not do one.
+  - **Anything that can write into the tree can choose its name.** An `fs` write grant covering
+    `node_modules`, a postinstall script, or any lifecycle hook can install code at a granted
+    package's path. Grants that let a dependency write into `node_modules` should be read as
+    grants of every other package's identity.
+  - **A `compile` or `vm` grant is a grant of every other grant**, as above.
+  - **`process.binding("contextify")` and other raw-internal compile routes** remain the
+    pre-existing, path-independent residual named below. A prototype patch survives
+    `getBuiltinModule`; it does not survive reaching past the module system entirely.
+  - **`Module.prototype._compile` is writable**, so in-process code can overwrite it and remove
+    the gate. Doing so also breaks `require` for the whole process, so it is loud rather than
+    silent; it is the same class of escape as un-patching any shim, which capwall does not claim
+    to stop. Hardened mode deliberately does not freeze this prototype — `require.extensions`
+    tooling replaces methods on it.
+  - **Nearest-package laundering is unchanged.** A granted package that invokes an
+    attacker-supplied callback still lends its frame, and therefore its name, to that callback.
+    See the nearest-package bullet above.
 - **Deep stacks past the attribution frame budget** — the walk inspects at most `maxFrames`
   frames (default 25). When the owning dependency's frame is deeper (long promise chains,
   dynamically-compiled or deeply-nested wrappers, `async_hooks`-heavy frameworks), the walk

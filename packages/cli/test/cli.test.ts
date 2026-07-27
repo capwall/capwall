@@ -168,6 +168,80 @@ describe("trace → policy → enforce round-trip (native addon, S2/#49)", () =>
   });
 });
 
+describe("trace → policy → enforce round-trip (package identity, #92 / #93)", () => {
+  /**
+   * The two halves of the package-identity work, through the real CLI:
+   *
+   *   #92 a genuinely nested install (`trace-dep/node_modules/nested-dep`) is the principal
+   *       `trace-dep>nested-dep`, so a chain key has to survive observe → gen-policy → enforce.
+   *       This is also the compatibility story: the key is generated, not hand-written.
+   *   #93 a direct `Module.prototype._compile` under another package's filename is the
+   *       `compile` capability. The escape hatch for the `require.extensions` transform tools
+   *       that legitimately need it IS the policy, so the round-trip must produce a working one.
+   */
+  let generated: string;
+
+  it("observe records a chain principal and the compile, and blocks neither", async () => {
+    generated = path.join(await mkdtemp(path.join(os.tmpdir(), "capwall-identity-")), "policy.json");
+    const r = await runCli(["observe", "-o", generated, "--", "node", "identity.js"], appDir);
+    expect(r.code).toBe(0);
+    // Nothing is blocked in observe, so both lines of output are present.
+    expect(r.stdout).toContain("nested: nested-dep fixture data");
+    expect(r.stdout).toContain("compile: compiled-ok");
+    // The nested copy is charged to its install chain, never to the bare name.
+    expect(r.stderr).toMatch(/observe: recorded fs:read .*nested\.txt for 'trace-dep>nested-dep'/);
+    expect(r.stderr).toMatch(/observe: recorded compile .*generated\.js for 'trace-dep'/);
+
+    const policy = JSON.parse(await readFile(generated, "utf8")) as Policy;
+    expect(Object.keys(policy.packages)).toContain("trace-dep>nested-dep");
+    // …and NOT the bare name, which would be the #92 conflation written into a policy file.
+    expect(Object.keys(policy.packages)).not.toContain("nested-dep");
+    expect(policy.packages["trace-dep"]?.compile).toBe(true);
+  });
+
+  it("enforce denies both by default under a policy that never saw them", async () => {
+    // `capabilities.json` in the fixture app was generated from `main.js`, which exercises
+    // neither. Deny-by-default, and the compile is refused before it can name anything.
+    const r = await runCli(["enforce", "--", "node", "identity.js"], appDir);
+    expect(r.code).not.toBe(0);
+    expect(r.stderr).toMatch(/DENY 'trace-dep>nested-dep' fs:read .*nested\.txt/);
+  });
+
+  it("enforce runs clean under the generated policy — the round-trip closes", async () => {
+    const r = await runCli(["enforce", "--policy", generated, "--", "node", "identity.js"], appDir);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("nested: nested-dep fixture data");
+    expect(r.stdout).toContain("compile: compiled-ok");
+  });
+
+  it("explain answers for a chain key and for `compile`", async () => {
+    const chain = await runCli(
+      ["explain", "--policy", generated, "trace-dep>nested-dep", "fs:read", "./nested.txt"],
+      appDir,
+    );
+    // The generated grant is the absolute path inside trace-dep, so a project-relative target
+    // must NOT match — the point here is that the chain key resolves at all, and that a bare
+    // `nested-dep` resolves to a different principal.
+    expect(chain.stdout).toMatch(/^(ALLOW|DENY)/);
+    const bare = await runCli(
+      ["explain", "--policy", generated, "nested-dep", "fs:read", "./nested.txt"],
+      appDir,
+    );
+    expect(bare.code).toBe(1);
+    expect(bare.stdout).toMatch(/^DENY/);
+
+    const compileAllowed = await runCli(
+      ["explain", "--policy", generated, "trace-dep", "compile"],
+      appDir,
+    );
+    expect(compileAllowed.code).toBe(0);
+    expect(compileAllowed.stdout).toMatch(/^ALLOW.*compile <any filename>/);
+    const compileDenied = await runCli(["explain", "trace-dep", "compile"], appDir);
+    expect(compileDenied.code).toBe(1);
+    expect(compileDenied.stdout).toMatch(/^DENY.*compile <any filename>/);
+  });
+});
+
 describe("express-app example (AGENTS.md § 7)", () => {
   const PORT = 3000 + (process.pid % 20000);
   const BASE = `http://localhost:${PORT}`;

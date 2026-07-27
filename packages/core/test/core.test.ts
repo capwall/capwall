@@ -46,6 +46,110 @@ describe("enforce mode — deny-by-default", () => {
   });
 });
 
+describe("install-chain principals and the `*>` / `**>` widenings (#92)", () => {
+  const chainPolicy: Policy = loadPolicyFromObject({
+    version: 1,
+    mode: "enforce",
+    default: {},
+    packages: {
+      lodash: { env: ["TOP"] },
+      "webpack>lodash": { env: ["NESTED"] },
+      // Two different packages, so each wildcard's reach is measured on its own. (Both keys for
+      // ONE package is legal and is tested separately, under precedence.)
+      "*>chalk": { env: ["ONE_DEEP"] },
+      "**>kleur": { env: ["ANY_DEPTH"] },
+    },
+  });
+  const envReq = (key: string) => ({ kind: "env", key }) as const;
+
+  it("keeps a bare key and a chain key as separate principals", () => {
+    // The #92 fix, at the policy layer: `evil>lodash` gets nothing from `lodash`'s entry.
+    expect(evaluate(chainPolicy, "enforce", "lodash", envReq("TOP")).allowed).toBe(true);
+    expect(evaluate(chainPolicy, "enforce", "evil>lodash", envReq("TOP")).allowed).toBe(false);
+    expect(evaluate(chainPolicy, "enforce", "webpack>lodash", envReq("NESTED")).allowed).toBe(true);
+    // …and the chain key does not leak back onto the top-level install either.
+    expect(evaluate(chainPolicy, "enforce", "lodash", envReq("NESTED")).allowed).toBe(false);
+  });
+
+  it("matches `*>name` against ONE leading link and `**>name` against one or more", () => {
+    // Deliberately the same one-vs-many rule `net.hosts` uses (`*.internal` / `**.internal`),
+    // over `>` instead of `.`. Two wildcard grammars in one policy file that spelled the same
+    // sigil differently would be a trap, so they are matched sigil for sigil.
+    expect(evaluate(chainPolicy, "enforce", "a>chalk", envReq("ONE_DEEP")).allowed).toBe(true);
+    expect(evaluate(chainPolicy, "enforce", "a>b>chalk", envReq("ONE_DEEP")).allowed).toBe(false);
+    expect(evaluate(chainPolicy, "enforce", "a>kleur", envReq("ANY_DEPTH")).allowed).toBe(true);
+    expect(evaluate(chainPolicy, "enforce", "a>b>kleur", envReq("ANY_DEPTH")).allowed).toBe(true);
+    // Only the FINAL link is wildcarded — there is no "everything this package vendors" key.
+    expect(evaluate(chainPolicy, "enforce", "kleur>evil", envReq("ANY_DEPTH")).allowed).toBe(false);
+  });
+
+  it("does NOT let either wildcard reach the top-level install", () => {
+    // Documented: "everywhere" is two keys. The wildcards read as "nested under something",
+    // matching `**.internal` not matching the apex `internal`.
+    expect(evaluate(chainPolicy, "enforce", "chalk", envReq("ONE_DEEP")).allowed).toBe(false);
+    expect(evaluate(chainPolicy, "enforce", "kleur", envReq("ANY_DEPTH")).allowed).toBe(false);
+  });
+
+  it("never lets a wildcard reach a sentinel", () => {
+    // `<app>` and `<unknown>` CONTAIN a `>`. A naive "split on the last `>`" widening reads
+    // `<app>` as a chain with an empty leaf, so a key of `"*>"` would have granted the TRUST
+    // ROOT. Sentinels match by exact key only.
+    const sentinelWild: Policy = loadPolicyFromObject({
+      version: 1,
+      mode: "enforce",
+      default: {},
+      packages: { "*>app": { env: ["X"] }, "**>unknown": { env: ["X"] } },
+    });
+    expect(evaluate(sentinelWild, "enforce", "<app>", envReq("X")).allowed).toBe(false);
+    expect(evaluate(sentinelWild, "enforce", "<unknown>", envReq("X")).allowed).toBe(false);
+  });
+
+  it("prefers the narrower wildcard when both could apply", () => {
+    const both: Policy = loadPolicyFromObject({
+      version: 1,
+      mode: "enforce",
+      default: {},
+      packages: { "**>chalk": { env: ["WIDE"] }, "*>chalk": { env: ["NARROW"] } },
+    });
+    // `a>chalk` is covered by both; the one-level key wins, as an explicit entry beats `default`.
+    expect(evaluate(both, "enforce", "a>chalk", envReq("NARROW")).allowed).toBe(true);
+    expect(evaluate(both, "enforce", "a>chalk", envReq("WIDE")).allowed).toBe(false);
+    // `a>b>chalk` is out of `*>`'s reach, so it falls through to `**>`.
+    expect(evaluate(both, "enforce", "a>b>chalk", envReq("WIDE")).allowed).toBe(true);
+  });
+
+  it("prefers an exact chain entry over the wildcard", () => {
+    const both: Policy = loadPolicyFromObject({
+      version: 1,
+      mode: "enforce",
+      default: {},
+      packages: { "*>chalk": { env: ["WIDE"] }, "a>chalk": { env: ["NARROW"] } },
+    });
+    expect(evaluate(both, "enforce", "a>chalk", envReq("NARROW")).allowed).toBe(true);
+    // The exact entry REPLACES the wildcard rather than merging with it, so a narrower entry
+    // is genuinely narrower — the same way an explicit entry replaces `default`.
+    expect(evaluate(both, "enforce", "a>chalk", envReq("WIDE")).allowed).toBe(false);
+  });
+});
+
+describe("the `compile` capability (#93)", () => {
+  it("is deny-by-default and ignores the filename", () => {
+    expect(isGranted({}, { kind: "compile", filename: "/x/index.js" })).toBe(false);
+    expect(isGranted({ compile: true }, { kind: "compile", filename: "/x/index.js" })).toBe(true);
+    // Boolean gate: any filename, same answer. A filename allowlist would be a per-run
+    // artifact and would not narrow the capability anyway — a package that may compile one
+    // foreign filename may compile any.
+    expect(isGranted({ compile: true }, { kind: "compile", filename: "<any>" })).toBe(true);
+  });
+
+  it("is not implied by any other grant, including vm", () => {
+    // `vm` carries comparable power by a different route, but the two are separate grants and
+    // neither is a superset of the other in the policy.
+    expect(isGranted({ vm: true }, { kind: "compile", filename: "/x.js" })).toBe(false);
+    expect(isGranted({ compile: true }, { kind: "vm" })).toBe(false);
+  });
+});
+
 describe("observe mode — never blocks, records", () => {
   it("allows everything but reports what it observed", () => {
     const d = evaluate(policy, "observe", "totally-unknown-pkg", {

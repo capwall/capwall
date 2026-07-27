@@ -82,6 +82,10 @@
         "native": {
           "type": "boolean",
           "description": "Gate: may this package load a native (.node) addon? Boolean, not a path list, because addon paths are platform/arch/ABI-specific build artifacts and would not reproduce across machines. Gating only — once an addon loads, capwall cannot confine it."
+        },
+        "compile": {
+          "type": "boolean",
+          "description": "Gate: may this package call Module.prototype._compile directly with a filename outside its own package? IDENTITY-GRANTING — V8 reports the chosen filename on every resulting stack frame, so a package with this grant can run code as any principal in the policy, including <app>. Needed only by require.extensions transform hooks (ts-node, @babel/register, pirates, require-in-the-middle). Granting it is granting every other grant in this file."
         }
       }
     }

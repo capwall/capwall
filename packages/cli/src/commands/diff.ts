@@ -61,6 +61,11 @@ function describeRequest(req: CapabilityRequest): string {
     // from "dep X loaded ./node_modules/X/build/Release/X.node".
     case "native":
       return `native ${req.path}`;
+    // The filename is informational only (the grant is a boolean), but it is the whole story
+    // for a reviewer: "some dep started compiling foreign code" is a very different report from
+    // "ts-node compiled ./src/index.ts".
+    case "compile":
+      return `compile ${req.filename}`;
   }
 }
 

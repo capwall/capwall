@@ -6,8 +6,18 @@ node_modules/
 !packages/core/test/fixtures/esm/node_modules/
 !packages/core/test/fixtures/launder/node_modules/
 !packages/core/test/fixtures/eval-forge/node_modules/
+!packages/core/test/fixtures/pkg-identity/node_modules/
 !packages/cli/test/fixtures/app/node_modules/
 !scripts/bench/fixtures/node_modules/
+# NESTED node_modules, which the `node_modules/` rule re-excludes at every level — git cannot
+# re-include a path whose parent directory is excluded, so each level needs its own negation.
+# These layouts ARE the subject under test for issue #92 (a package installed under another
+# package is a distinct principal), so they have to be committed exactly as npm would create
+# them, attacker-shaped copies included.
+!packages/core/test/fixtures/pkg-identity/node_modules/forge-dep/node_modules/
+!packages/core/test/fixtures/pkg-identity/node_modules/forge-dep/node_modules/.pnpm/forge-target@1.0.0/node_modules/
+!packages/core/test/fixtures/pkg-identity/node_modules/legit-host/node_modules/
+!packages/cli/test/fixtures/app/node_modules/trace-dep/node_modules/
 dist/
 *.log
 .DS_Store

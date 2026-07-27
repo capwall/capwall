@@ -12,11 +12,16 @@ const HELP = `usage: capwall explain [--policy <file>] <package> <capability> [t
 
 Capabilities and their targets:
   fs:read <path> | fs:write <path> | net <host:port> | ipc <socket-path> | env <KEY>
-  child_process | worker_threads | vm | native [addon-path]
+  child_process | worker_threads | vm | native [addon-path] | compile [filename]
 
-  'native' gates whether the package may load a .node addon at all. Its optional
-  [addon-path] target is echoed in the answer for readability only — the grant is a
-  boolean, so the path does not change the verdict (see docs/policy-format.md).
+  'native' gates whether the package may load a .node addon at all, and 'compile'
+  whether it may call Module.prototype._compile with a filename outside its own
+  package. Both optional targets are echoed in the answer for readability only —
+  the grants are booleans, so the target does not change the verdict (see
+  docs/policy-format.md).
+
+<package> is the principal attribution reports, which for a package installed under
+another package is its install chain — 'webpack>lodash', not 'lodash' (issue #92).
 
 Examples:
   capwall explain pino fs:write ./logs/app.log
@@ -24,6 +29,8 @@ Examples:
   capwall explain express net localhost:3000
   capwall explain sneaky-dep env AWS_SECRET_ACCESS_KEY
   capwall explain better-sqlite3 native
+  capwall explain webpack>lodash fs:read ./package.json
+  capwall explain ts-node compile
 `;
 
 function buildRequest(
@@ -68,6 +75,9 @@ function buildRequest(
       // not a matched target (isGranted ignores it). `<any addon>` keeps the printed reason
       // honest about that when the caller omits it.
       return { kind: "native", path: target ?? "<any addon>" };
+    case "compile":
+      // Same as `native`: a display string, not a matched target (isGranted ignores it).
+      return { kind: "compile", filename: target ?? "<any filename>" };
     default:
       return `unknown capability '${capability}' (see capwall explain --help)`;
   }

@@ -84,8 +84,10 @@ lands; capwall assumes one got through and *contains what it can do at runtime*.
 2. **Declarative per-package capability policy** — `capabilities.json` mapping each package
    to allowed `fs` (read/write path globs), `net` (host patterns/ports), `ipc` (unix-socket /
    named-pipe path globs), `child_process`, `worker_threads`, `env` (key allowlist), `vm`,
-   `native` (may it load a `.node` addon — a load-time gate, never confinement). Compact, a
-   handful of entries per dep.
+   `native` (may it load a `.node` addon — a load-time gate, never confinement), `compile`
+   (may it compile code under another package's filename — identity-granting, see the policy
+   docs). Compact, a handful of entries per dep. A key names an *install position*: `lodash`
+   is the top-level install, `webpack>lodash` the copy nested under `webpack`.
 3. **Two modes: `observe` and `enforce`** — observe logs violations without blocking (the
    on-ramp); enforce denies-by-default and throws.
 4. **Auto-policy generation from a trace run** — `capwall observe` runs the target's
@@ -170,6 +172,15 @@ Native addons and subprocesses can be **gated** (whether they run) but not **con
 with no confinement whatsoever — compiled code in the process reaches files, sockets and the
 environment without touching a shimmed JS builtin, so read it as trusting that package
 completely.
+
+**Package identity is a position in the dependency tree, not a verified fact.** A principal is
+the path a frame's file sits at — `lodash` for the top-level install, `webpack>lodash` for the
+copy nested under `webpack`. That keeps one package from *impersonating another's position*
+(issue #92), but capwall does not verify what is installed at a position: a typosquat, a
+compromised publish, or anything that can write into `node_modules` still answers to that name.
+The `compile` and `vm` grants are identity-granting in the same spirit — a package holding
+either can execute as any principal in the policy. See
+[`docs/threat-model.md`](./docs/threat-model.md) § Package identity.
 
 One coverage gap is worth naming here rather than leaving to the appendix, because it is
 cheap for an attacker and needs no knowledge of capwall: **`globalThis.fetch` and

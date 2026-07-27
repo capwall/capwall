@@ -12,7 +12,14 @@
  *  - `observe` mode: never denies. Every request returns { allowed: true }, but
  *    `observed` carries what was seen so the CLI can synthesize a starter policy.
  */
-import { ANY_HOST, matchesHostPattern, type Mode, type PackagePolicy, type Policy } from "@capwall/policy-schema";
+import {
+  ANY_HOST,
+  matchesHostPattern,
+  widenedPackageKeys,
+  type Mode,
+  type PackagePolicy,
+  type Policy,
+} from "@capwall/policy-schema";
 import { matchesGlob } from "./glob.js";
 import { IPC_PSEUDO_HOST, matchesIpcPath } from "./ipc.js";
 
@@ -32,6 +39,20 @@ export type CapabilityRequest =
   | { kind: "worker_threads" }
   | { kind: "env"; key: string }
   | { kind: "vm" }
+  /**
+   * A DIRECT call to `Module.prototype._compile(source, filename)` (issue #93) — compiling
+   * source under a caller-chosen filename, which every resulting stack frame then reports as
+   * its `getFileName()`. Only calls that do not come from Node's own module loader reach here,
+   * and only when the filename does not already belong to the calling package; see
+   * `shims/module.ts` for both discriminators.
+   *
+   * `filename` is carried for OBSERVABILITY ONLY — logs, the observe trace, `capwall diff` —
+   * and is deliberately NOT consulted by {@link isGranted}, for the same reason `native` ignores
+   * its path: the grant is the question "may this package name code as somebody else?", which is
+   * a boolean, and a filename allowlist would be a per-machine, per-run artifact. It is also the
+   * more honest grant, because a package that may compile ONE foreign filename may compile any.
+   */
+  | { kind: "compile"; filename: string }
   /**
    * A native (`.node`) addon load (roadmap S2, issue #49). `path` is the addon file as
    * resolved at load time; it is carried for OBSERVABILITY ONLY — logs, the observe trace,
@@ -57,13 +78,44 @@ export interface Decision {
   attributionTruncated?: boolean;
 }
 
-/** Resolve the effective per-package policy: explicit entry, else the `default` fallback. */
+/**
+ * Resolve the effective per-package policy: exact entry, then the wildcard keys that could cover
+ * it (most specific first), else the `default` fallback.
+ *
+ * Own-property checks only: a package name like `__proto__`/`constructor`, or a polluted
+ * `Object.prototype`, must not resolve a grant. Deny-by-default means the `default` fallback
+ * applies to any pkg without its OWN entry. (Defense-in-depth; prototype pollution remains a
+ * documented out-of-scope threat, but the policy lookup itself should not be a vector.)
+ *
+ * WHY THERE IS A WILDCARD AT ALL (issue #92). Attribution names a nested install by its install
+ * chain — `evil>lodash`, `webpack>lodash` — so a hand-written `"lodash": {…}` covers the
+ * TOP-LEVEL install only. That is the fix: a dependency that vendors a directory called `lodash`
+ * must not inherit `lodash`'s grants. It is also a real cost for the author who genuinely has two
+ * copies of a library in the tree and means "the library, wherever npm put it", so that reading
+ * stays available as `"*>lodash"` (nested one level) / `"**>lodash"` (any depth) — the same
+ * one-vs-many sigils `net.hosts` uses, over `>` instead of `.`. Neither covers the top-level
+ * install: "everywhere" is two keys, and being made to write both is the intended friction.
+ *
+ * The widening is an EXPLICIT, per-package opt-in rather than an implicit fallback, because
+ * writing it says something specific and unpleasant: *any* package in the tree may ship a
+ * directory named `lodash` and receive these grants. For an `fs.read` glob that is usually fine;
+ * for `child_process` it is a bypass with extra steps. An implicit fallback would have made that
+ * trade for every package silently, which is the original bug with a longer name.
+ *
+ * The grammar — including which keys are REFUSED at load time, so a mistyped wildcard is an error
+ * rather than a key that quietly matches nothing (#83's lesson) — lives in `@capwall/policy-schema`
+ * `package-key.ts`, alongside the host grammar and for the same reason.
+ *
+ * COST: `widenedPackageKeys` returns an empty array for a top-level name or a sentinel, which is
+ * every principal in a tree with no nesting, so the common case is still exactly the one
+ * `Object.hasOwn` it always was.
+ */
 function policyFor(policy: Policy, pkg: string): PackagePolicy {
-  // Own-property check only: a package name like "__proto__"/"constructor", or a polluted
-  // Object.prototype, must not resolve a grant. Deny-by-default means the `default` fallback
-  // applies to any pkg without its OWN entry. (Defense-in-depth; prototype pollution remains
-  // a documented out-of-scope threat, but the policy lookup itself should not be a vector.)
-  return Object.hasOwn(policy.packages, pkg) ? policy.packages[pkg]! : policy.default;
+  if (Object.hasOwn(policy.packages, pkg)) return policy.packages[pkg]!;
+  for (const key of widenedPackageKeys(pkg)) {
+    if (Object.hasOwn(policy.packages, key)) return policy.packages[key]!;
+  }
+  return policy.default;
 }
 
 /**
@@ -112,6 +164,11 @@ export function isGranted(grant: PackagePolicy, req: CapabilityRequest): boolean
       return own(grant, "worker_threads") === true;
     case "vm":
       return own(grant, "vm") === true;
+    // `req.filename` is intentionally ignored — see CapabilityRequest's `compile` variant.
+    // The grant answers "may this package compile code under a filename that is not its own",
+    // and the answer cannot usefully be narrowed to a file list.
+    case "compile":
+      return own(grant, "compile") === true;
     // `req.path` is intentionally ignored: the grant is a boolean gate on "may this package
     // bring compiled code into the process", not an allowlist of addon files. Matching the
     // path would make every generated policy machine-specific (see PackagePolicy.native).
@@ -170,6 +227,8 @@ function describe(req: CapabilityRequest): string {
       return `env:${req.key}`;
     case "native":
       return `native ${req.path}`;
+    case "compile":
+      return `compile ${req.filename}`;
     default:
       return req.kind;
   }

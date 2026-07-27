@@ -21,6 +21,7 @@ import { registerEsmHook, type EsmHookHandle } from "./loader/esm-hook.js";
 import { liveCtx } from "./loader/live-context.js";
 import { installNativeGate, type NativeGateHandle } from "./loader/native.js";
 import { installEnvGuard, type EnvGuardHandle } from "./shims/env.js";
+import { installCompileGate, type CompileGateHandle } from "./shims/module.js";
 import {
   installGlobalEgressGuard,
   type GlobalEgressGuardHandle,
@@ -154,18 +155,30 @@ export function install(
   // long-lived box the stack re-points — see loader/live-context.ts.
   const ctx: ShimContext = { policy, mode, onDecision, projectRoot, maxFrames, hardened };
   const handles: Array<
-    RequirePatchHandle | EsmHookHandle | EnvGuardHandle | NativeGateHandle | GlobalEgressGuardHandle
+    | RequirePatchHandle
+    | EsmHookHandle
+    | EnvGuardHandle
+    | NativeGateHandle
+    | GlobalEgressGuardHandle
+    | CompileGateHandle
   > = [];
   // First: this pushes `ctx` onto the install stack, so `liveCtx` below already describes THIS
   // install by the time the guards that read it are built.
   handles.push(patchRequire(ctx));
-  // The three guards below are handed `liveCtx`, NOT `ctx`. They are not import-routed, so each
+  // The four guards below are handed `liveCtx`, NOT `ctx`. They are not import-routed, so each
   // one hands a dependency a long-lived object (the `process.env` proxy, the wrapped `fetch`, the
-  // patched `process.dlopen`) that outlives its install exactly the way a captured `fs` shim
-  // does. Binding them to the per-install `ctx` is what made `process.env` tighten on a policy
-  // swap while `fs` did not (#87) — two capabilities in one process disagreeing about which
-  // policy is in force, which is worse than either behaviour applied consistently.
+  // patched `process.dlopen`, the patched `Module.prototype._compile`) that outlives its install
+  // exactly the way a captured `fs` shim does. Binding them to the per-install `ctx` is what made
+  // `process.env` tighten on a policy swap while `fs` did not (#87) — two capabilities in one
+  // process disagreeing about which policy is in force, which is worse than either behaviour
+  // applied consistently.
   //
+  // `Module.prototype._compile` gate (#93). Installed EAGERLY here, not from the shim registry,
+  // for the same reason as the env and native gates: the registry is built lazily on the first
+  // mediated require, and `process.getBuiltinModule("node:module")` reaches `Module.prototype`
+  // without ever touching it. A gate that only exists once somebody requires a mediated module
+  // is not a gate. See shims/module.ts § installCompileGate.
+  handles.push(installCompileGate(liveCtx));
   // Native (`.node`) addon gate (roadmap S2, #49). Always on, and deliberately not routed
   // through the require registry: `process.dlopen` is the chokepoint EVERY addon load passes
   // through, including a direct `process.dlopen(...)` that never touches the module system.
@@ -214,6 +227,7 @@ export {
   resolveMaxFrames,
   APP_ROOT,
   UNATTRIBUTED,
+  CHAIN_SEP,
   DEFAULT_MAX_FRAMES,
 } from "./attribution/index.js";
 export type { Attribution, AttributionOptions } from "./attribution/index.js";

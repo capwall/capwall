@@ -77,9 +77,19 @@ lower-level module is the reasoning error that produces a real bypass. See
 [`threat-model.md`](./threat-model.md) § per-capability notes, which states the same rule as
 a security property.
 
-`node:module` is also mediated, though it is not a policy capability: the shim gates
-`register`/`registerHooks` so a dependency cannot install a loader hook ahead of capwall's and
-un-mediate the ESM path process-wide (#61). Everything else on `node:module` passes through.
+`node:module` is also mediated: the shim gates `register`/`registerHooks` so a dependency cannot
+install a loader hook ahead of capwall's and un-mediate the ESM path process-wide (#61). That
+half is not a policy capability. Everything else on `node:module` passes through.
+
+`Module.prototype._compile` is gated **separately, and not by that shim** (#93). It is the one
+primitive that lets a caller choose what V8 reports as `getFileName()` on the frames of the code
+it runs, which — since attribution names principals from frame file names — is the ability to
+execute as an arbitrary principal, `<app>` included. The gate is a patch on `Module.prototype`
+installed from `install()`, because `m._compile` is read off the prototype (the shim's `get` trap
+never sees it) and because `process.getBuiltinModule("node:module")` returns the un-shimmed
+module on Node ≥22. Node's own loader calls are recognized by their caller frame and never gated,
+and a package compiling under its own name is not gated either; anything else needs the
+identity-granting `compile` grant. See `shims/module.ts` § `installCompileGate`.
 
 **The corollary of "one shim per module surface" is that non-module surfaces are outside the
 mechanism.** `globalThis.fetch` and `globalThis.WebSocket` never route through a module load,
@@ -101,8 +111,21 @@ by construction. Gating only: capwall cannot confine an addon once it is loaded 
 Maps "the code currently executing a shimmed call" to the **owning npm package**. The
 implementation captures structured V8 CallSites (temporary `prepareStackTrace` swap, no
 string parsing), skips capwall's own frames and Node internals, and resolves the first
-remaining frame's file path via its last `node_modules/<package>` path segment (pnpm's
-`.pnpm` layout falls out for free). Resolution of file-path → package is memoized.
+remaining frame's file path to its **install chain**. Resolution of file-path → principal is
+memoized (per project root).
+
+**The install chain (#92).** The principal is every `node_modules/<name>` segment of the path
+below the project root, joined by `>`: `lodash` for a top-level install, `webpack>lodash` for the
+copy installed under `webpack`. A package-manager virtual store — pnpm's `.pnpm`, yarn Berry's
+`.store` — is looked through, but only at the *first* link, so a `.pnpm` directory shipped inside
+somebody's tarball stays in the chain rather than resetting it.
+
+Reading only the *last* segment used to mean `node_modules/evil/node_modules/lodash/x.js` simply
+*was* `lodash`, so a dependency could collect a granted package's capabilities by shipping a
+directory with the right name (#92). capwall cannot distinguish that from the copy npm genuinely
+nests to resolve a version conflict — nothing on disk distinguishes them — so it stops conflating
+the two positions rather than guessing which is which. This changes what a policy key means; see
+[`policy-format.md`](policy-format.md) § Package keys are install positions.
 
 **Chosen attribution policy: nearest-package.** The package owning the frame closest to the
 shimmed call is charged. Cheap (the walk stops at the first qualifying frame),
@@ -128,7 +151,7 @@ the signal to raise the budget. See
 
 | Outcome | When | Treated as |
 |---|---|---|
-| `<pkg>` | a frame under `node_modules/<pkg>` | that package's grants |
+| `<pkg>` | a frame under `node_modules/<pkg>`; a nested install is its chain, `<host>><pkg>` | that principal's grants |
 | `<app>` | a real source file **not** under `node_modules`, with no opaque frame above it | the trust root — exempt from the `process.env` and `dgram` gates |
 | `<unknown>` | no qualifying frame at all, or app code reached only through opaque code | an ordinary untrusted principal — deny-by-default in enforce, recorded in observe, grantable by an explicit `"<unknown>"` policy entry |
 

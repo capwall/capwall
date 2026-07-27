@@ -123,6 +123,14 @@ export function mergeTraceIntoPolicy(
       case "native":
         grant.native = true;
         break;
+      // Same reasoning as `native`: the observed filename is dropped, because the grant is the
+      // boolean question "may this package name code as somebody else" and a filename list
+      // would be a per-run artifact. Unlike `native`, this one is IDENTITY-GRANTING (#93) —
+      // `capwall observe` will happily generate it for a transform hook that legitimately needs
+      // it, and the policy-format docs say in terms that it must be reviewed before it is kept.
+      case "compile":
+        grant.compile = true;
+        break;
     }
   }
 
