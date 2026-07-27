@@ -17,7 +17,7 @@ import { register } from "node:module";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import * as path from "node:path";
-import { setEsmContext, esmSpecifiers } from "./esm-runtime.js";
+import { pushEsmContext, popEsmContext, esmSpecifiers } from "./esm-runtime.js";
 import type { ShimContext } from "../shims/runtime.js";
 
 export interface EsmHookHandle {
@@ -29,8 +29,12 @@ export interface EsmHookHandle {
 let hookRegistered = false;
 
 export function registerEsmHook(ctx: ShimContext): EsmHookHandle {
-  // Make the shims resolvable on this (main) thread for the synthetic modules to import.
-  setEsmContext(ctx);
+  // Make the shims resolvable on this (main) thread for the synthetic modules to import. This
+  // pushes onto an install STACK whose top drives a long-lived context box, so a later
+  // install's policy reaches specifiers that were already imported under an earlier one (#62)
+  // — see esm-runtime.ts for why the mutability lives there rather than in the generated
+  // source.
+  pushEsmContext(ctx);
 
   // Enumerate each mediated builtin's export names on the main thread (the loader thread must
   // not import them — that would recurse through `resolve` and loop). Shim keys equal the real
@@ -59,9 +63,14 @@ export function registerEsmHook(ctx: ShimContext): EsmHookHandle {
 
   return {
     uninstall() {
-      // Best-effort: the hook stays registered, but with no context the synthetic modules'
-      // getEsmShim() throws (fail-closed, visible) rather than silently returning a raw builtin.
-      setEsmContext(null);
+      // Best-effort: the hook stays registered. Removing this install re-points the live
+      // context at whatever install is still active, or — if this was the last one — at a
+      // deny-all enforce policy. Either way it is fail-closed and visible, never a silent
+      // return to the raw builtin: a not-yet-imported specifier gets getEsmShim()'s explicit
+      // "capwall is no longer installed" error, and a specifier some module already imported
+      // gets a CapabilityError from the shim it captured (#62 — that second case previously
+      // kept serving the torn-down install's grants).
+      popEsmContext(ctx);
     },
   };
 }
