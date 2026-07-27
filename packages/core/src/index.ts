@@ -18,6 +18,7 @@
  */
 import { patchRequire, type RequirePatchHandle } from "./loader/require.js";
 import { registerEsmHook, type EsmHookHandle } from "./loader/esm-hook.js";
+import { liveCtx } from "./loader/live-context.js";
 import { installNativeGate, type NativeGateHandle } from "./loader/native.js";
 import { installEnvGuard, type EnvGuardHandle } from "./shims/env.js";
 import {
@@ -30,7 +31,22 @@ import type { Decision } from "./policy/evaluate.js";
 import type { Mode, Policy } from "@capwall/policy-schema";
 
 export interface InstallHandle {
-  /** Remove capwall's interception (best-effort for ESM). Primarily for tests/teardown. */
+  /**
+   * Remove capwall's interception (best-effort for ESM). Primarily for tests/teardown.
+   *
+   * WHAT THIS DOES AND DOES NOT UNDO (#62/#87). It restores the interception POINTS —
+   * `Module._load`, `process.env`, `process.dlopen`, the egress globals — so a fresh
+   * `require("node:fs")` or `process.env.X` after the last `uninstall()` is genuinely
+   * un-mediated. It cannot revoke a reference a module already CAPTURED (`const fs =
+   * require("node:fs")` at load time, an ESM `const` import binding, a stashed `process.env`).
+   * Those captures follow the live policy, so once the last install is gone they see a deny-all
+   * `enforce` policy and a dropped `onDecision` sink: they fail CLOSED and silently, rather than
+   * continuing to serve the torn-down install's grants or writing decisions into its collector.
+   *
+   * Installs nest. `uninstall()` deactivates ONE install and re-exposes whichever is still
+   * active — including for already-captured shims, which is the whole point of #87 — and works
+   * in any order, not just LIFO.
+   */
   uninstall(): void;
 }
 
@@ -132,23 +148,36 @@ export function install(
     "attribution.maxFrames",
   );
   const hardened = options.hardened === true;
+  // THIS OBJECT IS THE INSTALL'S IDENTITY, not the thing shims read (#62/#87). It is pushed on
+  // the shared install stack by `patchRequire` (and again by `registerEsmHook`), and popping it
+  // is what deactivates this install. What every shim actually reads is `liveCtx`, the
+  // long-lived box the stack re-points — see loader/live-context.ts.
   const ctx: ShimContext = { policy, mode, onDecision, projectRoot, maxFrames, hardened };
   const handles: Array<
     RequirePatchHandle | EsmHookHandle | EnvGuardHandle | NativeGateHandle | GlobalEgressGuardHandle
   > = [];
-  handles.push(patchRequire(policy, mode, { onDecision, projectRoot, maxFrames, hardened }));
+  // First: this pushes `ctx` onto the install stack, so `liveCtx` below already describes THIS
+  // install by the time the guards that read it are built.
+  handles.push(patchRequire(ctx));
+  // The three guards below are handed `liveCtx`, NOT `ctx`. They are not import-routed, so each
+  // one hands a dependency a long-lived object (the `process.env` proxy, the wrapped `fetch`, the
+  // patched `process.dlopen`) that outlives its install exactly the way a captured `fs` shim
+  // does. Binding them to the per-install `ctx` is what made `process.env` tighten on a policy
+  // swap while `fs` did not (#87) — two capabilities in one process disagreeing about which
+  // policy is in force, which is worse than either behaviour applied consistently.
+  //
   // Native (`.node`) addon gate (roadmap S2, #49). Always on, and deliberately not routed
   // through the require registry: `process.dlopen` is the chokepoint EVERY addon load passes
   // through, including a direct `process.dlopen(...)` that never touches the module system.
   // See loader/native.ts. Gating only — capwall cannot confine an addon once it is loaded.
-  handles.push(installNativeGate(ctx));
+  handles.push(installNativeGate(liveCtx));
   if (options.env !== false) {
-    handles.push(installEnvGuard(ctx));
+    handles.push(installEnvGuard(liveCtx));
   }
   // Global egress (#80). Not import-routed — `fetch`/`WebSocket`/`EventSource` are globals, so
   // like the env guard this is installed here rather than through the shim registry.
   if (options.globalEgress !== false) {
-    handles.push(installGlobalEgressGuard(ctx));
+    handles.push(installGlobalEgressGuard(liveCtx));
   }
   if (options.esm) {
     handles.push(registerEsmHook(ctx));

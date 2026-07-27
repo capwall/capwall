@@ -42,27 +42,55 @@ The shims are handed out **mutable by default** (so `graceful-fs` and friends ke
 `install(policy, mode, { hardened: true })` / `CAPWALL_HARDENED=1` freezes them instead —
 **off by default**, see § Hardened mode for what that does and does not buy.
 
+**Install lifecycle — what a policy swap and `uninstall()` do.** This applies to **both** module
+systems and to the non-import-routed guards (`process.env`, the egress globals, the native gate);
+it was fixed for ESM in #62 and for CJS in #87, and until #87 the two paths behaved differently.
+The thing that makes it subtle is that mediated references are **captured**: a CJS module's
+`const fs = require("node:fs")`, an ESM `const` import binding, a stashed `process.env`. Whatever
+those captures point at is what enforces policy for the rest of the process, and a capture cannot
+be revoked.
+
+- **Already-captured references follow the LIVE policy, in both directions.** `uninstall()` +
+  `install(tighter)` applies to a shim a module captured under an earlier install, and so does
+  loosening again. Before #62/#87 a capture was pinned to the install that was active when it was
+  made, so tightening was a silent no-op — fail-open with respect to the new policy. On the CJS
+  path that also meant a *freshly* required `fs` denied while a captured one allowed: one process
+  enforcing two policies at once, decided by when a module happened to call `require`.
+- **After the LAST `uninstall()` a capture fails CLOSED** — a deny-all `enforce` policy — rather
+  than passing through to the real builtin or continuing to serve the torn-down install's grants.
+  "capwall is off again" is not available to a capture; the only options are the dead install's
+  grants or none, and serving revoked grants is the fail-open one.
+- **The decision sink is dropped with its install.** A post-teardown denial still throws, but it is
+  not written into the torn-down embedder's `onDecision` collector or the CLI's trace file — that
+  would be a decision belonging to no install landing in the previous one's audit trail.
+- **A FRESH access after the last `uninstall()` is genuinely un-mediated on the CJS path**, because
+  the interception points (`Module._load`, `process.env`, `process.dlopen`, the egress globals)
+  really are restored. Fail-closed is about stale captures, not about leaving a torn-down process
+  deny-all. The ESM path differs — see the next section.
+- **Installs nest**, innermost wins, and they unwind in **any** order, not only LIFO (#22 for the
+  `Module._load` chain, #87 for the policy stack). Unwinding one install re-exposes the one below
+  it, including for already-captured shims.
+- **`hardened` is the one setting that is not live.** It freezes objects as they are built and a
+  frozen object cannot be unfrozen, so a capture keeps the hardening of the install that built it.
+  A later install's `hardened` still governs shims handed out fresh after it.
+- **None of this is dependency-reachable** — a dependency cannot call `install()`. It matters for
+  embedders swapping policy at runtime and for programmatic tests, which is why #87 is rated MEDIUM
+  rather than a live bypass.
+
 **ESM known limits** (documented, not silent):
 - A module that captured a raw builtin **before** capwall installed is not re-bound (same as
   CJS — install via the `--import` preload so capwall registers first).
 - The set of mediated specifiers is fixed at install time; a mediated builtin not in the shim
   registry is not intercepted (the registry covers the capabilities above).
-- Unregistering the ESM hook is best-effort (Node cannot fully remove a registered hook), so
-  teardown is **fail-closed rather than reversible**: there is no way to un-bind an ESM import,
-  and "capwall is off again" is not on the menu. A mediated builtin **not yet imported** when
-  `uninstall()` ran throws an explicit "capwall is no longer installed" error on re-import; one
-  that a module **had already imported** keeps the shim it captured, and that shim now denies
-  under a deny-all policy rather than continuing to serve the torn-down install's grants (#62 —
-  before that fix it kept serving them, so this bullet previously overclaimed: it was true only
-  for never-imported specifiers).
-- **The first install no longer wins.** A synthetic module resolves its shim once, at
-  evaluation, and ESM module caching is per-process and permanent, so an already-imported
-  specifier used to be pinned to the policy of the install that was active when it was first
-  imported — making `uninstall()` + `install(tighter)` a silent no-op on the import path
-  (fail-open with respect to the new policy). The ESM shims now read the live install's policy
-  on every call, so a runtime policy swap applies to already-imported specifiers in both
-  directions. This is not dependency-reachable; it mattered for embedders swapping policy at
-  runtime and for programmatic tests.
+- Unregistering the ESM hook is best-effort (Node cannot fully remove a registered hook), so ESM
+  teardown is **fail-closed rather than reversible** — this is the one place the lifecycle above
+  differs between the two paths. On CJS, a fresh `require` after the last `uninstall()` reaches the
+  real builtin; on ESM there is no equivalent, because the hook is still registered and an import
+  binding cannot be un-bound. A mediated builtin **not yet imported** when `uninstall()` ran
+  therefore throws an explicit "capwall is no longer installed" error on re-import, and one a
+  module **had already imported** denies under the deny-all torn-down policy (#62 — before that
+  fix it kept serving the torn-down install's grants, so this bullet previously overclaimed: it
+  was true only for never-imported specifiers).
 - **capwall cannot guarantee it stays outermost in the loader-hook chain** (#61). See
   "Loader-hook registration" below — this is the significant residual on the ESM path.
 - `process.env` is not import-routed; its Proxy guard (installed by `install()`) covers both
@@ -363,7 +391,8 @@ globals with guarded equivalents for the life of the install. What it covers and
   non-configurable global could never be restored by anyone — the same process-global constraint
   that keeps real builtins unfrozen (#77) and that shaped #65's Proxy-view approach. Restoration is
   skipped if something else replaced the global after capwall, so a later legitimate replacement is
-  not clobbered.
+  not clobbered. A dependency that **captured** the guarded `fetch` before teardown still holds it,
+  and it follows the live policy like any other capture — see § Install lifecycle (#87).
 - **Hardened mode (#17)** installs the guarded global `writable: false` (so `globalThis.fetch =
   evil` silently no-ops in sloppy-mode CJS and throws under `"use strict"`) and freezes the wrapper
   function / guarded class. `Object.defineProperty(globalThis, "fetch", …)` remains open — the same
