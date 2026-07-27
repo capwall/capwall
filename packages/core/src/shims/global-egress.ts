@@ -129,6 +129,12 @@
 import { evaluate } from "../policy/evaluate.js";
 import { CapabilityError } from "../errors.js";
 import {
+  defineSharedPatch,
+  globalPropertySlot,
+  type GlobalPropertySlot,
+  type GlobalReplacement,
+} from "../lifecycle/process-patch.js";
+import {
   defineGuardedClassIdentity,
   guard,
   type AnyCtor,
@@ -460,19 +466,91 @@ export interface GlobalEgressGuardHandle {
   uninstall(): void;
 }
 
-/** One replaced global, with everything needed to put it back exactly as it was. */
-interface ReplacedGlobal {
-  name: string;
-  /** The descriptor as it stood immediately before capwall wrote — restored verbatim. */
-  saved: PropertyDescriptor;
-  /** What capwall installed, so `uninstall()` can tell "still ours" from "someone else's". */
-  installed: unknown;
+/**
+ * The global egress surfaces, in install order, each with the guard to build for it.
+ *
+ * The SLOTS are created once at module evaluation and own every `Object.defineProperty` on
+ * `globalThis` capwall performs (see `lifecycle/process-patch.ts`). What stays here is the only
+ * thing specific to egress: which globals, and what to replace them with.
+ */
+const EGRESS_SURFACES: ReadonlyArray<{
+  slot: GlobalPropertySlot;
+  make: (real: unknown, ctx: ShimContext) => unknown;
+}> = [
+  { slot: globalPropertySlot("fetch"), make: (real, ctx) => guardedFetch(real as AnyFn, ctx) },
+  {
+    slot: globalPropertySlot("WebSocket"),
+    make: (real, ctx) => guardedWebSocketClass(ctx, real as AnyCtor),
+  },
+  {
+    slot: globalPropertySlot("EventSource"),
+    make: (real, ctx) => guardedUrlClass(real as AnyCtor, ctx),
+  },
+];
+
+/** What the guard holds while it is installed. */
+interface EgressState {
+  /** One entry per global actually replaced — a Node with no `WebSocket`/`EventSource`
+   *  legitimately replaces fewer than three. */
+  readonly replaced: ReadonlyArray<{ slot: GlobalPropertySlot; replacement: GlobalReplacement }>;
+  /** True once the installed globals carry hardened mode's `writable: false` pin. */
+  pinned: boolean;
+}
+
+/**
+ * The live state, mirrored out of the patch so {@link globalEgressHardeningGaps} can read it.
+ * `null` whenever no install holds the guard.
+ */
+let egressState: EgressState | null = null;
+
+/**
+ * Apply hardened mode's pin to globals that are already installed un-pinned.
+ *
+ * Needed because the guard is built once while `hardened` is a PER-INSTALL option: an
+ * un-hardened install followed by `install(…, { hardened: true })` would otherwise leave
+ * `globalThis.fetch = evil` open, which is #97's exact shape — a security option accepted and
+ * silently not applied. `install()` verifies the result rather than trusting this call.
+ *
+ * The pin is a RATCHET: it is never lifted when the hardened install unwinds, only when the last
+ * install restores the saved descriptors. Un-pinning would hand a dependency a window in which a
+ * global capwall is still mediating became writable again, and fail-closed is the right default
+ * for the direction that is merely inconvenient.
+ */
+function pinGlobalEgress(state: EgressState): void {
+  for (const { slot, replacement } of state.replaced) {
+    slot.pin(replacement); // best-effort — a global someone made non-configurable is reported below
+    // The wrapper / guarded class is capwall's own object, so freezing it is safe here in a way
+    // freezing a real builtin never is (harden.ts). Matches what `harden`/`hardenClass` would
+    // have done had this install been the one that built it.
+    const installed = replacement.installed;
+    if (typeof installed === "function") {
+      const proto: unknown = (installed as { prototype?: unknown }).prototype;
+      if (typeof proto === "object" && proto !== null) Object.freeze(proto);
+      Object.freeze(installed);
+    }
+  }
+  state.pinned = true;
+}
+
+/**
+ * The capwall-installed globals that hardened mode failed to pin — empty when hardening applied,
+ * and empty when no guard is installed at all. Read by `install()`'s hardening self-check, which
+ * refuses to return a handle for a `hardened: true` it could not honor (#97).
+ */
+export function globalEgressHardeningGaps(): string[] {
+  const state = egressState;
+  if (state === null) return [];
+  const gaps: string[] = [];
+  for (const { slot, replacement } of state.replaced) {
+    if (!slot.isPinned(replacement)) gaps.push(`globalThis.${slot.name}`);
+  }
+  return gaps;
 }
 
 /*
- * EXACTLY ONE SET OF GUARDED GLOBALS PER PROCESS, REFERENCE-COUNTED (#90) — the same rule as
- * `installCompileGate` (shims/module.ts) and the env guard, for the same reasons, and here the
- * blast radius makes it sharper still. A per-install replace meant:
+ * EXACTLY ONE SET OF GUARDED GLOBALS PER PROCESS, REFERENCE-COUNTED (#90, made structural by
+ * #107) — the same rule as `installCompileGate` (shims/module.ts) and the env guard, for the same
+ * reasons, and here the blast radius makes it sharper still. A per-install replace meant:
  *
  *   - a nested install wrapped capwall's OWN wrapper, so one `fetch()` was guarded twice and
  *     recorded twice — doubling every global-egress line in an `observe` trace and running the
@@ -487,82 +565,9 @@ interface ReplacedGlobal {
  *
  * Since #87 every guard reads `liveCtx`, so one wrapper already tracks whichever install is in
  * force and the count only decides when to put the originals back.
- */
-let egressInstalls = 0;
-/** Whether the globals are currently replaced (distinct from "replaced.length > 0" — a Node with
- * no `WebSocket`/`EventSource` legitimately replaces fewer than three). */
-let egressActive = false;
-let egressReplaced: ReplacedGlobal[] = [];
-/** True once the installed globals carry hardened mode's `writable: false` pin. */
-let egressPinned = false;
-
-/**
- * Apply hardened mode's pin to globals that are already installed un-pinned.
- *
- * Needed because the guard is built once (above) while `hardened` is a PER-INSTALL option: an
- * un-hardened install followed by `install(…, { hardened: true })` would otherwise leave
- * `globalThis.fetch = evil` open, which is #97's exact shape — a security option accepted and
- * silently not applied. `install()` verifies the result rather than trusting this call.
- *
- * The pin is a RATCHET: it is never lifted when the hardened install unwinds, only when the last
- * install restores the saved descriptors. Un-pinning would hand a dependency a window in which a
- * global capwall is still mediating became writable again, and fail-closed is the right default
- * for the direction that is merely inconvenient.
- */
-function pinGlobalEgress(): void {
-  const g = globalThis as unknown as Record<string, unknown>;
-  for (const entry of egressReplaced) {
-    if (g[entry.name] !== entry.installed) continue; // someone else's value — not ours to pin
-    try {
-      Object.defineProperty(g, entry.name, {
-        value: entry.installed,
-        writable: false,
-        enumerable: entry.saved.enumerable === true,
-        configurable: true, // NEVER false — uninstall() must be able to put the original back
-      });
-    } catch {
-      // Un-mediated code can pin a global non-configurable, and then nobody — including capwall
-      // — can redefine it. Swallowing here is not ignoring it: `globalEgressHardeningGaps()`
-      // still reports the property as un-pinned, and `install()` refuses the hardened install
-      // rather than running with a security option it could not apply (#97). Throwing from
-      // inside the guard instead would leave the install half-wired with no way back.
-      continue;
-    }
-    // The wrapper / guarded class is capwall's own object, so freezing it is safe here in a way
-    // freezing a real builtin never is (harden.ts). Matches what `harden`/`hardenClass` would
-    // have done had this install been the one that built it.
-    if (typeof entry.installed === "function") {
-      const proto: unknown = (entry.installed as { prototype?: unknown }).prototype;
-      if (typeof proto === "object" && proto !== null) Object.freeze(proto);
-      Object.freeze(entry.installed);
-    }
-  }
-  egressPinned = true;
-}
-
-/**
- * The capwall-installed globals that hardened mode failed to pin — empty when hardening applied,
- * and empty when no guard is installed at all. Read by `install()`'s hardening self-check, which
- * refuses to return a handle for a `hardened: true` it could not honor (#97).
- */
-export function globalEgressHardeningGaps(): string[] {
-  if (!egressActive) return [];
-  const g = globalThis as unknown as Record<string, unknown>;
-  const gaps: string[] = [];
-  for (const entry of egressReplaced) {
-    if (g[entry.name] !== entry.installed) continue; // replaced by someone else — not our claim
-    const desc = Object.getOwnPropertyDescriptor(g, entry.name);
-    if (desc === undefined || desc.writable !== false) gaps.push(`globalThis.${entry.name}`);
-  }
-  return gaps;
-}
-
-/**
- * Install the global egress guard: replace `fetch` / `WebSocket` / `EventSource` on
- * `globalThis` with guarded equivalents, for as long as ANY install is active.
  *
  * BLAST RADIUS. This is a process-global write, so the contract is stricter than for a shim
- * namespace:
+ * namespace, and the three invariants are enforced by the slot rather than restated here:
  *  - Only globals that ALREADY EXIST are replaced. capwall never adds a global.
  *  - The property keeps its original `enumerable` flag and is always installed
  *    **`configurable: true`**, INCLUDING under hardened mode. A non-configurable global cannot
@@ -578,68 +583,37 @@ export function globalEgressHardeningGaps(): string[] {
  *    the current value is still the one capwall installed — so a later legitimate replacement is
  *    not clobbered. This mirrors the env guard and the loader patch.
  */
-export function installGlobalEgressGuard(ctx: ShimContext): GlobalEgressGuardHandle {
-  const g = globalThis as unknown as Record<string, unknown>;
-
-  if (!egressActive) {
-    const replaced: ReplacedGlobal[] = [];
-    const replace = (name: string, make: (real: unknown) => unknown): void => {
-      // Read BEFORE snapshotting the descriptor: some Node globals are installed as one-shot
-      // lazy accessors that materialize into a data property on first access, and the descriptor
-      // worth restoring is the post-materialization one (restoring the accessor would be correct
-      // too, but capturing the state we actually replaced is the simpler invariant).
-      const real: unknown = g[name];
-      if (typeof real !== "function") return; // absent on this Node / behind an unset flag
-      const saved = Object.getOwnPropertyDescriptor(g, name);
-      if (saved === undefined || saved.configurable !== true) return; // cannot install, or could not restore
-      const value = make(real);
-      Object.defineProperty(g, name, {
-        value,
+const egressPatch = defineSharedPatch<EgressState>("globalThis egress (fetch/WebSocket/EventSource)", {
+  apply(ctx) {
+    const replaced: Array<{ slot: GlobalPropertySlot; replacement: GlobalReplacement }> = [];
+    for (const surface of EGRESS_SURFACES) {
+      const replacement = surface.slot.replace(
+        (real) => surface.make(real, ctx),
         // Hardened mode (#17) closes `globalThis.fetch = evil`; see the blast-radius note above.
-        writable: ctx.hardened !== true,
-        enumerable: saved.enumerable === true,
-        configurable: true, // NEVER false — uninstall() must be able to put the original back
-      });
-      replaced.push({ name, saved, installed: value });
-    };
+        ctx.hardened === true,
+      );
+      if (replacement !== null) replaced.push({ slot: surface.slot, replacement });
+    }
+    const state: EgressState = { replaced, pinned: ctx.hardened === true };
+    egressState = state;
+    return state;
+  },
+  // Every install, not just the first: a hardened install stacked on an un-hardened one must
+  // still get its pin (#97). The first install already installed pinned, so this is a no-op there.
+  refresh(ctx, state) {
+    if (ctx.hardened === true && !state.pinned) pinGlobalEgress(state);
+  },
+  restore(state) {
+    for (const { slot, replacement } of state.replaced) slot.restore(replacement);
+    egressState = null;
+  },
+  probe: () => EGRESS_SURFACES.map((s) => s.slot.current()),
+});
 
-    replace("fetch", (real) => guardedFetch(real as AnyFn, ctx));
-    replace("WebSocket", (real) => guardedWebSocketClass(ctx, real as AnyCtor));
-    replace("EventSource", (real) => guardedUrlClass(real as AnyCtor, ctx));
-
-    egressReplaced = replaced;
-    egressActive = true;
-    egressPinned = ctx.hardened === true;
-  } else if (ctx.hardened === true && !egressPinned) {
-    pinGlobalEgress();
-  }
-  egressInstalls++;
-
-  let uninstalled = false;
-  return {
-    uninstall() {
-      if (uninstalled) return; // idempotent, like every other handle
-      uninstalled = true;
-      if (--egressInstalls > 0) return; // an outer install still wants the guard
-      for (const entry of egressReplaced) {
-        // Only put the original back if OUR value is still there — otherwise something else
-        // replaced the global after us and restoring would clobber it (mirrors env.ts).
-        if (g[entry.name] !== entry.installed) continue;
-        try {
-          Object.defineProperty(g, entry.name, entry.saved);
-        } catch {
-          // Un-mediated code can make a global NON-CONFIGURABLE after capwall installed its
-          // (configurable) replacement, and then the restore is impossible for anyone. Letting
-          // the `TypeError` escape would abort `install()`'s teardown loop partway through and
-          // leave the loader patch, the env proxy and the dlopen gate installed forever — a
-          // failure far worse than the one global capwall cannot take back. `uninstall()` must
-          // never throw.
-          continue;
-        }
-      }
-      egressReplaced = [];
-      egressActive = false;
-      egressPinned = false;
-    },
-  };
+/**
+ * Install the global egress guard: replace `fetch` / `WebSocket` / `EventSource` on
+ * `globalThis` with guarded equivalents, for as long as ANY install is active.
+ */
+export function installGlobalEgressGuard(ctx: ShimContext): GlobalEgressGuardHandle {
+  return egressPatch.install(ctx);
 }

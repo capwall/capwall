@@ -60,6 +60,7 @@ import {
   packageForPath,
 } from "../attribution/index.js";
 import { CapabilityError } from "../errors.js";
+import { definePropertyPatch, valueSlot } from "../lifecycle/process-patch.js";
 import {
   attributionOptionsFor,
   guardAttributed,
@@ -296,8 +297,8 @@ function guardCompile(ctx: ShimContext, filename: string): void {
  *    `getBuiltinModule`; it does not survive reaching past the module system entirely.
  *
  * EXACTLY ONE PATCH PER PROCESS, REFERENCE-COUNTED — unlike `process.dlopen` (loader/native.ts)
- * and `process.env` (shims/env.ts), which let nested installs stack. That is not a style choice;
- * stacking would BREAK this gate, and loudly:
+ * and `Module._load` (loader/require.ts), which let nested installs stack. That is not a style
+ * choice; stacking would BREAK this gate, and loudly:
  *
  *   Node loader -> P2 -> P1 -> real          (two installs, P2 patched second)
  *
@@ -309,28 +310,28 @@ function guardCompile(ctx: ShimContext, filename: string): void {
  * stack re-points, a single patch already tracks whichever install is in force — so one patch is
  * both necessary and sufficient, and the count only decides when to put the real method back.
  *
- * `index.ts` therefore hands this `liveCtx`, and the closure below captures the FIRST caller's
- * context. Those are the same object by construction; a caller that passes a per-install `ctx`
- * instead (a test constructing a gate directly) gets that context for the gate's whole lifetime,
- * which is why the production call site must not.
+ * THAT DIFFERENCE IS WHY #107 SHIPPED TWO NAMED HELPERS RATHER THAN ONE WITH A FLAG.
+ * `defineRelinkedPatch` (stacking) and `definePropertyPatch` (single, refcounted) are separate
+ * names in `lifecycle/process-patch.ts` precisely because a `{ stack: false }` option on one
+ * helper is the kind of thing a future patch site copies from its neighbour without reading. The
+ * two sites that MUST stack and the three that MUST NOT now say so in the function they call.
+ *
+ * `index.ts` hands this `liveCtx`, and the patch below captures the FIRST caller's context. Those
+ * are the same object by construction; a caller that passes a per-install `ctx` instead (a test
+ * constructing a gate directly) gets that context for the gate's whole lifetime, which is why the
+ * production call site must not.
+ *
+ * A Node with no `Module.prototype._compile` (a future Node, an exotic runtime) is treated as
+ * "nothing to gate" rather than crashing the host process on install — the slot reads `undefined`
+ * and `definePropertyPatch` declines.
  */
-let compileGateInstalls = 0;
-/** The patch this process installed, so a repeat install can recognize its own work. */
-let compileGatePatch: CompileFn | null = null;
-/** What to put back when the last install goes. */
-let compileGateReal: CompileFn | null = null;
-
-export function installCompileGate(ctx: ShimContext): CompileGateHandle {
-  const proto = (realModule as unknown as { prototype?: Record<string, unknown> }).prototype;
-  const real = proto?.["_compile"];
-  // `_compile` is a Node internal, so treat its absence (a future Node, an exotic runtime) as
-  // "nothing to gate" rather than crashing the host process on install.
-  if (proto === undefined || typeof real !== "function") {
-    return { uninstall() {} };
-  }
-
-  if (compileGatePatch === null) {
-    const realCompile = real as CompileFn;
+const compileGatePatch = definePropertyPatch<CompileFn>("Module.prototype._compile", {
+  slot: valueSlot<CompileFn>(
+    "Module.prototype._compile",
+    () => (realModule as unknown as { prototype?: object }).prototype,
+    "_compile",
+  ),
+  build(ctx, realCompile) {
     const patched: CompileFn = function (this: unknown, content: string, filename: string): unknown {
       if (!calledByNodeLoader(patched)) guardCompile(ctx, filename);
       return realCompile.call(this, content, filename);
@@ -339,27 +340,17 @@ export function installCompileGate(ctx: ShimContext): CompileGateHandle {
     // prototype, and a wrapper that renamed the method would be a gratuitous behavior change.
     Object.defineProperty(patched, "name", { value: "_compile", configurable: true });
     Object.defineProperty(patched, "length", { value: realCompile.length, configurable: true });
-    compileGatePatch = patched;
-    compileGateReal = realCompile;
-    proto["_compile"] = patched;
-  }
-  compileGateInstalls++;
+    return patched;
+  },
+});
 
-  let uninstalled = false;
-  return {
-    uninstall() {
-      if (uninstalled) return; // idempotent, like every other handle here
-      uninstalled = true;
-      if (--compileGateInstalls > 0) return; // an outer install still wants the gate
-      // Only restore if nothing else has since replaced it — the same contract the require patch
-      // keeps. Clobbering a `require.extensions` tool's own patch would be worse than leaving
-      // ours in place, and leaving ours in place is safe: it reads `liveCtx`, which after the
-      // last uninstall is the deny-all torn-down policy that gates nothing Node itself does.
-      if (proto["_compile"] === compileGatePatch && compileGateReal !== null) {
-        proto["_compile"] = compileGateReal;
-      }
-      compileGatePatch = null;
-      compileGateReal = null;
-    },
-  };
+/**
+ * Install the `_compile` gate. Restoring is conditional on nothing else having since replaced the
+ * method — the same contract the require patch keeps. Clobbering a `require.extensions` tool's own
+ * patch would be worse than leaving ours in place, and leaving ours in place is safe: it reads
+ * `liveCtx`, which after the last uninstall is the deny-all torn-down policy that gates nothing
+ * Node itself does.
+ */
+export function installCompileGate(ctx: ShimContext): CompileGateHandle {
+  return compileGatePatch.install(ctx);
 }

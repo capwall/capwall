@@ -146,6 +146,39 @@ export interface InstallOptions {
  */
 const UNFREEZABLE_SPECIFIERS: ReadonlySet<string> = new Set(["module", "node:module"]);
 
+/** Anything `install()` collects that has to be released on teardown. */
+interface Releasable {
+  uninstall(): void;
+}
+
+/**
+ * Release every handle, ISOLATING FAILURES (issue #107, bug 3).
+ *
+ * The bug this exists for: `uninstall()` could throw a `TypeError` — from an egress global some
+ * un-mediated code had made non-configurable between install and teardown — and that exception
+ * aborted this loop partway through, leaving the loader patch, the `process.env` proxy and the
+ * `process.dlopen` gate installed for the rest of the process. One surface capwall could not take
+ * back turned into four it did not even try to.
+ *
+ * Since #107 every process-level patch goes through `lifecycle/process-patch.ts`, whose handles
+ * are documented never to throw, so this loop is belt-and-braces for the handles that are NOT
+ * process patches (the ESM hook) and for anything a future site adds. The first error is
+ * re-reported on stderr rather than swallowed silently — teardown continues either way, because
+ * a stranded patch is strictly worse than a noisy one.
+ */
+function releaseAll(handles: readonly Releasable[]): void {
+  for (const h of handles) {
+    try {
+      h.uninstall();
+    } catch (err) {
+      process.stderr.write(
+        `[capwall] WARN uninstall() failed for one interception point and was ignored so the ` +
+          `others could still be released: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+  }
+}
+
 /**
  * FAIL LOUDLY ON A SECURITY OPTION capwall ACCEPTED BUT DID NOT APPLY (issue #97).
  *
@@ -279,7 +312,7 @@ export function install(
   if (hardened) {
     const gaps = hardeningGaps(options.esm === true, options.globalEgress !== false);
     if (gaps.length > 0) {
-      for (const h of handles) h.uninstall();
+      releaseAll(handles);
       throw new Error(
         `capwall: install({ hardened: true }) could not harden ${gaps.length} mediated ` +
           `surface(s) — ${gaps.join(", ")}. Refusing to run with a security option accepted ` +
@@ -289,7 +322,7 @@ export function install(
   }
   return {
     uninstall() {
-      for (const h of handles) h.uninstall();
+      releaseAll(handles);
     },
   };
 }
