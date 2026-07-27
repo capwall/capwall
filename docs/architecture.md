@@ -92,10 +92,13 @@ and a package compiling under its own name is not gated either; anything else ne
 identity-granting `compile` grant. See `shims/module.ts` § `installCompileGate`.
 
 **The corollary of "one shim per module surface" is that non-module surfaces are outside the
-mechanism.** `globalThis.fetch` and `globalThis.WebSocket` never route through a module load,
-so no shim ever sees them and they are neither gated nor logged — a real, open gap in egress
-coverage, written up in [`threat-model.md`](./threat-model.md) § Global egress surfaces
-(tracked as #80).
+mechanism.** `globalThis.fetch`, `globalThis.WebSocket` and `globalThis.EventSource` never
+route through a module load, so no shim can ever see them. They are instead guarded on
+`globalThis` itself (#80, `core/src/shims/global-egress.ts`), against the same `net` grant a
+module-surface egress call is checked against — a dependency does not gain anything by
+reaching for `fetch` instead of `http.request`. What that guard does and does not cover
+(redirect hops, `init.dispatcher`) is in [`threat-model.md`](./threat-model.md) § Global
+egress surfaces.
 
 One capability is deliberately NOT a shim: `native` (`.node` addon loads, S2/#49) lives in
 `core/src/loader/native.ts` and patches `process.dlopen`. There is no module to wrap — the
