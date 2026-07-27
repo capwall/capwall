@@ -34,12 +34,17 @@
  *    `exists`/`existsSync` remain bespoke non-throwing probes (see below) — untouched by
  *    the above; a denial there means "does not exist", not an error at all.
  *  - Path checks are lexical on the resolved path; symlink traversal is out of scope.
+ *  - The shim object is MUTABLE by default: `graceful-fs` and friends legitimately patch
+ *    `fs`, and breaking them would violate the no-SES-tax thesis. Opt into
+ *    `install(…, { hardened: true })` / `CAPWALL_HARDENED=1` to freeze it instead — see
+ *    `harden.ts` for exactly which surfaces that covers and which it does not.
  */
 import realFs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Readable, Writable } from "node:stream";
 import { guard, type ShimContext, type ShimRegistry } from "./runtime.js";
+import { harden } from "./harden.js";
 import { CapabilityError } from "../errors.js";
 
 export type { DecisionSink, ShimContext } from "./runtime.js";
@@ -365,6 +370,10 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
    * Wrap a path-taking stream constructor (`ReadStream`/`WriteStream`) so
    * `new fs.ReadStream(path)` is mediated exactly like `createReadStream(path)`. Uses a
    * construct-trap Proxy so `instanceof` and the class identity are preserved.
+   *
+   * NOT hardened, even under hardened mode: `Object.freeze` on a Proxy forwards to its TARGET,
+   * so freezing this would freeze the real `fs.ReadStream` class process-wide. See
+   * `harden.ts` — this is one of the surfaces hardened mode deliberately leaves alone.
    */
   function wrapPathClass<T extends abstract new (...a: never[]) => unknown>(
     RealClass: T,
@@ -432,7 +441,9 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
     if (typeof native === "function") {
       (wrapped as AnyFn & { native?: AnyFn }).native = wrapFn(native, spec, delivery);
     }
-    return wrapped;
+    // Hardened mode: freeze LAST, once `name` and `.native` are in place — otherwise
+    // `fs.realpath.native = realRealpathNative` swaps a guarded wrapper for the raw builtin.
+    return harden(ctx, wrapped);
   }
 
   function wrapSurface<T extends object>(
@@ -471,11 +482,11 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
   }
 
   // Bespoke non-throwing existence probes (deny → "does not exist").
-  shimRecord["existsSync"] = function existsSync(p: unknown): boolean {
+  shimRecord["existsSync"] = harden(ctx, function existsSync(p: unknown): boolean {
     if (isDeniedExistence(p)) return false;
     return realFs.existsSync(p as Parameters<typeof realFs.existsSync>[0]);
-  };
-  shimRecord["exists"] = function exists(p: unknown, cb: unknown): void {
+  });
+  shimRecord["exists"] = harden(ctx, function exists(p: unknown, cb: unknown): void {
     if (typeof cb !== "function") {
       // Match Node: the callback is required; defer to the real impl for the deprecation path.
       (realFs.exists as (...a: unknown[]) => void)(p, cb);
@@ -486,14 +497,15 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
       return;
     }
     (realFs.exists as (...a: unknown[]) => void)(p, cb);
-  };
+  });
 
-  (shim as { promises: unknown }).promises = wrapSurface(
-    realFs.promises,
-    PROMISES_METHODS,
-    () => "reject",
+  (shim as { promises: unknown }).promises = harden(
+    ctx,
+    wrapSurface(realFs.promises, PROMISES_METHODS, () => "reject"),
   );
-  return shim;
+  // Hardened mode: freeze the namespace LAST, after `.promises` and the class/probe overrides
+  // are in place. This is what makes `fs.readFileSync = evil` / `delete fs.readFileSync` fail.
+  return harden(ctx, shim);
 }
 
 /**

@@ -41,6 +41,20 @@ export interface InstallOptions {
    * (e.g. if the Proxy overhead is a concern for a workload that reads env in a hot loop).
    */
   env?: boolean;
+  /**
+   * HARDENED MODE (opt-in, issue #17). `Object.freeze` the capability surfaces capwall hands
+   * to dependencies — each shim namespace (`fs`, `fs.promises`, `net`, …), the guarded
+   * wrapper functions on them, and the guarded subclasses (`net.Socket`,
+   * `child_process.ChildProcess`, …) plus their prototypes — so a dependency cannot
+   * `fs.readFileSync = evil` or `net.Socket.prototype.connect = evil` its way past mediation.
+   *
+   * **Off by default, and it is not free:** freezing `fs` breaks `graceful-fs` (a transitive
+   * dependency of npm, webpack, and much of the ecosystem) and every other legitimate `fs`
+   * monkey-patcher, which is exactly why this is opt-in rather than the default. It is also
+   * **not** a sandbox: it does nothing about `process.getBuiltinModule("node:fs")` or the
+   * other raw-builtin paths. Read `docs/threat-model.md` § hardened mode before enabling it.
+   */
+  hardened?: boolean;
 }
 
 /**
@@ -59,9 +73,10 @@ export function install(
 ): InstallHandle {
   const onDecision = options.onDecision ?? (() => {});
   const projectRoot = options.projectRoot ?? process.cwd();
-  const ctx: ShimContext = { policy, mode, onDecision, projectRoot };
+  const hardened = options.hardened === true;
+  const ctx: ShimContext = { policy, mode, onDecision, projectRoot, hardened };
   const handles: Array<RequirePatchHandle | EsmHookHandle | EnvGuardHandle> = [];
-  handles.push(patchRequire(policy, mode, { onDecision, projectRoot }));
+  handles.push(patchRequire(policy, mode, { onDecision, projectRoot, hardened }));
   if (options.env !== false) {
     handles.push(installEnvGuard(ctx));
   }

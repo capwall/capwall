@@ -27,6 +27,7 @@
  */
 import realVm from "node:vm";
 import { guard, type ShimContext, type ShimRegistry } from "./runtime.js";
+import { harden } from "./harden.js";
 
 export type { DecisionSink, ShimContext, ShimRegistry } from "./runtime.js";
 
@@ -67,13 +68,16 @@ export function createVmShim(ctx: ShimContext): typeof import("node:vm") {
       return orig.apply(this, args);
     };
     Object.defineProperty(wrapped, "name", { value: orig.name, configurable: true });
-    return wrapped;
+    return harden(ctx, wrapped);
   }
 
   /**
    * Wrap a `vm` class (`Script`, `SourceTextModule`, `SyntheticModule`) so `new Vm.X(...)`
    * is gated at construction. Uses a construct-trap Proxy so `instanceof` and class identity
    * are preserved — identical approach to `fs.ts`'s `wrapPathClass`.
+   *
+   * NOT hardened even under hardened mode: `Object.freeze` on a Proxy forwards to its TARGET,
+   * so freezing this would freeze the real `vm.Script` class process-wide (see harden.ts).
    */
   function wrapClass<T extends CtorClass>(RealClass: T): T {
     return new Proxy(RealClass, {
@@ -104,7 +108,7 @@ export function createVmShim(ctx: ShimContext): typeof import("node:vm") {
     }
   }
 
-  return shim as typeof import("node:vm");
+  return harden(ctx, shim) as typeof import("node:vm");
 }
 
 /** Register the vm shim's specifiers (`vm`, `node:vm`) into the loader registry. */

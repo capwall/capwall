@@ -129,4 +129,10 @@ The implementing agent should treat these as the real work, not incidentals:
 - **Monkey-patch robustness.** capwall's shims are JS-level patches. Malicious code may try
   to un-patch them (grabbing the original builtin via internal caches / `process.binding`).
   We cannot fully prevent this without SES — document it (threat-model) and make un-patching
-  at least awkward (freeze our shim references where possible, install as early as possible).
+  at least awkward (install as early as possible). The freeze half of that is implemented as
+  **opt-in hardened mode** (`install(…, { hardened: true })` / `CAPWALL_HARDENED=1`,
+  `shims/harden.ts`): it freezes the shim namespaces, the guarded wrapper functions, and the
+  guarded subclasses + their prototypes. It cannot be the default because freezing `fs` breaks
+  `graceful-fs`; and it closes only the reassignment escape, not `process.getBuiltinModule` or
+  the construct-trap `Proxy` class wrappers (freezing a Proxy would freeze the real builtin
+  target). Full accounting in threat-model.md § Hardened mode.

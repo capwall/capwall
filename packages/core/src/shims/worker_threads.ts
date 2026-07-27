@@ -15,6 +15,7 @@
  */
 import realWorkerThreads from "node:worker_threads";
 import { guard, type ShimContext, type ShimRegistry } from "./runtime.js";
+import { harden } from "./harden.js";
 
 export type { DecisionSink, ShimContext } from "./runtime.js";
 
@@ -34,6 +35,9 @@ export function createWorkerThreadsShim(ctx: ShimContext): typeof import("node:w
 
   const RealWorker = real["Worker"];
   if (typeof RealWorker === "function") {
+    // NOT hardened even under hardened mode: `Object.freeze` on a Proxy forwards to its
+    // TARGET, so freezing this would freeze the real `Worker` class process-wide (see
+    // harden.ts). The namespace freeze below still blocks `worker_threads.Worker = Real`.
     shim["Worker"] = new Proxy(RealWorker as WorkerClass, {
       construct(target, argArray, newTarget) {
         guard(ctx, { kind: "worker_threads" }); // throws on enforce-deny, before the worker starts
@@ -42,7 +46,7 @@ export function createWorkerThreadsShim(ctx: ShimContext): typeof import("node:w
     });
   }
 
-  return shim as typeof import("node:worker_threads");
+  return harden(ctx, shim) as typeof import("node:worker_threads");
 }
 
 /** Register the worker_threads shim's specifiers into the loader registry. */

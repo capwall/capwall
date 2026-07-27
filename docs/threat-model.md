@@ -21,6 +21,10 @@ the CJS path uses; it covers **static AND dynamic** `import` (`import { readFile
 "node:fs"` and `await import("node:fs")`), attributing to the importing package exactly like
 CJS. It is **on by default** under the CLI preload (disable with `CAPWALL_ESM=0`).
 
+The shims are handed out **mutable by default** (so `graceful-fs` and friends keep working);
+`install(policy, mode, { hardened: true })` / `CAPWALL_HARDENED=1` freezes them instead —
+**off by default**, see § Hardened mode for what that does and does not buy.
+
 **ESM known limits** (documented, not silent):
 - A module that captured a raw builtin **before** capwall installed is not re-bound (same as
   CJS — install via the `--import` preload so capwall registers first).
@@ -187,8 +191,8 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
   shim is a **shared, process-wide singleton**, so a single dependency that does un-patch it
   **silently disables enforcement for every other package and the app**, not just for itself,
   with no log line. Treat capwall's mediation as effective only against packages that do not
-  go looking for the raw builtin. A future opt-in hardened mode (frozen shims, accepting the
-  `graceful-fs` breakage) is tracked as a follow-up (#17).
+  go looking for the raw builtin. **Opt-in hardened mode (#17) closes the reassignment half of
+  this** — see § Hardened mode below for exactly how much, and how little, that buys.
 - **fd / symlink escapes** — using an already-open file descriptor, or a symlink, to reach a
   path outside the allowed globs.
 - **`vm` / `eval` / `node:sqlite`** and similar reflective or alternate-execution surfaces
@@ -207,6 +211,74 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
 (a policy decision about whether they are allowed to start) but **not confinement** (control
 over what they do after starting). Do not treat a gated-but-allowed addon or subprocess as
 confined.
+
+## Hardened mode (opt-in, off by default) — issue #17
+
+`install(policy, mode, { hardened: true })`, or `CAPWALL_HARDENED=1` for the CLI preload,
+freezes the capability surfaces capwall hands to dependencies. It exists because the default
+shim is a plain mutable object, so `fs.readFileSync = evil` is a one-line, un-logged removal
+of enforcement **for the whole process** (the bullet above). Hardened mode is **off by
+default and must stay off by default** — see the graceful-fs cost below.
+
+**What it freezes** (only objects capwall itself created — never a builtin):
+
+- Every shim **namespace** handed to a dependency: `fs`, `fs.promises`, `net`, `http`,
+  `https`, `tls`, `http2`, `dgram`, `child_process`, `worker_threads`, `vm`. So
+  `fs.readFileSync = evil`, `delete fs.readFileSync`, and
+  `Object.defineProperty(fs, "readFileSync", …)` all fail.
+- Every guarded **wrapper function** on those namespaces, including wrappers hanging off
+  other wrappers (`fs.realpath.native`).
+- Every guarded **subclass** capwall builds for a capability-bearing class — `net.Socket`,
+  `tls.TLSSocket`, `http.ClientRequest`, `http.Agent`, `dgram.Socket`,
+  `child_process.ChildProcess` — **and its prototype**. The prototype freeze is the one that
+  matters: `net.Socket.prototype.connect = evil` is otherwise the same one-line un-guard as
+  above, one level down.
+- The guarded `send`/`connect` own-properties capwall installs on a `dgram` socket instance
+  (made non-writable/non-configurable; the socket itself is not frozen — it needs its state).
+
+**Observable behavior of a blocked patch.** Freezing does not raise an alarm. A write to a
+frozen object **throws a `TypeError` only under `"use strict"`**; in sloppy-mode CJS — which
+is what most published packages still are — it **silently no-ops**. There is no capwall log
+line for a blocked patch attempt. The guarantee is only that the original guarded method is
+still installed and still enforcing afterwards.
+
+**What it does NOT protect against.** Hardened mode raises the cost of un-patching. It is not
+a sandbox and it closes none of the following, all verified against a hardened install:
+
+- **`process.getBuiltinModule("node:fs")`** (Node ≥22) — a plain public API returning the
+  real, un-shimmed module. Also `process.binding`, internal module caches, and builtins loaded
+  from a context capwall has not patched. These never touch a shim object, so freezing shim
+  objects is irrelevant to them. **This alone makes hardened mode defense-in-depth, not a
+  boundary.**
+- **The construct-trap `Proxy` class wrappers** — `fs.ReadStream`/`WriteStream` (and the
+  `File*Stream` aliases), `vm.Script`/`SourceTextModule`/`SyntheticModule`, and
+  `worker_threads.Worker` are guarded by a `Proxy` over the real class, not by a guarded
+  subclass. `Object.freeze` on a Proxy forwards to its **target**, so freezing them would
+  freeze the real builtin class process-wide — a global side effect capwall refuses to take.
+  They are therefore left unfrozen, and `new (fs.ReadStream.prototype.constructor)(path)`
+  reaches the real, unguarded class in hardened mode exactly as it does without it.
+- **`http.globalAgent` / `https.globalAgent`** — the shim's `Agent` **class** is guarded, but
+  `globalAgent` is a real `Agent` instance passed through untouched, so
+  `http.globalAgent.createConnection({host, port})` is un-gated egress with or without
+  hardened mode.
+- **Replacing `process.env` wholesale** — the env read allowlist is a `Proxy` over the live
+  `process.env`, not a capwall-created namespace. Freezing it would break `process.env.X = y`
+  for the whole process and freeze the real environment object, so it is left alone;
+  `process.env = {…}` still un-gates env reads.
+- **Prototype pollution / primordials / fd + symlink escapes / `eval` / native addons /
+  subprocess internals** — unchanged. Hardening primordials is SES's job.
+- **Climbing past a guarded subclass** — `Object.getPrototypeOf(net.Socket.prototype).connect`
+  still reaches the real method. Freezing capwall's subclass says nothing about the real class
+  above it.
+
+**Cost: it breaks `graceful-fs`, and therefore anything that depends on it.** `graceful-fs` is
+a transitive dependency of npm, webpack, and a large fraction of the ecosystem, and it patches
+`fs`'s methods at load time. Against a frozen `fs` that patch throws a `TypeError` (its
+sources are strict-mode), so the dependent package fails to load. The same applies to every
+other legitimate `fs` monkey-patcher. Enabling hardened mode is a deliberate trade: you lose
+`graceful-fs`-class compatibility — the no-SES-tax property that is capwall's whole adoption
+argument — and gain the closure of the reassignment escape only. Try it in `observe` mode
+first; a load-time `TypeError` from a patcher is what failure looks like.
 
 ## Comparison to other threat models
 

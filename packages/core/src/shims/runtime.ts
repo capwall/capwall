@@ -22,6 +22,13 @@ export interface ShimContext {
   onDecision: DecisionSink;
   /** Absolute project root; used for attribution and policy-glob resolution. */
   projectRoot?: string;
+  /**
+   * Opt-in HARDENED MODE (#17): freeze the shim surfaces handed to dependencies so a
+   * dependency cannot monkey-patch away mediation. **Off by default** — it breaks
+   * `graceful-fs` and every other legitimate `fs` patcher. See `shims/harden.ts` for exactly
+   * what is (and is not) frozen, and docs/threat-model.md for what it does not protect.
+   */
+  hardened?: boolean;
 }
 
 /** A shim contributes zero or more `specifier → module object` entries to the loader registry. */

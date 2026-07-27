@@ -52,6 +52,8 @@ export const MEDIATED_MODULES = [
 export interface RequirePatchOptions {
   onDecision: DecisionSink;
   projectRoot?: string;
+  /** Opt-in hardened mode (#17): freeze the shims this registry hands out. Off by default. */
+  hardened?: boolean;
 }
 
 export interface RequirePatchHandle {
@@ -100,6 +102,7 @@ export function patchRequire(
       policy,
       mode,
       onDecision: options.onDecision,
+      hardened: options.hardened === true,
       ...(options.projectRoot !== undefined ? { projectRoot: options.projectRoot } : {}),
     }));
 
