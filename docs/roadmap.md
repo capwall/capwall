@@ -75,10 +75,25 @@ Get the full **observe → policy → enforce** loop working end-to-end on **one
   Usage: `docs/ci-local.md` § Drift detection in CI.
 
 ### S4 — full ESM parity & performance hardening
-- Close remaining ESM gaps; benchmark and hold the **<1ms/req** target (see
+- Close remaining ESM gaps; benchmark and hold the **<1ms per intercepted call** target (see
   `scripts/bench/README.md`).
-- `pnpm bench` measures the hot path and gates on scenario 1's p50 against the 1ms budget.
-  The ESM residuals that are deliberately *not* closed are named in
+- `pnpm bench` measures every mediated surface — fs (including `glob`), egress (module and
+  global), spawn, the env Proxy, attribution hits *and* misses, the install-chain parse, the
+  `Module._load` chain, the ESM import path and hardened mode — as paired, ABBA-interleaved
+  arms against the same call un-mediated, and verifies its own premises before it times
+  anything.
+- **The budget holds per intercepted call, and only per intercepted call.** Measured added
+  latency is ~30–90 µs per interception. But a single JS call is not always a single
+  interception: `{...process.env}` runs the env Proxy twice per key and cost ~4.4 ms on an
+  81-key environment. `pnpm bench` prints those cases under `AMPLIFICATION` every run rather
+  than folding them into a healthy-looking average — see `scripts/bench/README.md` § Where the
+  budget does not hold. Any doc that states `<1ms/req` without the "per intercepted call"
+  qualifier is overclaiming.
+- `pnpm bench:gate` is the reduced run wired into CI and `pnpm ci:local`. It gates on three
+  things: the 1 ms per-interception budget, the harness's own self-checks, and a **ratio**
+  against a CPU calibration co-sampled in the same loop — the ratio is what actually catches a
+  regression, because the 1 ms budget has 10–30x headroom and would not notice a 3x slowdown.
+- The ESM residuals that are deliberately *not* closed are named in
   `docs/threat-model.md` § ESM known limits.
 
 ## Milestones summary
@@ -93,4 +108,4 @@ Get the full **observe → policy → enforce** loop working end-to-end on **one
 | S1 | SBOM/CBOM import | @capwall/sbom-import | ✅ done |
 | S2 | native-addon attribution | `.node` loads attributed + gated | ✅ done |
 | S3 | CI observed-vs-declared diff | `capwall diff` flags drift | ✅ done |
-| S4 | perf benchmark | pnpm bench, <1ms/req validated | ✅ done |
+| S4 | perf benchmark | pnpm bench, <1ms per intercepted call validated across every mediated surface; `pnpm bench:gate` in CI | ✅ done |

@@ -53,9 +53,10 @@ landed, and stayed false until #57. `packages/cli/test/express-app-policy.test.t
 now.
 
 The stretch items also landed: **S1** SBOM/CBOM →
-policy (`@capwall/sbom-import`), **S4** the perf benchmark (`pnpm bench`; measured per-call
-overhead is tens of microseconds, well inside the <1ms/req budget — see issue #34 on the cost
-model), **S3** the observed-vs-declared drift diff (`capwall diff`), and **S2** the
+policy (`@capwall/sbom-import`), **S4** the perf benchmark (`pnpm bench`; measured overhead is
+tens of microseconds per INTERCEPTED CALL, well inside the <1ms budget — with one measured
+exception, `{...process.env}`, where a single JS call is one interception per env key; see
+§ 5 and `scripts/bench/README.md`), **S3** the observed-vs-declared drift diff (`capwall diff`), and **S2** the
 native-addon load gate
 (`native` capability, `core/src/loader/native.ts` — a `process.dlopen` patch; gating only,
 never confinement, see `docs/threat-model.md` § Native `.node` addons). The **ESM hook (M5)**
@@ -142,15 +143,21 @@ Do not start step *n+1* until step *n* has passing tests and a clean typecheck.
   gate, not a style gate — it is configured to catch what `tsc` cannot (unused bindings,
   `no-explicit-any`, misuse patterns) and the pedantic/style rules are deliberately off. If a
   new rule would mean reformatting the codebase, it does not belong here.
-- **Performance.** Keep the hot path (attribution + policy lookup per intercepted call) with
-  the **<1ms/req** target in mind — the S4 benchmark (`pnpm bench`) measures added latency in
-  the tens of microseconds, comfortably inside it. The cost splits roughly evenly between
-  **attribution stack-walking** and the **shim wrapper's own dispatch** — not
-  attribution-dominant as originally assumed (see issue #34); policy `evaluate()` is
-  negligible. The exact split is machine-dependent (#34 measured ~40/~55; runs since have
-  landed nearer 50/50) — re-measure rather than quoting it. Cache module→package resolution
-  (the path→package cache gives ~20x cold-vs-warm); if you need more headroom, profile the
-  shim wrapper too.
+- **Performance.** The target is **<1ms per INTERCEPTED CALL**, and that qualifier is now
+  load-bearing. The S4 benchmark (`pnpm bench`) measures every mediated surface at tens of
+  microseconds of added latency, comfortably inside the budget — but **one JS call is not
+  always one interception**, and where it is not, the per-call budget does not hold:
+  `{...process.env}` is ~2 interceptions per environment variable and costs **milliseconds**
+  (measured ~4.4ms on an 81-key environment). The harness prints those cases under
+  `AMPLIFICATION` on every run; do not quote the headline without them. See
+  `scripts/bench/README.md` § Where the budget does not hold.
+  Two more things the benchmark now says that older notes here did not:
+  **cost scales with stack depth** (attribution materializes up to `maxFrames` CallSites per
+  call, so a 3-frame stack — what the old harness measured — under-reports a realistic one by
+  ~40%), and at a realistic depth **attribution is ~70% of the added latency**, not the ~50%
+  issue #34 recorded from a shallow stack. `evaluate()` is negligible (~125ns). Cache
+  module→package resolution (the path→package cache gives ~50x cold-vs-warm); if you need
+  headroom, the stack walk is where it is.
 - **License hygiene.** capwall is MIT. **Do NOT** pull in non-compete / source-available
   code (e.g. PolyForm-licensed Socket code). Prefer permissive (MIT/BSD/Apache-2.0) deps
   only.

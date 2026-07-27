@@ -22,6 +22,7 @@
     "test": "pnpm -r run test",
     "lint": "oxlint",
     "bench": "node scripts/bench/bench.mjs",
+    "bench:gate": "node scripts/bench/bench.mjs --quick",
     "ci:local": "bash scripts/ci-local.sh",
     "ci:local:22": "bash scripts/ci-local.sh 22"
   },

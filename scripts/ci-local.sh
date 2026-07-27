@@ -2,13 +2,14 @@
 # Run the full GitHub Actions CI matrix (.github/workflows/ci.yml) locally in Docker.
 #
 # Why: GitHub Actions is billing-blocked (issue #3), so PRs get no CI. This reproduces the
-# exact gates — pnpm install → build → typecheck → test → lint — on each Node version in the
-# CI matrix, in a clean container, so a merge can be gated on a real green run.
+# exact gates — pnpm install → build → typecheck → test → lint → bench:gate — on each Node
+# version in the CI matrix, in a clean container, so a merge can be gated on a real green run.
 #
 # Usage:
 #   scripts/ci-local.sh                 # Node 20 and 22 (the ci.yml matrix)
 #   scripts/ci-local.sh 22              # just Node 22 (fast iteration)
 #   CI_NODE_VERSIONS="18 20 22" scripts/ci-local.sh
+#   CI_BENCH=0 scripts/ci-local.sh      # skip the perf gate (scripts/bench/README.md)
 #
 # The build context is your current working tree's tracked + new (non-ignored) files — the
 # same set CI would check out, including the committed vendored fixtures and any uncommitted
@@ -52,10 +53,11 @@ for v in "${NODE_VERSIONS[@]}"; do
   if build_context | DOCKER_BUILDKIT="${CI_BUILDKIT:-0}" docker build \
       --build-arg "NODE_VERSION=${v}" \
       --build-arg "CACHEBUST=${CACHEBUST}" \
+      --build-arg "BENCH=${CI_BENCH:-1}" \
       -f "${DOCKERFILE}" \
       -t "capwall-ci:node${v}" \
       - ; then
-    echo "✅ Node ${v}: install + build + typecheck + test + lint all PASSED"
+    echo "✅ Node ${v}: install + build + typecheck + test + lint + perf gate all PASSED"
     RESULTS+=("Node ${v}: PASS")
   else
     echo "❌ Node ${v}: a gate FAILED (see the output above)"

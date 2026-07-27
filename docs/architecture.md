@@ -306,12 +306,19 @@ The implementing agent should treat these as the real work, not incidentals:
   error handlers, rare branches, and lazy requires will trip `enforce` mode later
   (false-positive fatigue). Mitigations: make "add a missing capability" a one-liner,
   support staged/partial enforcement, and merge (not overwrite) on repeated observe runs.
-- **Performance (<1ms/req).** The S4 benchmark (`pnpm bench`) says the cost is **not**
-  attribution-dominant, which is what this bullet originally assumed: it splits roughly
-  evenly between attribution stack-walking (~40%) and the shim wrapper's own dispatch (~55%),
-  with `evaluate()` negligible (issue #34). Cache module→package resolution aggressively (the
-  path→package cache is worth ~20x cold-vs-warm); avoid allocations on the hot path; and if
-  you need more headroom, profile the wrapper too, not just the walk.
+- **Performance (<1ms per intercepted call).** The S4 benchmark (`pnpm bench`) puts every
+  mediated surface at ~30–90 µs of added latency per interception, well inside the budget. Two
+  corrections to what this bullet used to say, both from the broadened harness:
+  **(1) the cost is attribution-dominant after all, at realistic stack depths.** Issue #34's
+  "roughly 50/50 between the stack walk and the wrapper's dispatch" was measured from a
+  three-frame stack. Attribution materializes up to `maxFrames` (25) V8 CallSites per call, so
+  the cost scales with the caller's depth: ~16 µs at depth 0, ~30 µs at the cap, which is ~70%
+  of the added latency for a call made from a realistic stack. The walk is where the headroom
+  is. **(2) the per-call budget does not hold where one JS call is many interceptions** —
+  `{...process.env}` costs ~2 attributions per environment variable and measured ~4.4 ms on an
+  81-key environment. Cache module→package resolution aggressively (the path→package cache is
+  worth ~50x cold-vs-warm); avoid allocations on the hot path; and read
+  `scripts/bench/README.md` before quoting a headline figure.
 - **Monkey-patch robustness.** capwall's shims are JS-level patches. Malicious code may try
   to un-patch them (grabbing the original builtin via internal caches / `process.binding`).
   We cannot fully prevent this without SES — document it (threat-model) and make un-patching
