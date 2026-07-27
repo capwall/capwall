@@ -3,6 +3,12 @@
 The authoritative build order. `AGENTS.md` § 4 mirrors this. **Do not start a step until the
 previous step has passing tests and a clean typecheck** (`pnpm -r test && pnpm -r typecheck`).
 
+> **This file is the single place milestone status is tracked.** Other docs point here rather
+> than restating it — they drifted twice when they did not. As of now, **M1–M5 and S1–S4 are
+> all done** (table at the bottom). "Done" means implemented and tested, not that capwall is
+> a boundary: read [`threat-model.md`](./threat-model.md) for what the mediation is and is
+> not worth.
+
 ## Principle: depth before breadth
 
 Get the full **observe → policy → enforce** loop working end-to-end on **one capability
@@ -47,7 +53,9 @@ Get the full **observe → policy → enforce** loop working end-to-end on **one
 
 ### S1 — SBOM / CBOM import
 - `@capwall/sbom-import`: CycloneDX (and CBOM) → starter policy, NodeShield-compatible.
-  Currently a stub; see `packages/sbom-import/README.md`.
+  Implemented — `sbomToPolicy()` / `parseCycloneDx()`, reading `capwall:*` component
+  properties as the CBOM annotation convention. No runtime dependency (a CycloneDX SBOM is
+  JSON). See `packages/sbom-import/README.md`.
 
 ### S2 — native-addon attribution
 - Attribute (and gate) `.node` addon loads. Confinement remains a non-goal.
@@ -59,12 +67,19 @@ Get the full **observe → policy → enforce** loop working end-to-end on **one
   owning package, so a shared resolver's grant is not a tree-wide skeleton key.
 
 ### S3 — CI observed-vs-declared diff
-- A CI action that runs observe and diffs against the committed policy, flagging new
-  capabilities a dependency started using (drift detection).
+- Runs observe and diffs against the committed policy, flagging new capabilities a dependency
+  started using (drift detection).
+- Shipped as the **`capwall diff`** subcommand (`cli/src/commands/diff.ts`): exit 0 = no
+  drift, 1 = drift, 2 = usage error / missing policy, plus `--json`. It gates
+  `examples/express-app` in this repo (`packages/cli/test/express-app-policy.test.ts`).
+  Usage: `docs/ci-local.md` § Drift detection in CI.
 
 ### S4 — full ESM parity & performance hardening
 - Close remaining ESM gaps; benchmark and hold the **<1ms/req** target (see
   `scripts/bench/README.md`).
+- `pnpm bench` measures the hot path and gates on scenario 1's p50 against the 1ms budget.
+  The ESM residuals that are deliberately *not* closed are named in
+  `docs/threat-model.md` § ESM known limits.
 
 ## Milestones summary
 

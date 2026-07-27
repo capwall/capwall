@@ -193,7 +193,7 @@ const attrStats = stats(attrNs);
 printStats("attributeCaller()", attrStats);
 console.log(
   `  -> ${((attrStats.mean / deltaStats.mean) * 100).toFixed(1)}% of scenario 1's mean added latency ` +
-    `(AGENTS.md §5: attribution is expected to dominate)`,
+    `(the rest is the shim wrapper's own dispatch — attribution does NOT dominate, see issue #34)`,
 );
 console.log();
 

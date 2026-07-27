@@ -2,13 +2,19 @@
  * @capwall/core — public entry point.
  *
  * `install(policy, mode)` turns capwall on for the current process: it patches the CJS
- * loader (and, later, registers the ESM hook) so that subsequent requires/imports of
- * capability-sensitive core modules return capwall's shims, which attribute each call to its
- * owning package and evaluate it against `policy` under `mode`.
+ * loader and (with `esm: true`, which the CLI preload sets) registers the ESM hook, so that
+ * subsequent requires/imports of capability-sensitive core modules return capwall's shims,
+ * which attribute each call to its owning package and evaluate it against `policy` under
+ * `mode`.
  *
- * CURRENT SCOPE (roadmap M4): the CJS path mediates fs, net/http(s), child_process,
- * worker_threads, vm (via the require registry) and process.env (via installEnvGuard). The
- * ESM hook is still a stub (roadmap M5).
+ * SCOPE. Mediated on BOTH the CJS require path and the ESM import path (roadmap M4 + M5):
+ * fs; the six egress modules net/http/https/tls/http2/dgram — each registered separately,
+ * because one module's shim never covers another (see docs/threat-model.md); child_process;
+ * worker_threads; vm; and node:module, which is mediated to keep a dependency from
+ * registering a loader hook ahead of capwall's (#61) rather than as a policy capability.
+ * Two capabilities are NOT require-routed and are installed directly here: process.env
+ * (installEnvGuard) and `native` .node addon loads (installNativeGate, a process.dlopen
+ * patch — roadmap S2, gating only, never confinement).
  */
 import { patchRequire, type RequirePatchHandle } from "./loader/require.js";
 import { registerEsmHook, type EsmHookHandle } from "./loader/esm-hook.js";
@@ -25,7 +31,13 @@ export interface InstallHandle {
 }
 
 export interface InstallOptions {
-  /** Also register the ESM loader hook (roadmap M5). Off by default while CJS-first. */
+  /**
+   * Also register the ESM loader hook (roadmap M5, implemented). Off by default for
+   * programmatic embedders — the CLI preload sets it to `true` unless `CAPWALL_ESM=0`.
+   * Note that unregistering is best-effort: Node cannot fully remove a registered hook, so
+   * ESM teardown is fail-closed rather than reversible (docs/threat-model.md § ESM known
+   * limits).
+   */
   esm?: boolean;
   /**
    * Called on EVERY capability decision (allowed and denied, both modes). This is the log
@@ -51,9 +63,12 @@ export interface InstallOptions {
      * SECURITY (issue #15): the walk charges the call to the nearest dependency frame it
      * finds. If the owning dependency sits deeper than this budget (long promise chains,
      * heavily-wrapped utilities, async_hooks-heavy frameworks), the walk runs out of frames
-     * and falls back to `<app>` — which typically holds BROAD grants, so a call that should
-     * have been denied can be allowed. Raise this for deep stacks; the cost is a longer walk
-     * on every mediated call (see the <1ms/req budget in AGENTS.md § 5).
+     * and falls back to `<unknown>` — an ordinary deny-by-default principal since #60, so a
+     * capped attribution now fails CLOSED (a benign deep stack is wrongly denied rather than
+     * wrongly allowed, which is what falling back to `<app>` used to mean). The decision
+     * carries `attributionTruncated: true` in that case, so the fix is to raise this budget
+     * rather than to grant `<unknown>`. Raising it costs a longer walk on every mediated call
+     * (see the <1ms/req budget in AGENTS.md § 5).
      *
      * Invalid values (non-integer, zero, negative, garbage) are IGNORED with a stderr warning
      * and the default is used — capwall must not crash a host app over a config typo.

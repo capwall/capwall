@@ -40,8 +40,11 @@ function sortedUnique(values: string[]): string[] {
 }
 
 /**
- * Merge observed trace entries into `existing` (or a fresh empty policy). Only fs entries
- * are produced today (roadmap M1–M3); other kinds are ignored until their shims land in M4.
+ * Merge observed trace entries into `existing` (or a fresh empty policy). Every capability
+ * kind is handled: fs, net, env, child_process, worker_threads, vm and native. Merging is
+ * ADDITIVE — a re-run appends to an existing policy rather than replacing it, which is why
+ * `docs/policy-format.md` § Generating a policy tells you to observe into a scratch file when
+ * you have a reviewed policy you want to keep.
  */
 export function mergeTraceIntoPolicy(
   entries: TraceEntry[],
