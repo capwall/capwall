@@ -236,6 +236,15 @@ Per-capability notes:
   `worker_threads.Worker`, `vm.Script`, and (only when `--experimental-vm-modules` makes them
   exist) `vm.SourceTextModule`/`vm.SyntheticModule` — are guarded subclasses, so the class is
   gated as well as the module function.
+
+  For `child_process`, the caller's **options object is pinned** before the real call (#89):
+  every own accessor is flattened to a value, so nothing the caller controls executes while the
+  spawn is in progress and Node cannot observe a field changing between capwall's read and its
+  own. That closes a `validate-one-value / execute-another` divergence that exists in plain Node
+  — `execFileSync` reads `options.argv0` five times, validating an early read and using a later
+  one as the child's `argv[0]` — and it is the mechanism that made a `child_process` grant
+  silently confer unlimited `process.env` reads before #89. See the `process.env` entry below for
+  what the spawn/env interaction now is, and what is still reachable during it.
 - **`native` (`.node` addons)** — a **load-time gate, not a runtime sandbox** (roadmap S2,
   issue #49). capwall decides whether a package may load a native addon at all; it does not,
   and will not, confine what that addon does once loaded. Read the whole of § Native `.node`
@@ -247,10 +256,7 @@ Per-capability notes:
   — the app is the trust root — but that means a **positively identified application source
   file on the stack**, and nothing else. A read capwall cannot attribute is `<unknown>` and is
   gated exactly like a dependency's (see § attribution outcomes). `CAPWALL_*` keys (capwall's
-  own preload plumbing) are never gated or recorded. When a package **spawns a child**, Node
-  reads `process.env` to build the child's environment block; those reads are exempted (the
-  child_process shim suspends the env gate around the spawn) so an allowed spawn inherits a
-  real environment rather than an empty one. A denied env read is a **soft deny**: it returns
+  own preload plumbing) are never gated or recorded. A denied env read is a **soft deny**: it returns
   `undefined` (hiding the value) rather than throwing, so a benign dependency probing an
   optional var is not crashed. The denial is still recorded and logged. **Key NAMES stay
   enumerable** to a denied dependency (`Object.keys`, `in`, `for..in`); only VALUES are hidden
@@ -273,6 +279,47 @@ Per-capability notes:
   returning an accessor descriptor so only an explicit `desc.get()` records) are spoofable by
   the attacker they target or catch only an attacker who has already adapted to capwall, and a
   spoofable heuristic inside the anti-exfiltration control is worse than a documented gap.
+
+  **Spawning and env (#89).** Node reads `process.env` while assembling a child's environment
+  block, from a stack whose nearest frame is the spawning dependency — indistinguishable from
+  that dependency reading the key itself. Gating those reads would launch the child with no
+  `PATH`/`HOME`, so something has to give. capwall used to bracket the **entire real spawn call**
+  with a process-wide suspension of the env gate, and forward the caller's options object
+  unpinned. Node reads that object *inside* the bracket, so a getter on `options.cwd` ran with
+  the gate off and copied every value out of `process.env` — unrecorded, and not even limited to
+  the spawning package: any other dependency reached from that getter read ungated too. That was
+  issue #89.
+
+  It is now handled in two independent ways, neither of which is a general suspension:
+
+  - **The options object is pinned.** Every own accessor on it is invoked exactly once, on
+    capwall's own stack, *before* the real call, and flattened into a data property; the object
+    handed to Node contains no getters. This is the same rule, and now literally the same
+    helper (`shims/pin.ts`), that `net` has applied since #26/#56. A caller's getter therefore
+    runs at a moment when nothing has been relaxed, and its env reads are gated and recorded
+    like any other read by that package.
+  - **The whole-environment read is eliminated, not exempted.** capwall always supplies an
+    explicit `options.env` — snapshotted from the un-proxied environment when the caller supplies
+    none — so Node's `options.env || { ...process.env }` never enumerates the proxy at all.
+
+  **What remains inside the window.** Node reads a small fixed set of variables *by name*
+  regardless of what the caller passed, and capwall cannot remove those reads from outside Node.
+  Exactly those keys — `NODE_V8_COVERAGE` on every platform, `comspec` on win32 with
+  `shell: true`, and nine z/OS codepage/redirect variables on `os390` — pass ungated, by exact
+  string match, and only while a real spawn is on the stack. Every other key stays gated and
+  recorded, for every package, including inside the real call. Nested objects the caller supplies
+  (`options.env`'s own keys, `options.stdio` entries' `fd`/`handle` getters, a duck-typed
+  `options.signal`, `toString` on an `args` element, a `URL` subclass as `cwd`) are values rather
+  than fields, so they are not flattened and their accessors *can* still run inside that window —
+  which is precisely why the exemption is scoped to keys rather than to wall-clock duration.
+  `new ChildProcess().spawn(options)` opens no window at all: it consumes an already-built
+  `envPairs` and Node's `internal/child_process.js` reads no `process.env`.
+
+  *Residual:* caller-controlled code running inside a spawn can learn whether (and to what)
+  those listed variables are set. They name a coverage output directory, the Windows command
+  interpreter, and z/OS stream settings; none can carry an application secret. Those reads are
+  also not recorded, on the same reasoning as `CAPWALL_*` — they are Node's plumbing, and
+  recording them would widen every generated policy with a key no dependency asked for.
 
   **Writes are NOT mediated (#66).** `env` grants are a *read* allowlist; a dependency may set,
   delete, and `defineProperty` on `process.env` freely, exactly as un-shimmed. The proxy's `set`

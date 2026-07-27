@@ -86,12 +86,24 @@
  * implementation detail, not app secrets, and gating them would pollute generated policies
  * and cause spurious mode-dependent denials (they differ between observe and enforce).
  *
- * When the env gate is suspended (see runtime.ts `suspendEnvGate` — used by the
- * child_process shim so a spawned child inherits a real environment), all reads pass through.
+ * THE SPAWN EXEMPTION IS KEY-SCOPED SINCE #89. It used to be `isEnvGateSuspended()`: a
+ * process-wide boolean the child_process shim raised around the whole real spawn, which turned
+ * this gate off for EVERY key and EVERY package for the duration — so a getter on a spawn
+ * options object read the entire environment ungated and unrecorded, and so did an unrelated
+ * dependency with no grants at all. It is now `isAuthorizedEnvKey(key)`: a fixed, audited set of
+ * non-secret keys that Node's own spawn implementation reads by name, exempt only while a real
+ * spawn is on the stack. See runtime.ts and shims/child_process.ts. Like `CAPWALL_*`, those keys
+ * are not recorded — they are Node's plumbing, not a package's read of a secret, and recording
+ * them would widen every generated policy with a key no dependency asked for.
  */
 import { APP_ROOT, attributeCaller } from "../attribution/index.js";
 import { evaluate, type Decision } from "../policy/evaluate.js";
-import { attributionOptionsFor, isEnvGateSuspended, type ShimContext } from "./runtime.js";
+import {
+  attributionOptionsFor,
+  isAuthorizedEnvKey,
+  setUnproxiedEnv,
+  type ShimContext,
+} from "./runtime.js";
 
 export interface EnvGuardHandle {
   /** Restore the original `process.env`. Best-effort: only if nobody replaced it after us. */
@@ -105,7 +117,8 @@ export function createEnvProxy(
 ): NodeJS.ProcessEnv {
   /**
    * Attribute + evaluate a single key read, WITHOUT reporting it. Returns `null` when the read
-   * is exempt entirely — symbol keys, a suspended gate, `CAPWALL_*` plumbing, and reads
+   * is exempt entirely — symbol keys, one of the few keys Node's own spawn reads while a spawn
+   * is on the stack (#89), `CAPWALL_*` plumbing, and reads
    * attributed to `<app>` (application code; see header) — and otherwise the attributed
    * package plus its decision. An UNATTRIBUTABLE read is not exempt: it comes back as
    * `<unknown>` with a decision, like any dependency (#60).
@@ -117,7 +130,9 @@ export function createEnvProxy(
    */
   function decide(key: string | symbol): { pkg: string; decision: Decision } | null {
     if (typeof key !== "string") return null;
-    if (isEnvGateSuspended()) return null;
+    // #89: exempt by KEY, not by wall-clock window. Only the fixed non-secret keys Node's own
+    // spawn implementation reads by name, and only while a real spawn is on the stack.
+    if (isAuthorizedEnvKey(key)) return null;
     if (key.startsWith("CAPWALL_")) return null;
     // Shared frame budget with every other attribution site (#15/#58) — a shim that quietly
     // kept the default while the rest honored a raised cap would attribute the same call to a
@@ -216,9 +231,15 @@ export function installEnvGuard(ctx: ShimContext): EnvGuardHandle {
   const realEnv = process.env;
   const proxy = createEnvProxy(realEnv, ctx);
   process.env = proxy;
+  // #89: hand the un-proxied reference to the shim runtime so the child_process shim can build a
+  // child's environment block WITHOUT enumerating this proxy. That enumeration — Node's
+  // `options.env || { ...process.env }` — is what the old process-wide gate suspension existed to
+  // let through; supplying the env explicitly deletes the need for it rather than narrowing it.
+  setUnproxiedEnv(realEnv);
   return {
     uninstall() {
       if (process.env === proxy) process.env = realEnv;
+      setUnproxiedEnv(undefined);
     },
   };
 }
