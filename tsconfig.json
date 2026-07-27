@@ -11,5 +11,5 @@
       "@capwall/core/preload": ["packages/core/src/preload.ts"]
     }
   },
-  "include": ["packages/*/src/**/*.ts", "packages/*/test/**/*.ts"]
+  "include": ["packages/*/src/**/*.ts", "packages/*/src/**/*.cts", "packages/*/test/**/*.ts"]
 }

@@ -82,7 +82,7 @@
  *    is set. (`options.killSignal` is NOT a hook — Node rejects a non string/number before any
  *    coercion, so no `toString` runs.)
  */
-import realChildProcess from "node:child_process";
+import { realChildProcess } from "../real-builtins.cjs"; // never `import … from "node:child_process"` — see #78
 import {
   defineGuardedClassIdentity,
   guard,

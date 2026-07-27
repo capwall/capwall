@@ -52,7 +52,7 @@
  * never gated or recorded by the env guard, so reading it here is safe from inside a shim.
  */
 import * as path from "node:path";
-import realModule from "node:module";
+import { realModule } from "../real-builtins.cjs"; // never `import … from "node:module"` — see #78
 import {
   APP_ROOT,
   attributeCaller,

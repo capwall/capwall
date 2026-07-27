@@ -15,7 +15,11 @@
  * `path.isAbsolute` doesn't recognize a drive letter as absolute and would wrongly resolve the
  * glob AS IF relative, against `projectRoot` — producing garbage like `/proj/C:/logs/**`.
  */
-import { readFile } from "node:fs/promises";
+// capwall's own fs, captured through `../real-builtins.cjs` rather than a static
+// `import … from "node:fs/promises"` — that import would cache the mediated specifier in the ESM
+// module cache before the loader hook registers, which is what left the hook's re-mediation
+// backstop dead (#78). `node:path` is not mediated and stays an ordinary import.
+import { realFsPromises } from "../real-builtins.cjs";
 import * as path from "node:path";
 import {
   parsePolicy,
@@ -91,7 +95,7 @@ export async function loadPolicy(
   filePath: string,
   options: LoadPolicyOptions = {},
 ): Promise<Policy> {
-  const raw = await readFile(filePath, "utf8");
+  const raw = await realFsPromises.readFile(filePath, "utf8");
   const json: unknown = JSON.parse(raw);
   return normalizePolicy(parsePolicy(json), options.projectRoot);
 }

@@ -3,7 +3,9 @@
  * map the CJS loader consumes: requiring a registered specifier hands back the shim.
  *
  * Adding a capability shim is two lines: import its `register*Shim` and call it here. Each
- * shim owns which specifiers it claims; the loader stays generic. Every specifier in
+ * shim owns which specifiers it claims; the loader stays generic. The shim itself must take its
+ * REAL module from `../real-builtins.cjs` and never from a static `import … from "node:x"` — see
+ * that file for why (#78); `test/real-builtins.test.ts` fails the build otherwise. Every specifier in
  * `loader/require.ts` MEDIATED_MODULES is currently claimed by a shim registered below —
  * keep it that way, since a mediated-but-unregistered specifier passes through un-shimmed
  * (silently, with no log line).

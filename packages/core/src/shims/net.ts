@@ -129,12 +129,16 @@
  * `http2.connect` both strip the brackets a `URL` keeps on `.hostname`. Brackets are put back
  * only when composing a URL/authority STRING, where `http://::1:8080` would not parse.
  */
-import realNet from "node:net";
-import realHttp from "node:http";
-import realHttps from "node:https";
-import realTls from "node:tls";
-import realHttp2 from "node:http2";
-import realDgram from "node:dgram";
+// All six real egress modules come from `../real-builtins.cjs` (#78) — see that file for why a
+// static `import … from "node:net"` would leave the ESM load-hook backstop dead.
+import {
+  realDgram,
+  realHttp,
+  realHttp2,
+  realHttps,
+  realNet,
+  realTls,
+} from "../real-builtins.cjs";
 import { APP_ROOT, attributeCaller } from "../attribution/index.js";
 import { evaluate, type CapabilityRequest } from "../policy/evaluate.js";
 // #72 — IPC destinations carry their concrete socket path now, canonicalized here (once, at the

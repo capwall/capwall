@@ -46,9 +46,31 @@ export function popEsmContext(ctx: ShimContext): void {
   popInstall(ctx);
 }
 
-/** The specifiers that have shims (registry keys) — the set the ESM resolve hook mediates. */
-export function esmSpecifiers(): string[] {
-  return [...liveRegistry("esm").keys()];
+/**
+ * specifier → the named exports its synthetic module must declare, for every specifier the ESM
+ * path mediates. This is the whole payload `registerEsmHook` ships to the loader thread: the
+ * thread cannot import a mediated builtin itself (that would recurse through `resolve` and loop),
+ * so the export names have to be enumerated here, on the main thread.
+ *
+ * Enumerated from the ESM SHIMS — the very objects `getEsmShim` will hand the synthetic modules —
+ * rather than from the real builtins. The two key sets are the same (the shims copy every own
+ * key), but taking them from the shim is what guarantees no generated `export const x = shim.x`
+ * can name something the shim does not have. Before #78 this read the shims back through a
+ * `createRequire()` of each specifier, which worked only because `Module._load` was already
+ * patched by the time it ran; going straight to the registry drops that indirection along with
+ * the `node:module` import it needed (see `real-builtins.cts`).
+ */
+export function esmExportNames(): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const [specifier, shim] of liveRegistry("esm")) {
+    // `typeof shim === "function"` is NOT a defensive extra: `node:module`'s shim is a Proxy over
+    // the `Module` CLASS, so an object-only test silently yields zero export names for it and the
+    // synthetic module ends up with nothing but a default — which is `module.register` vanishing
+    // from the ESM namespace, i.e. #61's gate disappearing rather than failing loudly.
+    const enumerable = typeof shim === "object" || typeof shim === "function";
+    out[specifier] = enumerable && shim !== null ? Object.keys(shim as object) : [];
+  }
+  return out;
 }
 
 /**

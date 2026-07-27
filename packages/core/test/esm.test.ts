@@ -13,6 +13,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { MEDIATED_MODULES } from "../src/loader/require.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const APP = path.join(here, "fixtures", "esm", "app.mjs");
@@ -23,6 +24,8 @@ const LAUNDER_APP = path.join(APP_DIR, "launder-app.mjs");
 const HOOKJACK_APP = path.join(APP_DIR, "hookjack-app.mjs");
 /** #62 regression entry: an embedder swapping policy at runtime (installs capwall itself). */
 const POLICY_SWAP_APP = path.join(APP_DIR, "policy-swap-app.mjs");
+/** #78 regression entry: a loader hook ahead of capwall's, caught by the load()-level backstop. */
+const BACKSTOP_APP = path.join(APP_DIR, "backstop-app.mjs");
 const PRELOAD = createRequire(import.meta.url).resolve("../dist/preload.js");
 
 interface RunResult {
@@ -110,7 +113,13 @@ describe("#59 — a specifier that RESOLVES to a mediated builtin is mediated, h
   // (plain, documented Node metadata — bare targets work, `"node:fs"` targets are rejected by
   // Node). Against the pre-fix hook, which classified on the specifier STRING, every route
   // below reached the raw builtin and produced no capwall log line at all.
-  const ROUTES = ["bare-fs", "cond-fs", "pat-fs"] as const;
+  //
+  // `self-fs` (a module reached through the package's own `exports` map by package name, which
+  // re-exports `#bare-fs`), `data-fs` (a `data:` URL module re-exporting the builtin — no
+  // filesystem parent, and the route #60 showed defeats attribution if it is not handled) and
+  // `meta-fs` (`import.meta.resolve` to a `node:` URL, then importing that string) are the same
+  // finding reached three other ways.
+  const ROUTES = ["bare-fs", "cond-fs", "pat-fs", "self-fs", "data-fs", "meta-fs"] as const;
 
   it("denies every subpath-imports route to fs under a deny-all policy", async () => {
     const r = await runApp(
@@ -125,12 +134,16 @@ describe("#59 — a specifier that RESOLVES to a mediated builtin is mediated, h
     expect(r.stdout).not.toMatch(/LAUNDER:[a-z-]+:RAW/);
   });
 
-  it("denies the subpath-imports route to child_process too", async () => {
+  it("denies the subpath-imports routes to child_process and fs/promises too", async () => {
+    // `fs/promises` is a separate registry key with its own shim surface and its own denial
+    // channel (a rejected promise, not a synchronous throw), so it is its own route rather than
+    // a spelling of `fs`.
     const r = await runApp(
       { CAPWALL_MODE: "enforce", CAPWALL_POLICY_FILE: denyPolicy },
       LAUNDER_APP,
     );
     expect(r.stdout).toContain("LAUNDER:bare-cp:BLOCKED:esm-launder-dep");
+    expect(r.stdout).toContain("LAUNDER:bare-fsp:BLOCKED:esm-launder-dep");
   });
 
   it("records the laundered read in observe mode, attributed to the laundering package", async () => {
@@ -187,6 +200,107 @@ describe("#61 — a dependency cannot register a loader hook ahead of capwall's"
     );
     expect(r.stdout).toContain("HOOKJACK:register:REGISTERED");
     expect(r.stderr).toMatch(/WARN 'esm-hookjack-dep' called module\.register.*CAPWALL_ALLOW_LOADER_HOOKS=1/);
+  });
+});
+
+describe("#78 — the load()-level re-mediation backstop actually fires", () => {
+  /**
+   * Every builtin capwall mediates. The point of the suite is that the backstop covers the WHOLE
+   * set: it is only reachable for a specifier whose `node:` URL is absent from the ESM module
+   * cache, and capwall's own bootstrap is the only thing that could have put one there.
+   */
+  const MEDIATED = [
+    "fs",
+    "fs/promises",
+    "net",
+    "http",
+    "https",
+    "tls",
+    "http2",
+    "dgram",
+    "child_process",
+    "worker_threads",
+    "vm",
+    "module",
+  ] as const;
+
+  let out: RunResult;
+
+  beforeAll(async () => {
+    out = await runApp(
+      { CAPWALL_MODE: "enforce", CAPWALL_POLICY_FILE: denyPolicy },
+      BACKSTOP_APP,
+    );
+  });
+
+  it("covers the whole mediated set — the list above is not allowed to drift", () => {
+    // A capability added to MEDIATED_MODULES but not here would leave the new specifier's backstop
+    // unexercised, and the suite would still be green. `esm-backstop-dep` carries the same list;
+    // it is a fixture, so it cannot import from src.
+    const distinct = [
+      ...new Set(MEDIATED_MODULES.map((m) => m.replace(/^node:/, ""))),
+    ].sort();
+    expect([...MEDIATED].sort()).toEqual(distinct);
+  });
+
+  it("re-mediates every mediated builtin a foreign hook resolved straight to the raw URL", () => {
+    // The app registers a loader hook that short-circuits `raw:<builtin>` to `node:<builtin>` with
+    // `shortCircuit: true, format: "builtin"` — the strongest form. Node runs the newest hook
+    // first, so capwall's `resolve` is never consulted for any of these; only `load` is left.
+    //
+    // Pre-#78 this returned RAW for every specifier capwall's own shims had ESM-imported (which
+    // was all of them): a `node:` URL already in the ESM cache is served from cache and the load
+    // chain is never consulted at all. Measured both ways — re-adding a single
+    // `import "node:fs"` to `preload.ts` flips the `fs` row below back to RAW.
+    for (const spec of MEDIATED) {
+      expect(out.stdout, `${spec} reached the raw builtin`).toContain(`BACKSTOP:${spec}:SHIM`);
+    }
+    // Covers the `enforce-fs:RAW:<contents>` line too, which is what a bypass actually looks like.
+    expect(out.stdout).not.toMatch(/BACKSTOP:[a-z_/-]+:RAW\b/);
+  });
+
+  it("says so on stderr — once per specifier, because reaching here is never normal", () => {
+    // capwall's only in-band signal that something is ahead of it in the hook chain. This is also
+    // the version-independent half of the proof: it does not depend on
+    // `process.getBuiltinModule`, which the fixture uses to tell shim from raw.
+    for (const spec of MEDIATED) {
+      expect(out.stderr, `no re-mediation warning for node:${spec}`).toContain(
+        `WARN another module-customization hook resolved 'node:${spec}' straight to the raw builtin`,
+      );
+    }
+  });
+
+  it("holds against the SYNCHRONOUS registerHooks chain too, which runs ahead of capwall's", async () => {
+    // `module.registerHooks()` (Node ≥22.15) is the strictly stronger position: its resolve chain
+    // runs entirely ahead of the asynchronous `register` chain capwall lives in. The asynchronous
+    // LOAD chain still descends to capwall, which is what makes the backstop reach this case —
+    // asserted rather than assumed, since it is the case the backstop most needs to cover.
+    // Absent on Node 20, where the API simply does not exist; that is not a bypass.
+    const r = await runApp(
+      {
+        CAPWALL_MODE: "enforce",
+        CAPWALL_POLICY_FILE: denyPolicy,
+        BACKSTOP_SYNC_HOOK: "1",
+      },
+      BACKSTOP_APP,
+    );
+    if (r.stdout.includes("BACKSTOP:UNSUPPORTED")) return;
+    for (const spec of MEDIATED) {
+      expect(r.stdout, `${spec} reached the raw builtin via the sync chain`).toContain(
+        `BACKSTOP:${spec}:SHIM`,
+      );
+    }
+    expect(r.stdout).toContain("BACKSTOP:enforce-fs:BLOCKED:esm-backstop-dep");
+  });
+
+  it("re-mediates into a shim that ENFORCES, not merely one that is not the builtin", () => {
+    // Identity is necessary but not sufficient. Under the deny-all policy the re-mediated `fs`
+    // must actually deny, attributed to the importing package — and the re-mediated `node:module`
+    // must still carry #61's loader-hook gate, which is the one shim that is a Proxy over a class
+    // rather than a plain namespace.
+    expect(out.stdout).toContain("BACKSTOP:enforce-fs:BLOCKED:esm-backstop-dep");
+    expect(out.stdout).toContain("BACKSTOP:enforce-module:BLOCKED:esm-backstop-dep");
+    expect(out.stderr).toMatch(/DENY 'esm-backstop-dep' fs:read/);
   });
 });
 

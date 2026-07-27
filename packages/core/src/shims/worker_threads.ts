@@ -20,7 +20,7 @@
  * confine what code runs inside it — a spawned worker is a fresh Node isolate outside this
  * shim's in-process interception unless capwall is separately installed inside it.
  */
-import realWorkerThreads from "node:worker_threads";
+import { realWorkerThreads } from "../real-builtins.cjs"; // never `import … from "node:worker_threads"` — see #78
 import {
   guard,
   guardedConstructorSubclass,

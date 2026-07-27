@@ -32,7 +32,7 @@
  * next site cannot get it wrong. `_load` STACKS (`defineRelinkedPatch`): two installs may route
  * to different registries, so each one's link must run.
  */
-import Module from "node:module";
+import { realModule } from "../real-builtins.cjs"; // never `import … from "node:module"` — see #78
 import { liveRegistry, popInstall, pushInstall } from "./live-context.js";
 import { defineRelinkedPatch, valueSlot } from "../lifecycle/process-patch.js";
 import type { ShimContext } from "../shims/runtime.js";
@@ -85,7 +85,7 @@ type ModuleLoad = (this: unknown, request: string, parent: unknown, isMain: bool
  * ever restoring the bottom of the stack (#22).
  */
 const loadPatch = defineRelinkedPatch<ModuleLoad>("Module._load", {
-  slot: valueSlot<ModuleLoad>("Module._load", () => Module as unknown as object, "_load"),
+  slot: valueSlot<ModuleLoad>("Module._load", () => realModule as unknown as object, "_load"),
   patch: (_ctx, link) =>
     function (this: unknown, request, parent, isMain) {
       // Fast path: only the fixed candidate set can possibly be shimmed; everything else is a

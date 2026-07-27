@@ -49,6 +49,28 @@ package's slice of the policy.
   are enumerated on the main thread at registration and passed to the hook, so the loader
   thread never imports the real builtin (which would recurse). Covers static and dynamic
   `import`; attribution and `onDecision` run on the main thread exactly as for CJS.
+  `esm-hooks.ts`'s `load` also **re-mediates** a raw `node:<mediated>` URL it is handed, the
+  backstop for a resolution route capwall's `resolve` never saw — which only works because of
+  the capture rule below.
+
+### Real-builtin capture (`core/src/real-builtins.cts`)
+
+Every real mediated builtin capwall holds is captured in this one file, and it is the only
+CommonJS source file in the package. That is a security property rather than a style quirk
+(#78): Node's ESM module cache is keyed by resolved URL, and a URL already in it is served from
+cache **without the `load` hook chain being consulted at all**. A static
+`import realFs from "node:fs"` in a shim therefore cached `node:fs` raw before
+`module.register()` ran and left the re-mediation backstop above as dead code. A CommonJS
+`require` populates the CJS cache and leaves the ESM cache untouched, and in a `.cjs` file
+`require` is ambient — so the capture needs no ESM import of `node:module` either, which is
+itself mediated.
+
+The `require`s cannot loop through capwall's own `Module._load` patch: the file sits in
+`index.js`'s **static** import graph, and ES module evaluation completes that graph before
+`install()` — the only thing that patches `_load` — can be called. `test/real-builtins.test.ts`
+holds both halves in place: a source scan that fails on any mediated-builtin import elsewhere in
+`core/src` or any lazy route to this file, and a post-install identity check against
+`process.getBuiltinModule`.
 
 ### Capability shims (`core/src/shims`)
 

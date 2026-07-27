@@ -94,6 +94,7 @@ Where each concern lives:
 | Public API — `install(policy, mode)` | `packages/core/src/index.ts` |
 | CJS `require` patch | `packages/core/src/loader/require.ts` |
 | ESM loader hook (`module.register`) | `packages/core/src/loader/{esm-hook,esm-hooks,esm-runtime}.ts` |
+| Real-builtin capture (the ONLY place a mediated builtin is loaded — CJS on purpose, #78) | `packages/core/src/real-builtins.cts` |
 | Native `.node` load gate (`process.dlopen`) | `packages/core/src/loader/native.ts` |
 | Core-API capability shims | `packages/core/src/shims/{fs,net,child_process,worker_threads,env,vm}.ts` (`net.ts` registers all six egress modules) |
 | Loader-hook registration gate (`node:module`) | `packages/core/src/shims/module.ts` |
