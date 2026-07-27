@@ -58,6 +58,15 @@ owning package, (2) asks `policy/evaluate` for a decision, then (3) forwards to 
 logs, or throws. Shims must preserve the real API's signatures and error semantics so
 correct code is unaffected.
 
+One capability is deliberately NOT a shim: `native` (`.node` addon loads, S2/#49) lives in
+`core/src/loader/native.ts` and patches `process.dlopen`. There is no module to wrap — the
+capability is the *load itself*, and `process.dlopen` is the one JS-reachable point every
+addon load funnels through, whether it arrives via `require`, `createRequire` from ESM, a
+`bindings`/`node-gyp-build` resolver, or a direct `process.dlopen(...)` call. It follows the
+same attribute→evaluate→forward/throw sequence as the shims, but is module-system-independent
+by construction. Gating only: capwall cannot confine an addon once it is loaded (see
+`threat-model.md`).
+
 ### Attribution (`core/src/attribution`)
 
 Maps "the code currently executing a shimmed call" to the **owning npm package**. The

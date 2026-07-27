@@ -34,6 +34,7 @@
  * | `capwall:child_process`   | `"true"` / `"false"`                  | `child_process`        |
  * | `capwall:worker_threads`  | `"true"` / `"false"`                  | `worker_threads`       |
  * | `capwall:vm`              | `"true"` / `"false"`                  | `vm`                   |
+ * | `capwall:native`          | `"true"` / `"false"`                  | `native`               |
  * | `capwall:env`             | comma-separated env key names, or `*` | `env`                  |
  *
  * A property may be repeated (e.g. two separate `capwall:fs:read` entries) — values from
@@ -228,6 +229,21 @@ function grantFromProperties(
           );
         } else {
           grant.vm = parsed;
+        }
+        break;
+      }
+      // A native (`.node`) addon load gate (#49). Boolean like the other gates, and for the
+      // same reason it is boolean in the policy: an addon path is a platform/arch/ABI build
+      // artifact, so an SBOM that named one would not describe the component on another
+      // machine. Gating only — nothing here confines an addon once it loads.
+      case "capwall:native": {
+        const parsed = parseBoolean(value);
+        if (parsed === undefined) {
+          warnings.push(
+            `${componentLabel}: ignoring non-boolean capwall:native value "${value}"`,
+          );
+        } else {
+          grant.native = parsed;
         }
         break;
       }

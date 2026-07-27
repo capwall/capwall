@@ -80,6 +80,15 @@ export function mergeTraceIntoPolicy(
       case "vm":
         grant.vm = true;
         break;
+      // The observed addon PATH is deliberately dropped here (#49). It is recorded in the
+      // trace and shown by `observe`/`diff` so an operator can see which addon loaded, but it
+      // is a platform/arch/ABI-specific build artifact — writing it into the policy would
+      // produce a grant that stops matching on the next machine, the same non-reproducibility
+      // that bit ephemeral ports (#27) and host-specific env keys (#57). The grant is the
+      // boolean question: may this package load compiled code at all.
+      case "native":
+        grant.native = true;
+        break;
     }
   }
 

@@ -8,7 +8,8 @@
     "child_process": false,
     "worker_threads": false,
     "env": [],
-    "vm": false
+    "vm": false,
+    "native": false
   },
   "packages": {
     "express": {

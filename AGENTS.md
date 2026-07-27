@@ -44,9 +44,13 @@ example policies** — the express-app claim above silently became false when M4
 landed, and stayed false until #57. `packages/cli/test/express-app-policy.test.ts` gates it
 now.
 
-Two stretch items also landed: **S1** SBOM/CBOM →
-policy (`@capwall/sbom-import`) and **S4** the perf benchmark (`pnpm bench`; measured overhead
-is ~30x under the <1ms/req budget — see issue #34 on the cost model). The **ESM hook (M5)** is implemented (both static and dynamic `import` of mediated builtins are intercepted via a `module.register` hook; on by default under the CLI, `CAPWALL_ESM=0` to disable). Shims are handed out
+The stretch items also landed: **S1** SBOM/CBOM →
+policy (`@capwall/sbom-import`), **S4** the perf benchmark (`pnpm bench`; measured overhead
+is ~30x under the <1ms/req budget — see issue #34 on the cost model), **S3** the
+observed-vs-declared drift diff (`capwall diff`), and **S2** the native-addon load gate
+(`native` capability, `core/src/loader/native.ts` — a `process.dlopen` patch; gating only,
+never confinement, see `docs/threat-model.md` § Native `.node` addons). The **ESM hook (M5)**
+is implemented (both static and dynamic `import` of mediated builtins are intercepted via a `module.register` hook; on by default under the CLI, `CAPWALL_ESM=0` to disable). Shims are handed out
 **mutable by default** (graceful-fs compatibility); opt-in **hardened mode**
 (`install(…, { hardened: true })` / `CAPWALL_HARDENED=1`, issue #17) freezes them instead —
 see `core/src/shims/harden.ts` and threat-model.md § Hardened mode for what it does and does
@@ -65,6 +69,7 @@ Where each concern lives:
 | Public API — `install(policy, mode)` | `packages/core/src/index.ts` |
 | CJS `require` patch | `packages/core/src/loader/require.ts` |
 | ESM loader hook (`module.register`) | `packages/core/src/loader/esm-hook.ts` |
+| Native `.node` load gate (`process.dlopen`) | `packages/core/src/loader/native.ts` |
 | Core-API capability shims | `packages/core/src/shims/{fs,net,child_process,worker_threads,env,vm}.ts` |
 | Stack-walk → owning package | `packages/core/src/attribution/index.ts` |
 | Policy load / mode resolution / evaluate | `packages/core/src/policy/{load,mode,evaluate}.ts` |
@@ -162,8 +167,9 @@ as the gate.
 
 ## 9. Non-goals (MVP)
 
-- **Native-addon confinement.** `.node` addons can be gated (allowed to load or not) but not
-  confined once loaded.
+- **Native-addon confinement.** `.node` addons ARE gated (allowed to load or not — the
+  `native` capability, S2/#49) but are never confined once loaded. Keep every doc claim on the
+  gate side of that line; overclaiming here would be worse than not shipping the feature.
 - **Subprocess-internal confinement.** We can gate whether a `child_process` spawn happens;
   we do not confine what the child does.
 - **Browser / bundler builds.** That is LavaMoat's turf.

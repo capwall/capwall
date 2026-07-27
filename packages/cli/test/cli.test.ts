@@ -104,6 +104,70 @@ describe("trace → policy → enforce round-trip (fs)", () => {
   });
 });
 
+describe("trace → policy → enforce round-trip (native addon, S2/#49)", () => {
+  /**
+   * The whole loop for the `native` capability, end to end through the real CLI. The fixture
+   * `.node` is a placeholder, which is fine and in fact useful: the gate decides before
+   * `process.dlopen` opens the file, so `native: CapabilityError` vs. `native: Error` in the
+   * app's own output is an unambiguous denied-vs-allowed signal that needs no compiler.
+   */
+  let generated: string;
+
+  it("observe records the addon load and emits `native: true` for the owning package", async () => {
+    generated = path.join(await mkdtemp(path.join(os.tmpdir(), "capwall-native-")), "policy.json");
+    const r = await runCli(["observe", "-o", generated, "--", "node", "native.js"], appDir);
+    expect(r.code).toBe(0);
+    expect(r.stderr).toMatch(/observe: recorded native .*trace-dep\.node/);
+    // Never blocked in observe: the load reached the real loader and failed on the file.
+    expect(r.stdout).toContain("native: Error");
+
+    const policy = JSON.parse(await readFile(generated, "utf8")) as Policy;
+    // The grant is the BOOLEAN question, not the observed path — an addon path is a
+    // platform/arch/ABI build artifact and would not reproduce on another machine (#27/#57).
+    expect(policy.packages["trace-dep"]?.native).toBe(true);
+    expect(JSON.stringify(policy)).not.toContain(".node");
+  });
+
+  it("enforce denies-by-default a package that was never granted `native`", async () => {
+    const r = await runCli(["enforce", "--", "node", "native.js"], appDir);
+    expect(r.stderr).toMatch(/DENY 'trace-dep' native .*trace-dep\.node/);
+    expect(r.stdout).toContain("native: CapabilityError");
+  });
+
+  it("enforce under the generated policy lets the load through", async () => {
+    const r = await runCli(["enforce", "--policy", generated, "--", "node", "native.js"], appDir);
+    expect(r.stderr).not.toMatch(/DENY/);
+    expect(r.stdout).toContain("native: Error"); // gate passed; the placeholder file failed
+  });
+
+  it("diff reports an ungranted addon load as drift", async () => {
+    const r = await runCli(["diff", "--json", "--", "node", "native.js"], appDir);
+    expect(r.code).toBe(1);
+    const drift = JSON.parse(r.stdout.trim().split("\n").at(-1)!) as Array<{
+      pkg: string;
+      kind: string;
+      detail: string;
+    }>;
+    expect(drift).toContainEqual(
+      expect.objectContaining({ pkg: "trace-dep", kind: "native" }),
+    );
+    expect(drift.find((d) => d.kind === "native")!.detail).toMatch(/^native .*trace-dep\.node$/);
+  });
+
+  it("explain answers for `native`, with and without a path target", async () => {
+    const denied = await runCli(["explain", "trace-dep", "native"], appDir);
+    expect(denied.code).toBe(1);
+    expect(denied.stdout).toMatch(/^DENY.*native <any addon>/);
+
+    const allowed = await runCli(
+      ["explain", "--policy", generated, "trace-dep", "native", "./build/Release/trace-dep.node"],
+      appDir,
+    );
+    expect(allowed.code).toBe(0);
+    expect(allowed.stdout).toMatch(/^ALLOW/);
+  });
+});
+
 describe("express-app example (AGENTS.md § 7)", () => {
   const PORT = 3000 + (process.pid % 20000);
   const BASE = `http://localhost:${PORT}`;

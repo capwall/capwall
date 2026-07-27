@@ -12,6 +12,7 @@
  */
 import { patchRequire, type RequirePatchHandle } from "./loader/require.js";
 import { registerEsmHook, type EsmHookHandle } from "./loader/esm-hook.js";
+import { installNativeGate, type NativeGateHandle } from "./loader/native.js";
 import { installEnvGuard, type EnvGuardHandle } from "./shims/env.js";
 import { resolveMaxFrames } from "./attribution/index.js";
 import type { ShimContext } from "./shims/runtime.js";
@@ -101,8 +102,15 @@ export function install(
   );
   const hardened = options.hardened === true;
   const ctx: ShimContext = { policy, mode, onDecision, projectRoot, maxFrames, hardened };
-  const handles: Array<RequirePatchHandle | EsmHookHandle | EnvGuardHandle> = [];
+  const handles: Array<
+    RequirePatchHandle | EsmHookHandle | EnvGuardHandle | NativeGateHandle
+  > = [];
   handles.push(patchRequire(policy, mode, { onDecision, projectRoot, maxFrames, hardened }));
+  // Native (`.node`) addon gate (roadmap S2, #49). Always on, and deliberately not routed
+  // through the require registry: `process.dlopen` is the chokepoint EVERY addon load passes
+  // through, including a direct `process.dlopen(...)` that never touches the module system.
+  // See loader/native.ts. Gating only — capwall cannot confine an addon once it is loaded.
+  handles.push(installNativeGate(ctx));
   if (options.env !== false) {
     handles.push(installEnvGuard(ctx));
   }

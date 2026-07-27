@@ -1,0 +1,2 @@
+Placeholder, not a real addon — deliberately OUTSIDE any node_modules tree so capwall's
+native gate resolves its owning package to `<app>`. See test/native.test.ts.
