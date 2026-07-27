@@ -11,6 +11,7 @@
  * not to a package name. Grants below are therefore made under `default` (which `<app>`
  * falls back to, since it has no explicit `policy.packages["<app>"]` entry).
  */
+import * as realVm from "node:vm";
 import { describe, expect, it } from "vitest";
 import { loadPolicyFromObject, type Decision, type Policy } from "../src/index.js";
 import { createVmShim, type ShimContext } from "../src/shims/vm.js";
@@ -86,7 +87,62 @@ describe("vm shim — enforce mode, granted", () => {
     const vmShim = createVmShim(ctx);
     const script = new vmShim.Script("1+1");
     expect(script).toBeInstanceOf(vmShim.Script);
+    expect(script).toBeInstanceOf(realVm.Script); // guarded subclass keeps the real chain
     expect(script.runInThisContext()).toBe(2);
+  });
+
+  it("a further subclass of Script still works and is still gated", () => {
+    const granted = makeCtx(grantedEnforcePolicy(), "enforce");
+    const grantedShim = createVmShim(granted.ctx);
+    class MyScript extends grantedShim.Script {}
+    const mine = new MyScript("1+1");
+    expect(mine).toBeInstanceOf(MyScript);
+    expect(mine).toBeInstanceOf(grantedShim.Script);
+    expect(mine.runInThisContext()).toBe(2);
+    // An unrelated real Script must NOT satisfy `instanceof MyScript` — the guarded class's
+    // `Symbol.hasInstance` is inherited down the static chain, so it has to fall back to
+    // ordinary prototype-chain semantics for any receiver other than itself.
+    expect(new realVm.Script("1+1") instanceof MyScript).toBe(false);
+
+    const denied = makeCtx(emptyEnforcePolicy(), "enforce");
+    const deniedShim = createVmShim(denied.ctx);
+    class MyDeniedScript extends deniedShim.Script {}
+    expect(() => new MyDeniedScript("1+1")).toThrowError(
+      expect.objectContaining({ name: "CapabilityError" }),
+    );
+  });
+});
+
+describe("vm shim — class escape surfaces (#64)", () => {
+  it("`Script.prototype.constructor` is the guarded class, not the real one", () => {
+    const { ctx } = makeCtx(emptyEnforcePolicy(), "enforce");
+    const vmShim = createVmShim(ctx);
+    expect(vmShim.Script).not.toBe(realVm.Script);
+    expect(vmShim.Script.prototype.constructor).toBe(vmShim.Script);
+    expect(vmShim.Script.name).toBe("Script");
+    // The escape that motivated #64: with a construct-trap Proxy this compiled and ran code
+    // with the guard never firing.
+    // Cast is typing-only: `.prototype.constructor` is declared as `Function`.
+    const Escaped = vmShim.Script.prototype.constructor as new (code: string) => unknown;
+    expect(() => new Escaped("1+1")).toThrowError(
+      expect.objectContaining({ name: "CapabilityError" }),
+    );
+  });
+
+  it("SourceTextModule/SyntheticModule are gated when present, and absent ones don't throw", () => {
+    // These live behind `--experimental-vm-modules`; the shim must build either way.
+    const { ctx } = makeCtx(emptyEnforcePolicy(), "enforce");
+    const vmShim = createVmShim(ctx) as unknown as Record<string, unknown>;
+    const real = realVm as unknown as Record<string, unknown>;
+    for (const name of ["SourceTextModule", "SyntheticModule"]) {
+      if (typeof real[name] !== "function") {
+        expect(vmShim[name]).toBeUndefined();
+        continue;
+      }
+      const Cls = vmShim[name] as new (...a: never[]) => unknown;
+      expect(Cls).not.toBe(real[name]);
+      expect((Cls as { prototype: Record<string, unknown> }).prototype["constructor"]).toBe(Cls);
+    }
   });
 });
 

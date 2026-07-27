@@ -1,12 +1,19 @@
 /**
  * `worker_threads` capability shim (roadmap M4, issue #7).
  *
- * Gates whether a package may START a Worker at all: `new Worker(...)` goes through a
- * construct-trap `Proxy` (same technique as `wrapPathClass` in fs.ts) that calls
- * `guard(ctx, { kind: "worker_threads" })` before `Reflect.construct`, so an enforce-mode
- * denial throws synchronously before the worker thread is created. `instanceof` and class
- * identity are preserved. Everything else on the module (`isMainThread`, `parentPort`,
- * `threadId`, `MessageChannel`, `SHARE_ENV`, …) passes through untouched.
+ * Gates whether a package may START a Worker at all: `new Worker(...)` goes through a guarded
+ * SUBCLASS whose constructor calls `guard(ctx, { kind: "worker_threads" })` before `super(...)`,
+ * so an enforce-mode denial throws synchronously before the worker thread is created — the
+ * real `Worker` constructor is what spawns the thread, so nothing runs on denial. `instanceof`
+ * still works for real and guarded instances alike via a `Symbol.hasInstance` override.
+ * Everything else on the module (`isMainThread`, `parentPort`, `threadId`, `MessageChannel`,
+ * `SHARE_ENV`, …) passes through untouched.
+ *
+ * NOT a construct-trap `Proxy` (#64). A Proxy forwards `.prototype` to its target, so
+ * `new (worker_threads.Worker.prototype.constructor)(script)` spawned a worker with the guard
+ * never firing. That is the highest-consequence escape in the codebase: a worker is a fresh
+ * Node context with none of capwall's shims installed, so it is a full capability escape, not
+ * just an unmediated call. See {@link guardedConstructorSubclass}.
  *
  * This is a GATE, not confinement (see docs/threat-model.md): capwall decides whether a
  * package may start a Worker at all; once a worker is allowed to start, this shim does not
@@ -14,11 +21,15 @@
  * shim's in-process interception unless capwall is separately installed inside it.
  */
 import realWorkerThreads from "node:worker_threads";
-import { guard, type ShimContext, type ShimRegistry } from "./runtime.js";
+import {
+  guard,
+  guardedConstructorSubclass,
+  type AnyCtor,
+  type ShimContext,
+  type ShimRegistry,
+} from "./runtime.js";
 
 export type { DecisionSink, ShimContext } from "./runtime.js";
-
-type WorkerClass = abstract new (...a: never[]) => unknown;
 
 /**
  * Build a shimmed `worker_threads` module: the `Worker` constructor is guarded; everything
@@ -34,11 +45,8 @@ export function createWorkerThreadsShim(ctx: ShimContext): typeof import("node:w
 
   const RealWorker = real["Worker"];
   if (typeof RealWorker === "function") {
-    shim["Worker"] = new Proxy(RealWorker as WorkerClass, {
-      construct(target, argArray, newTarget) {
-        guard(ctx, { kind: "worker_threads" }); // throws on enforce-deny, before the worker starts
-        return Reflect.construct(target, argArray as never[], newTarget);
-      },
+    shim["Worker"] = guardedConstructorSubclass(RealWorker as AnyCtor, () => {
+      guard(ctx, { kind: "worker_threads" }); // throws on enforce-deny, BEFORE super() spawns
     });
   }
 

@@ -36,7 +36,8 @@ Per-capability notes:
 
 - **`fs`** — path-taking read/write families (sync, callback, `fs.promises`) plus the
   path-taking stream constructors (`ReadStream`/`WriteStream` and their `File*Stream`
-  aliases). Purely fd-based operations (`fs.read`, `fs.write`, `ftruncate`, …) are not
+  aliases, guarded as **guarded subclasses** — see "Capability-bearing classes" below).
+  Purely fd-based operations (`fs.read`, `fs.write`, `ftruncate`, …) are not
   mediated — consistent with the fd-escape exclusion below.
 - **`net`/`http`/`https`/`tls`/`http2`/`dgram`** — **egress only**. Mediated: `net.connect`/
   `createConnection` **and** `new net.Socket().connect()`; `http(s).request`/`get` **and**
@@ -51,8 +52,9 @@ Per-capability notes:
   are approximated coarsely as `{ host: "<ipc>", port: 0 }`. Capability-bearing classes
   (`net.Socket`, `tls.TLSSocket`, `http.ClientRequest`, `http.Agent`, `dgram.Socket`) are
   guarded via a **guarded subclass** whose prototype method (or constructor) runs the check,
-  so `new Cls()`, `(instance).constructor`, and `Cls.prototype.method.call(...)` are all
-  covered (a construct-trap Proxy would not be). **Not covered:** `dns` lookups (a lookup
+  so `new Cls()`, `(instance).constructor`, `Cls.prototype.constructor`, and
+  `Cls.prototype.method.call(...)` are all covered (a construct-trap Proxy would not be — see
+  "Capability-bearing classes" below). **Not covered:** `dns` lookups (a lookup
   moves no payload; DNS tunneling is a determined-attacker technique out of scope); reaching
   the real prototype by climbing past the guarded subclass (two levels from an instance,
   `Object.getPrototypeOf(Object.getPrototypeOf(sock)).connect`, or equivalently one hop from
@@ -64,7 +66,11 @@ Per-capability notes:
   gaps.
 - **`child_process`, `worker_threads`, `vm`** — boolean **gates** (may this package spawn /
   start a worker / use `vm` at all). Gating, not confinement: capwall does not constrain what
-  the subprocess/worker/vm-context does once started (see § gating vs confinement).
+  the subprocess/worker/vm-context does once started (see § gating vs confinement). The
+  capability-bearing classes on these surfaces — `child_process.ChildProcess`,
+  `worker_threads.Worker`, `vm.Script`, and (only when `--experimental-vm-modules` makes them
+  exist) `vm.SourceTextModule`/`vm.SyntheticModule` — are guarded subclasses, so the class is
+  gated as well as the module function.
 - **`process.env`** — a read allowlist enforced via a `Proxy` on `process.env` (`get` **and**
   `getOwnPropertyDescriptor` traps, so `Object.getOwnPropertyDescriptor(process.env, k).value`
   cannot leak a value a direct read denies). Only reads attributed to a **dependency** are
@@ -79,6 +85,31 @@ Per-capability notes:
   optional var is not crashed. The denial is still recorded and logged. **Key NAMES stay
   enumerable** to a denied dependency (`Object.keys`, `in`, `for..in`); only VALUES are hidden
   — names are not the secret, and hiding them would break feature-detection.
+
+**Capability-bearing classes are guarded subclasses, not Proxies.** Where a capability can be
+reached through a class rather than a module function, capwall replaces the class with a
+**subclass it owns**, whose constructor (or prototype method) runs the check before delegating,
+plus a `Symbol.hasInstance` override so `instanceof` still answers correctly for instances
+built by the real builtin's own factories. That covers `fs.ReadStream`/`WriteStream` (and the
+`File*Stream` aliases), `vm.Script`/`SourceTextModule`/`SyntheticModule`,
+`worker_threads.Worker`, `net.Socket`, `tls.TLSSocket`, `http(s).ClientRequest`,
+`http(s).Agent`, `dgram.Socket`, and `child_process.ChildProcess`.
+
+The earlier approach for some of those sites was a construct-trap `Proxy`, which **did not
+hold**: a `Proxy` forwards property reads to its target, so the proxied class's `.prototype`
+is the real prototype and `Cls.prototype.constructor` is the real, unguarded class. A single
+line — `new (fs.ReadStream.prototype.constructor)(deniedPath)` — read any file, evaluated any
+code (`vm.Script`), or spawned a worker (`worker_threads.Worker`) with the guard never firing.
+The worker case was the worst of the three, because a worker is a fresh Node context with none
+of capwall's shims in it. All such sites are now subclasses, and a regression test asserts the
+`.prototype.constructor` invariant over **every** guarded class in the codebase (issue #64).
+
+**Residual, unchanged:** climbing PAST the guarded subclass still reaches the real method or
+class — `Object.getPrototypeOf(fs.ReadStream.prototype).constructor` from the class object, or
+two prototype levels up from an instance. That is the same class of escape as un-patching a
+shim outright: in-process code deliberately climbing above the guard. capwall does not claim to
+stop it. A guarded subclass raises the cost of the accidental and the opportunistic walk; it is
+not a boundary.
 
 **Behavior change vs. real `fs` (operational note).** In `enforce` mode a denial is delivered
 via the SAME channel the real `fs` API would use for that call, not always a synchronous
