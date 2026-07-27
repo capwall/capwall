@@ -4,6 +4,14 @@
   "description": "capwall command-line interface: observe | enforce | run | diff | gen-policy | explain.",
   "license": "MIT",
   "author": "William Zujkowski",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/williamzujkowski/capwall.git",
+    "directory": "packages/cli"
+  },
+  "homepage": "https://github.com/williamzujkowski/capwall#readme",
+  "bugs": "https://github.com/williamzujkowski/capwall/issues",
+  "publishConfig": { "access": "public" },
   "type": "module",
   "bin": {
     "capwall": "./dist/index.js"
@@ -13,6 +21,7 @@
   "files": ["dist"],
   "engines": { "node": ">=20" },
   "scripts": {
+    "prepack": "node ../../scripts/assert-pnpm-pack.mjs",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "vitest run"

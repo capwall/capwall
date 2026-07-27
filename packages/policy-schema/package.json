@@ -4,6 +4,14 @@
   "description": "capabilities.json schema (Zod + inferred TS types) and JSON Schema for capwall policies.",
   "license": "MIT",
   "author": "William Zujkowski",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/williamzujkowski/capwall.git",
+    "directory": "packages/policy-schema"
+  },
+  "homepage": "https://github.com/williamzujkowski/capwall#readme",
+  "bugs": "https://github.com/williamzujkowski/capwall/issues",
+  "publishConfig": { "access": "public" },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -17,6 +25,7 @@
   "files": ["dist", "schema.json"],
   "engines": { "node": ">=20" },
   "scripts": {
+    "prepack": "node ../../scripts/assert-pnpm-pack.mjs",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run --passWithNoTests"
