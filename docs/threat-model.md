@@ -162,6 +162,17 @@ Per-capability notes:
   aliases, guarded as **guarded subclasses** — see "Capability-bearing classes" below).
   Purely fd-based operations (`fs.read`, `fs.write`, `ftruncate`, …) are not
   mediated — consistent with the fd-escape exclusion below.
+  A path argument is recognized in every shape Node's own `getValidatedPath` accepts: a string,
+  **any `Uint8Array`** (not only a `Buffer`), and a **duck-typed** file URL — Node's `isURL` is
+  `href && protocol && auth === undefined && path === undefined`, not `instanceof URL`, so a
+  plain object with those fields is a real path to `fs`. Both of the latter two used to fall
+  through capwall's check and were therefore **not gated at all** (#99). A URL argument is
+  converted once and the resulting **string** is what is forwarded, so a shadowed `pathname`
+  accessor cannot make Node open a file other than the one that was guarded.
+  **Not yet mediated:** `fs.glob` / `fs.globSync` / `fs.promises.glob` (Node ≥22 only). Their
+  argument is a *pattern* rather than a path, so gating them needs a policy decision about how a
+  pattern is matched against `fs.read` grants rather than a table entry; until then a package
+  can enumerate directory contents through them un-gated. Tracked as #106.
 - **`net`/`http`/`https`/`tls`/`http2`/`dgram`** — **egress only**. Mediated: `net.connect`/
   `createConnection` **and** `new net.Socket().connect()`; `http(s).request`/`get` **and**
   `new http.ClientRequest()`; `http(s).Agent#createConnection`, on both a caller-built agent and
@@ -181,6 +192,13 @@ Per-capability notes:
   package may *reach*, not that it may serve). IPC/unix-socket connects have no host:port and
   are gated as their own `ipc` capability, keyed on the socket path (#72 — previously they were
   all one `<ipc>:0` pseudo-target; see the egress residuals below for what that leaves).
+  **How a destination is derived is checked against Node's own normalization**, not against what
+  a signature appears to say — see the note on argument normalization below, and #99 for why that
+  distinction has produced real holes. Two spellings a policy author will notice: a positional
+  numeric-string port (`net.connect("9999", host)`) is a **TCP** target, not an IPC path, because
+  Node's `isPipeName` says so; and a `dgram` `send`/`connect` that names no address is recorded
+  as **`127.0.0.1`** (udp4) or **`::1`** (udp6), the literals Node's own `lookup4`/`lookup6`
+  substitute — not `localhost`.
   `dgram` ops attributed to `<app>`
   are not gated (the app is the trust root, as for `process.env`); since #60 that requires a
   positively identified application frame, and Node's auto-bind `send` replay — which used to
@@ -223,6 +241,19 @@ Per-capability notes:
   endpoint could reach an arbitrary unix socket by returning `undefined` on the read capwall saw
   and `/var/run/docker.sock` on the read Node made.
 
+  **Argument normalization is derived from Node's source, not from the signature (#99).** Reading
+  a destination once is only half of it: the *rule* capwall uses to decide which argument holds
+  the destination has to be Node's rule, or the guarded target and the real target differ for a
+  second reason having nothing to do with getters. Two confirmed holes came from a plausible
+  reading of a signature that the implementation did not share — a numeric-string `dgram` port
+  that `validatePort` accepts (#95, gate skipped entirely) and a `tls` options object read from
+  an index Node never merges (#46, granted host guarded, evil host dialled). #99 was the
+  systematic pass over every entry point, diffing capwall's derivation against Node's own
+  `net._normalizeArgs` / `normalizeConnectArgs` / `urlToHttpOptions` / `getValidatedPath` /
+  `normalizeSpawnArguments` line by line. Each entry point now carries the relevant excerpt of
+  Node's source in a comment at the site, and every deliberate divergence says so and why. What
+  that pass changed, in policy-visible terms, is listed under the `fs` and egress bullets above.
+
   **Still open, deliberately.** (a) IPC path grants (#72) are matched **lexically**, like `fs`
   globs and for the same reasons: capwall compares the path string a call names, and does not
   resolve symlinks or otherwise ask the kernel what the path leads to. A socket reachable at two
@@ -240,7 +271,16 @@ Per-capability notes:
   address is not caught here. A wildcard host grant (`*.internal`, #83) inherits that: it names
   a set of *names*, and capwall does not check where those names point. Prefer the narrowest
   pattern that covers the real need, and remember that `*.example.com` is only as trustworthy as
-  whoever can create records under `example.com`. (d) Reaching the real prototype by climbing past the guard — two
+  whoever can create records under `example.com`. The same reasoning covers the caller-supplied
+  resolvers Node accepts — `options.lookup` on `net`/`tls`, and the `lookup` option of
+  `dgram.createSocket` — which turn "which name" into "which address" inside the caller's own
+  code: capwall guards the **name** the call asked for, which is the level a policy is written
+  at, and a resolver that answers with somebody else's address is the `dns` residual reached by
+  a shorter path. (c2) Node ≥22's built-in proxy support (`--use-env-proxy` /
+  `NODE_USE_ENV_PROXY`, absent on Node 20) makes `http(s).Agent#createConnection` dial the
+  **proxy** rather than the endpoint. capwall guards the endpoint the request named; when that
+  flag is set, the socket that actually opens goes to the configured proxy instead. Grant the
+  proxy's host:port as well if you enable it. (d) Reaching the real prototype by climbing past the guard — two
   levels from an instance of a guarded class
   (`Object.getPrototypeOf(Object.getPrototypeOf(sock)).connect`), equivalently one hop from the
   class object (`net.Socket.prototype.__proto__.connect`), or one hop from a guarded *instance*

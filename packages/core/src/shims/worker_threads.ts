@@ -50,6 +50,10 @@ export function createWorkerThreadsShim(ctx: ShimContext): typeof import("node:w
       RealWorker as AnyCtor,
       () => {
         guard(ctx, { kind: "worker_threads" }); // throws on enforce-deny, BEFORE super() spawns
+        // Nothing to pin: `worker_threads` is a boolean gate, so no argument decides a target
+        // that Node could later re-read differently (the #99 audit's verdict for this entry
+        // point). The `filename`/`options` bag is forwarded exactly as the caller wrote it.
+        return undefined;
       },
       ctx, // hardened mode (#17) freezes the guarded subclass; no-op by default
     );

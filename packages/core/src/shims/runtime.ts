@@ -236,16 +236,23 @@ export function defineGuardedClassIdentity(Guarded: AnyCtor, RealClass: AnyCtor)
  * what opens the fd / compiles the code / spawns the OS thread, so an enforce-mode denial has
  * to throw before it runs. Nothing before `super()` touches `this` (which would be illegal) —
  * `check` only inspects the constructor arguments.
+ *
+ * `check` MAY return a replacement argument list, which is what gets forwarded to `super(...)`.
+ * That is how a guarded constructor applies the pinning invariant (#26/#56/#99): the value that
+ * decided the guard is handed to the real class instead of the caller's object, so nothing Node
+ * reads afterwards can disagree with what was guarded. Returning nothing forwards the caller's
+ * arguments untouched, which is what the pure boolean gates (`vm`, `worker_threads`) do.
  */
 export function guardedConstructorSubclass<T extends AnyCtor>(
   RealClass: T,
-  check: (args: unknown[]) => void,
+  check: (args: unknown[]) => unknown[] | undefined,
   ctx: ShimContext,
 ): T {
   const Guarded = class extends RealClass {
     constructor(...args: any[]) {
-      check(args); // throws on enforce-deny, before the real constructor does anything
-      super(...args);
+      // Throws on enforce-deny, before the real constructor does anything.
+      const forwarded = check(args) ?? args;
+      super(...forwarded);
     }
   };
   defineGuardedClassIdentity(Guarded, RealClass);
