@@ -32,7 +32,11 @@
     // Style-only on arrays we just created: `[...new Set(x)].sort()` mutates nothing shared.
     "unicorn/no-array-sort": "off",
     // The bench harness preallocates sample buffers with `new Array(n)` on purpose.
-    "unicorn/no-new-array": "off"
+    "unicorn/no-new-array": "off",
+    // Helpers defined inside a `describe` are how vitest suites are written — the scoping is
+    // for readability, and "recreated on every call" is meaningless for a helper called once
+    // per test. Flagging it would push shared state out to module scope, which is worse.
+    "unicorn/consistent-function-scoping": "off"
   },
   // node_modules/ is ignored by default, which also covers the committed vendored fixtures
   // under packages/*/test/fixtures/node_modules — deliberately odd code that must stay odd.
