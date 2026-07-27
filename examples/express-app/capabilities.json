@@ -1,6 +1,7 @@
 {
+  "$schema": "../../packages/policy-schema/schema.json",
   "version": 1,
-  "mode": "observe",
+  "mode": "enforce",
   "default": {},
   "packages": {
     "<app>": {
@@ -11,6 +12,28 @@
           "./logs/requests.log"
         ]
       }
+    },
+    "debug": {
+      "env": [
+        "*"
+      ]
+    },
+    "depd": {
+      "env": [
+        "NO_DEPRECATION",
+        "TRACE_DEPRECATION"
+      ]
+    },
+    "express": {
+      "env": [
+        "NODE_CLUSTER_SCHED_POLICY",
+        "NODE_ENV"
+      ]
+    },
+    "mime": {
+      "env": [
+        "DEBUG_MIME"
+      ]
     }
   }
 }
