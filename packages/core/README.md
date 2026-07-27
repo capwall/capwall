@@ -38,6 +38,7 @@ evaluates it against the policy. The CLI installs this automatically in child pr
 | `env` | `true` | Gate `process.env` reads by dependencies against the `env` allowlist. |
 | `esm` | `false` (`true` under the CLI) | Also register the ESM loader hook. |
 | `attribution.maxFrames` | `25` | Frames the attribution stack walk may inspect — see below. |
+| `hardened` | `false` | **Opt-in.** Freeze the shim surfaces so a dependency cannot monkey-patch away mediation. **Breaks `graceful-fs`** — see below. |
 
 ### Environment variables (the preload channel)
 
@@ -53,6 +54,40 @@ yourself when wiring the preload by hand.
 | `CAPWALL_PROJECT_ROOT` | `process.cwd()` | Project root for attribution and glob resolution. |
 | `CAPWALL_ESM` | on | `0` disables the ESM loader hook (the CJS path is unaffected). |
 | `CAPWALL_MAX_FRAMES` | `25` | Attribution frame budget — see below. |
+| `CAPWALL_HARDENED` | off | `1` (exactly) enables hardened mode — see below. Any other value leaves it off. |
+
+### Hardened mode (`hardened: true` / `CAPWALL_HARDENED=1`)
+
+capwall's shims are ordinary mutable objects by default, so a dependency can do
+`fs.readFileSync = evil` (or `net.Socket.prototype.connect = evil`) and silently disable
+enforcement **for the whole process**, with no log line. Hardened mode `Object.freeze`s the
+surfaces capwall created:
+
+- every shim namespace (`fs`, `fs.promises`, `net`, `http`, `https`, `tls`, `http2`, `dgram`,
+  `child_process`, `worker_threads`, `vm`);
+- every guarded wrapper function on them (including `fs.realpath.native`);
+- every guarded class **and its prototype** — `fs.ReadStream`/`WriteStream`, `net.Socket`,
+  `tls.TLSSocket`, `http(s).ClientRequest`, `http(s).Agent`, `dgram.Socket`,
+  `child_process.ChildProcess`, `vm.Script`/`SourceTextModule`/`SyntheticModule`,
+  `worker_threads.Worker`;
+- the guarded `send`/`connect` properties capwall installs on a `dgram` socket instance.
+
+Real builtins are never frozen — that would be a process-global side effect outliving
+`uninstall()`. Subclassing a guarded class (`class Mine extends fs.ReadStream {}`) still works.
+
+```bash
+CAPWALL_HARDENED=1 capwall enforce -- node ./src/server.js
+```
+
+It is opt-in for a blunt reason: **freezing `fs` breaks `graceful-fs`** — a transitive
+dependency of npm, webpack, and much of the ecosystem — and every other legitimate `fs`
+patcher, which fails to load with a `TypeError`. Note also that a blocked patch is **silent**
+in sloppy-mode CJS (the write just no-ops; only `"use strict"` code sees the `TypeError`), and
+that hardened mode closes only the reassignment escape: `process.getBuiltinModule("node:fs")`,
+`http.globalAgent.createConnection` (issue #65), replacing `process.env`, and climbing past a
+guarded prototype are all unaffected. Read
+[`docs/threat-model.md` § Hardened mode](../../docs/threat-model.md) for the full accounting
+before turning it on, and roll it out under `observe` first.
 
 ### Attribution frame budget (`maxFrames` / `CAPWALL_MAX_FRAMES`)
 

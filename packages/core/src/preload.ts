@@ -14,6 +14,9 @@
  *   CAPWALL_PROJECT_ROOT  project root for attribution/glob resolution (default: cwd)
  *   CAPWALL_ESM           "0" disables the ESM loader hook (default: on)
  *   CAPWALL_MAX_FRAMES    attribution stack-walk frame budget (default: 25, see issue #15)
+ *   CAPWALL_HARDENED      "1" enables hardened mode — freeze the shims so a dependency
+ *                         cannot monkey-patch away mediation (default: off; BREAKS
+ *                         graceful-fs — see docs/threat-model.md § hardened mode)
  *
  * Trace format: one JSON object per line, `{ "pkg": string, "req": CapabilityRequest }`,
  * deduplicated per process. `capwall gen-policy` aggregates this into a capabilities.json.
@@ -74,6 +77,9 @@ if (active) {
     // disable (leaves the CJS `require` path unaffected). The preload is loaded via --import,
     // which runs before the target's entry point, so the ESM hook is registered in time.
     esm: process.env["CAPWALL_ESM"] !== "0",
+    // Opt-in hardened mode (#17): freeze the shims. Off unless CAPWALL_HARDENED is exactly
+    // "1" — it is a breaking change for graceful-fs-style patchers, so it never defaults on.
+    hardened: process.env["CAPWALL_HARDENED"] === "1",
     onDecision(pkg, decision) {
       if (decision.attributionTruncated && !warnedTruncated) {
         warnedTruncated = true;

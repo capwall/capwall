@@ -29,6 +29,7 @@ import {
   type ShimContext,
   type ShimRegistry,
 } from "./runtime.js";
+import { harden, hardenClass } from "./harden.js";
 
 export type { DecisionSink, ShimContext } from "./runtime.js";
 
@@ -66,7 +67,7 @@ export function createChildProcessShim(ctx: ShimContext): typeof import("node:ch
       return spawnWithEnv(() => orig.apply(this, args));
     };
     Object.defineProperty(wrapped, "name", { value: orig.name, configurable: true });
-    return wrapped;
+    return harden(ctx, wrapped);
   }
 
   const real = realChildProcess as unknown as Record<string, unknown>;
@@ -108,10 +109,13 @@ export function createChildProcessShim(ctx: ShimContext): typeof import("node:ch
       value: (RealCP as { name: string }).name,
       configurable: true,
     });
+    // Hardened mode (#17): freeze the subclass + its prototype so
+    // `ChildProcess.prototype.spawn = evil` fails instead of removing the gate. See harden.ts.
+    hardenClass(ctx, Guarded);
     shim["ChildProcess"] = Guarded;
   }
 
-  return shim as typeof import("node:child_process");
+  return harden(ctx, shim) as typeof import("node:child_process");
 }
 
 /** Register the child_process shim's specifiers into the loader registry. */

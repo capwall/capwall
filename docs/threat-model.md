@@ -33,6 +33,10 @@ probed route still reaching a raw builtin is `process.getBuiltinModule` — the 
 path-independent residual listed under "what capwall does NOT stop", which defeats the CJS
 patch identically and is not ESM-specific.
 
+The shims are handed out **mutable by default** (so `graceful-fs` and friends keep working);
+`install(policy, mode, { hardened: true })` / `CAPWALL_HARDENED=1` freezes them instead —
+**off by default**, see § Hardened mode for what that does and does not buy.
+
 **ESM known limits** (documented, not silent):
 - A module that captured a raw builtin **before** capwall installed is not re-bound (same as
   CJS — install via the `--import` preload so capwall registers first).
@@ -235,6 +239,9 @@ code (`vm.Script`), or spawned a worker (`worker_threads.Worker`) with the guard
 The worker case was the worst of the three, because a worker is a fresh Node context with none
 of capwall's shims in it. All such sites are now subclasses, and a regression test asserts the
 `.prototype.constructor` invariant over **every** guarded class in the codebase (issue #64).
+A second benefit of that conversion: a subclass is an object capwall owns, so opt-in hardened
+mode (#17) can freeze it — a `Proxy` could not be frozen without freezing the real builtin
+class it wraps.
 
 **Residual, unchanged:** climbing PAST the guarded subclass still reaches the real method or
 class — `Object.getPrototypeOf(fs.ReadStream.prototype).constructor` from the class object, or
@@ -350,9 +357,10 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
   shim is a **shared, process-wide singleton**, so a single dependency that does un-patch it
   **silently disables enforcement for every other package and the app**, not just for itself,
   with no log line. Treat capwall's mediation as effective only against packages that do not
-  go looking for the raw builtin. A future opt-in hardened mode (frozen shims, accepting the
-  `graceful-fs` breakage) is tracked as a follow-up (#17). On the ESM path specifically,
-  **hijacking the loader-hook chain** is a second route with the same
+  go looking for the raw builtin. **Opt-in hardened mode (#17) closes the reassignment half of
+  this** — see § Hardened mode below for exactly how much, and how little, that buys. It does
+  nothing about `getBuiltinModule` and the other raw-builtin paths in this bullet. On the ESM
+  path specifically, **hijacking the loader-hook chain** is a second route with the same
   disables-it-for-everyone property; it is now gated and logged rather than silent, but not
   closed — see "Loader-hook registration (#61)" above for exactly what remains.
 - **fd / symlink escapes** — using an already-open file descriptor, or a symlink, to reach a
@@ -389,6 +397,88 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
 (a policy decision about whether they are allowed to start) but **not confinement** (control
 over what they do after starting). Do not treat a gated-but-allowed addon or subprocess as
 confined.
+
+## Hardened mode (opt-in, off by default) — issue #17
+
+`install(policy, mode, { hardened: true })`, or `CAPWALL_HARDENED=1` for the CLI preload,
+freezes the capability surfaces capwall hands to dependencies. It exists because the default
+shim is a plain mutable object, so `fs.readFileSync = evil` is a one-line, un-logged removal
+of enforcement **for the whole process** (the un-patching bullet above). Hardened mode is
+**off by default and must stay off by default** — see the graceful-fs cost below.
+
+**What it freezes** (only objects capwall itself created — never a builtin):
+
+- Every shim **namespace** handed to a dependency: `fs`, `fs.promises`, `net`, `http`,
+  `https`, `tls`, `http2`, `dgram`, `child_process`, `worker_threads`, `vm`. So
+  `fs.readFileSync = evil`, `delete fs.readFileSync`, and
+  `Object.defineProperty(fs, "readFileSync", …)` all fail.
+- Every guarded **wrapper function** on those namespaces, including wrappers hanging off
+  other wrappers (`fs.realpath.native`).
+- Every guarded **class in every shim — and its prototype**. That is the complete set from
+  "Capability-bearing classes" above: the prototype-method sites (`net.Socket`,
+  `tls.TLSSocket`, `http(s).Agent`, `dgram.Socket`, `child_process.ChildProcess`) and the
+  constructor sites (`fs.ReadStream`/`WriteStream` + their `File*Stream` aliases,
+  `vm.Script`/`SourceTextModule`/`SyntheticModule`, `worker_threads.Worker`,
+  `http(s).ClientRequest`). The prototype freeze is what matters for the method sites:
+  `net.Socket.prototype.connect = evil` is otherwise the same one-line un-guard, one level
+  down. Freezing a guarded class does **not** stop `class Mine extends fs.ReadStream {}` —
+  that reads the frozen class and writes to a new one.
+- The guarded `send`/`connect` own-properties capwall installs on a `dgram` socket instance
+  (made non-writable/non-configurable; the socket itself is not frozen — it needs its state).
+
+Note the dependency on issue #64: while `fs.ReadStream`, `vm.Script` and
+`worker_threads.Worker` were construct-trap Proxies, hardened mode could not freeze them at
+all — `Object.freeze` on a Proxy forwards `[[PreventExtensions]]`/`[[DefineOwnProperty]]` to
+its **target**, so freezing one would have frozen the real builtin class process-wide,
+outliving `uninstall()`. Converting them to guarded subclasses made them capwall-owned
+objects, and therefore freezable. Hardened mode now covers every guarded class, not a subset.
+
+**Observable behavior of a blocked patch.** Freezing does not raise an alarm. A write to a
+frozen object **throws a `TypeError` only under `"use strict"`**; in sloppy-mode CJS — which
+is what most published packages still are — it **silently no-ops**. There is no capwall log
+line for a blocked patch attempt. The guarantee is only that the original guarded method is
+still installed and still enforcing afterwards.
+
+**What it does NOT protect against.** Hardened mode raises the cost of un-patching. It is not
+a sandbox and it closes none of the following, each re-verified against a hardened install
+with a deny-all `enforce` policy:
+
+- **`process.getBuiltinModule("node:fs")`** (Node ≥22) — a plain public API returning the
+  real, un-shimmed module; the read succeeds. Also `process.binding`, internal module caches,
+  and builtins loaded from a context capwall has not patched. These never touch a shim object,
+  so freezing shim objects is irrelevant to them. **This alone makes hardened mode
+  defense-in-depth, not a boundary.**
+- **`http.globalAgent` / `https.globalAgent` (issue #65)** — the shim's `Agent` **class** is
+  guarded, but `globalAgent` is a real `Agent` instance passed through untouched, so
+  `http.globalAgent.createConnection({host, port})` is un-gated egress with or without
+  hardened mode. Freezing cannot fix this: the object is a builtin instance, not a capwall
+  object, and the missing guard is the problem, not a writable property.
+- **Replacing `process.env` wholesale** — the env read allowlist is a `Proxy` over the live
+  `process.env`, not a capwall-created namespace. Freezing it would break `process.env.X = y`
+  for the whole process and freeze the real environment object, so it is left alone;
+  `process.env = {…}` still un-gates env reads.
+- **Climbing PAST a guarded class**, exactly as documented under "Capability-bearing classes":
+  `Object.getPrototypeOf(net.Socket.prototype).connect` still reaches the real method, and
+  `new (Object.getPrototypeOf(fs.ReadStream.prototype).constructor)(deniedPath)` still reaches
+  the real class. Freezing capwall's subclass says nothing about the real class above it.
+- **Prototype pollution / primordials / fd + symlink escapes / `eval` / native addons /
+  subprocess internals / attribution laundering / deep stacks** — all unchanged. Hardening
+  primordials is SES's job.
+
+What hardened mode **did** close, verified the same way: `fs.readFileSync = evil`,
+`delete fs.readFileSync`, `Object.defineProperty(fs, …)`, `fs.promises.readFile = evil`,
+`net.Socket.prototype.connect = evil`, and replacing a guarded class on its namespace
+(`fs.ReadStream = evil`, `vm.Script = evil`, `worker_threads.Worker = evil`) — each is a
+silent no-op or a `TypeError`, with the original guard still denying afterwards.
+
+**Cost: it breaks `graceful-fs`, and therefore anything that depends on it.** `graceful-fs` is
+a transitive dependency of npm, webpack, and a large fraction of the ecosystem, and it patches
+`fs`'s methods at load time. Against a frozen `fs` that patch throws a `TypeError` (its
+sources are strict-mode), so the dependent package fails to load. The same applies to every
+other legitimate `fs` monkey-patcher. Enabling hardened mode is a deliberate trade: you lose
+`graceful-fs`-class compatibility — the no-SES-tax property that is capwall's whole adoption
+argument — and gain the closure of the reassignment escape only. Try it in `observe` mode
+first; a load-time `TypeError` from a patcher is what failure looks like.
 
 ## Comparison to other threat models
 

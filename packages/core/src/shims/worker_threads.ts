@@ -28,6 +28,7 @@ import {
   type ShimContext,
   type ShimRegistry,
 } from "./runtime.js";
+import { harden } from "./harden.js";
 
 export type { DecisionSink, ShimContext } from "./runtime.js";
 
@@ -45,12 +46,16 @@ export function createWorkerThreadsShim(ctx: ShimContext): typeof import("node:w
 
   const RealWorker = real["Worker"];
   if (typeof RealWorker === "function") {
-    shim["Worker"] = guardedConstructorSubclass(RealWorker as AnyCtor, () => {
-      guard(ctx, { kind: "worker_threads" }); // throws on enforce-deny, BEFORE super() spawns
-    });
+    shim["Worker"] = guardedConstructorSubclass(
+      RealWorker as AnyCtor,
+      () => {
+        guard(ctx, { kind: "worker_threads" }); // throws on enforce-deny, BEFORE super() spawns
+      },
+      ctx, // hardened mode (#17) freezes the guarded subclass; no-op by default
+    );
   }
 
-  return shim as typeof import("node:worker_threads");
+  return harden(ctx, shim) as typeof import("node:worker_threads");
 }
 
 /** Register the worker_threads shim's specifiers into the loader registry. */

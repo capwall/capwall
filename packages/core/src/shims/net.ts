@@ -16,6 +16,11 @@
  * (`Object.getPrototypeOf(Object.getPrototypeOf(sock)).connect`) reaches the real method —
  * determined-attacker territory, the same class as un-patching.
  *
+ * Under opt-in HARDENED MODE (#17) each guarded subclass and its prototype are frozen, so
+ * `net.Socket.prototype.connect = evil` fails instead of silently removing the guard for the
+ * whole process. The residual above is unaffected — freezing our subclass says nothing about
+ * the real class above it. See `harden.ts`.
+ *
  * Coverage & limits (kept in sync with docs/threat-model.md):
  *  - `net`: `connect`/`createConnection` and `new net.Socket().connect()`.
  *  - `http`/`https`: `request`/`get`, `new ClientRequest()`, and `Agent.createConnection`.
@@ -88,6 +93,7 @@ import { APP_ROOT, attributeCaller } from "../attribution/index.js";
 import { evaluate } from "../policy/evaluate.js";
 import { CapabilityError } from "../errors.js";
 import { attributionOptionsFor, guard, type ShimContext, type ShimRegistry } from "./runtime.js";
+import { guardedPropFlags, harden, hardenClass } from "./harden.js";
 
 export type { DecisionSink, ShimContext } from "./runtime.js";
 
@@ -621,7 +627,7 @@ function wrapFn(orig: AnyFn, resolve: (args: unknown[]) => ResolvedCall, ctx: Sh
     return orig.apply(this, call.args); // pinned clone, never the original
   };
   Object.defineProperty(wrapped, "name", { value: orig.name, configurable: true });
-  return wrapped;
+  return harden(ctx, wrapped);
 }
 
 /**
@@ -636,6 +642,8 @@ function guardedSubclassMethod(
   ctx: ShimContext,
 ): AnyCtor {
   const realMethod = (RealClass.prototype as Record<string, unknown>)[method];
+  // NOTE: returns the REAL class untouched when the method is absent — so nothing below this
+  // line may harden it (freezing a builtin is off the table; see harden.ts).
   if (typeof realMethod !== "function") return RealClass;
   const Guarded = class extends RealClass {};
   Object.defineProperty(Guarded.prototype, method, {
@@ -656,6 +664,10 @@ function guardedSubclassMethod(
     configurable: true,
   });
   Object.defineProperty(Guarded, "name", { value: RealClass.name, configurable: true });
+  // Hardened mode (#17): freeze the SUBCLASS's prototype, closing
+  // `net.Socket.prototype.connect = evil` — otherwise a one-line removal of the guard for
+  // every caller in the process. No-op by default.
+  hardenClass(ctx, Guarded);
   return Guarded;
 }
 
@@ -668,7 +680,7 @@ function wrapHttpFn(orig: AnyFn, defaultPort: number, ctx: ShimContext): AnyFn {
     return orig.apply(this, resolved.args); // pinned/synthesized args, never the original
   };
   Object.defineProperty(wrapped, "name", { value: orig.name, configurable: true });
-  return wrapped;
+  return harden(ctx, wrapped);
 }
 
 /** Guarded subclass of `http.ClientRequest`: the constructor initiates the connection. */
@@ -685,6 +697,7 @@ function guardedClientRequestClass(RealClass: AnyCtor, ctx: ShimContext, default
     configurable: true,
   });
   Object.defineProperty(Guarded, "name", { value: RealClass.name, configurable: true });
+  hardenClass(ctx, Guarded); // hardened mode only (#17) — see harden.ts
   return Guarded;
 }
 
@@ -708,7 +721,7 @@ export function createNetShim(ctx: ShimContext): typeof import("node:net") {
       ctx,
     );
   }
-  return shim as unknown as typeof import("node:net");
+  return harden(ctx, shim) as unknown as typeof import("node:net");
 }
 
 /**
@@ -742,7 +755,7 @@ function wrapHttpModule<T extends object>(real: T, ctx: ShimContext, defaultPort
       ctx,
     );
   }
-  return shim as unknown as T;
+  return harden(ctx, shim) as unknown as T;
 }
 
 export function createHttpShim(ctx: ShimContext): typeof import("node:http") {
@@ -769,7 +782,7 @@ export function createTlsShim(ctx: ShimContext): typeof import("node:tls") {
   if (typeof realTls.TLSSocket === "function") {
     shim["TLSSocket"] = guardedSubclassMethod(realTls.TLSSocket as unknown as AnyCtor, "connect", resolveTlsCall, ctx);
   }
-  return shim as unknown as typeof import("node:tls");
+  return harden(ctx, shim) as unknown as typeof import("node:tls");
 }
 
 /**
@@ -830,7 +843,8 @@ export function createHttp2Shim(ctx: ShimContext): typeof import("node:http2") {
     if (pinnedAuthority !== undefined) out[0] = pinnedAuthority; // a STRING, never the original
     return realConnect.apply(this, out);
   };
-  return shim as unknown as typeof import("node:http2");
+  harden(ctx, shim["connect"] as object);
+  return harden(ctx, shim) as unknown as typeof import("node:http2");
 }
 
 /** Attribute a dgram op and guard it, EXCEPT reads attributed to `<app>` (see header — this
@@ -864,7 +878,10 @@ function deriveDgramConnect(args: unknown[]): { host: string; port: number } {
   return { host, port };
 }
 
-/** Install guarded `send`/`connect` on a dgram socket instance (used for createSocket results). */
+/** Install guarded `send`/`connect` on a dgram socket instance (used for createSocket results).
+ * Under hardened mode (#17) these OWN properties are installed non-writable/non-configurable
+ * (`guardedPropFlags`) so `socket.send = evil` cannot strip the guard off a socket capwall
+ * handed out. The socket itself is never frozen — it needs its mutable internal state. */
 function guardDgramInstance(socket: Record<string, unknown>, ctx: ShimContext): void {
   const realSend = socket["send"];
   const realConnect = socket["connect"];
@@ -875,8 +892,7 @@ function guardDgramInstance(socket: Record<string, unknown>, ctx: ShimContext): 
         if (t) guardDgram(ctx, t.host, t.port);
         return (realSend as AnyFn).apply(this, args);
       },
-      writable: true,
-      configurable: true,
+      ...guardedPropFlags(ctx),
     });
   }
   if (typeof realConnect === "function") {
@@ -886,8 +902,7 @@ function guardDgramInstance(socket: Record<string, unknown>, ctx: ShimContext): 
         guardDgram(ctx, t.host, t.port);
         return (realConnect as AnyFn).apply(this, args);
       },
-      writable: true,
-      configurable: true,
+      ...guardedPropFlags(ctx),
     });
   }
 }
@@ -899,11 +914,11 @@ export function createDgramShim(ctx: ShimContext): typeof import("node:dgram") {
     shim[key] = (realDgram as unknown as Record<string, unknown>)[key];
   }
   const realCreate = realDgram.createSocket as unknown as AnyFn;
-  shim["createSocket"] = function (this: unknown, ...args: unknown[]): unknown {
+  shim["createSocket"] = harden(ctx, function (this: unknown, ...args: unknown[]): unknown {
     const socket = realCreate.apply(this, args) as Record<string, unknown>;
     guardDgramInstance(socket, ctx);
     return socket;
-  };
+  });
   const RealDgramSocket = (realDgram as unknown as Record<string, unknown>)["Socket"];
   if (typeof RealDgramSocket === "function") {
     const Guarded = class extends (RealDgramSocket as AnyCtor) {};
@@ -929,9 +944,10 @@ export function createDgramShim(ctx: ShimContext): typeof import("node:dgram") {
       value: (RealDgramSocket as { name: string }).name,
       configurable: true,
     });
+    hardenClass(ctx, Guarded); // hardened mode only (#17) — see harden.ts
     shim["Socket"] = Guarded;
   }
-  return shim as unknown as typeof import("node:dgram");
+  return harden(ctx, shim) as unknown as typeof import("node:dgram");
 }
 
 /**
