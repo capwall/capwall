@@ -44,6 +44,13 @@
  * `<unknown>` is an ordinary principal: it is evaluated against the policy like any package
  * name, so it is deny-by-default in enforce, recorded in observe, and grantable by writing an
  * explicit `"<unknown>"` entry in `capabilities.json`. What it is NOT is exempt.
+ *
+ * NOTHING SELF-REPORTED IS AN IDENTITY (issue #84). Only a frame's `getFileName()` — which V8
+ * takes from how the code was LOADED — is used to name a package. The one place capwall read a
+ * string the running code could shape, `getEvalOrigin()`, turned out to be forgeable through a
+ * nested `eval` and let a dependency with zero grants impersonate any package (or `<app>`). It
+ * is no longer consulted; every `eval`/`new Function` frame is {@link OPAQUE}. See
+ * {@link frameSource} for the mechanism and the proof that no stricter parse recovers it.
  */
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -60,11 +67,11 @@ export const APP_ROOT = "<app>" as const;
  * Sentinel for a call capwall could not attribute to any source file (issue #60).
  *
  * Returned when the stack walk finds no qualifying frame, or reaches app code only through
- * code with no filesystem identity (a `data:` URL module, `eval`/`new Function` output with
- * no usable origin, a bundler `sourceURL`). It is treated as an ordinary, untrusted principal
- * — evaluated against the policy, deny-by-default in enforce, recorded in observe — and it
- * never receives the `<app>` exemptions. Grant it explicitly (a `"<unknown>"` entry in the
- * policy) if a legitimate setup genuinely produces path-less frames.
+ * code with no filesystem identity (a `data:` URL module, any `eval`/`new Function` output, a
+ * bundler `sourceURL`). It is treated as an ordinary, untrusted principal — evaluated against
+ * the policy, deny-by-default in enforce, recorded in observe — and it never receives the
+ * `<app>` exemptions. Grant it explicitly (a `"<unknown>"` entry in the policy) if a legitimate
+ * setup genuinely produces path-less frames.
  */
 export const UNATTRIBUTED = "<unknown>" as const;
 
@@ -188,9 +195,10 @@ function toFsPath(fileName: string): string | null {
 }
 
 /**
- * A frame whose code has NO filesystem identity: a `data:`/`blob:`/`http:` module, `eval`ed
- * code whose origin we cannot trust, `node -e`/stdin (`[eval]`, `[stdin]`), a `vm` script's
- * default `evalmachine.<anonymous>`, a bundler `//# sourceURL=`.
+ * A frame whose code has NO filesystem identity: a `data:`/`blob:`/`http:` module, ANY
+ * `eval`/`new Function` frame (issue #84 — see {@link frameSource} for why the reported origin
+ * cannot be believed), `node -e`/stdin (`[eval]`, `[stdin]`), a `vm` script's default
+ * `evalmachine.<anonymous>`, a bundler `//# sourceURL=`.
  *
  * Distinct from a *neutral* frame (a `node:*` internal or a native frame, both of which are
  * capwall's or Node's own machinery and are skipped): an opaque frame is USER-CONTROLLED code
@@ -200,48 +208,54 @@ function toFsPath(fileName: string): string | null {
 const OPAQUE = Symbol("capwall.opaque-frame");
 
 /**
- * V8's own eval-origin form: `eval at <fn> (<origin>:<line>:<col>)`, possibly nested
- * (`eval at <fn> (eval at <fn> (/real/file.js:1:1))`). The innermost parenthesised group is
- * the real script, so take the LAST match. `[^()]` keeps the match from spanning the nesting.
- */
-const EVAL_ORIGIN = /\(([^()]+):\d+:\d+\)/g;
-
-/**
- * Where an `eval`/`new Function` frame was compiled, as a filesystem path — or {@link OPAQUE}.
- *
- * V8 reports no `getFileName()` for eval'd code but does report `getEvalOrigin()`, which for
- * code it compiled itself names the file the `eval` literally sits in. Using it keeps the
- * common, benign cases attributing exactly as before (a template engine that compiles with
- * `new Function` is charged to the engine, as it already was via the frame below) while
- * closing the detached variants of #60: `eval("setTimeout(payload)")` in a dependency is now
- * charged to that dependency BY NAME rather than laundering to `<app>`.
- *
- * SECURITY: a `//# sourceURL=` comment REPLACES the origin string with an attacker-chosen
- * value, which would otherwise let evaled code name any package it likes. Only V8's own form
- * is trusted, detected by the literal `"eval at "` prefix — a `sourceURL` cannot contain
- * whitespace (verified on V8/Node 20 and 22: a `sourceURL` with spaces is rejected outright
- * and the genuine origin is reported), so the prefix cannot be forged. Anything else is
- * OPAQUE, i.e. fails closed.
- */
-function evalOriginPath(site: NodeJS.CallSite): string | typeof OPAQUE {
-  const origin = site.getEvalOrigin();
-  if (origin === undefined || !origin.startsWith("eval at ")) return OPAQUE;
-  let innermost: string | undefined;
-  for (const match of origin.matchAll(EVAL_ORIGIN)) innermost = match[1];
-  if (innermost === undefined) return OPAQUE;
-  return toFsPath(innermost) ?? OPAQUE;
-}
-
-/**
  * Classify one frame: its filesystem path, `null` if it is neutral machinery to skip
  * (a `node:*` internal or a native frame), or {@link OPAQUE}.
+ *
+ * SECURITY — `getEvalOrigin()` IS NOT USABLE AS AN IDENTITY (issue #84). Until this commit an
+ * eval frame was resolved by parsing `getEvalOrigin()`, on the reasoning that a `//# sourceURL=`
+ * could not forge V8's own `eval at <fn> (<file>:L:C)` form because a `sourceURL` may not
+ * contain whitespace. The whitespace half of that is true and still verifiable — V8 rejects a
+ * `sourceURL` containing a space and reports the genuine origin — but the conclusion did not
+ * follow, because for a NESTED eval **V8 synthesizes the `eval at …` wrapper itself**, around
+ * the outer script's name, and the outer script's name is exactly what its `sourceURL` set:
+ *
+ *   inner = "<payload>"
+ *   outer = 'eval("<payload>")\n//# sourceURL=/proj/node_modules/lodash/index.js:1:1'
+ *   eval(outer)  ->  getEvalOrigin() === "eval at <anonymous> (…/lodash/index.js:1:1)"
+ *
+ * The attacker never writes the prefix and never writes whitespace; V8 writes the prefix for
+ * them, and the `:1:1` they appended to the `sourceURL` completes the shape. A dependency with
+ * zero grants thereby named any package in the policy — or `<app>`, the trust root, whose env
+ * reads are exempted before the decision is even recorded.
+ *
+ * NO STRICTER PARSE FIXES THIS, and it is worth being precise about why rather than tightening
+ * the regex and hoping. V8's depth-1 origin is `eval at <fn> (<script>:L:C)`; its depth-N origin
+ * is `eval at <fn> (` + the *origin of the outer script* + `)`. When the outer script carries a
+ * `sourceURL`, its origin is that bare `sourceURL` string — so a forged depth-2 origin is
+ * `eval at <fn> (<attacker string>)`, which is character-for-character the shape of a genuine
+ * depth-1 origin. Counting `eval at ` tokens, taking the outermost match instead of the
+ * innermost, or demanding a trailing `:L:C` all fail on the same input, because the two cases
+ * are not distinguishable as strings. V8 exposes the origin only as a formatted string (there is
+ * no `getEvalOriginScript()`), so there is nothing else to consult.
+ *
+ * WHAT WE DO INSTEAD: an eval frame has no filesystem identity, so it is {@link OPAQUE} — the
+ * same treatment `data:` modules, `[eval]`/`[stdin]` and bundler `sourceURL`s already get. The
+ * walk continues past it to the nearest frame that DOES have a real file name. Nothing an
+ * attacker can write is consulted. Costs and residuals are in `docs/threat-model.md`.
+ *
+ * The `isEval()` test comes FIRST, before `getFileName()` is trusted: on every Node we have
+ * checked, an eval frame reports no file name, but ordering it this way means a V8 that ever
+ * did surface a `sourceURL` through `getFileName()` fails closed here instead of handing an
+ * attacker-chosen path straight to {@link packageForPath}. `vm`-compiled scripts are NOT eval
+ * frames (`isEval()` is false and they carry the real `filename` option), so this does not
+ * touch them — see the `vm` residual in `docs/threat-model.md`.
  */
 function frameSource(site: NodeJS.CallSite): string | null | typeof OPAQUE {
+  if (site.isEval()) return OPAQUE;
   const fileName = site.getFileName();
   if (fileName === undefined || fileName === null || fileName === "") {
-    // No script name at all: either a native frame (neutral) or eval'd code, which V8
-    // reports with no file name but WITH an origin.
-    return site.isEval() ? evalOriginPath(site) : null;
+    // No script name and not eval: a native frame — neutral machinery, skipped like `node:*`.
+    return null;
   }
   const fsPath = toFsPath(fileName);
   if (fsPath !== null) return fsPath;

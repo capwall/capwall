@@ -98,16 +98,23 @@ afterAll(async () => {
  * Every vector a dependency can use to run its capability calls from frames with no
  * filesystem path. All of them used to be charged to `<app>`; none may be now.
  *
- * `expectedPkg` is what the denial must NAME: the vectors where V8 still tells us where the
- * code was compiled (`eval`, `new Function`) or still has the dependency's own frame on the
- * stack (the non-detached `data:` import) are charged to the dependency BY NAME; the rest are
- * `<unknown>`, which is a principal like any other — evaluated, recorded, deny-by-default.
+ * `expectedPkg` is what the denial must NAME: a vector that still has the dependency's own frame
+ * on the stack (the non-detached `data:` import) is charged to the dependency BY NAME; the rest
+ * are `<unknown>`, which is a principal like any other — evaluated, recorded, deny-by-default.
+ *
+ * The two `eval` vectors were charged to `launder-dep` by name until issue #84, because V8's
+ * `getEvalOrigin()` was read to recover the compile site. That string turned out to be partly
+ * attacker-controlled — a nested `eval` puts a `//# sourceURL=` inside the `eval at …` wrapper
+ * V8 synthesizes — and no parse of it can be trusted, so it is no longer consulted. Detached
+ * eval'd code leaves no real frame behind, so it is now `<unknown>`. That keeps the half of #60
+ * that mattered (it is not `<app>`, so it is gated and recorded) and gives up the by-name
+ * precision, which was resting on a forgeable string.
  */
 const VECTORS: Array<{ vector: string; expectedPkg: string }> = [
   { vector: "data-detached", expectedPkg: "<unknown>" },
   { vector: "data-direct", expectedPkg: "launder-dep" },
-  { vector: "eval-detached", expectedPkg: "launder-dep" },
-  { vector: "function-detached", expectedPkg: "launder-dep" },
+  { vector: "eval-detached", expectedPkg: "<unknown>" },
+  { vector: "function-detached", expectedPkg: "<unknown>" },
   { vector: "native-detached", expectedPkg: "<unknown>" },
 ];
 

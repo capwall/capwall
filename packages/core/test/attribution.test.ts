@@ -63,24 +63,68 @@ describe("attributeCaller — the three outcomes (#60)", () => {
     expect(attributeCaller({ projectRoot: here, maxFrames: 1 })).toBe(UNATTRIBUTED);
   });
 
-  it("attributes eval'd code to the package that compiled it, via V8's eval origin", () => {
-    // `eval` frames carry no file name; V8 reports where the eval literally sits, and this
-    // file is app code, so the eval is charged to `<app>` rather than laundering anywhere.
+  it("never infers <app> through an eval frame (#84)", () => {
+    // `eval` frames carry no file name, and since #84 the origin V8 reports for them is not
+    // consulted at all — it is partly attacker-controlled (see below). An eval frame is
+    // therefore opaque, and `<app>`, the trust root, may not be claimed through opaque code.
     const evaluate = eval; // indirect eval — global scope, same origin reporting
-    expect(evaluate(ATTRIBUTE_CALL)).toBe(APP_ROOT);
+    expect(evaluate(ATTRIBUTE_CALL)).toBe(UNATTRIBUTED);
   });
 
-  it("attributes new Function code to its compile site too", () => {
-    expect(new Function(`return ${ATTRIBUTE_CALL}`)()).toBe(APP_ROOT);
+  it("never infers <app> through a new Function frame either (#84)", () => {
+    expect(new Function(`return ${ATTRIBUTE_CALL}`)()).toBe(UNATTRIBUTED);
   });
 
   it("attributes code with an attacker-supplied sourceURL to <unknown>", () => {
-    // `//# sourceURL=` REPLACES V8's eval origin with an arbitrary string. If it were trusted,
-    // evaled code could name any package it liked — including one with broad grants. Only
-    // V8's own `eval at … (path:line:col)` form is accepted, so this falls to `<unknown>`.
+    // `//# sourceURL=` REPLACES V8's eval origin with an arbitrary string, so evaled code
+    // could otherwise name any package it liked — including one with broad grants.
     const evaluate = eval;
     const pkg = evaluate(
       `${ATTRIBUTE_CALL}\n//# sourceURL=/proj/node_modules/lodash/index.js`,
+    ) as string;
+    expect(pkg).toBe(UNATTRIBUTED);
+  });
+
+  it("cannot be made to name a package by a NESTED eval + sourceURL (#84)", () => {
+    // The #84 forgery, at unit level. A single `sourceURL` cannot forge V8's `eval at …` form,
+    // because a `sourceURL` may not contain whitespace — that much was always true. But for a
+    // NESTED eval V8 synthesizes the `eval at <fn> (…)` wrapper itself, wrapped around the
+    // OUTER script's name, and the outer script's name is exactly what its `sourceURL` set.
+    // Appending `:1:1` (still no whitespace) completes the shape, and the result is
+    // indistinguishable from a genuine depth-1 origin:
+    //
+    //   getEvalOrigin() === "eval at <anonymous> (/proj/node_modules/lodash/index.js:1:1)"
+    //
+    // The forged path need not exist — attribution never touches the disk.
+    const evaluate = eval;
+    const forged = "/proj/node_modules/lodash/index.js";
+    const pkg = evaluate(
+      `eval(${JSON.stringify(ATTRIBUTE_CALL)})\n//# sourceURL=${forged}:1:1`,
+    ) as string;
+    expect(pkg).not.toBe("lodash");
+    expect(pkg).toBe(UNATTRIBUTED);
+  });
+
+  it("cannot be made to name a package at any nesting depth (#84)", () => {
+    // There is no depth at which the innermost group stops being attacker-chosen, so no
+    // "reject more than one `eval at`" or "take the outermost match" parse recovers this.
+    const evaluate = eval;
+    const forged = "/proj/node_modules/lodash/deep.js";
+    const inner = `eval(${JSON.stringify(ATTRIBUTE_CALL)})`;
+    const pkg = evaluate(
+      `eval(${JSON.stringify(inner)})\n//# sourceURL=${forged}:1:1`,
+    ) as string;
+    expect(pkg).not.toBe("lodash");
+    expect(pkg).toBe(UNATTRIBUTED);
+  });
+
+  it("cannot be made to name <app> by a nested eval naming a non-node_modules path (#84)", () => {
+    // The variant that needs no granted package in the policy at all: any path outside
+    // `node_modules` resolves to `<app>`, the trust root, whose env reads are exempted before
+    // the decision is recorded.
+    const evaluate = eval;
+    const pkg = evaluate(
+      `eval(${JSON.stringify(ATTRIBUTE_CALL)})\n//# sourceURL=${path.join(here, "app.js")}:1:1`,
     ) as string;
     expect(pkg).toBe(UNATTRIBUTED);
   });
