@@ -4,9 +4,11 @@
  * capwall attributes a mediated call to the nearest package frame it can find, walking at most
  * `maxFrames` frames. When the owning dependency's frame sits deeper than that budget — deep
  * promise chains, dynamically-compiled wrappers, async_hooks-heavy frameworks — the walk runs
- * out of frames and falls back to `<app>`. That is a SECURITY problem in both directions: the
- * app is the trust root and usually holds broad grants (wrongly ALLOW), and a dependency's
- * legitimate, granted call gets denied under `<app>`'s deny-by-default (wrongly DENY).
+ * out of frames and cannot find the owner. Before #60 that fell back to `<app>`, the trust
+ * root, which usually holds broad grants — a wrongly-ALLOW. It now falls back to `<unknown>`,
+ * which is deny-by-default, so the remaining failure mode is a wrongly-DENY: a dependency's
+ * legitimate, granted call is refused because capwall could not see whose it was. Same
+ * mis-attribution, failing closed instead of open; the fix is still to raise the budget.
  *
  * These tests prove: (a) the knob actually changes the outcome for one and the same call,
  * (b) garbage config falls back to the default instead of throwing or silently capturing zero
@@ -19,8 +21,8 @@ import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  APP_ROOT,
   DEFAULT_MAX_FRAMES,
+  UNATTRIBUTED,
   install,
   loadPolicyFromObject,
   resolveMaxFrames,
@@ -94,13 +96,14 @@ afterEach(() => {
 });
 
 describe("attribution maxFrames — the knob changes the outcome", () => {
-  it("mis-attributes a deep dependency stack to <app> at the default budget", () => {
+  it("mis-attributes a deep dependency stack to <unknown> at the default budget", () => {
     const { decisions } = withCapwall(observePolicy(), "observe", undefined, (dep) => {
       expect(dep.readDataViaDeepStack(DEEP)).toContain("fixture data");
     });
     expect(decisions).toHaveLength(1);
-    // The read really came from fixture-dep; the walk never got there.
-    expect(decisions[0]!.pkg).toBe(APP_ROOT);
+    // The read really came from fixture-dep; the walk never got there. Since #60 that lands
+    // on `<unknown>` rather than the trust root, so it fails closed instead of open.
+    expect(decisions[0]!.pkg).toBe(UNATTRIBUTED);
   });
 
   it("attributes the same call to fixture-dep when maxFrames is raised", () => {
@@ -112,9 +115,9 @@ describe("attribution maxFrames — the knob changes the outcome", () => {
   });
 
   it("flags the capped fallback as truncated, and does not flag a normal attribution", () => {
-    // Item 3 of #15: "exhausted the budget" must be distinguishable from "walked the whole
-    // stack and found only app code", so an operator can tell a mis-attribution from a real
-    // app-root call instead of it disappearing into <app>.
+    // Item 3 of #15: "exhausted the budget" must be distinguishable from every other
+    // unattributable call, so an operator knows to raise the budget rather than to grant
+    // `<unknown>`.
     const capped = withCapwall(observePolicy(), "observe", undefined, (dep) =>
       dep.readDataViaDeepStack(DEEP),
     );
@@ -133,15 +136,16 @@ describe("attribution maxFrames — the knob changes the outcome", () => {
 
   it("enforces against the WRONG package when the budget is too low (the security bug)", () => {
     // Same policy, same call, two budgets. At the default budget the granted dependency's read
-    // is charged to <app>, which has no entry and is therefore denied by default — a false
-    // deny here, and the mirror image of the false ALLOW that occurs when the app (or another
-    // package) holds a broad grant the real caller does not.
+    // is charged to `<unknown>`, which has no entry and is therefore denied — a false deny.
+    // Before #60 it was charged to `<app>`, where the same call would be ALLOWED outright in
+    // the (normal) case that the app holds a broad grant: a false allow of a dependency's
+    // call. Failing closed is the deliberate trade.
     const capped = withCapwall(grantFixtureDep(), "enforce", undefined, (dep) => {
       expect(() => dep.readDataViaDeepStack(DEEP)).toThrowError(
         expect.objectContaining({ name: "CapabilityError" }),
       );
     });
-    expect(capped.decisions[0]!.pkg).toBe(APP_ROOT);
+    expect(capped.decisions[0]!.pkg).toBe(UNATTRIBUTED);
     expect(capped.decisions[0]!.decision.allowed).toBe(false);
 
     const raised = withCapwall(grantFixtureDep(), "enforce", RAISED, (dep) => {
@@ -205,8 +209,9 @@ describe("attribution maxFrames — validation falls back to the default", () =>
 
   it("a bad maxFrames does not silently disable attribution", () => {
     // The failure mode this guards: NaN/0 reaching Error.stackTraceLimit captures ZERO frames,
-    // so EVERY call would attribute to <app> — capwall would look installed while attributing
-    // nothing. A shallow dependency call must still resolve to the dependency.
+    // so EVERY call would attribute to <unknown> — capwall would look installed while
+    // attributing nothing (and, since #60, denying everything). A shallow dependency call must
+    // still resolve to the dependency.
     captureStderr();
     const { decisions } = withCapwall(observePolicy(), "observe", 0, (dep) => dep.readData());
     expect(decisions[0]!.pkg).toBe("fixture-dep");
@@ -244,12 +249,13 @@ describe("CAPWALL_MAX_FRAMES env path (preload)", () => {
     });
   }
 
-  it("mis-attributes the deep read to <app> with no CAPWALL_MAX_FRAMES set", async () => {
+  it("mis-attributes the deep read to <unknown> with no CAPWALL_MAX_FRAMES set", async () => {
     expect(existsSync(PRELOAD), `built preload not found at ${PRELOAD} — run 'pnpm build' first`).toBe(true);
     const r = await runApp({});
     expect(r.stdout).toContain("READ_OK:fixture data");
-    expect(r.stderr).toMatch(/observe: recorded fs:read .* for '<app>'/);
-    // The one-time warning is the operator's signal that this <app> attribution is suspect.
+    expect(r.stderr).toMatch(/observe: recorded fs:read .* for '<unknown>'/);
+    // The one-time warning is the operator's signal that this <unknown> is a capped walk, not
+    // genuinely unattributable code.
     expect(r.stderr).toContain(`attribution hit the ${DEFAULT_MAX_FRAMES}-frame budget`);
     expect(r.code).toBe(0);
   });
@@ -266,7 +272,7 @@ describe("CAPWALL_MAX_FRAMES env path (preload)", () => {
     const r = await runApp({ CAPWALL_MAX_FRAMES: "twenty-five" });
     expect(r.stderr).toContain('ignoring invalid CAPWALL_MAX_FRAMES="twenty-five"');
     expect(r.stdout).toContain("READ_OK:fixture data"); // fail-open: the app still ran
-    expect(r.stderr).toMatch(/observe: recorded fs:read .* for '<app>'/);
+    expect(r.stderr).toMatch(/observe: recorded fs:read .* for '<unknown>'/);
     expect(r.code).toBe(0);
   });
 });

@@ -57,6 +57,29 @@ Consequences worth knowing:
 - An unrecognized `CAPWALL_MODE` (a typo) is inert rather than falling back to the file.
   `capwall run` refuses to launch in that case instead of running the target unmediated.
 
+### Two sentinel keys
+
+Besides real package names, `packages` accepts two sentinels:
+
+| Key | Charged when | Notes |
+|---|---|---|
+| `"<app>"` | the call came from the application's own code — a real source file not under `node_modules` | the trust root; also exempt from the `process.env` and `dgram` gates, so entries here only matter for `fs`, `net`, `child_process`, `worker_threads`, `vm` |
+| `"<unknown>"` | capwall could not attribute the call to any source file | e.g. a `data:` URL module, `eval`'d code with no trustworthy origin, or a native function invoked straight from a timer |
+
+`<unknown>` is gated like any dependency — deny-by-default in `enforce` — so a legitimate
+setup that produces path-less frames needs an explicit grant. Node's own ESM loader reads
+`WATCH_REPORT_DEPENDENCIES` from such a stack, so most projects end up with:
+
+```jsonc
+"<unknown>": { "env": ["WATCH_REPORT_DEPENDENCIES"] }
+```
+
+`capwall observe` writes that for you. **Keep it narrow.** A broad `<unknown>` grant applies
+to every call capwall cannot attribute, which includes a dependency deliberately running its
+payload from a path-less frame — the fail-open that
+[`threat-model.md`](threat-model.md) § attribution laundering describes. The preload prints a
+warning at startup when a policy grants `<unknown>`.
+
 ## `PackagePolicy`
 
 Every field is optional; an omitted capability means **not granted**.

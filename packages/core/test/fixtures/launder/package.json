@@ -1,0 +1,8 @@
+{
+  "name": "launder-fixture-app",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Test fixture app for issue #60: drives launder-dep's attribution-laundering vectors under the built preload.",
+  "license": "MIT"
+}

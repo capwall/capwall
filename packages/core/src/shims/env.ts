@@ -10,13 +10,25 @@
  * `Object.getOwnPropertyDescriptor(process.env, k).value` would otherwise hand back the value
  * a `get` denies — a one-line exfiltration hole for an anti-exfiltration control.
  *
- * SCOPE DECISION (documented in docs/threat-model.md): only reads attributed to a **real
- * dependency package** are gated. Reads attributed to {@link APP_ROOT} — application code AND
- * Node-internal frames (core modules read `process.env` constantly during startup, and those
- * stacks attribute to `<app>` because internal frames are skipped) — pass through ungated.
- * Gating `<app>` would either break Node startup or force the app to enumerate every internal
- * env read, for no security gain: the app is the trust root, and the threat we model is a
- * *dependency* exfiltrating secrets, not the app reading its own environment.
+ * SCOPE DECISION (documented in docs/threat-model.md): reads attributed to {@link APP_ROOT}
+ * pass through ungated. The app is the trust root, and the threat we model is a *dependency*
+ * exfiltrating secrets, not the app reading its own environment.
+ *
+ * THE EXEMPTION IS NARROW SINCE #60. `<app>` now means "a real application source file was
+ * found on the stack", nothing else. It used to ALSO mean "the walk found nothing" — which is
+ * how a dependency running from a `data:` URL module, from `eval`, or simply via
+ * `setTimeout(Object.assign, 0, stash, process.env)` (a native reader on a stack with no
+ * caller frame) could read any key in the environment and never appear in a log line. Those
+ * now attribute to `<unknown>` and are gated here exactly like a dependency: evaluated,
+ * recorded, soft-denied when not granted.
+ *
+ * The blast radius of that is small but real, and it is NOT zero: Node's own ESM loader reads
+ * `process.env.WATCH_REPORT_DEPENDENCIES` per module job from a purely internal stack, so
+ * every run under the CLI produces one unattributable env read. It soft-denies to `undefined`
+ * (i.e. behaves as if the variable were unset) and is recorded, so `capwall observe` emits a
+ * `"<unknown>": { "env": [...] }` grant for it automatically. That grant is the documented
+ * escape hatch for any other setup that legitimately reads env from path-less frames — an
+ * explicit, reviewable line in `capabilities.json`, not a silent exemption.
  *
  * SOFT DENY: a denied env read returns `undefined` rather than throwing. The security goal
  * is to keep the *value* from the reading package (anti-exfiltration) — hiding it achieves
@@ -94,8 +106,9 @@ export function createEnvProxy(
   /**
    * Attribute + evaluate a single key read, WITHOUT reporting it. Returns `null` when the read
    * is exempt entirely — symbol keys, a suspended gate, `CAPWALL_*` plumbing, and reads
-   * attributed to `<app>` (app code and Node internals; see header) — and otherwise the
-   * attributed package plus its decision.
+   * attributed to `<app>` (application code; see header) — and otherwise the attributed
+   * package plus its decision. An UNATTRIBUTABLE read is not exempt: it comes back as
+   * `<unknown>` with a decision, like any dependency (#60).
    *
    * Deciding and recording are separated because the two gated traps need different halves of
    * it: `get` decides AND records, `getOwnPropertyDescriptor` decides but must not record (see
@@ -110,7 +123,9 @@ export function createEnvProxy(
     // kept the default while the rest honored a raised cap would attribute the same call to a
     // different package depending on which capability it touched.
     const pkg = attributeCaller(attributionOptionsFor(ctx));
-    // App code and Node internals (both attribute to <app>) are not gated — see header.
+    // App code is not gated — see header. Since #60 this is a POSITIVE identification (a real
+    // application source file on the stack); an unattributable read is `<unknown>`, which
+    // falls through to the policy below rather than being exempted here.
     if (pkg === APP_ROOT) return null;
     return { pkg, decision: evaluate(ctx.policy, ctx.mode, pkg, { kind: "env", key }) };
   }

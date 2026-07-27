@@ -33,9 +33,11 @@
  *    `http:` authority (h2c/cleartext), 443 for `https:`.
  *  - `dgram`: socket `send`/`connect` (UDP), on both `createSocket()` results and
  *    `new dgram.Socket()`. A `send` on a *connected* socket (no destination args) is not
- *    re-gated (the `connect` was). Reads attributed to `<app>` are not gated, which also
- *    prevents a crash: Node auto-binds an unbound socket and REPLAYS `send` on an internal
- *    tick whose stack has no dependency frame (attributes to `<app>`).
+ *    re-gated (the `connect` was). Ops attributed to `<app>` are not gated (the app is the
+ *    trust root) — but since #60 that means a positively-identified application frame, not
+ *    "the stack walk found nothing", which is now `<unknown>` and IS gated. Node's auto-bind
+ *    `send` replay, which used to ride on that fail-open, is handled by state instead — see
+ *    `applyAuthorizedDgramSend`.
  *  - Inbound `server.listen` is deliberately NOT gated (egress, not binding).
  *  - IPC/unix-socket connects have no host:port and are approximated as `{ "<ipc>", 0 }`.
  *  - `dns` is NOT shimmed (a lookup moves no payload; DNS tunneling is out of scope).
@@ -847,14 +849,58 @@ export function createHttp2Shim(ctx: ShimContext): typeof import("node:http2") {
   return harden(ctx, shim) as unknown as typeof import("node:http2");
 }
 
-/** Attribute a dgram op and guard it, EXCEPT reads attributed to `<app>` (see header — this
- * also prevents the auto-bind replay crash, where Node re-invokes send on an internal tick). */
+/**
+ * Attribute a dgram op and guard it, EXCEPT ops attributed to `<app>` — the app is the trust
+ * root, exactly as in the `process.env` shim.
+ *
+ * Since #60 that exemption applies ONLY to a positively-identified application frame:
+ * attribution no longer falls off the end of the stack into `<app>`, it returns `<unknown>`,
+ * which is evaluated like any other principal. The auto-bind replay this exemption used to
+ * absorb is handled properly, by state, in {@link applyAuthorizedDgramSend}.
+ */
 function guardDgram(ctx: ShimContext, host: string, port: number): void {
   const pkg = attributeCaller(attributionOptionsFor(ctx));
   if (pkg === APP_ROOT) return;
   const decision = evaluate(ctx.policy, ctx.mode, pkg, { kind: "net", host, port });
   ctx.onDecision(pkg, decision);
   if (!decision.allowed) throw new CapabilityError(decision.reason, pkg);
+}
+
+/**
+ * Forward an ALREADY-AUTHORIZED `send` so Node's auto-bind replay cannot re-enter the guard.
+ *
+ * `send` on an unbound socket makes Node bind it and defer the datagram by queueing
+ * `this.send.bind(this, …)` — reading the property, i.e. capwall's wrapper — and re-invoking
+ * it from the socket's `'listening'` event, on a stack with no caller frame at all. That
+ * replay used to attribute to `<app>` and be exempted; since #60 it attributes to
+ * `<unknown>`, and re-guarding it would throw a `CapabilityError` for a send that was already
+ * allowed, from inside Node's internals where the caller cannot catch it (the DoS regression
+ * covered in `test/routing.test.ts`).
+ *
+ * Fixing this by state rather than by attribution is also the only sound option: the replay's
+ * stack is byte-for-byte the same shape as `setTimeout(sock.send.bind(sock), 0, …)`, which is
+ * precisely the laundering trick #60 is about, so no stack-based rule could tell the two
+ * apart. Here we KNOW the send was authorized, because we just authorized it.
+ *
+ * Mechanism: shadow `send` with the real method for the synchronous duration of the call, so
+ * whatever Node captures for the replay is the unguarded method, then restore the wrapper.
+ * This exposes the real `send` only within that synchronous window, and only to code that
+ * could already reach it one prototype hop up (`Object.getPrototypeOf(sock).send`) — the
+ * documented shim-un-patching residual, not a new one.
+ */
+function applyAuthorizedDgramSend(receiver: unknown, realSend: AnyFn, args: unknown[]): unknown {
+  if (typeof receiver !== "object" || receiver === null) {
+    return realSend.apply(receiver, args); // odd receiver: nothing to shadow, just forward
+  }
+  const socket = receiver as Record<string, unknown>;
+  const saved = Object.getOwnPropertyDescriptor(socket, "send");
+  Object.defineProperty(socket, "send", { value: realSend, writable: true, configurable: true });
+  try {
+    return realSend.apply(socket, args);
+  } finally {
+    if (saved) Object.defineProperty(socket, "send", saved);
+    else delete socket["send"];
+  }
 }
 
 /** `send(msg[, offset, length], port[, address][, cb])`: last number = port, last string = host.
@@ -890,7 +936,7 @@ function guardDgramInstance(socket: Record<string, unknown>, ctx: ShimContext): 
       value: function (this: unknown, ...args: unknown[]) {
         const t = deriveDgramSend(args);
         if (t) guardDgram(ctx, t.host, t.port);
-        return (realSend as AnyFn).apply(this, args);
+        return applyAuthorizedDgramSend(this, realSend as AnyFn, args);
       },
       ...guardedPropFlags(ctx),
     });
@@ -930,7 +976,9 @@ export function createDgramShim(ctx: ShimContext): typeof import("node:dgram") {
         value: function (this: unknown, ...args: unknown[]) {
           const t = method === "send" ? deriveDgramSend(args) : deriveDgramConnect(args);
           if (t) guardDgram(ctx, t.host, t.port);
-          return (realMethod as AnyFn).apply(this, args);
+          return method === "send"
+            ? applyAuthorizedDgramSend(this, realMethod as AnyFn, args)
+            : (realMethod as AnyFn).apply(this, args);
         },
         writable: true,
         configurable: true,

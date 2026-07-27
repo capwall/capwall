@@ -126,7 +126,13 @@ Per-capability notes:
   another — and a dependency could otherwise bypass the control simply by choosing `tls`
   (or `dgram`) over `net`. Inbound `server.listen` is not gated (capwall mediates who a
   package may *reach*, not that it may serve). IPC/unix-socket connects have no host:port and
-  are approximated coarsely as `{ host: "<ipc>", port: 0 }`. Capability-bearing classes
+  are approximated coarsely as `{ host: "<ipc>", port: 0 }`. `dgram` ops attributed to `<app>`
+  are not gated (the app is the trust root, as for `process.env`); since #60 that requires a
+  positively identified application frame, and Node's auto-bind `send` replay — which used to
+  ride on the old fail-open, because Node re-invokes `send` from the socket's `'listening'`
+  event on a stack with no caller frame — is handled by state instead: the already-authorized
+  send is forwarded with the real method shadowing the guard, so the replay cannot re-enter it.
+  Capability-bearing classes
   (`net.Socket`, `tls.TLSSocket`, `http.ClientRequest`, `http.Agent`, `dgram.Socket`) are
   guarded via a **guarded subclass** whose prototype method (or constructor) runs the check,
   so `new Cls()`, `(instance).constructor`, `Cls.prototype.constructor`, and
@@ -178,10 +184,10 @@ Per-capability notes:
   gated as well as the module function.
 - **`process.env`** — a read allowlist enforced via a `Proxy` on `process.env` (`get` **and**
   `getOwnPropertyDescriptor` traps, so `Object.getOwnPropertyDescriptor(process.env, k).value`
-  cannot leak a value a direct read denies). Only reads attributed to a **dependency** are
-  gated; reads attributed to `<app>` (application code AND Node-internal frames, which
-  attribute to `<app>` because internal frames are skipped) pass through — gating them would
-  break Node startup for no gain, since the app is the trust root. `CAPWALL_*` keys (capwall's
+  cannot leak a value a direct read denies). Reads attributed to `<app>` pass through ungated
+  — the app is the trust root — but that means a **positively identified application source
+  file on the stack**, and nothing else. A read capwall cannot attribute is `<unknown>` and is
+  gated exactly like a dependency's (see § attribution outcomes). `CAPWALL_*` keys (capwall's
   own preload plumbing) are never gated or recorded. When a package **spawns a child**, Node
   reads `process.env` to build the child's environment block; those reads are exempted (the
   child_process shim suspends the env gate around the spawn) so an allowed spawn inherits a
@@ -249,6 +255,27 @@ two prototype levels up from an instance. That is the same class of escape as un
 shim outright: in-process code deliberately climbing above the guard. capwall does not claim to
 stop it. A guarded subclass raises the cost of the accidental and the opportunistic walk; it is
 not a boundary.
+
+**Attribution outcomes: `<pkg>`, `<app>`, `<unknown>`.** Every mediated call is charged to one
+of three principals. A frame under `node_modules/<pkg>` charges that package. A real source
+file **not** under `node_modules` charges `<app>`, the trust root, which the `process.env` and
+`dgram` gates exempt. Everything else — no qualifying frame on the stack at all, or app code
+reached only *through* code with no filesystem identity (a `data:`/`blob:` module, `eval`
+output with no trustworthy origin, a bundler `//# sourceURL=`, `node -e`/stdin) — charges
+`<unknown>`.
+
+`<unknown>` is an ordinary principal, not an exemption: deny-by-default in `enforce`, recorded
+in `observe`, and grantable with an explicit `"<unknown>"` entry in `capabilities.json`. That
+entry is the **escape hatch**, and it is needed in practice: Node's own ESM loader reads
+`process.env.WATCH_REPORT_DEPENDENCIES` from a stack with no caller frame, so every run under
+the CLI produces one unattributable env read. `capwall observe` emits the corresponding grant
+automatically. Granting `<unknown>` broadly (`"env": ["*"]`, a wide `net` grant) hands that
+authority to **every** call capwall cannot attribute, including a dependency deliberately
+running from a `data:` module — so the preload prints a one-line warning at startup when a
+policy grants it. Keep the grant as narrow as the observed keys.
+
+Before this split (issue #60), "could not attribute" and "this is the app" were the same value.
+See the § attribution laundering residual for what that cost and what remains.
 
 **Behavior change vs. real `fs` (operational note).** In `enforce` mode a denial is delivered
 via the SAME channel the real `fs` API would use for that call, not always a synchronous
@@ -366,28 +393,60 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
 - **fd / symlink escapes** — using an already-open file descriptor, or a symlink, to reach a
   path outside the allowed globs.
 - **`vm` / `eval` / `node:sqlite`** and similar reflective or alternate-execution surfaces
-  that can sidestep the shimmed API.
+  that can sidestep the shimmed API. Note the narrower claim since #60: code compiled with
+  `eval`/`new Function` no longer escapes *attribution* — V8 reports where it was compiled, so
+  it is charged to the compiling package, and code capwall cannot place is `<unknown>` rather
+  than `<app>`. What these surfaces still buy an attacker is reaching APIs capwall does not
+  mediate at all, and (with a `vm` grant) choosing the filename its frames report.
 - **Attribution laundering** — capwall attributes each call to the **nearest** package frame
   on the stack (see `core/src/attribution`). A malicious package that arranges for its
   operation to be *executed by* a trusted helper's code (passing a path to a logger that
   writes it, scheduling work a broadly-granted package performs) is charged to the helper.
   Keep helper grants tight; broad grants are laundering targets.
+
+  **What is now closed (issue #60).** This entry used to describe the whole risk, and it was
+  wrong: laundering did not require a trusted helper at all. The walk discarded every frame
+  with no filesystem path and then fell off the end into `<app>` — so "capwall could not work
+  out whose code this is" and "this is the application" were one value, and `<app>` is exempt
+  from the `process.env` and `dgram` gates. A dependency reached that state with ~15 lines of
+  ordinary ESM: run the payload from a `data:` URL module (no path on any frame) and detach one
+  tick through a timer (V8's async stack traces keep the dependency on the stack if it `await`s
+  straight through, so the detachment was the essential part). It could then read any
+  `process.env` key and send UDP **with no log line at all**, because the `<app>` short-circuit
+  returned before `evaluate()`/`onDecision()`. `eval`, `new Function`, and — needing neither
+  `data:` nor `eval` — handing a native function to a timer (`setTimeout(Object.assign, 0,
+  stash, process.env)`, `setTimeout(sock.send.bind(sock), …)`) all reached the same state. That
+  was a fail-open in exactly the Shai-Hulud shape capwall exists to stop, and it is fixed at
+  the attribution layer, so all of those vectors close together: an unattributable call is now
+  `<unknown>` and is evaluated like any other principal.
+
+  **What remains.** Nearest-package is still nearest-package, so a dependency can still route
+  work through a broadly-granted helper (including the app itself) and be charged to it. It can
+  still **deliberately deepen or launder its own stack** — push its frame past the frame budget,
+  or arrange for another package's frame to be the nearest one — and a `vm` grant lets it name
+  any file it likes (`vm.runInThisContext(code, { filename: "…/node_modules/lodash/x.js" })`
+  produces frames that attribute to `lodash`). A file that is not under any `node_modules` is
+  `<app>` regardless of where it lives, so a dependency that can write a file **and** load it
+  (`require("/tmp/x.js")`) is charged to the app; the fs write is itself gated, but a dependency
+  with any write grant plus load is an escalation path. And granting `<unknown>` broadly in a
+  policy restores an exemption for every unattributable call by hand. These are the
+  determined-in-process-attacker class, same as un-patching the shims — real, and not papered
+  over.
 - **Deep stacks past the attribution frame budget** — the walk inspects at most `maxFrames`
   frames (default 25). When the owning dependency's frame is deeper (long promise chains,
   dynamically-compiled or deeply-nested wrappers, `async_hooks`-heavy frameworks), the walk
-  runs out of budget and falls back to `<app>`. Since `<app>` is the trust root and usually
-  holds broad grants, that can **wrongly allow** a dependency's call — and, symmetrically,
-  wrongly deny a granted one under `<app>`'s deny-by-default. Mitigation: the budget is
-  configurable — `CAPWALL_MAX_FRAMES` for the preload/CLI, `install(…, { attribution: {
+  runs out of budget without finding it. That used to fall back to `<app>`, the trust root,
+  which could **wrongly allow** the call; since #60 it falls back to `<unknown>`, so it is
+  denied by default in enforce instead — a capped attribution now fails closed, including on
+  the `process.env` and `dgram` paths that exempt `<app>`. The trade is the other direction:
+  a benign deep stack is **wrongly denied** rather than wrongly allowed. Mitigation: the budget
+  is configurable — `CAPWALL_MAX_FRAMES` for the preload/CLI, `install(…, { attribution: {
   maxFrames } })` in-process — and an exhausted walk is **flagged, not silent** (the decision
-  carries `attributionTruncated: true`; the preload warns once on stderr), so a capped
-  attribution can be noticed and the budget raised. The flag rides on recorded decisions, so
-  the paths that deliberately exempt `<app>` **without** recording a decision — the
-  `process.env` read guard and `dgram` — still pass a capped call through silently. This is a
-  **mitigation, not a fix**: a
-  dependency can deliberately deepen its own stack to push its frame past whatever budget is
-  configured — the same determined-in-process-attacker class as un-patching the shims. Raising
-  the budget also costs throughput on every mediated call (issue #15).
+  carries `attributionTruncated: true`; the preload warns once on stderr), so the fix is to
+  raise the budget rather than to grant `<unknown>`. This is still a **mitigation, not a fix**:
+  a dependency can deliberately deepen its own stack past whatever budget is configured, which
+  now costs it its grants rather than gaining it the app's. Raising the budget costs throughput
+  on every mediated call (issue #15).
 - **Native `.node` addons** — arbitrary compiled code; capwall can gate *whether* an addon
   loads but cannot confine what it does once loaded.
 - **Subprocess internals** — capwall can gate *whether* a `child_process` spawn happens, but

@@ -4,6 +4,7 @@ node_modules/
 !examples/malicious-dep-demo/node_modules/
 !packages/core/test/fixtures/node_modules/
 !packages/core/test/fixtures/esm/node_modules/
+!packages/core/test/fixtures/launder/node_modules/
 !packages/cli/test/fixtures/app/node_modules/
 !scripts/bench/fixtures/node_modules/
 dist/

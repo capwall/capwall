@@ -3,13 +3,24 @@
  *
  * install() replaces process.env with a read-gating Proxy. A dependency (attributed to
  * "fixture-dep") reading a non-granted env key is denied in enforce / logged in observe;
- * app-and-internal reads (attributed to <app>) pass through ungated by design.
+ * reads attributed to <app> pass through ungated by design.
+ *
+ * Since #60 that exemption requires a POSITIVELY identified application frame. A read the
+ * walk cannot attribute at all is `<unknown>` and is gated like any dependency — see the two
+ * `<unknown>` cases below, and `attribution-laundering.test.ts` for the end-to-end vectors.
  */
 import { createRequire } from "node:module";
 import * as path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { install, loadPolicyFromObject, type Decision, type Policy } from "../src/index.js";
+import {
+  install,
+  loadPolicyFromObject,
+  UNATTRIBUTED,
+  type Decision,
+  type Policy,
+} from "../src/index.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const requireCjs = createRequire(import.meta.url);
@@ -43,6 +54,39 @@ function withCapwall<T>(
   } finally {
     handle.uninstall();
   }
+}
+
+/** Like `withCapwall`, but keeps the install up across awaits (the #60 cases need timers). */
+async function withCapwallAsync<T>(
+  policy: Policy,
+  mode: "observe" | "enforce",
+  fn: () => Promise<T>,
+): Promise<{ result: T; decisions: Recorded[] }> {
+  const decisions: Recorded[] = [];
+  const handle = install(policy, mode, {
+    projectRoot: here,
+    onDecision: (pkg, decision) => decisions.push({ pkg, decision }),
+  });
+  try {
+    return { result: await fn(), decisions };
+  } finally {
+    handle.uninstall();
+  }
+}
+
+/**
+ * Read `key` from a stack with NO caller frame — the #60 shape. `Object.assign` is a native
+ * reader (it leaves no JS frame of its own) and is handed straight to `setTimeout`, so when
+ * the env proxy's `get` trap fires, every frame on the stack is a Node internal.
+ */
+async function unattributedRead(key: string): Promise<unknown> {
+  const stash: Record<string, unknown> = {};
+  // NOT `setTimeout(() => Object.assign(...))` — that arrow would be a frame in THIS file, and
+  // the walk would attribute the read to the app. Passing the native function itself, with its
+  // arguments, is the whole point: the timer invokes it with nothing of ours on the stack.
+  setTimeout(Object.assign, 0, stash, process.env);
+  await sleep(5);
+  return stash[key];
 }
 
 const SECRET = "FIXTURE_SECRET_XYZ";
@@ -84,11 +128,38 @@ describe("env shim — enforce (soft deny: hide value, never throw)", () => {
     });
   });
 
-  it("does NOT gate app/internal reads (attributed to <app>)", () => {
+  it("does NOT gate app reads (attributed to <app>)", () => {
     // Deny-by-default policy, but a read from THIS test file attributes to <app>.
     withCapwall(enforce([]), "enforce", () => {
       expect(process.env[SECRET]).toBe("s3cr3t"); // not gated, not thrown
     });
+  });
+
+  it("DOES gate an unattributable read, and records it (#60)", async () => {
+    // `Object.assign` copies the env from a NATIVE frame; handed straight to a timer, there
+    // is no caller frame on the stack at all. That used to attribute to `<app>` and be
+    // exempted here — a two-line path around the anti-exfiltration control, needing no
+    // `data:` URL and no `eval`. It is now `<unknown>`: evaluated, recorded, soft-denied.
+    const { result, decisions } = await withCapwallAsync(enforce([]), "enforce", () =>
+      unattributedRead(SECRET),
+    );
+    expect(result).toBeUndefined(); // soft deny — value hidden
+    const rec = decisions.find(
+      (d) => d.pkg === UNATTRIBUTED && d.decision.observed.kind === "env",
+    );
+    expect(rec?.decision.allowed).toBe(false);
+  });
+
+  it("allows an unattributable read when the policy grants <unknown> (escape hatch)", async () => {
+    // The documented escape hatch: legitimate path-less frames exist (Node's own ESM loader
+    // reads WATCH_REPORT_DEPENDENCIES from an internal stack), so `<unknown>` is grantable
+    // — explicitly, in capabilities.json, never by silent exemption.
+    const policy = loadPolicyFromObject(
+      { version: 1, mode: "enforce", packages: { [UNATTRIBUTED]: { env: ["*"] } } },
+      { projectRoot: here },
+    );
+    const { result } = await withCapwallAsync(policy, "enforce", () => unattributedRead(SECRET));
+    expect(result).toBe("s3cr3t");
   });
 
   it("closes the getOwnPropertyDescriptor(...).value exfiltration path", () => {

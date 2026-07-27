@@ -128,6 +128,7 @@ export {
   packageForPath,
   resolveMaxFrames,
   APP_ROOT,
+  UNATTRIBUTED,
   DEFAULT_MAX_FRAMES,
 } from "./attribution/index.js";
 export type { Attribution, AttributionOptions } from "./attribution/index.js";
