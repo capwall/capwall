@@ -35,12 +35,16 @@ function loadFixtureFresh(): FixtureDep {
 const denyAll = (): Policy =>
   loadPolicyFromObject({ version: 1, mode: "enforce" }, { projectRoot: here });
 
+/** A deny-all CJS patch. `patchRequire` takes the whole ShimContext since #87. */
+const patchDenyAll = (): ReturnType<typeof patchRequire> =>
+  patchRequire({ policy: denyAll(), mode: "enforce", onDecision: () => {}, projectRoot: here });
+
 describe("loader — nested patchRequire install/uninstall (#22)", () => {
   it("an out-of-LIFO-order uninstall does not leak the outer layer", () => {
-    const outer = patchRequire(denyAll(), "enforce", { onDecision: () => {}, projectRoot: here });
+    const outer = patchDenyAll();
     let inner: ReturnType<typeof patchRequire> | undefined;
     try {
-      inner = patchRequire(denyAll(), "enforce", { onDecision: () => {}, projectRoot: here });
+      inner = patchDenyAll();
 
       // Both layers active: fs is shimmed + enforced (topmost — inner — handles the require).
       expect(() => loadFixtureFresh().readData()).toThrowError(
@@ -72,16 +76,16 @@ describe("loader — nested patchRequire install/uninstall (#22)", () => {
   });
 
   it("uninstall is idempotent and a second call is a safe no-op", () => {
-    const handle = patchRequire(denyAll(), "enforce", { onDecision: () => {}, projectRoot: here });
+    const handle = patchDenyAll();
     handle.uninstall();
     expect(() => handle.uninstall()).not.toThrow();
     expect(loadFixtureFresh().readData()).toBe("fixture data\n");
   });
 
   it("normal LIFO-order nested install/uninstall still works (no regression)", () => {
-    const outer = patchRequire(denyAll(), "enforce", { onDecision: () => {}, projectRoot: here });
+    const outer = patchDenyAll();
     try {
-      const inner = patchRequire(denyAll(), "enforce", { onDecision: () => {}, projectRoot: here });
+      const inner = patchDenyAll();
       try {
         expect(() => loadFixtureFresh().readData()).toThrowError(
           expect.objectContaining({ name: "CapabilityError" }),
@@ -100,7 +104,7 @@ describe("loader — nested patchRequire install/uninstall (#22)", () => {
   });
 
   it("a single install/uninstall (no nesting) behaves exactly as before", () => {
-    const handle = patchRequire(denyAll(), "enforce", { onDecision: () => {}, projectRoot: here });
+    const handle = patchDenyAll();
     try {
       expect(() => loadFixtureFresh().readData()).toThrowError(
         expect.objectContaining({ name: "CapabilityError" }),

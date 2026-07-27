@@ -11,17 +11,25 @@
  * determined attacker can try to reach the original builtin via internal caches /
  * `process.binding`.
  *
- * The specific shims are supplied by {@link buildShimRegistry}; this module just routes a
- * required specifier to its registered shim (built lazily on first mediated require) and
- * passes everything else through. Which specifiers are *candidates* is {@link MEDIATED_MODULES};
- * which are *actually shimmed* is whatever the registry contains — as of M4 that is fs,
- * net/http(s), child_process, worker_threads, and vm. (process.env is guarded separately, not
- * via require — see shims/env.ts.)
+ * The specific shims are supplied by `buildShimRegistry` via {@link liveRegistry}; this module
+ * just routes a required specifier to its registered shim (built lazily on first mediated
+ * require) and passes everything else through. Which specifiers are *candidates* is
+ * {@link MEDIATED_MODULES}; which are *actually shimmed* is whatever the registry contains — as
+ * of M4 that is fs, net/http(s), child_process, worker_threads, and vm. (process.env is guarded
+ * separately, not via require — see shims/env.ts.)
+ *
+ * LIFECYCLE (issue #87). Each install pushes its context onto the SHARED install stack in
+ * `live-context.ts` and pops it on `uninstall()`; the registry is built ONCE against that
+ * stack's live context box rather than per install. Before #87 this module built a fresh
+ * `ShimContext` object literal per install and never re-pointed the old one, so a module that
+ * captured `fs` under a loose policy kept enforcing that loose policy after `uninstall()` AND
+ * after `install(tighterPolicy)` — fail-open with respect to the new policy, while a freshly
+ * required `fs` correctly denied. See `live-context.ts` for the full reasoning; it is the same
+ * defect #62 fixed for ESM.
  */
 import Module from "node:module";
-import { buildShimRegistry, type ShimRegistry } from "../shims/index.js";
-import type { DecisionSink } from "../shims/runtime.js";
-import type { Mode, Policy } from "@capwall/policy-schema";
+import { liveRegistry, popInstall, pushInstall } from "./live-context.js";
+import type { ShimContext } from "../shims/runtime.js";
 
 /** Core modules capwall mediates; requiring any of these returns a shim once installed. */
 export const MEDIATED_MODULES = [
@@ -56,15 +64,6 @@ export const MEDIATED_MODULES = [
   "node:module",
 ] as const;
 
-export interface RequirePatchOptions {
-  onDecision: DecisionSink;
-  projectRoot?: string;
-  /** Attribution frame budget (#15); already validated by `install()`. */
-  maxFrames?: number;
-  /** Opt-in hardened mode (#17): freeze the shims this registry hands out. Off by default. */
-  hardened?: boolean;
-}
-
 export interface RequirePatchHandle {
   /** Restore the original loader (used by tests and teardown). */
   uninstall(): void;
@@ -95,26 +94,21 @@ interface ChainNode {
  */
 const installChain: ChainNode[] = [];
 
-/** Patch the CJS loader to return shimmed builtins for mediated modules. */
-export function patchRequire(
-  policy: Policy,
-  mode: Mode,
-  options: RequirePatchOptions,
-): RequirePatchHandle {
+/**
+ * Patch the CJS loader to return shimmed builtins for mediated modules.
+ *
+ * Takes the whole {@link ShimContext} (rather than the fields spread across an options object,
+ * as before #87) because the context is now the unit of the install lifecycle: this exact
+ * object is what gets pushed on the shared install stack and what `uninstall()` pops, and
+ * `install()` hands the same one to the env guard, the global-egress guard and the ESM hook so
+ * every mediated surface in the process agrees on which policy is live.
+ */
+export function patchRequire(ctx: ShimContext): RequirePatchHandle {
   const moduleInternals = Module as unknown as ModuleInternals;
 
-  // The registry is built lazily on the first mediated require so no shim (and thus no
-  // real-module capture) happens for a process that never touches a mediated specifier.
-  let registry: ShimRegistry | null = null;
-  const getRegistry = (): ShimRegistry =>
-    (registry ??= buildShimRegistry({
-      policy,
-      mode,
-      onDecision: options.onDecision,
-      hardened: options.hardened === true,
-      ...(options.projectRoot !== undefined ? { projectRoot: options.projectRoot } : {}),
-      ...(options.maxFrames !== undefined ? { maxFrames: options.maxFrames } : {}),
-    }));
+  // Activate this install BEFORE the patch goes live, so a require that lands between the two
+  // can never be evaluated against the previous install's policy.
+  pushInstall(ctx);
 
   // `node` here is the mutable chain link this install owns; `patchedLoad` always delegates
   // via `node.next` (read at CALL time), never a captured constant, so a later relink is
@@ -123,9 +117,11 @@ export function patchRequire(
   const node = { next: moduleInternals._load } as ChainNode;
   const patchedLoad: ModuleLoad = function (this: unknown, request, parent, isMain) {
     // Fast path: only the fixed candidate set can possibly be shimmed; everything else is a
-    // plain delegate with no registry work.
+    // plain delegate with no registry work. The registry itself is built on the first mediated
+    // require, so a process that never touches one never constructs a shim (and so never
+    // captures a real builtin).
     if ((MEDIATED_CANDIDATES as Set<string>).has(request)) {
-      const reg = getRegistry();
+      const reg = liveRegistry("cjs");
       if (reg.has(request)) return reg.get(request);
     }
     return node.next.call(this, request, parent, isMain);
@@ -139,6 +135,11 @@ export function patchRequire(
     uninstall() {
       if (uninstalled) return; // idempotent
       uninstalled = true;
+      // Deactivate the policy even if the `_load` relink below bails out: a shim some module
+      // captured reads the live context on every call, so this — not the loader unpatching —
+      // is what stops the torn-down install's grants (and its `onDecision` sink) from being
+      // used. Popping first also means the two are never observed out of order.
+      popInstall(ctx);
       const idx = installChain.indexOf(node);
       if (idx === -1) return; // already removed (shouldn't happen given the guard above)
       installChain.splice(idx, 1);
