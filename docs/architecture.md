@@ -1,7 +1,8 @@
 # capwall architecture
 
-> Design doc. The CJS path with the `fs` shim (roadmap M1–M3) is implemented; the other
-> the full MVP + ESM (M1–M5) is implemented. Build order lives in [`roadmap.md`](./roadmap.md).
+> Design doc. The full MVP + ESM (M1–M5) is implemented, as are the four stretch items
+> (S1–S4). Build order and per-milestone status live in [`roadmap.md`](./roadmap.md); what
+> that mediation is and is not worth is in [`threat-model.md`](./threat-model.md).
 
 ## Overview
 
@@ -51,12 +52,39 @@ package's slice of the policy.
 
 ### Capability shims (`core/src/shims`)
 
-One shim per core surface: `fs`, `net` (covers `http`/`https` since they build on `net`),
-`child_process`, `worker_threads`, `env` (a `process.env` accessor guard), `vm`. Each shim
-wraps the real API; on every capability-sensitive call it (1) asks `attribution` for the
-owning package, (2) asks `policy/evaluate` for a decision, then (3) forwards to the real API,
-logs, or throws. Shims must preserve the real API's signatures and error semantics so
-correct code is unaffected.
+One shim per core surface: `fs`; the six egress modules `net`, `http`, `https`, `tls`,
+`http2`, `dgram` (all six evaluated against the one `net` capability, and all six registered
+separately by `shims/net.ts`); `child_process`; `worker_threads`; `env` (a `process.env`
+accessor guard); `vm`. Each shim wraps the real API; on every capability-sensitive call it
+(1) asks `attribution` for the owning package, (2) asks `policy/evaluate` for a decision, then
+(3) forwards to the real API, logs, or throws. Shims must preserve the real API's signatures
+and error semantics so correct code is unaffected.
+
+**Every egress module is shimmed separately, and this is load-bearing — do not assume one
+covers another.** It is tempting to think shimming `net` gets `http`/`https` for free, since
+they build on it. It does not, for two independent reasons:
+
+1. capwall's require patch only sees `Module._load`-routed requires — that is, requires made
+   by user and dependency code. Node's own HTTP client pulls in `net` through the **internal
+   bootstrap loader**, which never reaches `Module._load`, so `http`'s internal use of `net`
+   never passes through capwall's `net` shim.
+2. Even if it did, a dependency could sidestep a `net`-only shim just by picking `tls`,
+   `http2` or `dgram` instead.
+
+So a new egress surface needs its **own** shim registration; inheriting coverage from a
+lower-level module is the reasoning error that produces a real bypass. See
+[`threat-model.md`](./threat-model.md) § per-capability notes, which states the same rule as
+a security property.
+
+`node:module` is also mediated, though it is not a policy capability: the shim gates
+`register`/`registerHooks` so a dependency cannot install a loader hook ahead of capwall's and
+un-mediate the ESM path process-wide (#61). Everything else on `node:module` passes through.
+
+**The corollary of "one shim per module surface" is that non-module surfaces are outside the
+mechanism.** `globalThis.fetch` and `globalThis.WebSocket` never route through a module load,
+so no shim ever sees them and they are neither gated nor logged — a real, open gap in egress
+coverage, written up in [`threat-model.md`](./threat-model.md) § Global egress surfaces
+(tracked as #80).
 
 One capability is deliberately NOT a shim: `native` (`.node` addon loads, S2/#49) lives in
 `core/src/loader/native.ts` and patches `process.dlopen`. There is no module to wrap — the
@@ -133,6 +161,10 @@ are imported from there directly — core does not restate or re-export them.
 - `enforce` — launch the target with capwall in enforce mode.
 - `run` — launch the target in the mode the policy document declares (`mode`), for projects
   that want the committed file, not the command line, to be the authority.
+- `diff` — run the target in observe mode, then report every observed capability the
+  committed policy would deny in enforce mode (drift detection, roadmap S3). Exits 0 = no
+  drift, 1 = drift, 2 = usage error / missing policy, and takes `--json`, so it can gate a
+  merge. See [`ci-local.md`](./ci-local.md) § Drift detection.
 - `gen-policy` — (re)generate a policy from a prior observe trace.
 - `explain` — explain why a `(package, capability, target)` tuple would be allowed or denied.
 
@@ -153,22 +185,29 @@ what their dependency tree actually does before committing to enforcement. Stage
 The implementing agent should treat these as the real work, not incidentals:
 
 - **ESM attribution & interception.** Static imports resolve before hooks run and bindings
-  are immutable — the CJS module-swap trick does not port directly. CJS-first; ESM
-  fast-follow. Expect partial parity initially.
+  are immutable — the CJS module-swap trick does not port directly. *Addressed in M5* by
+  having the hook supply the module source up front (see Loader interception above), so the
+  binding is to the shim from the start. The residuals that remain — loader-hook chain
+  ordering, pre-install capture, best-effort teardown — are enumerated in
+  [`threat-model.md`](./threat-model.md) § ESM known limits.
 - **Attribution through shared helpers (THE core risk).** When a call passes through a shared
   utility (`lodash`, a logger, a promise wrapper), the nearest `node_modules` frame may be
   the *helper*, not the package that *initiated* the operation. Stack-walking to find the
   "responsible" package is **fragile and costly**, and adversarially manipulable (a malicious
-  package can arrange to call through a trusted helper to launder attribution). Decide and
-  document the attribution policy (nearest-package vs first-non-core vs
-  initiating-app-boundary) and its known blind spots.
+  package can arrange to call through a trusted helper to launder attribution). *Decided:*
+  nearest-package (see Attribution above); the blind spots it keeps are written up in
+  [`threat-model.md`](./threat-model.md) § attribution laundering. Still the core risk —
+  deciding it did not remove it.
 - **Policy-generation completeness.** A trace only covers exercised code paths. Unexercised
   error handlers, rare branches, and lazy requires will trip `enforce` mode later
   (false-positive fatigue). Mitigations: make "add a missing capability" a one-liner,
   support staged/partial enforcement, and merge (not overwrite) on repeated observe runs.
-- **Performance (<1ms/req).** Attribution stack-walking is the hot cost. Cache
-  module→package resolution aggressively; consider capturing only the minimal stack depth
-  needed; avoid allocations on the hot path.
+- **Performance (<1ms/req).** The S4 benchmark (`pnpm bench`) says the cost is **not**
+  attribution-dominant, which is what this bullet originally assumed: it splits roughly
+  evenly between attribution stack-walking (~40%) and the shim wrapper's own dispatch (~55%),
+  with `evaluate()` negligible (issue #34). Cache module→package resolution aggressively (the
+  path→package cache is worth ~20x cold-vs-warm); avoid allocations on the hot path; and if
+  you need more headroom, profile the wrapper too, not just the walk.
 - **Monkey-patch robustness.** capwall's shims are JS-level patches. Malicious code may try
   to un-patch them (grabbing the original builtin via internal caches / `process.binding`).
   We cannot fully prevent this without SES — document it (threat-model) and make un-patching
