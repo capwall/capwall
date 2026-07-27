@@ -200,12 +200,17 @@ describe("native gate — enforce mode denies by default", () => {
     expect(subjects(o)).toEqual(["fixture-dep"]);
   });
 
-  it("denies a dlopen whose filename argument is not a string", () => {
+  it("denies a dlopen whose filename argument is not a string, ON THE FILE IT WOULD OPEN (#99)", () => {
+    // `process.dlopen` is a C++ binding that reads its second argument as `node::Utf8Value` —
+    // it STRINGIFIES whatever it is handed, so `{ toString: () => "/…/fixture-addon.node" }`
+    // loads that addon for real. capwall used to require `typeof raw === "string"` and record
+    // `<unknown>`, which skipped the OWNER half of the two-subject check: the half that stops a
+    // package holding its own `native` grant from loading a `.node` belonging to someone else.
     const o = withCapwall(DENY_ALL, "enforce", (dep) => dep.loadNativeViaBadArg(FIXTURE_ADDON));
     expect(o.error?.name).toBe("CapabilityError");
     expect(nativeDecisions(o)[0]!.decision.observed).toEqual({
       kind: "native",
-      path: "<unknown>",
+      path: FIXTURE_ADDON,
     });
   });
 

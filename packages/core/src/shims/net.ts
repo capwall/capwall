@@ -107,6 +107,23 @@
  * Node ends up reading only plain data properties / immutable strings equal to what was
  * guarded — a getter has no chance to diverge because it is never consulted again.
  *
+ * ARGUMENT NORMALIZATION MIRRORS NODE'S SOURCE, NOT THE SIGNATURE (issue #99). Reading a field
+ * once is only half the problem: the RULE that decides WHICH argument holds the destination has
+ * to be Node's rule too, or the guarded target and the real target diverge for a second reason
+ * having nothing to do with getters. Every resolver below therefore quotes the Node function it
+ * mirrors — `net._normalizeArgs`/`isPipeName` (`lib/net.js`), `normalizeConnectArgs`
+ * (`lib/internal/tls/wrap.js`), `ClientRequest` + `urlToHttpOptions` (`lib/_http_client.js`,
+ * `lib/internal/url.js`), `connect` (`lib/internal/http2/core.js`), `Socket.prototype.send` and
+ * `lookup4`/`lookup6` (`lib/dgram.js`, `lib/internal/dgram.js`) — and anywhere capwall knowingly
+ * differs says so, and why. IF YOU CHANGE A DERIVATION, READ THE NODE FUNCTION FIRST. The holes
+ * this rule exists to prevent all read as reasonable interpretations of a documented signature:
+ * a numeric-string port `validatePort` accepts (#95, gate skipped entirely); an options object
+ * read from an index Node never merges (#46, granted host guarded, evil host dialled); a
+ * positional numeric STRING that `isPipeName` says is a port and capwall called a socket path; a
+ * `path: ""` that Node's `pipe = !!path` treats as no path at all; a `URL` in a MERGE slot whose
+ * prototype accessors `ObjectAssign` never copies; and a plain object that is a perfectly legal
+ * `http2` authority.
+ *
  * HOST SPELLING. An IPv6 literal is guarded (and therefore written in policy) UNBRACKETED —
  * `::1`, not `[::1]` — because that is what Node itself dials: `urlToHttpOptions` and
  * `http2.connect` both strip the brackets a `URL` keeps on `.hostname`. Brackets are put back
@@ -136,13 +153,14 @@ import {
 import { defineGuardedAccessor, harden, hardenClass } from "./harden.js";
 // The accessor-flattening clone helper moved to `shims/pin.ts` (#89) with NO behavior change, so
 // the child_process shim applies the identical rule rather than growing a second copy of it.
-import { copyOwnFieldsExcept, NO_SKIPPED_KEYS } from "./pin.js";
+import { copyOwnFieldsExcept, NO_SKIPPED_KEYS, pinAllOwnFields } from "./pin.js";
 import { guardedWebSocketClass } from "./global-egress.js";
 // The single-read URL pinning helpers live in their own module so the global egress guard
 // (#80) can share this exact implementation without an import cycle — see url-snapshot.ts.
 import {
   bracketIpv6,
   coercePort,
+  isNodeUrlLike,
   snapshotUrl,
   stripIpv6Brackets,
   type UrlSnapshot,
@@ -163,6 +181,42 @@ const IPC_HOST = "<ipc>";
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null;
+}
+
+/**
+ * Node's `isPipeName` (`lib/net.js`, identical on Node 20 and 22):
+ *
+ *     function toNumber(x) { return (x = Number(x)) >= 0 ? x : false; }
+ *     function isPipeName(s) { return typeof s === 'string' && toNumber(s) === false; }
+ *
+ * A STRING first argument to `net.connect`/`tls.connect`/`Socket#connect` is a unix-socket /
+ * named-pipe PATH **only when it does not coerce to a non-negative number**. Everything else —
+ * `"9999"`, `" 9999 "`, `"0x270f"`, even `""` — lands in Node's `([port][, host])` branch and
+ * opens a TCP connection.
+ *
+ * capwall used to treat EVERY string first argument as an IPC path, so
+ * `net.connect("9999", "evil.host")` was guarded as the `ipc` capability on the path `"9999"`
+ * while Node dialled `evil.host:9999` — the same shape as #95 (a numeric-string port that
+ * Node's `validatePort` accepts and capwall's heuristic did not), one module over. A package
+ * holding any IPC grant reached arbitrary TCP egress through it. Tracked as #105.
+ */
+function isPipeName(s: string): boolean {
+  const n = Number(s);
+  return !(n >= 0); // NaN or negative → Node's `toNumber` returns `false` → it is a pipe name
+}
+
+/**
+ * Does Node's `ObjectAssign(options, source)` merge copy anything from `source`?
+ *
+ * `tls.connect`'s overlay slot and `http2.connect`'s `{ ...options }` are MERGES, not
+ * property reads: they copy `source`'s OWN ENUMERABLE properties and nothing else. Primitives
+ * contribute nothing capability-relevant (a string's own properties are its character indices),
+ * and `null`/`undefined` contribute nothing at all — so only objects and functions can move a
+ * destination. Note this deliberately INCLUDES functions (`ObjectAssign` copies an own
+ * enumerable `host` off a function just as happily) and EXCLUDES nothing that Node includes.
+ */
+function isMergeSource(v: unknown): v is object {
+  return (typeof v === "object" || typeof v === "function") && v !== null;
 }
 
 /** Like {@link isPlainObject} but excludes `URL` instances. Used where Node itself would NOT
@@ -294,44 +348,103 @@ function pinNetOptions(src: Record<string, unknown>): PinnedNetOptions {
   if (hasPath) pinned["path"] = rawPath;
 
   return {
-    host: typeof rawHost === "string" ? rawHost : undefined,
+    // Node: `const host = options.host || 'localhost'` — a FALSY host names no host, which is
+    // why the empty string does not survive as a guarded target here (#99). A truthy non-string
+    // fails Node's `validateString(host)`, so `undefined` (→ `localhost`) is the fail-closed
+    // answer for that too: capwall guards loopback and Node throws.
+    host: typeof rawHost === "string" && rawHost !== "" ? rawHost : undefined,
     port: coercePort(rawPort),
-    ipc: hasPath ? typeof rawPath === "string" : undefined,
-    ipcPath: typeof rawPath === "string" ? rawPath : undefined,
+    // Node decides pipe-vs-TCP with `const { path } = options; const pipe = !!path;` — pure
+    // TRUTHINESS, not "is a string". `{ path: "", host, port }` is therefore an ordinary TCP
+    // connect, which capwall used to guard as an `ipc` capability on the empty path while Node
+    // dialled `host:port` (#99). A truthy NON-string `path` is a pipe to Node right up until
+    // `validateString(path, 'options.path')` throws — `ipcPath` stays undefined there, so the
+    // call is guarded as IPC-to-`<unknown>` (fail closed) and then throws exactly as it would
+    // have without capwall.
+    ipc: hasPath ? Boolean(rawPath) : undefined,
+    ipcPath: typeof rawPath === "string" && rawPath !== "" ? rawPath : undefined,
+    pinned,
+  };
+}
+
+/**
+ * The overlay-slot counterpart of {@link pinNetOptions}: the same information, read with the
+ * semantics of Node's `ObjectAssign(options, source)` / `{ ...source }` MERGE rather than of a
+ * property read.
+ *
+ * Two differences, both load-bearing, both found by the #99 audit:
+ *
+ *  1. ONLY OWN ENUMERABLE PROPERTIES COUNT. `ObjectAssign` copies exactly those. Reading through
+ *     the prototype chain here invents a merge Node never performs — and the case that matters is
+ *     a `URL`, whose `host`/`port` live on `URL.prototype` and are therefore copied by NOTHING.
+ *     `tls.connect(443, "evil.host", new URL("https://granted.host"))` was guarded as
+ *     `granted.host` and connected to `evil.host`; the URL contributed nothing to Node's merge.
+ *  2. THE CLONE IS BUILT FIRST, and the target keys are read back off it. `pinAllOwnFields`
+ *     invokes each own accessor EXACTLY ONCE; reading the source again afterwards would be a
+ *     second invocation, i.e. the very TOCTOU this file exists to close. The clone's fields are
+ *     plain data properties by then, so reading them is free of that hazard.
+ */
+function pinNetOverlay(src: object): PinnedNetOptions {
+  const pinned = pinAllOwnFields(src); // every own accessor runs here, exactly once
+  const own = (key: string): { has: boolean; value: unknown } => {
+    const desc = Object.getOwnPropertyDescriptor(pinned, key);
+    if (desc === undefined || desc.enumerable !== true) return { has: false, value: undefined };
+    return { has: true, value: desc.value };
+  };
+  const host = own("host");
+  const port = own("port");
+  const path = own("path");
+  return {
+    host: typeof host.value === "string" && host.value !== "" ? host.value : undefined,
+    port: coercePort(port.value),
+    ipc: path.has ? Boolean(path.value) : undefined,
+    ipcPath: typeof path.value === "string" && path.value !== "" ? path.value : undefined,
     pinned,
   };
 }
 
 /**
  * Resolve ONE `net.connect`/`net.createConnection`/`Socket#connect`/`Agent#createConnection`
- * call — guarded target AND forwarded args — in a single pass. Accepted forms:
- *   - `(options[, cb])` — TCP `{host?, port}`, or IPC `{path}`
- *   - `(port[, host][, ...])` — TCP positional (primitives already: no getter surface)
- *   - `(path[, cb])` — IPC positional string
+ * call — guarded target AND forwarded args — in a single pass.
+ *
+ * This mirrors Node's `net._normalizeArgs` (`lib/net.js`) branch for branch, rather than the
+ * signature's three documented overloads, because the two do not agree (#99):
+ *
+ *     if (typeof arg0 === 'object' && arg0 !== null) options = arg0;      // (options[…][, cb])
+ *     else if (isPipeName(arg0))                     options.path = arg0; // (path[…][, cb])
+ *     else { options.port = arg0;                                        // ([port][, host][…])
+ *            if (args.length > 1 && typeof args[1] === 'string') options.host = args[1]; }
+ *
+ * The `else` is the catch-all: a numeric STRING is not a pipe name (see {@link isPipeName}), and
+ * neither is a number, a boolean, `null`, or `undefined`. All of them are ports.
  * IPC connects resolve to the `ipc` capability, carrying the canonicalized socket path (#72).
  */
 function resolveNetCall(args: unknown[], defaultPort = 0): ResolvedCall {
   const first = args[0];
-  if (typeof first === "number") {
-    const host = typeof args[1] === "string" ? args[1] : "localhost";
-    return { host, port: first, args };
+  if (typeof first === "string" && isPipeName(first)) {
+    return ipcCall(first, args); // (path[, cb]) — the ONLY positional string form that is IPC
   }
-  if (typeof first === "string") {
-    return ipcCall(first, args); // positional path form — IPC
+  if (!isPlainObject(first)) {
+    // ([port][, host][, …]) — Node's catch-all branch. `port` is coerced the way `validatePort`
+    // coerces it, so `net.connect("9999", "evil.host")` derives `evil.host:9999` (a TCP connect)
+    // instead of an IPC path. A port Node will reject (`true`, `{}`, …) coerces to `undefined`
+    // here: capwall guards the default, and the call then throws exactly as it would have.
+    // Primitives have no getter surface, so there is nothing to pin — args pass through.
+    const host = args.length > 1 && typeof args[1] === "string" && args[1] !== "" ? args[1] : "localhost";
+    return { host, port: coercePort(first) ?? defaultPort, args };
   }
-  if (isPlainObject(first)) {
-    // Any object is the options bag here, including a `URL` (nonsensical but legal — Node
-    // reads `.host`, which on a URL carries the port suffix; pinning reproduces that exactly
-    // instead of leaving the URL's accessors live for a second read).
-    const p = pinNetOptions(first);
-    const out = args.slice();
-    out[0] = p.pinned;
-    if (p.ipc === true) return ipcCall(p.ipcPath, out);
-    // `hostname` is deliberately NOT a fallback: Node's net/tls ignore it and dial `localhost`,
-    // so honoring it would guard a host the socket never reaches (a false-allow).
-    return { host: p.host ?? "localhost", port: p.port ?? defaultPort, args: out };
-  }
-  return ipcCall(undefined, args);
+  // (options[…][, cb]) — ANY non-null object is the options bag here, including a `URL`
+  // (nonsensical but legal: Node reads `.host`, which on a URL carries the port suffix, THROUGH
+  // THE PROTOTYPE CHAIN — so unlike the `tls`/`http2` overlay slots, a URL in this position
+  // really does supply a host, and pinning reproduces that exactly instead of leaving the URL's
+  // accessors live for a second read).
+  const p = pinNetOptions(first);
+  const out = args.slice();
+  out[0] = p.pinned;
+  if (p.ipc === true) return ipcCall(p.ipcPath, out);
+  // `hostname` is deliberately NOT a fallback: Node's net/tls ignore it and dial `localhost`,
+  // so honoring it would guard a host the socket never reaches (a false-allow).
+  return { host: p.host ?? "localhost", port: p.port ?? defaultPort, args: out };
 }
 
 /**
@@ -340,31 +453,35 @@ function resolveNetCall(args: unknown[], defaultPort = 0): ResolvedCall {
  * target must mirror that merge or a call like `tls.connect(443, "granted.host",
  * { host: "evil.host" })` would guard the granted target while Node connects to the evil one.
  *
- * The merge Node performs (`lib/_tls_wrap.js` `normalizeConnectArgs`) is exactly:
- *   options = net._normalizeArgs(args)[0]                         // args[0] object, or (port[, host])
- *   ObjectAssign(options, args[1] if object, ELSE args[2] if object)
- * — the FIRST of those two slots only. Following that rule precisely matters in both
- * directions: an options object at any other index is ignored by Node, so treating it as an
- * overlay guarded a target Node never dials (`tls.connect(443, "evil.host", {}, { host:
- * "granted.host" })` guarded granted.host and connected to evil.host — a false-allow).
+ * The merge Node performs (`lib/internal/tls/wrap.js` `normalizeConnectArgs`) is exactly:
  *
- * EVERY object argument is pinned regardless of whether it participates in the merge: an
- * accessor must never reach Node, and pinning normalizes each object's target keys to own
- * enumerable data properties so Node's `ObjectAssign` sees precisely what capwall read.
+ *     const options = net._normalizeArgs(listArgs)[0];   // args[0] object, or (port[, host])
+ *     if (listArgs[1] !== null && typeof listArgs[1] === 'object') ObjectAssign(options, listArgs[1]);
+ *     else                                                        ObjectAssign(options, listArgs[2]);
+ *
+ * Three rules come out of those two lines, and getting any of them wrong is a false-allow:
+ *
+ *  1. EXACTLY ONE overlay slot is consulted, chosen by whether `args[1]` is a non-null OBJECT —
+ *     never both. An options object at any other index is ignored by Node, so treating it as an
+ *     overlay guarded a target Node never dials (`tls.connect(443, "evil.host", {},
+ *     { host: "granted.host" })` guarded granted.host and connected to evil.host — issue #46).
+ *  2. If `args[1]` IS an object, `args[2]` is not consulted AT ALL — not even when `args[1]`
+ *     turns out to contribute nothing. Falling back to `args[2]` in that case was the residue of
+ *     #46 that #99 found: `tls.connect(443, "evil.host", new URL("https://granted.host"))` put a
+ *     `URL` in slot 1, and capwall read `granted.host` off its PROTOTYPE while Node's
+ *     `ObjectAssign` copied nothing (a `URL` has no own enumerable properties) and connected to
+ *     `evil.host` (#105).
+ *  3. The overlay is a MERGE, so only OWN ENUMERABLE properties of it move anything — which is
+ *     what {@link pinNetOverlay} reads, as opposed to the prototype-chain read
+ *     {@link pinNetOptions} correctly performs for the BASE slot, where Node does
+ *     `options = arg0` and then reads `options.host`.
+ *
+ * Every object argument is still PINNED, whether or not it participates in the merge: an
+ * accessor must never reach Node, and pinning flattens each object's fields to data properties
+ * so Node's `ObjectAssign` sees precisely what capwall read.
  */
 function resolveTlsCall(args: unknown[]): ResolvedCall {
   const out = args.slice();
-  const pins: Array<PinnedNetOptions | undefined> = [];
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (!isPlainObject(a)) {
-      pins.push(undefined);
-      continue;
-    }
-    const p = pinNetOptions(a);
-    pins.push(p);
-    out[i] = p.pinned;
-  }
 
   let host: string | undefined;
   let port: number | undefined;
@@ -372,32 +489,52 @@ function resolveTlsCall(args: unknown[]): ResolvedCall {
   // Tracked alongside `ipc` so the guarded socket PATH follows the same merge order as the
   // ipc flag itself (#72) — the last object to speak to `path` decides both.
   let ipcPath: string | undefined;
+
+  // ── The BASE: net._normalizeArgs(args), which is resolveNetCall's rule set verbatim ────────
   const first = args[0];
-  if (typeof first === "number") {
-    port = first;
-    if (typeof args[1] === "string") host = args[1];
-  } else if (typeof first === "string") {
-    ipc = true; // positional path form
-    ipcPath = first;
-  }
-  const base = pins[0];
-  if (base) {
-    host = base.host ?? host;
-    port = base.port ?? port;
+  let base: PinnedNetOptions | undefined;
+  if (isPlainObject(first)) {
+    base = pinNetOptions(first);
+    out[0] = base.pinned;
+    host = base.host;
+    port = base.port;
     if (base.ipc !== undefined) {
       ipc = base.ipc;
       ipcPath = base.ipcPath;
     }
+  } else if (typeof first === "string" && isPipeName(first)) {
+    ipc = true; // (path[, …]) — only a NON-numeric string is a pipe name; see isPipeName (#99)
+    ipcPath = first;
+  } else {
+    port = coercePort(first); // ([port][, host][, …]) — including the numeric-string port
+    if (args.length > 1 && typeof args[1] === "string" && args[1] !== "") host = args[1];
   }
-  const overlay = pins[1] ?? pins[2];
-  if (overlay) {
+
+  // ── The OVERLAY: exactly one slot, chosen by Node's own test, merged with ObjectAssign ─────
+  const overlayIndex = isPlainObject(args[1]) ? 1 : 2;
+  const overlaySource = args[overlayIndex];
+  if (isMergeSource(overlaySource)) {
+    const overlay = pinNetOverlay(overlaySource);
+    // Substitute the pinned clone for a plain OBJECT only. A FUNCTION in this slot is the
+    // caller's callback — `normalizeArgs` takes the last function argument as `cb`, and
+    // `ObjectAssign` merges it as well, harmlessly, since a callback carries no own enumerable
+    // `host`/`port`/`path`. Replacing it with a clone would delete the callback, so it is
+    // forwarded untouched; the residual is that an own ACCESSOR on a callback function would be
+    // read twice. Pathological, and accepted rather than traded for a broken `tls.connect`.
+    if (isPlainObject(overlaySource)) out[overlayIndex] = overlay.pinned;
     host = overlay.host ?? host;
     port = overlay.port ?? port;
     if (overlay.ipc !== undefined) {
-      ipc = overlay.ipc; // ObjectAssign overwrites, even with undefined
+      ipc = overlay.ipc; // ObjectAssign overwrites, even with a falsy path
       ipcPath = overlay.ipcPath;
     }
   }
+  // The slot Node did NOT consult is still pinned when it is an object — an accessor on it must
+  // not be able to run inside the real call — but it contributes nothing to the target.
+  const unusedIndex = overlayIndex === 1 ? 2 : 1;
+  const unused = args[unusedIndex];
+  if (isPlainObject(unused)) out[unusedIndex] = pinAllOwnFields(unused);
+
   if (ipc) return ipcCall(ipcPath, out);
   return { host: host ?? "localhost", port: port ?? 443, args: out };
 }
@@ -454,19 +591,48 @@ function urlSnapshotToOptions(s: UrlSnapshot): Record<string, unknown> {
 /** An http-style options bag with every capability-relevant key read EXACTLY ONCE, plus the
  * clone to forward. See {@link HTTP_TARGET_KEYS} for why the set differs from the net flavor. */
 interface PinnedHttpOptions {
+  /**
+   * `hostname` and `host` are kept SEPARATE, not collapsed into one "the host this object names"
+   * field (#99). Node resolves them on the MERGED object —
+   * `validateHost(options.hostname) || validateHost(options.host) || 'localhost'` — so a
+   * `hostname` from the url and a `host` from the overlay do not compete as peers: the
+   * `hostname` still wins. Collapsing them made `http.request(new URL("http://a/"),
+   * { host: "b" })` resolve to `b`, where Node resolves to `a`.
+   */
+  hostname: string | undefined;
   host: string | undefined;
+  /** Whether the object HAS the key at all — an overlay's `hostname: undefined` ERASES a base's
+   * under Node's `ObjectAssign` merge, which "names no host" alone cannot express. */
+  hasHostname: boolean;
+  hasHost: boolean;
   port: number | undefined;
   defaultPort: number | undefined;
   socketPath: string | undefined;
-  /** Whether the object HAS a `socketPath` key — an overlay's `socketPath: undefined` erases a
-   * base's under Node's `ObjectAssign` merge, which "no socketPath" alone cannot express. */
+  /** Whether the object HAS a `socketPath` key — same `ObjectAssign` reasoning as above. */
   hasSocketPath: boolean;
   pinned: Record<string, unknown>;
 }
 
-/** Read an http-style options bag's capability-relevant keys once each and build the pinned
+/**
+ * Read an http-style options bag's capability-relevant keys once each and build the pinned
  * clone. Same contract as {@link pinNetOptions} — raw single reads written straight back — with
- * http's key set and http's precedence rules. */
+ * http's key set and http's precedence rules.
+ *
+ * DELIBERATE DIVERGENCE (#99), do not "fix" it back: presence is tested with `in`, i.e. THROUGH
+ * THE PROTOTYPE CHAIN, whereas Node reaches these fields only through `ObjectAssign`/spread
+ * copies of OWN ENUMERABLE properties (`ObjectAssign(input || {}, options)` in `ClientRequest`,
+ * and `{ __proto__: null, ...options }` a line later). So an inherited `hostname` is guarded here
+ * and ignored by Node. That is safe in BOTH of the shapes it can occur in, which is why it is
+ * kept: for the base slot the inherited value is guarded and then dropped from the forwarded
+ * clone (capwall names a host the socket never reaches — it can only DENY a call Node would have
+ * allowed), and for the overlay slot the endpoint is PINNED onto the forwarded object, so the
+ * host capwall guarded is the host Node dials. Either way the guarded target and the real target
+ * agree. The alternative — a second, subtly different reader for a shape
+ * (`http.request(Object.create({hostname: …}))`) no real caller writes — buys nothing and is one
+ * more place for the two derivations to drift apart. `tls`/`http2`, where the merge slot is NOT
+ * backed by an endpoint pin and the same distinction really is a false-ALLOW, do use
+ * own-enumerable semantics — see {@link pinNetOverlay}.
+ */
 function pinHttpOptions(src: Record<string, unknown>): PinnedHttpOptions {
   const hasHost = "host" in src;
   const hasHostname = "hostname" in src;
@@ -488,8 +654,15 @@ function pinHttpOptions(src: Record<string, unknown>): PinnedHttpOptions {
   if (hasDefaultPort) pinned["defaultPort"] = rawDefaultPort;
 
   return {
-    // Node: `hostname` wins over `host` here (unlike `net`, which reads only `host`).
-    host: typeof rawHostname === "string" ? rawHostname : typeof rawHost === "string" ? rawHost : undefined,
+    // Node: `validateHost(options.hostname) || validateHost(options.host) || 'localhost'`, so a
+    // FALSY value — including the empty string — names no host and falls through to the next
+    // candidate. `hostname: ""` used to survive here as the guarded host while Node went on to
+    // use `host` (#99). A truthy NON-string fails `validateHost`, so `undefined` is again the
+    // fail-closed answer: capwall guards `localhost` and the call then throws.
+    hostname: typeof rawHostname === "string" && rawHostname !== "" ? rawHostname : undefined,
+    host: typeof rawHost === "string" && rawHost !== "" ? rawHost : undefined,
+    hasHostname,
+    hasHost,
     // Node resolves the port with `||`, so a FALSY port (0, "", null) names no port at all.
     port: rawPort ? coercePort(rawPort) : undefined,
     defaultPort: rawDefaultPort ? coercePort(rawDefaultPort) : undefined,
@@ -527,19 +700,40 @@ function agentDefaultPort(opts: Record<string, unknown>): number | undefined {
  *
  * `socketPath` (http's unix-socket field, the `path` equivalent — see {@link HTTP_TARGET_KEYS})
  * makes the call an IPC connect, guarded on the socket path exactly like `net.connect({path})`.
+ *
+ * WHICH ARGUMENT IS THE URL is decided by Node's own DUCK-TYPED {@link isNodeUrlLike}, not by
+ * `instanceof URL` (#99). `ClientRequest` does
+ *
+ *     if (typeof input === 'string')  input = urlToHttpOptions(new URL(input));
+ *     else if (isURL(input))          input = urlToHttpOptions(input);
+ *     else { cb = options; options = input; input = null; }
+ *
+ * so ANY object with a truthy `href` and `protocol` and no `auth`/`path` is a URL to Node — and
+ * that decision is also what makes `args[1]` an options OVERLAY rather than the callback.
+ * capwall's `instanceof` test therefore classified
+ * `http.request({href, protocol, hostname: "granted.host"}, {hostname: "evil.host"})` as
+ * "options bag + callback", guarded `granted.host`, and let Node merge and dial `evil.host` (#105).
  */
 function resolveHttpCall(args: unknown[], defaultPort: number): ResolvedCall {
   const first = args[0];
   let urlOptions: Record<string, unknown> | undefined;
-  let urlHost: string | undefined;
+  let urlHostname: string | undefined;
   let urlPort: number | undefined;
 
   const fromUrl = (u: URL): void => {
     const snap = snapshotUrl(u); // the ONLY read of this URL's fields
     urlOptions = urlSnapshotToOptions(snap);
-    urlHost = stripIpv6Brackets(snap.hostname) || undefined; // unbracketed: what Node dials
+    urlHostname = stripIpv6Brackets(snap.hostname) || undefined; // unbracketed: what Node dials
     urlPort = snap.port !== "" ? coercePort(snap.port) : undefined;
   };
+
+  // A url-like object that is NOT a real `URL`: Node still runs it through `urlToHttpOptions`,
+  // whose `...url` spread carries its OWN properties into the merged options. Those own fields
+  // are read here — once, via `pinHttpOptions` — so `host`/`socketPath`/`defaultPort` sitting on
+  // such an object are guarded rather than smuggled past the guard. (A real `URL` instance has
+  // no own enumerable properties, and capwall deliberately does not replicate the `...url`
+  // spread for one — see {@link urlSnapshotToOptions}.)
+  let urlOwn: PinnedHttpOptions | undefined;
 
   if (typeof first === "string") {
     try {
@@ -547,8 +741,9 @@ function resolveHttpCall(args: unknown[], defaultPort: number): ResolvedCall {
     } catch {
       /* not an absolute URL */
     }
-  } else if (first instanceof URL) {
-    fromUrl(first); // the caller's URL instance — read exactly once, via snapshotUrl
+  } else if (isNodeUrlLike(first)) {
+    if (!(first instanceof URL)) urlOwn = pinHttpOptions(first as Record<string, unknown>);
+    fromUrl(first as URL); // read exactly once, via snapshotUrl
   }
 
   // Node's `ClientRequest` treats `args[1]` as an options OVERLAY only when `args[0]` was a
@@ -566,24 +761,35 @@ function resolveHttpCall(args: unknown[], defaultPort: number): ResolvedCall {
   if (urlOptions !== undefined) {
     // Node's own merged options here are the NULL-PROTOTYPE object `urlToHttpOptions` returns
     // with the overlay `ObjectAssign`ed onto it; mirroring the null prototype keeps a polluted
-    // `Object.prototype` from injecting fields into a synthesized options bag.
+    // `Object.prototype` from injecting fields into a synthesized options bag. The layer order
+    // is Node's: `{ ...url, <normalized url fields> }` then the overlay on top.
     forwarded = Object.create(null) as Record<string, unknown>;
+    if (urlOwn) copyOwnFieldsExcept(forwarded, urlOwn.pinned, NO_SKIPPED_KEYS);
     copyOwnFieldsExcept(forwarded, urlOptions, NO_SKIPPED_KEYS);
     if (overlay) copyOwnFieldsExcept(forwarded, overlay.pinned, NO_SKIPPED_KEYS);
   } else if (base) {
     forwarded = base.pinned;
   }
 
-  // An overlay `socketPath` key wins even when its value is undefined (ObjectAssign overwrites).
-  const socketPath = overlay?.hasSocketPath === true ? overlay.socketPath : base?.socketPath;
-  const finalHost = overlay?.host ?? base?.host ?? urlHost ?? "localhost";
+  // Every field below is resolved on the MERGED object, exactly as `ClientRequest` resolves it:
+  // a key PRESENT on the overlay wins even when its value is undefined (ObjectAssign overwrites),
+  // and only then does the layer beneath it speak.
+  const socketPath = overlay?.hasSocketPath === true ? overlay.socketPath : (urlOwn ?? base)?.socketPath;
+  // `hostname` and `host` are resolved as two independent merged fields and only THEN combined
+  // with Node's `hostname || host || 'localhost'` (#99). Collapsing them per-layer made an
+  // overlay `host` beat a url `hostname`, which Node never does.
+  const mergedHostname = overlay?.hasHostname === true ? overlay.hostname : (urlHostname ?? urlOwn?.hostname ?? base?.hostname);
+  const mergedHost = overlay?.hasHost === true ? overlay.host : (urlOwn ?? base)?.host;
+  const finalHost = mergedHostname ?? mergedHost ?? "localhost";
   // Node: `options.port || options.defaultPort || agent.defaultPort || <scheme default>`.
   const finalPort =
     overlay?.port ??
     base?.port ??
     urlPort ??
+    urlOwn?.port ??
     overlay?.defaultPort ??
     base?.defaultPort ??
+    urlOwn?.defaultPort ??
     (forwarded !== undefined ? agentDefaultPort(forwarded) : undefined) ??
     defaultPort;
 
@@ -591,6 +797,9 @@ function resolveHttpCall(args: unknown[], defaultPort: number): ResolvedCall {
     // Pin the endpoint onto the forwarded object. `port` is written UNCONDITIONALLY (even when
     // the caller supplied none) — that is what removes `agent.defaultPort`/`options.defaultPort`
     // from Node's later resolution and makes the guarded port provably the connected port.
+    // BOTH `hostname` and `host` are set to the ALREADY-RESOLVED host, so Node's own
+    // `hostname || host || 'localhost'` can only land on the value that was guarded no matter
+    // which of the two it reaches first.
     if (urlOptions !== undefined || "hostname" in forwarded) forwarded["hostname"] = finalHost;
     if ("host" in forwarded) forwarded["host"] = finalHost;
     forwarded["port"] = finalPort;
@@ -811,22 +1020,57 @@ export function createTlsShim(ctx: ShimContext): typeof import("node:tls") {
   // would ignore the override and false-allow).
   shim["connect"] = wrapFn(realTls.connect as unknown as AnyFn, resolveTlsCall, ctx);
   if (typeof realTls.TLSSocket === "function") {
-    shim["TLSSocket"] = guardedSubclassMethod(realTls.TLSSocket as unknown as AnyCtor, "connect", resolveTlsCall, ctx);
+    // ...but `TLSSocket#connect` is the NET rule, not the tls one (#99). `normalizeConnectArgs`
+    // and its `ObjectAssign` overlay live in `tls.connect` alone; `TLSSocket` defines no
+    // `connect` of its own and inherits `net.Socket.prototype.connect`, which normalizes with
+    // plain `net._normalizeArgs` and merges nothing. Applying the tls resolver here let
+    // `new tls.TLSSocket().connect(443, "evil.host", { host: "granted.host" })` be guarded as
+    // `granted.host` while Node dialled `evil.host` — the #46 false-allow, reintroduced by
+    // sharing a resolver between two entry points that only LOOK like the same signature (#105).
+    shim["TLSSocket"] = guardedSubclassMethod(
+      realTls.TLSSocket as unknown as AnyCtor,
+      "connect",
+      (a) => resolveNetCall(a, 443),
+      ctx,
+    );
   }
   return harden(ctx, shim) as unknown as typeof import("node:tls");
 }
 
 /**
  * Build a shimmed `http2` module: `http2.connect(authority[, options])` is guarded.
- * The authority (a url string OR a `URL` instance) is read via {@link snapshotUrl} — EACH
- * field exactly once — then rebuilt as a pinned, immutable STRING and forwarded in place of
- * the original: Node's own `connect` internally re-parses/re-reads the authority a second
- * time, which is exactly what a `URL` instance with a shadowed `hostname`/`port` accessor could
- * exploit (issue #26, URL-argument follow-up). A plain string authority is rebuilt too, for
- * uniformity, though strings have no getter surface to begin with.
  *
- * Rebuilding the authority means reproducing Node's own defaults exactly (`lib/internal/http2/
- * core.js`), and getting either of these wrong silently breaks a legitimate call:
+ * WHAT NODE ACCEPTS AS AN AUTHORITY (`lib/internal/http2/core.js`, identical on Node 20 and 22):
+ *
+ *     if (typeof authority === 'string') authority = new URL(authority);
+ *     assertIsObject(authority, 'authority', ['string', 'Object', 'URL']);
+ *     const protocol = authority.protocol || options.protocol || 'https:';
+ *     const port = '' + (authority.port !== '' ? authority.port
+ *                                              : (authority.protocol === 'http:' ? 80 : 443));
+ *     let host = 'localhost';
+ *     if (authority.hostname) { host = authority.hostname; if (host[0] === '[') host = host.slice(1, -1); }
+ *     else if (authority.host) { host = authority.host; }
+ *
+ * — so a PLAIN OBJECT is a first-class authority, not only a string or a `URL`. capwall used to
+ * run every non-`URL` authority through `new URL(String(authority))`, which for a plain object
+ * parses `"[object Object]"`, throws, and falls back to guarding `localhost:443` while Node went
+ * on to dial `{hostname: "evil.host", port: 9999, protocol: "http:"}` (#99, #105). A grant for
+ * loopback was therefore a grant for anywhere, and an `observe` trace recorded the wrong target.
+ *
+ * SO THE THREE SHAPES ARE HANDLED SEPARATELY, each reading every field EXACTLY ONCE:
+ *  - a STRING — parsed into capwall's own `URL` (no external getter surface), then rebuilt as a
+ *    pinned authority STRING that is forwarded in place of the original.
+ *  - a `URL` INSTANCE — read via {@link snapshotUrl}, then likewise replaced by the rebuilt
+ *    string. Node's own `connect` re-reads the authority, which is exactly what a shadowed
+ *    `hostname`/`port` accessor exploits (issue #26, URL-argument follow-up).
+ *  - any other OBJECT — the four fields Node reads are read once each and forwarded as a fresh,
+ *    inert 4-field object. It is deliberately NOT rebuilt into a URL string: an object authority
+ *    without a `port` makes Node compute the literal port `"undefined"` and throw
+ *    `ERR_SOCKET_BAD_PORT`, and synthesizing a valid authority there would turn a call Node
+ *    rejects into one it performs.
+ *
+ * Rebuilding an authority STRING means reproducing Node's own defaults exactly, and getting
+ * either of these wrong silently breaks a legitimate call:
  *  - the default port is SCHEME-AWARE — 80 for `http:` (h2c/cleartext), 443 for `https:`.
  *    Defaulting both to 443 broke every `http2.connect("http://internal-svc")`, which worked
  *    before the authority was rebuilt at all.
@@ -846,27 +1090,52 @@ export function createHttp2Shim(ctx: ShimContext): typeof import("node:http2") {
     let port = 443;
     let ipc = false;
     let ipcPath: string | undefined;
-    let pinnedAuthority: string | undefined;
-    try {
-      const u = authority instanceof URL ? authority : new URL(String(authority));
-      const snap = snapshotUrl(u); // the ONLY read of the authority's URL fields
-      const protocol = snap.protocol || "https:";
-      host = stripIpv6Brackets(snap.hostname) || "localhost"; // Node strips them before dialing
-      port = coercePort(snap.port) ?? (protocol === "http:" ? 80 : 443); // scheme-aware, like Node
-      pinnedAuthority = `${protocol}//${bracketIpv6(host)}:${port}`; // brackets back for the STRING
-    } catch {
-      /* unparseable authority — deny-leaning localhost:443; forwarded unchanged below, so Node
-       * raises the same parse error the un-shimmed API would */
+    const out = args.slice();
+
+    if (typeof authority === "string" || authority instanceof URL) {
+      try {
+        // capwall's own freshly-parsed URL for the string form — no external getter surface.
+        const snap = snapshotUrl(typeof authority === "string" ? new URL(authority) : authority);
+        const protocol = snap.protocol || "https:";
+        host = stripIpv6Brackets(snap.hostname) || "localhost"; // Node strips them before dialing
+        port = coercePort(snap.port) ?? (protocol === "http:" ? 80 : 443); // scheme-aware, like Node
+        out[0] = `${protocol}//${bracketIpv6(host)}:${port}`; // a STRING, never the original
+      } catch {
+        /* unparseable authority — deny-leaning localhost:443, and args[0] is left as the caller
+         * wrote it so Node raises the same parse error the un-shimmed API would */
+      }
+    } else if (isPlainObject(authority)) {
+      // The four fields Node reads off an object authority, one read each, forwarded inert.
+      const rawProtocol = authority["protocol"];
+      const rawPort = authority["port"];
+      const rawHostname = authority["hostname"];
+      const rawHost = authority["host"];
+      host =
+        typeof rawHostname === "string" && rawHostname !== ""
+          ? stripIpv6Brackets(rawHostname)
+          : typeof rawHost === "string" && rawHost !== ""
+            ? rawHost
+            : "localhost";
+      // Node's own expression, including its use of the RAW `authority.protocol` — not the
+      // `options.protocol` fallback — to pick the default port.
+      port = (rawPort !== "" ? coercePort(rawPort) : undefined) ?? (rawProtocol === "http:" ? 80 : 443);
+      const pinnedAuthority: Record<string, unknown> = {};
+      if (rawProtocol !== undefined) pinnedAuthority["protocol"] = rawProtocol;
+      pinnedAuthority["port"] = rawPort;
+      pinnedAuthority["hostname"] = rawHostname;
+      pinnedAuthority["host"] = rawHost;
+      out[0] = pinnedAuthority;
     }
     // Node honors options.host/port over the authority: both branches of its connect end up
     // spreading the options object over `{port, host}` (`net.connect({port, host, ...options})`
-    // for h2c, `tls.connect(port, host, {...options})` for h2). `options.path` would make it an
-    // IPC connect, so the overlay resolves through the NET flavor.
-    const out = args.slice();
+    // for h2c, `tls.connect(port, host, {...options})` for h2). Both are `ObjectAssign`-shaped
+    // MERGES of `{ ...options }`, so only OWN ENUMERABLE properties of the overlay move the
+    // destination — {@link pinNetOverlay}, not the prototype-chain read (#99). `options.path`
+    // would make it an IPC connect.
     const opts = args[1];
-    if (isPinnableOptions(opts)) {
-      const p = pinNetOptions(opts); // one read per capability-relevant key
-      out[1] = p.pinned;
+    if (isMergeSource(opts)) {
+      const p = pinNetOverlay(opts); // one read per capability-relevant key
+      if (isPlainObject(opts)) out[1] = p.pinned;
       if (p.host !== undefined) host = p.host;
       if (p.port !== undefined) port = p.port;
       if (p.ipc === true) {
@@ -875,8 +1144,7 @@ export function createHttp2Shim(ctx: ShimContext): typeof import("node:http2") {
       }
     }
     guard(ctx, targetRequest(ipc ? ipcCall(ipcPath, out) : { host, port, args: out }));
-    if (pinnedAuthority !== undefined) out[0] = pinnedAuthority; // a STRING, never the original
-    return realConnect.apply(this, out);
+    return realConnect.apply(this, out); // pinned authority + options, never the originals
   };
   // ISSUE #96 — every guarded wrapper capwall hands out reports the REAL function's `name`, and
   // this one did not: assigning through a computed member (`shim["connect"] = function …`) does
@@ -1014,7 +1282,7 @@ function readGuardedDgramSend(receiver: unknown, guardedSend: AnyFn): AnyFn {
 function mintDgramReplayToken(auth: DgramAuthorization): AnyFn {
   let spent = false;
   const token: AnyFn = function replayAuthorizedSend(this: unknown, ...args: unknown[]): unknown {
-    const target = deriveDgramSend(args);
+    const target = deriveDgramSend(args, this);
     if (
       spent ||
       this !== auth.socket ||
@@ -1057,7 +1325,7 @@ function mintDgramReplayToken(auth: DgramAuthorization): AnyFn {
  *     point — the replay's destination is identical to the one authorized — which is what
  *     {@link mintDgramReplayToken} matches on.
  */
-function deriveDgramSend(args: unknown[]): DgramTarget | null {
+function deriveDgramSend(args: unknown[], receiver: unknown): DgramTarget | null {
   // Node: `if (address || (port && typeof port !== 'function'))` picks the 6-argument form
   // `(buffer, offset, length, port, address, callback)`; otherwise the arguments shift down to
   // `(buffer, port, address, callback)`.
@@ -1066,15 +1334,39 @@ function deriveDgramSend(args: unknown[]): DgramTarget | null {
   const rawAddress = long ? args[4] : args[2];
   const port = coercePort(rawPort);
   if (port === undefined) return null; // connected send — no destination args
-  return { host: typeof rawAddress === "string" ? rawAddress : "localhost", port };
+  return { host: typeof rawAddress === "string" && rawAddress !== "" ? rawAddress : defaultDgramHost(receiver), port };
+}
+
+/**
+ * The address a `dgram` socket sends to when the call names none.
+ *
+ * NOT `"localhost"`. Node resolves an absent/empty address inside the socket's own bound lookup
+ * helper (`lib/internal/dgram.js`):
+ *
+ *     function lookup4(lookup, address, callback) { return lookup(address || '127.0.0.1', 4, callback); }
+ *     function lookup6(lookup, address, callback) { return lookup(address || '::1', 6, callback); }
+ *
+ * so the default depends on the socket TYPE and is a literal IP, never a name. capwall guarded
+ * `localhost` for both, which is a policy-spelling divergence in the direction that hurts a
+ * round trip: `capwall observe` recorded `localhost`, and a policy written the way an operator
+ * would (`"127.0.0.1"`) then denied the very call that produced the trace (#99). The socket's
+ * `type` is a plain data property Node sets in the `dgram.Socket` constructor.
+ */
+function defaultDgramHost(receiver: unknown): string {
+  if (typeof receiver === "object" && receiver !== null) {
+    const type = (receiver as { type?: unknown }).type;
+    if (type === "udp6") return "::1";
+  }
+  return "127.0.0.1";
 }
 
 /** `connect(port[, address][, cb])`. The port is coerced the way Node's `validatePort` does,
  * for the same reason as in {@link deriveDgramSend} — a string port must not derive a
- * different destination from the one Node dials. */
-function deriveDgramConnect(args: unknown[]): DgramTarget {
+ * different destination from the one Node dials. Node normalizes an absent address to `''`
+ * and then resolves it through the same {@link defaultDgramHost} rule `send` uses. */
+function deriveDgramConnect(args: unknown[], receiver: unknown): DgramTarget {
   const port = coercePort(args[0]) ?? 0;
-  const host = typeof args[1] === "string" ? args[1] : "localhost";
+  const host = typeof args[1] === "string" && args[1] !== "" ? args[1] : defaultDgramHost(receiver);
   return { host, port };
 }
 
@@ -1082,7 +1374,7 @@ function deriveDgramConnect(args: unknown[]): DgramTarget {
  * Node's auto-bind replay is served by a token rather than by a second policy check. */
 function guardedDgramSend(ctx: ShimContext, realSend: AnyFn): AnyFn {
   const guarded: AnyFn = function (this: unknown, ...args: unknown[]): unknown {
-    const target = deriveDgramSend(args);
+    const target = deriveDgramSend(args, this);
     if (target) guardDgram(ctx, target.host, target.port);
     return forwardAuthorizedDgramSend(this, target, realSend, guarded, args);
   };
@@ -1101,7 +1393,7 @@ function guardedDgramSend(ctx: ShimContext, realSend: AnyFn): AnyFn {
  * loudly (an uncatchable `CapabilityError` from Node's internals) if that ever changed. */
 function guardedDgramConnect(ctx: ShimContext, realConnect: AnyFn): AnyFn {
   const guarded: AnyFn = function (this: unknown, ...args: unknown[]): unknown {
-    const target = deriveDgramConnect(args);
+    const target = deriveDgramConnect(args, this);
     guardDgram(ctx, target.host, target.port);
     return realConnect.apply(this, args);
   };

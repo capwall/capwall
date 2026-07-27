@@ -85,13 +85,34 @@ interface ChainNode {
 const installChain: ChainNode[] = [];
 
 /**
- * Recorded path for a `dlopen` call whose filename argument is not a string.
+ * Recorded path for a `dlopen` call whose filename argument names no file capwall can read —
+ * an empty string, or a value whose string conversion threw.
  *
- * Real Node throws `ERR_INVALID_ARG_TYPE` for this, but the gate runs BEFORE the real call,
- * so it has to have an answer. We still gate (on the caller alone — there is no file to own),
- * because "the argument was garbage" must not become a way to reach an un-gated `dlopen`.
+ * The gate still fires (on the caller alone — there is no file to own), because "the argument
+ * was garbage" must not become a way to reach an un-gated `dlopen`.
  */
 export const UNKNOWN_ADDON = "<unknown>";
+
+/**
+ * The filename `dlopen` will actually open, plus the value to forward in its place.
+ *
+ * `process.dlopen` is a C++ binding that reads its second argument as `node::Utf8Value`, i.e.
+ * it STRINGIFIES whatever it is given — `process.dlopen(m, { toString: () => "/tmp/x.node" })`
+ * loads `/tmp/x.node`, verified on Node 20 and 22. capwall required `typeof raw === "string"`
+ * and recorded `<unknown>` for anything else, which skipped the OWNER half of the two-subject
+ * check in {@link gateNativeLoad} — the half that stops a package with its own `native` grant
+ * from loading someone else's `.node` (#99).
+ *
+ * So the conversion happens ONCE, here, and the resulting STRING is what gets forwarded: the
+ * same pin the egress shims apply to a URL argument, for the same reason — a `toString` that
+ * answered differently on Node's own conversion would otherwise load a file the gate never saw.
+ */
+interface ResolvedAddon {
+  /** Absolute path for attribution and the policy decision. */
+  path: string;
+  /** The pinned filename argument to forward, or `undefined` to forward the caller's value. */
+  forward: string | undefined;
+}
 
 /**
  * Normalize the filename `dlopen` was handed into something attributable and loggable.
@@ -101,8 +122,8 @@ export const UNKNOWN_ADDON = "<unknown>";
  * it is stripped before resolving. A direct caller may pass a relative path, so resolve
  * against the cwd the way the OS loader will.
  */
-function normalizeAddonPath(raw: unknown): string {
-  if (typeof raw !== "string" || raw === "") return UNKNOWN_ADDON;
+function normalizeAddonPath(raw: string): string {
+  if (raw === "") return UNKNOWN_ADDON;
   // Strip the Windows extended-length prefix (`\\?\C:\...`, or `\\?\UNC\server\share`).
   const stripped = raw.startsWith("\\\\?\\UNC\\")
     ? "\\\\" + raw.slice(8)
@@ -113,6 +134,24 @@ function normalizeAddonPath(raw: unknown): string {
     return path.resolve(stripped);
   } catch {
     return stripped;
+  }
+}
+
+/**
+ * Perform Node's own string conversion of the filename argument ONCE, and report both the path
+ * to gate on and the pinned value to forward. See {@link ResolvedAddon}.
+ *
+ * A conversion that THROWS (a symbol, an object whose `toString` throws) propagates nothing:
+ * the load is still gated, on `<unknown>`, and the caller's value is forwarded so the real
+ * `dlopen` raises the identical error it would have raised without capwall.
+ */
+function resolveAddon(raw: unknown): ResolvedAddon {
+  if (typeof raw === "string") return { path: normalizeAddonPath(raw), forward: undefined };
+  try {
+    const converted = String(raw); // the ONE conversion — Node's `node::Utf8Value`, in JS
+    return { path: normalizeAddonPath(converted), forward: converted };
+  } catch {
+    return { path: UNKNOWN_ADDON, forward: undefined };
   }
 }
 
@@ -175,8 +214,8 @@ function ownerOfAddon(ctx: ShimContext, addonPath: string): string {
  * the operator the full picture (which of the two subjects was missing the grant) instead of
  * only the first.
  */
-function gateNativeLoad(ctx: ShimContext, rawFilename: unknown): void {
-  const addonPath = normalizeAddonPath(rawFilename);
+function gateNativeLoad(ctx: ShimContext, resolved: ResolvedAddon): void {
+  const addonPath = resolved.path;
   const { pkg: caller, budgetExhausted } = attributeCallerDetailed(attributionOptionsFor(ctx));
   const owner = addonPath === UNKNOWN_ADDON ? caller : ownerOfAddon(ctx, addonPath);
   // Dedup: the overwhelmingly common shape is a package requiring its own addon, where
@@ -228,12 +267,18 @@ export function installNativeGate(ctx: ShimContext): NativeGateHandle {
 
   const node = { next: proc.dlopen } as ChainNode;
   const patched: Dlopen = function (this: unknown, ...args: unknown[]) {
-    gateNativeLoad(ctx, args[1]); // throws on enforce-deny, before the addon is mapped in
+    const resolved = resolveAddon(args[1]); // the ONE string conversion (#99)
+    gateNativeLoad(ctx, resolved); // throws on enforce-deny, before the addon is mapped in
     // Forward with the ORIGINAL arity. `process.dlopen`'s third parameter has a default
     // (`RTLD_LAZY`); passing an explicit `undefined` in its place defeats the default and the
     // real call fails with "invalid mode for dlopen()" — an accidental denial-of-service on
     // every native package. Spreading `args` preserves arity exactly.
-    return Reflect.apply(node.next, this, args);
+    if (resolved.forward === undefined) return Reflect.apply(node.next, this, args);
+    // A non-string filename: forward the PINNED conversion so the file the OS loader opens is
+    // provably the one the gate decided about, not whatever a second `toString` returns.
+    const pinnedArgs = args.slice();
+    pinnedArgs[1] = resolved.forward;
+    return Reflect.apply(node.next, this, pinnedArgs);
   };
   node.patched = patched;
   installChain.push(node);

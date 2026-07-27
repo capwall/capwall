@@ -92,6 +92,7 @@ export function createVmShim(ctx: ShimContext): typeof import("node:vm") {
       RealClass,
       () => {
         check(); // throws on enforce-deny, before super() compiles anything
+        return undefined; // nothing to pin — `vm` is a boolean gate with no target to derive
       },
       ctx, // hardened mode (#17) freezes the guarded subclass; no-op by default
     );

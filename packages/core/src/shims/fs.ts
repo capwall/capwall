@@ -44,8 +44,10 @@
  */
 import realFs from "node:fs";
 import * as path from "node:path";
+import { types } from "node:util";
 import { fileURLToPath } from "node:url";
 import { Readable, Writable } from "node:stream";
+import { isNodeUrlLike } from "./url-snapshot.js";
 import {
   guard,
   guardedConstructorSubclass,
@@ -104,6 +106,9 @@ const FS_METHODS: Record<string, MethodSpec> = {
   access: "access",
   accessSync: "access",
   // exists / existsSync are handled bespoke (they must never throw — see createFsShim).
+  // `openAsBlob` reads the file's CONTENTS (through the Blob it returns), so it is an ordinary
+  // read — it was simply missing from this table until the #99 sweep. Present on Node 20 and 22.
+  openAsBlob: R0,
   opendir: R0,
   opendirSync: R0,
   watch: R0,
@@ -125,6 +130,11 @@ const FS_METHODS: Record<string, MethodSpec> = {
   truncateSync: W0,
   chmod: W0,
   chmodSync: W0,
+  // `lchmod`/`lchmodSync` exist only where `O_SYMLINK` does (darwin) — `wrapSurface` skips a
+  // name the runtime does not define, so listing them here costs nothing on Linux/Windows and
+  // closes the gap on macOS (#99).
+  lchmod: W0,
+  lchmodSync: W0,
   chown: W0,
   chownSync: W0,
   lchown: W0,
@@ -169,6 +179,7 @@ const PROMISES_METHODS: Record<string, MethodSpec> = {
   unlink: W0,
   truncate: W0,
   chmod: W0,
+  lchmod: W0,
   chown: W0,
   lchown: W0,
   utimes: W0,
@@ -183,29 +194,76 @@ const PROMISES_METHODS: Record<string, MethodSpec> = {
 };
 
 /**
+ * One path argument, resolved: the string to check against policy AND the value to forward in
+ * its place. See {@link coercePath}.
+ */
+interface ResolvedPathArg {
+  /** Absolute, `/`-separated, for the policy glob match. */
+  target: string;
+  /**
+   * What to hand the real `fs` instead of the caller's argument. Identical to the caller's value
+   * for the string and `Uint8Array` shapes (neither has an accessor surface Node could re-read);
+   * the CONVERTED PATH STRING for a file-URL argument, which is the pin — see {@link coercePath}.
+   */
+  forward: unknown;
+}
+
+/**
  * Coerce a path-like argument to an absolute, `/`-separated path string, or null when the
  * argument is not a path (an fd number, a FileHandle, …) — those are out of scope.
+ *
+ * WHAT NODE ACCEPTS HERE, exactly (`getValidatedPath` → `toPathIfFileURL` → `validatePath`,
+ * `lib/internal/fs/utils.js` + `lib/internal/url.js`, identical on Node 20 and 22). Audited
+ * argument-shape by argument-shape under #99 (tracked as #104), because every shape capwall does
+ * NOT recognize is
+ * a call it returns `null` for — which means the gate is SKIPPED, not failed closed:
+ *
+ *  - `string` — MATCHES.
+ *  - any `Uint8Array` — Node's `validatePath` accepts `isUint8Array(path)`, which is every
+ *    `Uint8Array`, not only a `Buffer`. capwall tested `Buffer.isBuffer`, so
+ *    `fs.readFileSync(new Uint8Array(Buffer.from("/etc/passwd")))` was an UN-GATED, unlogged read
+ *    under a deny-all enforce policy. FIXED — `util.types.isUint8Array`, the same predicate Node
+ *    uses (a plain `instanceof` would miss a cross-realm array Node still accepts).
+ *  - a file URL — Node's test is the DUCK-TYPED {@link isNodeUrlLike}, not `instanceof URL`, so
+ *    `{ href, protocol: "file:", pathname: "/etc/passwd" }` is a real path to `fs`. capwall
+ *    tested `instanceof URL` and skipped the gate for that object entirely. FIXED.
+ *  - anything else — Node throws `ERR_INVALID_ARG_TYPE`; returning `null` here forwards it
+ *    unchanged so it throws identically. (An fd `number` is accepted by `readFile`/`writeFile`
+ *    and is the documented out-of-scope fd surface.)
+ *
+ * PINNING A URL ARGUMENT (the getter-TOCTOU of #26/#56, fs flavor — also #99). `fileURLToPath`
+ * reads `protocol`/`hostname`/`pathname` off the object, and the real `fs` call then reads them
+ * a SECOND time through its own `toPathIfFileURL`. A caller-supplied URL with an own shadowed
+ * `pathname` accessor could legally answer differently the second time: capwall guarded
+ * `/tmp/ok` and Node opened `/etc/passwd`. So the converted STRING is what gets forwarded — Node
+ * stores exactly that string internally anyway (`this.path = toPathIfFileURL(path)`), so this is
+ * a pin, not a behavior change.
  *
  * Fix #19: a Buffer path is decoded with `"latin1"`, not `"utf8"`. `latin1` maps every byte
  * 1:1 to a code point (U+0000–U+00FF), so the decode round-trips exactly — including
  * non-UTF-8 bytes, which a `utf8` decode would lossily collapse to U+FFFD. That lossiness
  * previously meant the STRING checked against policy could differ from the bytes actually
- * forwarded to real `fs` (the original Buffer is forwarded verbatim, unchanged by this
- * function). `/` is 0x2F, which is the same code point in latin1 as in ASCII/UTF-8, so
- * segment-splitting on `path.sep` below is unaffected.
+ * forwarded to real `fs` (the byte array is forwarded verbatim, unchanged by this function).
+ * `/` is 0x2F, which is the same code point in latin1 as in ASCII/UTF-8, so segment-splitting
+ * on `path.sep` below is unaffected.
  */
-function coercePath(arg: unknown): string | null {
+function coercePath(arg: unknown): ResolvedPathArg | null {
   let p: string;
+  let forward: unknown = arg;
   if (typeof arg === "string") p = arg;
   else if (Buffer.isBuffer(arg)) p = arg.toString("latin1");
-  else if (arg instanceof URL) {
+  else if (types.isUint8Array(arg)) p = Buffer.from(arg).toString("latin1");
+  else if (isNodeUrlLike(arg)) {
     try {
-      p = fileURLToPath(arg);
+      p = fileURLToPath(arg as URL);
     } catch {
+      // Not a `file:` URL (or an unconvertible one) — Node's own `fileURLToPath` throws the
+      // same way on the same object, so forward it untouched and let it.
       return null;
     }
+    forward = p; // THE PIN — never the caller's object, which Node would read a second time
   } else return null;
-  return path.resolve(p).split(path.sep).join("/");
+  return { target: path.resolve(p).split(path.sep).join("/"), forward };
 }
 
 /** Derive the effective PathSpecs for an `open`-kind call from its flags argument. */
@@ -259,6 +317,10 @@ type Delivery = "throw" | "reject" | "callback" | "streamRead" | "streamWrite";
  */
 function fsDeliveryFor(name: string): Delivery {
   if (name.endsWith("Sync")) return "throw";
+  // `openAsBlob` is the one promise-returning method on the CALLBACK surface — it takes no
+  // callback at all, so the `cb(err)` channel does not exist for it and a denial has to be a
+  // rejection, exactly like real `fs.openAsBlob` reports every failure (#99).
+  if (name === "openAsBlob") return "reject";
   if (name === "watch" || name === "watchFile") return "throw"; // watch throws in Node too; watchFile is a deliberate loud-fail (listener isn't error-first)
   if (name === "createReadStream") return "streamRead";
   if (name === "createWriteStream") return "streamWrite";
@@ -347,18 +409,31 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
    * (fd / FileHandle — out of scope). Throws `CapabilityError` on an enforce-mode denial;
    * the caller decides whether to propagate, reject, or translate that into a return value.
    */
-  function check(access: Access, arg: unknown): void {
-    const target = coercePath(arg);
-    if (target === null) return;
-    guard(ctx, { kind: "fs", access, path: target });
+  function check(access: Access, arg: unknown): ResolvedPathArg | null {
+    const resolved = coercePath(arg);
+    if (resolved === null) return null;
+    guard(ctx, { kind: "fs", access, path: resolved.target });
+    return resolved;
   }
 
-  /** Attribute + evaluate each path of a call; throws CapabilityError on an enforce deny. */
-  function guardCall(args: unknown[], spec: MethodSpec): void {
+  /**
+   * Attribute + evaluate each path of a call; throws CapabilityError on an enforce deny.
+   *
+   * Returns the argument list to FORWARD. It is the caller's own array unless a path argument
+   * had to be pinned (a file URL — see {@link coercePath}), in which case a copy carries the
+   * converted string in that slot so the real `fs` cannot re-read the caller's object and reach
+   * a different file from the one that was guarded (#99).
+   */
+  function guardCall(args: unknown[], spec: MethodSpec): unknown[] {
     const specs = spec === "open" ? openSpecs(args) : spec === "access" ? accessSpecs(args) : spec;
+    let out = args;
     for (const { index, access } of specs) {
-      check(access, args[index]);
+      const resolved = check(access, args[index]);
+      if (resolved === null || resolved.forward === args[index]) continue;
+      if (out === args) out = args.slice();
+      out[index] = resolved.forward;
     }
+    return out;
   }
 
   /**
@@ -366,12 +441,12 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
    * enforce-mode denial we report "does not exist" instead of throwing: `existsSync` → false,
    * `exists(path, cb)` → `cb(false)`. Observe mode allows and falls through to the real call.
    */
-  function isDeniedExistence(pathArg: unknown): boolean {
+  function probeExistence(pathArg: unknown): { denied: boolean; forward: unknown } {
     try {
-      check("read", pathArg);
-      return false;
+      const resolved = check("read", pathArg);
+      return { denied: false, forward: resolved === null ? pathArg : resolved.forward };
     } catch (err) {
-      if (err instanceof CapabilityError) return true;
+      if (err instanceof CapabilityError) return { denied: true, forward: pathArg };
       throw err;
     }
   }
@@ -391,7 +466,14 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
     return guardedConstructorSubclass(
       RealClass,
       (args) => {
-        check(access, args[0]); // throws on enforce-deny, before super() opens anything
+        // Throws on enforce-deny, before super() opens anything. The returned array carries the
+        // PINNED path when the caller passed a file URL (#99) — `guardedConstructorSubclass`
+        // forwards what the check returns.
+        const resolved = check(access, args[0]);
+        if (resolved === null || resolved.forward === args[0]) return undefined;
+        const out = args.slice();
+        out[0] = resolved.forward;
+        return out;
       },
       ctx, // hardened mode (#17) freezes the guarded subclass; no-op by default
     );
@@ -402,24 +484,25 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
       switch (delivery) {
         case "throw": {
           // Real sync fs throws synchronously — matches, no translation needed.
-          guardCall(args, spec);
-          return orig.apply(this, args);
+          return orig.apply(this, guardCall(args, spec));
         }
         case "reject": {
           // Real fs.promises rejects — matches, no translation needed.
+          let forwarded: unknown[];
           try {
-            guardCall(args, spec);
+            forwarded = guardCall(args, spec);
           } catch (err) {
             return Promise.reject(err);
           }
-          return orig.apply(this, args);
+          return orig.apply(this, forwarded);
         }
         case "callback": {
           // Real callback-style fs NEVER throws synchronously; it delivers errors via the
           // callback. Translate a sync guard throw into an async `cb(err)` so idiomatic
           // (try/catch-free) callback code isn't crashed by an uncaught exception (#16).
+          let forwarded: unknown[];
           try {
-            guardCall(args, spec);
+            forwarded = guardCall(args, spec);
           } catch (err) {
             if (!(err instanceof CapabilityError)) throw err;
             const cb = args[args.length - 1];
@@ -427,21 +510,22 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
             process.nextTick(() => (cb as (e: unknown) => void)(err));
             return undefined;
           }
-          return orig.apply(this, args);
+          return orig.apply(this, forwarded);
         }
         case "streamRead":
         case "streamWrite": {
           // Real createReadStream/createWriteStream never throw synchronously either — the
           // returned stream emits 'error' asynchronously. Mirror that on denial (#16).
+          let forwarded: unknown[];
           try {
-            guardCall(args, spec);
+            forwarded = guardCall(args, spec);
           } catch (err) {
             if (!(err instanceof CapabilityError)) throw err;
             return delivery === "streamRead"
               ? denyReadStream(err, args[0])
               : denyWriteStream(err, args[0]);
           }
-          return orig.apply(this, args);
+          return orig.apply(this, forwarded);
         }
       }
     };
@@ -503,8 +587,9 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
 
   // Bespoke non-throwing existence probes (deny → "does not exist").
   shimRecord["existsSync"] = harden(ctx, function existsSync(p: unknown): boolean {
-    if (isDeniedExistence(p)) return false;
-    return realFs.existsSync(p as Parameters<typeof realFs.existsSync>[0]);
+    const probe = probeExistence(p);
+    if (probe.denied) return false;
+    return realFs.existsSync(probe.forward as Parameters<typeof realFs.existsSync>[0]);
   });
   shimRecord["exists"] = harden(ctx, function exists(p: unknown, cb: unknown): void {
     if (typeof cb !== "function") {
@@ -512,11 +597,12 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
       (realFs.exists as (...a: unknown[]) => void)(p, cb);
       return;
     }
-    if (isDeniedExistence(p)) {
+    const probe = probeExistence(p);
+    if (probe.denied) {
       (cb as (exists: boolean) => void)(false);
       return;
     }
-    (realFs.exists as (...a: unknown[]) => void)(p, cb);
+    (realFs.exists as (...a: unknown[]) => void)(probe.forward, cb);
   });
 
   (shim as { promises: unknown }).promises = harden(

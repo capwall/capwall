@@ -37,6 +37,34 @@ export function bracketIpv6(host: string): string {
   return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
 }
 
+/**
+ * Node's OWN test for "is this argument a URL" (`isURL` in `lib/internal/url.js`, byte-identical
+ * on Node 20 and 22):
+ *
+ *     Boolean(self?.href && self.protocol && self.auth === undefined && self.path === undefined)
+ *
+ * It is **duck-typed, not `instanceof URL`**, and that distinction decides real behavior at two
+ * of capwall's entry points, which is why this predicate is shared rather than re-derived (#99):
+ *
+ *  - `http(s)` `ClientRequest` calls `isURL(input)` to decide whether `args[0]` is a URL to run
+ *    through `urlToHttpOptions` — and therefore whether `args[1]` is an options OVERLAY or the
+ *    callback. Using `instanceof` instead let `http.request({href, protocol, hostname: granted},
+ *    {hostname: evil})` be guarded as `granted` and connected to `evil`.
+ *  - `fs`'s `toPathIfFileURL` calls it on every path argument, so a plain object with `href` and
+ *    `protocol: "file:"` IS a path to Node. `instanceof` made capwall classify it as "not a path"
+ *    and skip the gate entirely.
+ *
+ * The reads are ordinary property reads, exactly as Node performs them; a caller that installs
+ * accessors here has them invoked once by this predicate and once by Node's — which is why every
+ * caller of this function goes on to PIN what it derived (a synthesized options object, or the
+ * converted path string) rather than forwarding the caller's object for Node to re-read.
+ */
+export function isNodeUrlLike(v: unknown): boolean {
+  if (v === null || (typeof v !== "object" && typeof v !== "function")) return false;
+  const o = v as Record<string, unknown>;
+  return Boolean(o["href"] && o["protocol"] && o["auth"] === undefined && o["path"] === undefined);
+}
+
 /** Coerce an ALREADY-READ raw `port` value to a number; `undefined` when it names no port.
  * Reads nothing — the caller performed the single read. */
 export function coercePort(raw: unknown): number | undefined {
