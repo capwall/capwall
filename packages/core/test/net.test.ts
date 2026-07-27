@@ -243,13 +243,16 @@ describe("net shim — enforce + deny-by-default", () => {
     expect(decisions[0]!.decision.observed).toMatchObject({ kind: "net", port: 443 });
   });
 
-  it("IPC/unix-socket connect (path form) is approximated as <ipc>:0 and denied by default", () => {
+  it("IPC/unix-socket connect (path form) is gated as the `ipc` capability, carrying the socket path (#72)", () => {
     const { ctx, decisions } = makeCtx(emptyEnforcePolicy(), "enforce");
     const netShim = createNetShim(ctx);
     expect(() => netShim.connect("/tmp/does-not-matter.sock")).toThrowError(
       expect.objectContaining({ name: "CapabilityError" }),
     );
-    expect(decisions[0]!.decision.observed).toMatchObject({ kind: "net", host: "<ipc>", port: 0 });
+    expect(decisions[0]!.decision.observed).toMatchObject({
+      kind: "ipc",
+      path: "/tmp/does-not-matter.sock",
+    });
   });
 });
 
@@ -736,7 +739,7 @@ describe("net shim — `path`/`socketPath` accessor cannot escape pinning (issue
     expect(decisions[0]!.decision.observed).toMatchObject({ host: "127.0.0.1", port: tcp.port });
   });
 
-  it("net.connect: a `path` getter yielding the socket path on the FIRST read is guarded as <ipc>:0 and DENIED", async () => {
+  it("net.connect: a `path` getter yielding the socket path on the FIRST read is guarded on the socket PATH and DENIED", async () => {
     const ipc = await startIpcServer();
     const grantedPort = await closedLocalPort();
     let reads = 0;
@@ -759,11 +762,11 @@ describe("net shim — `path`/`socketPath` accessor cannot escape pinning (issue
     expect(ipc.hit()).toBe(false);
     expect(decisions).toHaveLength(1);
     expect(decisions[0]!.decision.allowed).toBe(false);
-    // A TCP grant is NOT an IPC grant: the target is the `<ipc>` pseudo-host, not 127.0.0.1.
-    expect(decisions[0]!.decision.observed).toMatchObject({ kind: "net", host: "<ipc>", port: 0 });
+    // A TCP grant is NOT an IPC grant: the target is the socket path, not 127.0.0.1.
+    expect(decisions[0]!.decision.observed).toMatchObject({ kind: "ipc", path: ipc.sockPath });
   });
 
-  it("negative control: a plain (non-accessor) `{path}` option is guarded as <ipc>:0 and DENIED under a TCP grant", async () => {
+  it("negative control: a plain (non-accessor) `{path}` option is guarded on the socket PATH and DENIED under a TCP grant", async () => {
     const ipc = await startIpcServer();
     const grantedPort = await closedLocalPort();
     const { ctx, decisions } = makeCtx(grantedPolicy(grantedPort), "enforce");
@@ -775,10 +778,10 @@ describe("net shim — `path`/`socketPath` accessor cannot escape pinning (issue
     );
     await ipc.close();
     expect(ipc.hit()).toBe(false);
-    expect(decisions[0]!.decision.observed).toMatchObject({ kind: "net", host: "<ipc>", port: 0 });
+    expect(decisions[0]!.decision.observed).toMatchObject({ kind: "ipc", path: ipc.sockPath });
   });
 
-  it("http.request({socketPath}) is guarded as <ipc>:0 — a `localhost:80` grant is not a unix-socket grant", async () => {
+  it("http.request({socketPath}) is guarded as `ipc` — a `localhost:80` grant is not a unix-socket grant", async () => {
     const sockPath = nodePath.join(makeTmpDir(), "http.sock");
     let hit = false;
     const srv = http.createServer((_req, res) => {
@@ -803,7 +806,7 @@ describe("net shim — `path`/`socketPath` accessor cannot escape pinning (issue
 
     expect(hit).toBe(false);
     expect(decisions).toHaveLength(1);
-    expect(decisions[0]!.decision.observed).toMatchObject({ kind: "net", host: "<ipc>", port: 0 });
+    expect(decisions[0]!.decision.observed).toMatchObject({ kind: "ipc", path: sockPath });
   });
 
   it("the object handed to the real API carries NO accessor on ANY key (the fail-closed backstop)", () => {
@@ -1331,7 +1334,7 @@ describe("net shim — globalAgent is a guarded instance, not a copied-through r
     expect(decisions[0]!.decision.observed).toMatchObject({ host: "evil.com", port: 443 });
   });
 
-  it("a unix socket reached through globalAgent is gated as <ipc>, like every other IPC connect", () => {
+  it("a unix socket reached through globalAgent is gated as `ipc`, like every other IPC connect", () => {
     const { ctx, decisions } = makeCtx(emptyEnforcePolicy(), "enforce");
     const httpShim = createHttpShim(ctx);
     expect(() =>
@@ -1339,7 +1342,10 @@ describe("net shim — globalAgent is a guarded instance, not a copied-through r
         path: "/var/run/docker.sock",
       }),
     ).toThrowError(expect.objectContaining({ name: "CapabilityError" }));
-    expect(decisions[0]!.decision.observed).toMatchObject({ host: "<ipc>", port: 0 });
+    expect(decisions[0]!.decision.observed).toMatchObject({
+      kind: "ipc",
+      path: "/var/run/docker.sock",
+    });
   });
 
   it("observe mode records the call instead of blocking it", () => {

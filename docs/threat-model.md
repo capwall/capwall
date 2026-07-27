@@ -168,7 +168,9 @@ Per-capability notes:
   denial, not a log line. That is why the global egress guard above exists as a separate
   mechanism rather than as one more module shim. Inbound `server.listen` is not gated (capwall mediates who a
   package may *reach*, not that it may serve). IPC/unix-socket connects have no host:port and
-  are approximated coarsely as `{ host: "<ipc>", port: 0 }`. `dgram` ops attributed to `<app>`
+  are gated as their own `ipc` capability, keyed on the socket path (#72 — previously they were
+  all one `<ipc>:0` pseudo-target; see the egress residuals below for what that leaves).
+  `dgram` ops attributed to `<app>`
   are not gated (the app is the trust root, as for `process.env`); since #60 that requires a
   positively identified application frame, and Node's auto-bind `send` replay — which used to
   ride on the old fail-open, because Node re-invokes `send` from the socket's `'listening'`
@@ -210,16 +212,24 @@ Per-capability notes:
   endpoint could reach an arbitrary unix socket by returning `undefined` on the read capwall saw
   and `/var/run/docker.sock` on the read Node made.
 
-  **Still open, deliberately.** (a) IPC is modelled COARSELY: every unix-socket/named-pipe
-  connect is the single pseudo-target `<ipc>:0`, so a package granted `<ipc>` may reach **any**
-  local socket, not the one it was observed using. Granting `<ipc>` is close to granting local
-  IPC wholesale — review it as such. (b) `options.createConnection` (`http(s)`/`http2`) lets the
+  **Still open, deliberately.** (a) IPC path grants (#72) are matched **lexically**, like `fs`
+  globs and for the same reasons: capwall compares the path string a call names, and does not
+  resolve symlinks or otherwise ask the kernel what the path leads to. A socket reachable at two
+  paths is two grants, and a symlink from a granted path to another socket is not caught — the
+  same residual `fs` carries, and the reason IPC grants bound *ordinary* access rather than a
+  determined attacker. A policy written before #72 that grants `net: {hosts: ["<ipc>"], ports:
+  [0]}` still means **every** socket and pipe, unchanged and deliberately so; that shape is the
+  coarse one and is worth narrowing to `ipc.paths` on review.
+  (b) `options.createConnection` (`http(s)`/`http2`) lets the
   caller supply the function that opens the socket; capwall guards the target it derived, but a
   function that ignores its options and dials elsewhere is only re-gated if the module it uses
   to dial is itself capwall-mediated — the same class as the pre-install capture residual below.
   (c) `dns` lookups are not mediated (a lookup moves no payload; DNS tunneling is a
   determined-attacker technique out of scope), so a granted host name resolving to an attacker's
-  address is not caught here. (d) Reaching the real prototype by climbing past the guard — two
+  address is not caught here. A wildcard host grant (`*.internal`, #83) inherits that: it names
+  a set of *names*, and capwall does not check where those names point. Prefer the narrowest
+  pattern that covers the real need, and remember that `*.example.com` is only as trustworthy as
+  whoever can create records under `example.com`. (d) Reaching the real prototype by climbing past the guard — two
   levels from an instance of a guarded class
   (`Object.getPrototypeOf(Object.getPrototypeOf(sock)).connect`), equivalently one hop from the
   class object (`net.Socket.prototype.__proto__.connect`), or one hop from a guarded *instance*

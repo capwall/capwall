@@ -5,6 +5,7 @@
   "default": {
     "fs": { "read": [], "write": [] },
     "net": { "hosts": [], "ports": [] },
+    "ipc": { "paths": [] },
     "child_process": false,
     "worker_threads": false,
     "env": [],

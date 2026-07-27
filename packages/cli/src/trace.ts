@@ -5,7 +5,7 @@
  */
 import { readFile, writeFile } from "node:fs/promises";
 import * as path from "node:path";
-import type { CapabilityRequest } from "@capwall/core";
+import { placeholderizeIpcPath, type CapabilityRequest } from "@capwall/core";
 import { parsePolicy, type PackagePolicy, type Policy } from "@capwall/policy-schema";
 
 export interface TraceEntry {
@@ -40,8 +40,31 @@ function sortedUnique(values: string[]): string[] {
 }
 
 /**
+ * The form of an observed socket path to WRITE INTO A POLICY (#72). Generated policies have to
+ * reproduce on someone else's machine — the constraint that has already bitten this project
+ * three times (#27 ephemeral ports, #57 host-specific env keys, #49 native addon build paths) —
+ * and a socket path is very often machine-specific.
+ *
+ * Three cases, most portable first:
+ *  1. Under the project root → a `./relative` glob, exactly as for `fs` (`sock/api.sock`).
+ *  2. Under the temp dir or the home dir → the `<tmp>`/`<home>` placeholder, which
+ *     `loadPolicy` expands against the machine that loads the policy. This is what makes a
+ *     socket in `/tmp` on Linux CI and `/var/folders/…` on a maintainer's mac the same grant.
+ *  3. Anything else (`/var/run/app.sock`, `/./pipe/NAME`) → the literal path. Those are stable
+ *     system locations; a remaining volatile component (a randomized temp directory name, a
+ *     `/run/user/<uid>` segment) is left for the author to widen with `*`. capwall deliberately
+ *     does not guess which segment is random: silently emitting a wider grant than what was
+ *     observed is exactly the thing an operator is reviewing this file to catch.
+ */
+function portableIpcPath(observedPath: string, projectRoot: string): string {
+  const rel = relativize(observedPath, projectRoot);
+  if (rel !== observedPath) return rel;
+  return placeholderizeIpcPath(observedPath);
+}
+
+/**
  * Merge observed trace entries into `existing` (or a fresh empty policy). Every capability
- * kind is handled: fs, net, env, child_process, worker_threads, vm and native. Merging is
+ * kind is handled: fs, net, ipc, env, child_process, worker_threads, vm and native. Merging is
  * ADDITIVE — a re-run appends to an existing policy rather than replacing it, which is why
  * `docs/policy-format.md` § Generating a policy tells you to observe into a scratch file when
  * you have a reviewed policy you want to keep.
@@ -68,6 +91,14 @@ export function mergeTraceIntoPolicy(
         const net = (grant.net ??= { hosts: [], ports: [] });
         net.hosts.push(req.host);
         net.ports.push(req.port);
+        break;
+      }
+      // A unix socket / named pipe, recorded per-path since #72 rather than as one `<ipc>`
+      // grant covering every socket on the machine. The observed path is already canonical
+      // (absolute, `/`-separated, `/./pipe/NAME` for a pipe) — see core's policy/ipc.ts.
+      case "ipc": {
+        const ipc = (grant.ipc ??= { paths: [] });
+        ipc.paths.push(portableIpcPath(req.path, projectRoot));
         break;
       }
       case "env": {
@@ -109,6 +140,7 @@ export function mergeTraceIntoPolicy(
       );
       grant.net.ports = ports.includes("*") ? ["*", ...nums] : nums;
     }
+    if (grant.ipc) grant.ipc.paths = sortedUnique(grant.ipc.paths);
     if (grant.env) grant.env = sortedUnique(grant.env);
   }
   // Deterministic package order for stable diffs.

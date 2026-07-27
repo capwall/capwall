@@ -42,8 +42,24 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "hosts": { "type": "array", "items": { "type": "string" } },
+            "hosts": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Allowed hosts: an exact hostname, the single literal \"*\" (any host), or a wildcard pattern — \"*.internal\" (exactly one label) or \"**.internal\" (one or more). A wildcard never crosses a dot and never matches an IP literal; IP addresses (IPv6 unbracketed) must be listed exactly. Matching lowercases ASCII A-Z only; no IDNA conversion, so list the punycode form Node dials. Malformed patterns are rejected at load time. See docs/policy-format.md \u00a7 net."
+            },
             "ports": { "type": "array", "items": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "const": "*" }] } }
+          }
+        },
+        "ipc": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Unix-domain sockets and Windows named pipes this package may connect to (#72). Without it, IPC is denied.",
+          "properties": {
+            "paths": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "description": "Socket-path globs, matched by the same matcher fs grants use. Relative patterns resolve against the project root; <tmp>/<home> expand against the loading machine; a Windows named pipe may be written \\\\.\\pipe\\NAME or //./pipe/NAME. The legacy net: {hosts: [\"<ipc>\"], ports: [0]} grant still means EVERY socket and pipe."
+            }
           }
         },
         "child_process": {

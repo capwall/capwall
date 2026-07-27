@@ -17,7 +17,14 @@
  */
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
-import { parsePolicy, type FsCapability, type Policy } from "@capwall/policy-schema";
+import {
+  parsePolicy,
+  type FsCapability,
+  type IpcCapability,
+  type PackagePolicy,
+  type Policy,
+} from "@capwall/policy-schema";
+import { canonicalIpcPattern, expandIpcPlaceholders, isCanonicalNamedPipe } from "./ipc.js";
 
 export interface LoadPolicyOptions {
   /** Absolute project root to resolve relative fs globs against. */
@@ -46,10 +53,33 @@ function normalizeFs(fs: FsCapability | undefined, projectRoot: string): void {
   fs.write = fs.write.map((g) => normalizeGlob(g, projectRoot));
 }
 
+/**
+ * `ipc.paths` globs (#72) get the same treatment as `fs` globs — relative patterns resolved
+ * against the project root, `/`-separated — after two IPC-specific steps:
+ *  1. `<tmp>`/`<home>` are expanded against THIS machine, which is what makes an
+ *     observe-generated grant for a socket in a temp dir portable (see policy/ipc.ts).
+ *  2. Windows named pipes are canonicalized and then left alone: `\\.\pipe\x` is not relative,
+ *     but `path.isAbsolute` on a POSIX host does not know that and would resolve it against the
+ *     project root into nonsense — the same trap the drive-letter case in `normalizeGlob` fixes.
+ */
+function normalizeIpc(ipc: IpcCapability | undefined, projectRoot: string): void {
+  if (!ipc) return;
+  ipc.paths = ipc.paths.map((raw) => {
+    const pattern = canonicalIpcPattern(expandIpcPlaceholders(raw));
+    if (isCanonicalNamedPipe(pattern)) return pattern;
+    return normalizeGlob(pattern, projectRoot);
+  });
+}
+
+function normalizeGrant(grant: PackagePolicy, projectRoot: string): void {
+  normalizeFs(grant.fs, projectRoot);
+  normalizeIpc(grant.ipc, projectRoot);
+}
+
 function normalizePolicy(policy: Policy, projectRoot: string | undefined): Policy {
   if (!projectRoot) return policy;
-  normalizeFs(policy.default.fs, projectRoot);
-  for (const pkg of Object.values(policy.packages)) normalizeFs(pkg.fs, projectRoot);
+  normalizeGrant(policy.default, projectRoot);
+  for (const pkg of Object.values(policy.packages)) normalizeGrant(pkg, projectRoot);
   return policy;
 }
 

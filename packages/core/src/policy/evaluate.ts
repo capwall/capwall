@@ -3,23 +3,31 @@
  *
  * Given a policy, the active mode, the attributed owning package, and a capability request,
  * decide whether the operation is allowed. All logic here is REAL and tested: deny-by-default,
- * the boolean/env gates, and `fs` path-glob matching (see `./glob.ts`). NOTE the asymmetry:
- * `fs` paths match by glob, but `net` HOSTS match by exact equality or the single literal
- * `"*"` — partial host globs (`"*.internal"`) are NOT implemented and are documented as
- * unimplemented in docs/policy-format.md § net. Do not describe them as supported.
+ * the boolean/env gates, `fs` path-glob matching (see `./glob.ts`), `net` host matching (the
+ * grammar lives in `@capwall/policy-schema` `host.ts`, which also VALIDATES it at policy-load
+ * time — issue #83) and `ipc` socket-path matching (`./ipc.ts`, issue #72).
  *
  * Semantics:
  *  - `enforce` mode: deny-by-default. A package with no matching grant is DENIED.
  *  - `observe` mode: never denies. Every request returns { allowed: true }, but
  *    `observed` carries what was seen so the CLI can synthesize a starter policy.
  */
-import type { Mode, PackagePolicy, Policy } from "@capwall/policy-schema";
+import { ANY_HOST, matchesHostPattern, type Mode, type PackagePolicy, type Policy } from "@capwall/policy-schema";
 import { matchesGlob } from "./glob.js";
+import { IPC_PSEUDO_HOST, matchesIpcPath } from "./ipc.js";
 
 /** A capability-sensitive operation, attributed to a package, awaiting a decision. */
 export type CapabilityRequest =
   | { kind: "fs"; access: "read" | "write"; path: string }
   | { kind: "net"; host: string; port: number }
+  /**
+   * A unix-domain-socket / Windows-named-pipe connect (issue #72). `path` is the destination,
+   * canonicalized by `./ipc.ts` — an absolute `/`-separated path, `/./pipe/NAME` for a named
+   * pipe, or `<unknown>` when the call's shape hid it. IPC is its OWN capability rather than a
+   * `net` host because it has no host:port pair to name; modelling it as the single pseudo-
+   * target `<ipc>:0` is what made one socket grant equal every socket grant.
+   */
+  | { kind: "ipc"; path: string }
   | { kind: "child_process" }
   | { kind: "worker_threads" }
   | { kind: "env"; key: string }
@@ -122,13 +130,29 @@ export function isGranted(grant: PackagePolicy, req: CapabilityRequest): boolean
     case "net": {
       const net = own(grant, "net");
       if (!net) return false;
-      // Host matching is exact, or the single literal "*". Partial host GLOBS (e.g.
-      // "*.internal") are a possible follow-up and are NOT implemented — docs/policy-format.md
-      // § net says so explicitly, so keep the two in step if this ever changes.
-      const hostOk = net.hosts.some((h) => h === "*" || h === req.host);
+      // Exact hostname, the single literal "*", or a wildcard pattern ("*.internal",
+      // "**.internal") — one grammar, validated at load time and applied here (#83). See
+      // `@capwall/policy-schema` host.ts and docs/policy-format.md § net.
+      const hostOk = net.hosts.some((h) => matchesHostPattern(h, req.host));
       // A `"*"` port grants any port — needed for deps that connect to a dynamically-assigned
       // (ephemeral) port, where a concrete observed port won't match on the next run (#27).
       const portOk = net.ports.some((p) => p === "*" || p === req.port);
+      return hostOk && portOk;
+    }
+    case "ipc": {
+      // The narrow, preferred form: a glob list over socket paths (#72).
+      if ((own(grant, "ipc")?.paths ?? []).some((g) => matchesIpcPath(g, req.path))) return true;
+      // BACKWARD COMPATIBILITY. Before #72 every IPC connect was gated as the pseudo-target
+      // `<ipc>:0`, so a pre-#72 policy grants IPC through `net`. That shape is still honored and
+      // still means EVERY socket and pipe — deliberately unchanged rather than silently
+      // narrowed, because a policy that becomes MORE restrictive on upgrade breaks a working
+      // deployment just as surely as one that becomes more permissive. The test is written
+      // with literal comparisons, NOT through matchesHostPattern: a new host wildcard must
+      // never be able to acquire IPC authority as a side effect.
+      const net = own(grant, "net");
+      if (!net) return false;
+      const hostOk = net.hosts.some((h) => h === ANY_HOST || h === IPC_PSEUDO_HOST);
+      const portOk = net.ports.some((p) => p === ANY_HOST || p === 0);
       return hostOk && portOk;
     }
   }
@@ -140,6 +164,8 @@ function describe(req: CapabilityRequest): string {
       return `fs:${req.access} ${req.path}`;
     case "net":
       return `net ${req.host}:${req.port}`;
+    case "ipc":
+      return `ipc ${req.path}`;
     case "env":
       return `env:${req.key}`;
     case "native":

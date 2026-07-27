@@ -6,12 +6,12 @@
  * the answer matches enforcement exactly. Exit code: 0 allowed, 1 denied, 2 usage error.
  */
 import * as path from "node:path";
-import { evaluate, loadPolicy, type CapabilityRequest } from "@capwall/core";
+import { canonicalIpcPath, evaluate, loadPolicy, type CapabilityRequest } from "@capwall/core";
 
 const HELP = `usage: capwall explain [--policy <file>] <package> <capability> [target]
 
 Capabilities and their targets:
-  fs:read <path> | fs:write <path> | net <host:port> | env <KEY>
+  fs:read <path> | fs:write <path> | net <host:port> | ipc <socket-path> | env <KEY>
   child_process | worker_threads | vm | native [addon-path]
 
   'native' gates whether the package may load a .node addon at all. Its optional
@@ -20,6 +20,7 @@ Capabilities and their targets:
 
 Examples:
   capwall explain pino fs:write ./logs/app.log
+  capwall explain some-dep ipc /var/run/docker.sock
   capwall explain express net localhost:3000
   capwall explain sneaky-dep env AWS_SECRET_ACCESS_KEY
   capwall explain better-sqlite3 native
@@ -44,6 +45,13 @@ function buildRequest(
         return "capability 'net' requires a <host:port> target";
       }
       return { kind: "net", host, port };
+    }
+    case "ipc": {
+      if (!target) return "capability 'ipc' requires a <socket-path> target";
+      // Canonicalized the same way the shim canonicalizes an observed destination (#72), so
+      // `explain` answers the question enforcement would answer: a relative path is resolved,
+      // and `\\.\pipe\x` and `//./pipe/x` are the same pipe.
+      return { kind: "ipc", path: canonicalIpcPath(target) };
     }
     case "env": {
       if (!target) return "capability 'env' requires a <KEY> target";
