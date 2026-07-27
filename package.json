@@ -5,6 +5,12 @@
   "description": "Runtime, per-package capability firewall for Node.js \u2014 defense-in-depth against supply-chain malware.",
   "license": "MIT",
   "author": "William Zujkowski",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/williamzujkowski/capwall.git"
+  },
+  "homepage": "https://github.com/williamzujkowski/capwall#readme",
+  "bugs": "https://github.com/williamzujkowski/capwall/issues",
   "type": "module",
   "engines": {
     "node": ">=20"
