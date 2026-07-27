@@ -43,7 +43,7 @@ import realDgram from "node:dgram";
 import { APP_ROOT, attributeCaller } from "../attribution/index.js";
 import { evaluate } from "../policy/evaluate.js";
 import { CapabilityError } from "../errors.js";
-import { guard, type ShimContext, type ShimRegistry } from "./runtime.js";
+import { attributionOptionsFor, guard, type ShimContext, type ShimRegistry } from "./runtime.js";
 
 export type { DecisionSink, ShimContext } from "./runtime.js";
 
@@ -338,7 +338,7 @@ export function createHttp2Shim(ctx: ShimContext): typeof import("node:http2") {
 /** Attribute a dgram op and guard it, EXCEPT reads attributed to `<app>` (see header — this
  * also prevents the auto-bind replay crash, where Node re-invokes send on an internal tick). */
 function guardDgram(ctx: ShimContext, host: string, port: number): void {
-  const pkg = attributeCaller(ctx.projectRoot !== undefined ? { projectRoot: ctx.projectRoot } : {});
+  const pkg = attributeCaller(attributionOptionsFor(ctx));
   if (pkg === APP_ROOT) return;
   const decision = evaluate(ctx.policy, ctx.mode, pkg, { kind: "net", host, port });
   ctx.onDecision(pkg, decision);

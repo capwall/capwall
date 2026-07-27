@@ -198,6 +198,22 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
   operation to be *executed by* a trusted helper's code (passing a path to a logger that
   writes it, scheduling work a broadly-granted package performs) is charged to the helper.
   Keep helper grants tight; broad grants are laundering targets.
+- **Deep stacks past the attribution frame budget** — the walk inspects at most `maxFrames`
+  frames (default 25). When the owning dependency's frame is deeper (long promise chains,
+  dynamically-compiled or deeply-nested wrappers, `async_hooks`-heavy frameworks), the walk
+  runs out of budget and falls back to `<app>`. Since `<app>` is the trust root and usually
+  holds broad grants, that can **wrongly allow** a dependency's call — and, symmetrically,
+  wrongly deny a granted one under `<app>`'s deny-by-default. Mitigation: the budget is
+  configurable — `CAPWALL_MAX_FRAMES` for the preload/CLI, `install(…, { attribution: {
+  maxFrames } })` in-process — and an exhausted walk is **flagged, not silent** (the decision
+  carries `attributionTruncated: true`; the preload warns once on stderr), so a capped
+  attribution can be noticed and the budget raised. The flag rides on recorded decisions, so
+  the paths that deliberately exempt `<app>` **without** recording a decision — the
+  `process.env` read guard and `dgram` — still pass a capped call through silently. This is a
+  **mitigation, not a fix**: a
+  dependency can deliberately deepen its own stack to push its frame past whatever budget is
+  configured — the same determined-in-process-attacker class as un-patching the shims. Raising
+  the budget also costs throughput on every mediated call (issue #15).
 - **Native `.node` addons** — arbitrary compiled code; capwall can gate *whether* an addon
   loads but cannot confine what it does once loaded.
 - **Subprocess internals** — capwall can gate *whether* a `child_process` spawn happens, but

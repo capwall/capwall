@@ -13,6 +13,7 @@
 import { patchRequire, type RequirePatchHandle } from "./loader/require.js";
 import { registerEsmHook, type EsmHookHandle } from "./loader/esm-hook.js";
 import { installEnvGuard, type EnvGuardHandle } from "./shims/env.js";
+import { resolveMaxFrames } from "./attribution/index.js";
 import type { ShimContext } from "./shims/runtime.js";
 import type { Decision } from "./policy/evaluate.js";
 import type { Mode, Policy } from "@capwall/policy-schema";
@@ -41,6 +42,23 @@ export interface InstallOptions {
    * (e.g. if the Proxy overhead is a concern for a workload that reads env in a hot loop).
    */
   env?: boolean;
+  /** Tuning for the stack-walk attribution step. */
+  attribution?: {
+    /**
+     * Max stack frames the attribution walk inspects (default 25 — {@link DEFAULT_MAX_FRAMES}).
+     *
+     * SECURITY (issue #15): the walk charges the call to the nearest dependency frame it
+     * finds. If the owning dependency sits deeper than this budget (long promise chains,
+     * heavily-wrapped utilities, async_hooks-heavy frameworks), the walk runs out of frames
+     * and falls back to `<app>` — which typically holds BROAD grants, so a call that should
+     * have been denied can be allowed. Raise this for deep stacks; the cost is a longer walk
+     * on every mediated call (see the <1ms/req budget in AGENTS.md § 5).
+     *
+     * Invalid values (non-integer, zero, negative, garbage) are IGNORED with a stderr warning
+     * and the default is used — capwall must not crash a host app over a config typo.
+     */
+    maxFrames?: number;
+  };
 }
 
 /**
@@ -59,9 +77,16 @@ export function install(
 ): InstallHandle {
   const onDecision = options.onDecision ?? (() => {});
   const projectRoot = options.projectRoot ?? process.cwd();
-  const ctx: ShimContext = { policy, mode, onDecision, projectRoot };
+  // Validated once, here, rather than per attribution: a bad value warns exactly once and
+  // every shim then shares the identical (already-sane) budget. Never throws — see
+  // resolveMaxFrames on why install-time config errors must fail open.
+  const maxFrames = resolveMaxFrames(
+    options.attribution?.maxFrames,
+    "attribution.maxFrames",
+  );
+  const ctx: ShimContext = { policy, mode, onDecision, projectRoot, maxFrames };
   const handles: Array<RequirePatchHandle | EsmHookHandle | EnvGuardHandle> = [];
-  handles.push(patchRequire(policy, mode, { onDecision, projectRoot }));
+  handles.push(patchRequire(policy, mode, { onDecision, projectRoot, maxFrames }));
   if (options.env !== false) {
     handles.push(installEnvGuard(ctx));
   }
@@ -81,7 +106,15 @@ export { evaluate, isGranted } from "./policy/evaluate.js";
 export type { CapabilityRequest, Decision } from "./policy/evaluate.js";
 export { loadPolicy, loadPolicyFromObject } from "./policy/load.js";
 export type { LoadPolicyOptions } from "./policy/load.js";
-export { attributeCaller, packageForPath, APP_ROOT } from "./attribution/index.js";
+export {
+  attributeCaller,
+  attributeCallerDetailed,
+  packageForPath,
+  resolveMaxFrames,
+  APP_ROOT,
+  DEFAULT_MAX_FRAMES,
+} from "./attribution/index.js";
+export type { Attribution, AttributionOptions } from "./attribution/index.js";
 export type { DecisionSink } from "./shims/fs.js";
 export type {
   Policy,

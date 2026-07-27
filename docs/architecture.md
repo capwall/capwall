@@ -74,6 +74,17 @@ helper, so a malicious package can launder operations through a broadly-granted 
 keep helper grants tight. Files not under any `node_modules` attribute to the app sentinel
 `<app>`.
 
+**Frame budget.** The walk inspects at most `maxFrames` frames (default 25) to bound the
+hot-path cost. If the owning dependency's frame sits deeper — long promise chains,
+dynamically-compiled or deeply-nested wrappers, `async_hooks`-heavy frameworks — the walk
+exhausts its budget and falls back to `<app>`, i.e. **mis-attributes** the call (issue #15).
+The budget is configurable per install (`install(policy, mode, { attribution: { maxFrames } })`)
+and via `CAPWALL_MAX_FRAMES` for the preload; invalid values warn and fall back to the default
+rather than throwing, because capwall must not crash a host process over a config typo. A
+budget-exhausted fallback is distinguishable from a genuine app-root call: the decision carries
+`attributionTruncated: true` (the preload warns once on stderr). See
+[`../packages/core/README.md`](../packages/core/README.md) § Configuration.
+
 **This is THE core research risk.** See Risks below.
 
 ### Policy (`core/src/policy`)
