@@ -21,6 +21,8 @@ const APP_DIR = path.dirname(APP);
 const LAUNDER_APP = path.join(APP_DIR, "launder-app.mjs");
 /** #61 regression entry: a dep that tries to register a loader hook ahead of capwall's. */
 const HOOKJACK_APP = path.join(APP_DIR, "hookjack-app.mjs");
+/** #62 regression entry: an embedder swapping policy at runtime (installs capwall itself). */
+const POLICY_SWAP_APP = path.join(APP_DIR, "policy-swap-app.mjs");
 const PRELOAD = createRequire(import.meta.url).resolve("../dist/preload.js");
 
 interface RunResult {
@@ -185,5 +187,45 @@ describe("#61 — a dependency cannot register a loader hook ahead of capwall's"
     );
     expect(r.stdout).toContain("HOOKJACK:register:REGISTERED");
     expect(r.stderr).toMatch(/WARN 'esm-hookjack-dep' called module\.register.*CAPWALL_ALLOW_LOADER_HOOKS=1/);
+  });
+});
+
+describe("#62 — a runtime policy swap reaches already-imported ESM specifiers", () => {
+  // The subprocess is load-bearing, not incidental: synthetic ESM modules are cached per
+  // process and never re-evaluated, so an in-process test would be asserting against whatever
+  // policy the FIRST install in the worker happened to leave behind — which is the bug.
+  let out: RunResult;
+
+  beforeAll(async () => {
+    out = await new Promise<RunResult>((resolve, reject) => {
+      execFile(
+        process.execPath,
+        [POLICY_SWAP_APP],
+        { cwd: APP_DIR, env: { ...process.env, CAPWALL_MODE: "", CAPWALL_POLICY_FILE: "" } },
+        (err, stdout, stderr) => {
+          if (err && typeof err.code !== "number") return reject(err);
+          resolve({ code: err ? (err.code as number) : 0, stdout, stderr });
+        },
+      );
+    });
+  });
+
+  it("applies a TIGHTER policy installed after the specifier was already imported", () => {
+    // The finding: uninstall() + install(tighter) was a silent no-op on the ESM path, because
+    // getEsmShim() ran once per synthetic module and its result was captured in const bindings.
+    expect(out.stdout).toContain("SWAP:loose:OK:esm fixture data");
+    expect(out.stdout).toContain("SWAP:strict:CapabilityError:esm-fixture-dep");
+  });
+
+  it("fails closed after uninstall() with no reinstall", () => {
+    // docs/threat-model.md claimed this already held; it held only for NEVER-imported
+    // specifiers. Both cases are now covered, by different mechanisms.
+    expect(out.stdout).toContain("SWAP:uninstalled:CapabilityError:esm-fixture-dep");
+    expect(out.stdout).toContain("SWAP:never-imported:FAILS_CLOSED");
+  });
+
+  it("is a live policy, not a one-way ratchet — loosening applies too", () => {
+    expect(out.stdout).toContain("SWAP:reloose:OK:esm fixture data");
+    expect(out.code).toBe(0);
   });
 });
