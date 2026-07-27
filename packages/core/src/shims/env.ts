@@ -27,12 +27,18 @@
  * where a denied *operation with side effects* throws — hiding a return value has no analog
  * there.)
  *
- * Only string-key reads are mediated. Symbol keys, and the write / `has` / `delete` /
- * `ownKeys` traps, forward straight through so `process.env` keeps its normal semantics
- * (values coerced to strings, assignment reaching the real environment, `in`, `for..in`).
- * Key NAMES therefore remain enumerable to a denied dependency (`Object.keys`, `in`); only
- * VALUES are hidden — names are not the secret, and hiding them would break benign
- * feature-detection. This is documented in docs/threat-model.md.
+ * Only string-key READS are mediated. Symbol keys, and the `has` / `delete` / `defineProperty`
+ * / `ownKeys` traps, forward straight through so `process.env` keeps its normal semantics
+ * (values coerced to strings, `in`, `for..in`). Key NAMES therefore remain enumerable to a
+ * denied dependency (`Object.keys`, `in`); only VALUES are hidden — names are not the secret,
+ * and hiding them would break benign feature-detection. Documented in docs/threat-model.md.
+ *
+ * WRITES ARE NOT MEDIATED (#66). The `set` trap below exists only to restore ordinary
+ * assignment semantics — see the comment on the trap itself for why a Proxy *without* one
+ * crashed the host app. `has` / `deleteProperty` / `defineProperty` / `ownKeys` need no trap at
+ * all: they forward to the target and already match un-shimmed `process.env` exactly (verified
+ * in test/env-traps.test.ts against the real object, including that a partial
+ * `Object.defineProperty` descriptor throws either way).
  *
  * `CAPWALL_*` keys (capwall's own preload plumbing) are never gated or recorded — they are
  * implementation detail, not app secrets, and gating them would pollute generated policies
@@ -77,6 +83,37 @@ export function createEnvProxy(
     get(target, key, receiver) {
       if (denied(key)) return undefined;
       return Reflect.get(target, key, receiver);
+    },
+    /**
+     * Restores ordinary assignment semantics; it mediates nothing (#66).
+     *
+     * With NO `set` trap, `proxy.K = v` falls through to the target's `[[Set]]` with
+     * `receiver` = the PROXY. When the target already has the own property, the spec finishes
+     * the assignment as `receiver.[[DefineOwnProperty]](K, { [[Value]]: v })` — a *partial*
+     * descriptor — which reaches Node's `process.env` `defineProperty` handler and is rejected
+     * with `ERR_INVALID_OBJECT_DEFINE_PROPERTY`. Absent keys take the `CreateDataProperty` path
+     * instead (a complete descriptor), which is why *new* keys worked and *existing* ones threw.
+     * Net effect before this trap: any dependency writing to an env var the process already had
+     * crashed the host app (`debug`'s `process.env.DEBUG = namespaces` is the common trigger) —
+     * a hard failure capwall itself introduced, with no security benefit.
+     *
+     * Forwarding with `receiver` defaulting to the target skips the `defineProperty` hop, so the
+     * write lands as a plain `[[Set]]` on the real environment, exactly as un-shimmed.
+     *
+     * Writes are intentionally NOT gated or recorded. The policy vocabulary (`env: [key…]`)
+     * expresses a READ allowlist and has no write-grant concept; gating writes under it would
+     * either forbid every dependency write (a far larger blast radius than the bug being fixed)
+     * or silently conflate "may read K" with "may set K". Soft deny does not compose with writes
+     * either: a silently dropped write leaves the dependency believing it succeeded, and a
+     * throwing write reintroduces the crash. Recording writes would be worse than useless —
+     * `gen-policy` merges every observed `{kind:"env"}` into the package's READ allowlist, so an
+     * observed write would silently widen read access. The residual (a dependency can set
+     * `NODE_OPTIONS` / `LD_PRELOAD` / `HTTP_PROXY` to influence other code) is documented in
+     * docs/threat-model.md; its payoff is realized at spawn time, and spawning is already a
+     * gated capability.
+     */
+    set(target, key, value) {
+      return Reflect.set(target, key, value);
     },
     // Close the Object.getOwnPropertyDescriptor(process.env, k).value exfiltration path: a
     // denied key's descriptor reports value: undefined (property still "present" and

@@ -187,6 +187,19 @@ Per-capability notes:
   enumerable** to a denied dependency (`Object.keys`, `in`, `for..in`); only VALUES are hidden
   — names are not the secret, and hiding them would break feature-detection.
 
+  **Writes are NOT mediated (#66).** `env` grants are a *read* allowlist; a dependency may set,
+  delete, and `defineProperty` on `process.env` freely, exactly as un-shimmed. The proxy's `set`
+  trap exists only to restore ordinary assignment semantics — without it, assignment to an
+  already-set key crashed the host app with `ERR_INVALID_OBJECT_DEFINE_PROPERTY`. *Residual:* a
+  dependency can set `NODE_OPTIONS`, `LD_PRELOAD`, `NODE_EXTRA_CA_CERTS` or proxy variables to
+  influence other code. In-process this is largely inert (`NODE_OPTIONS` is consumed at startup,
+  before any dependency runs); its payoff is in a **child process**, and spawning is already a
+  gated capability, so the spawn is the control point. A proxy variable that redirects egress is
+  still subject to the `net` gate, which guards the target actually connected to. Gating writes
+  would require write-grant vocabulary the policy language does not have, and soft deny does not
+  compose with writes (a silently dropped write leaves the dependency believing it succeeded; a
+  throwing write reintroduces the crash). Tracked as a policy-language question, not a bug.
+
 **Capability-bearing classes are guarded subclasses, not Proxies.** Where a capability can be
 reached through a class rather than a module function, capwall replaces the class with a
 **subclass it owns**, whose constructor (or prototype method) runs the check before delegating,

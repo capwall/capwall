@@ -133,6 +133,10 @@ subprocess, worker, or vm context then does.
 An allowlist of `process.env` keys the package may read. This is the anti-exfiltration
 control: a package with `"env": ["NODE_ENV"]` reading `AWS_SECRET_ACCESS_KEY` is a violation.
 
+**Reads only.** `env` grants nothing about writes; `process.env.K = v`,
+`delete process.env.K` and `Object.defineProperty(process.env, …)` are unmediated for every
+package (see [threat-model](./threat-model.md) for why, and the residual it leaves).
+
 Matching is **exact string equality**, or the single literal `"*"`. There are no prefix or
 glob forms — `"DEBUG_*"` matches a key literally named `DEBUG_*`, nothing else.
 
