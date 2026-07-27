@@ -21,16 +21,89 @@ the CJS path uses; it covers **static AND dynamic** `import` (`import { readFile
 "node:fs"` and `await import("node:fs")`), attributing to the importing package exactly like
 CJS. It is **on by default** under the CLI preload (disable with `CAPWALL_ESM=0`).
 
+Interception is decided on the URL a specifier **resolves to**, not on the specifier string
+(#59). A specifier does not have to *name* a builtin to reach one — Node's subpath imports let
+a package map a private `#…` specifier onto a bare builtin in its own `package.json`
+(`"imports": { "#x": "fs" }`; bare targets work, `"node:fs"` targets Node rejects outright),
+and conditional and `*`-pattern targets do the same. Classifying on the resolved URL covers
+every such spelling at once, including ones nobody has enumerated yet. Verified mediated after
+the fix: bare / conditional / `*`-pattern imports targets, `fs/promises` targets,
+self-referencing package exports, `data:` URL re-exports and `import.meta.resolve`. The only
+probed route still reaching a raw builtin is `process.getBuiltinModule` — the pre-existing,
+path-independent residual listed under "what capwall does NOT stop", which defeats the CJS
+patch identically and is not ESM-specific.
+
 **ESM known limits** (documented, not silent):
 - A module that captured a raw builtin **before** capwall installed is not re-bound (same as
   CJS — install via the `--import` preload so capwall registers first).
 - The set of mediated specifiers is fixed at install time; a mediated builtin not in the shim
   registry is not intercepted (the registry covers the capabilities above).
-- Unregistering the ESM hook is best-effort (Node cannot fully remove a registered hook);
-  after `uninstall()` a re-import of a mediated builtin throws a visible error rather than
-  silently returning the raw builtin (fail-closed).
+- Unregistering the ESM hook is best-effort (Node cannot fully remove a registered hook), so
+  teardown is **fail-closed rather than reversible**: there is no way to un-bind an ESM import,
+  and "capwall is off again" is not on the menu. A mediated builtin **not yet imported** when
+  `uninstall()` ran throws an explicit "capwall is no longer installed" error on re-import; one
+  that a module **had already imported** keeps the shim it captured, and that shim now denies
+  under a deny-all policy rather than continuing to serve the torn-down install's grants (#62 —
+  before that fix it kept serving them, so this bullet previously overclaimed: it was true only
+  for never-imported specifiers).
+- **The first install no longer wins.** A synthetic module resolves its shim once, at
+  evaluation, and ESM module caching is per-process and permanent, so an already-imported
+  specifier used to be pinned to the policy of the install that was active when it was first
+  imported — making `uninstall()` + `install(tighter)` a silent no-op on the import path
+  (fail-open with respect to the new policy). The ESM shims now read the live install's policy
+  on every call, so a runtime policy swap applies to already-imported specifiers in both
+  directions. This is not dependency-reachable; it mattered for embedders swapping policy at
+  runtime and for programmatic tests.
+- **capwall cannot guarantee it stays outermost in the loader-hook chain** (#61). See
+  "Loader-hook registration" below — this is the significant residual on the ESM path.
 - `process.env` is not import-routed; its Proxy guard (installed by `install()`) covers both
   module systems already.
+
+**Loader-hook registration (#61) — partially closed, residual named.** Node's module
+customization hooks are deliberately composable: the **most recently registered hook runs
+first**, and the synchronous `module.registerHooks()` chain runs entirely ahead of the
+asynchronous `module.register()` chain capwall lives in. A dependency that reaches
+`register`/`registerHooks` can therefore short-circuit a mediated specifier straight to the
+real `node:` URL before capwall's `resolve` is consulted — and because the hook is
+process-wide and the ESM cache is keyed by resolved URL, that de-mediates **every** package
+loaded afterwards, not just the attacker: an innocent third dependency's ordinary
+`import * as fs from "node:fs"` binds to the raw builtin, with no log line.
+
+What capwall does about it: `node:module` is mediated, and `register`/`registerHooks` are
+treated as **application-only**. A registration attributed to a dependency is refused with a
+`CapabilityError` in `enforce`, and warned about loudly in `observe` (which by contract never
+blocks). `CAPWALL_ALLOW_LOADER_HOOKS=1` permits it, still warning, for a tree where a
+dependency legitimately installs a loader. Everything else on `node:module` passes through
+untouched, so the application's own tooling (`tsx`, `ts-node`, a custom loader) is unaffected —
+the app is the trust root.
+
+What it does **not** do, plainly:
+
+- It gates *reaching* the API through a mediated module, not the API itself.
+  `process.getBuiltinModule("node:module")` hands over the real one and defeats this exactly as
+  it defeats every other shim.
+- The gate allows `<app>`, so it inherits whatever attribution fails open to. The `data:` URL
+  escape tracked as **#60** walks past it exactly as it walks past the `process.env` and
+  `dgram` gates (verified). That is one bug in attribution, not three in the gates.
+- A hook registered **before** capwall installs is already ahead of it.
+- capwall does **not** re-assert first position after an allowed registration. It could — the
+  synchronous chain can be rejoined — but that would silently override the application's own
+  loader tooling, and it still would not beat a hook that short-circuits `load` as well as
+  `resolve`, which nothing in-process can.
+- As defense in depth the `load` hook **re-mediates** any raw `node:<mediated>` URL it is
+  handed and warns once per specifier, since capwall's own `resolve` never emits one. Measured
+  reach, so this is not read as more than it is: a `node:` URL already resident in the ESM
+  module cache is served from cache and the load chain is never consulted — and capwall's own
+  shims capture their real modules with a static ESM `import`, so every mediated builtin is
+  already cached raw before the hook registers. Today this branch is therefore a **latent**
+  backstop for the mediated set, active only for specifiers capwall does not itself import and
+  for resolution routes a future Node might add. Capturing the real modules through
+  `createRequire()` would make it active for the whole set (a CJS `require` does not populate
+  the ESM cache — verified); that is follow-up work, not something this change claims.
+
+Net: a dependency doing this opportunistically is now stopped and logged. A dependency that
+knows about capwall has routes left. Treat ESM mediation as effective against packages that do
+not go looking for the loader chain.
 
 Per-capability notes:
 
@@ -247,7 +320,10 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
   **silently disables enforcement for every other package and the app**, not just for itself,
   with no log line. Treat capwall's mediation as effective only against packages that do not
   go looking for the raw builtin. A future opt-in hardened mode (frozen shims, accepting the
-  `graceful-fs` breakage) is tracked as a follow-up (#17).
+  `graceful-fs` breakage) is tracked as a follow-up (#17). On the ESM path specifically,
+  **hijacking the loader-hook chain** is a second route with the same
+  disables-it-for-everyone property; it is now gated and logged rather than silent, but not
+  closed — see "Loader-hook registration (#61)" above for exactly what remains.
 - **fd / symlink escapes** — using an already-open file descriptor, or a symlink, to reach a
   path outside the allowed globs.
 - **`vm` / `eval` / `node:sqlite`** and similar reflective or alternate-execution surfaces
