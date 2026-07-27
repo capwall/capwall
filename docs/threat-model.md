@@ -70,6 +70,17 @@ be revoked.
 - **Installs nest**, innermost wins, and they unwind in **any** order, not only LIFO (#22 for the
   `Module._load` chain, #87 for the policy stack). Unwinding one install re-exposes the one below
   it, including for already-captured shims.
+- **Each process-global replacement is installed exactly ONCE, reference-counted** — the
+  `process.env` proxy, the egress globals, and the `Module.prototype._compile` gate. Every guard
+  reads the live context, so one patch already tracks whichever install is in force; the count
+  only decides when to put the original back. Stacking them was a real defect found by the #90
+  composition matrix: a second env guard proxied the FIRST guard's proxy and registered it as the
+  "un-proxied" environment, so a **granted** `spawn` under nested installs launched its child with
+  a completely empty environment, and an out-of-LIFO-order `uninstall()` left capwall's proxy on
+  `process.env` (and its wrapper on `globalThis.fetch`) permanently — contradicting the bullet
+  above. Restoring an egress global is also best-effort in one direction: if code outside capwall
+  made it non-configurable in the meantime, `uninstall()` skips it rather than throwing, because
+  an escaping `TypeError` there would abort teardown and strand every other patch.
 - **`hardened` is the one setting that is not live.** It freezes objects as they are built and a
   frozen object cannot be unfrozen, so a capture keeps the hardening of the install that built it.
   A later install's `hardened` still governs shims handed out fresh after it.
@@ -979,7 +990,22 @@ object rejects assignment on its own), but `net.Socket.prototype.connect = evil`
 that. #87's live-context rework closed it in passing, which is luck, not coverage: nothing in the
 suite crossed hardened mode with the ESM path, so it could have regressed as quietly as it
 arrived. `test/hardened.test.ts` now pins both states of the `CAPWALL_HARDENED` override on the
-ESM path.
+ESM path, and `test/install-option-parity.test.ts` (#90/#97) asserts every install option —
+`hardened` among them — on **both** paths from one process, so a regression on either is a test
+failure rather than a silence.
+
+**`hardened: true` now FAILS LOUDLY when capwall cannot apply it (#97).** A security option that
+is accepted and silently not applied is worse than one that is refused, so `install()` verifies
+the post-condition after wiring everything up: the shim namespaces it just built must be frozen
+(on the CJS registry always, and on the ESM registry when `esm: true`), and the egress globals it
+just replaced must be non-writable. If any is not, the partial install is **rolled back** and
+`install()` throws, naming the surfaces. The check observes rather than predicts — it inspects
+only objects capwall itself created, on only the paths that call is mediating — so it cannot
+produce a spurious startup throw for an option capwall *did* honor. What it does catch is the
+#97 class: a plumbing change that stops `hardened` reaching one of the two paths. The one
+realistic way to trip it is code outside capwall pinning an egress global non-configurable before
+a hardened install, after which nobody can harden or restore it; capwall refuses rather than
+running with the option quietly absent.
 
 One consequence of `hardened` is worth stating plainly, because `Object.freeze` is irreversible
 and everything else about an install IS live: a shim reference a module already captured keeps

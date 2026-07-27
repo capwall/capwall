@@ -222,23 +222,69 @@ export function createEnvProxy(
   });
 }
 
+/*
+ * EXACTLY ONE PROXY PER PROCESS, REFERENCE-COUNTED (#90) — the same rule, and the same reasoning,
+ * as `installCompileGate` in shims/module.ts. Not a style choice; stacking BROKE this guard three
+ * separate ways, and every one of them was invisible to a single-install test:
+ *
+ *   1. A second `installEnvGuard` captured `process.env` — which by then was the FIRST guard's
+ *      proxy — and wrapped it again, so every dependency read ran the attribute→evaluate→record
+ *      sequence TWICE and every decision was recorded twice in the trace.
+ *   2. Worse, it then called `setUnproxiedEnv(proxy1)`. `unproxiedProcessEnv()` exists precisely
+ *      so the child_process shim can build a child's environment block WITHOUT going through the
+ *      read gate (#89); handed a proxy, it enumerated the gate instead, every key soft-denied to
+ *      `undefined`, Node dropped the undefined values — and a GRANTED `spawn` launched its child
+ *      with a completely empty environment. That is the #86 shape exactly: hardened/nested
+ *      configuration breaking an ALLOWED operation, with the denied path still working fine.
+ *   3. `uninstall()` restored `process.env` to whatever this install had captured, so an
+ *      out-of-LIFO-order teardown left capwall's proxy on `process.env` PERMANENTLY — reading the
+ *      deny-all torn-down policy for the rest of the process, in direct contradiction of
+ *      `InstallHandle.uninstall`'s documented promise that a fresh access after teardown is
+ *      un-mediated. `loader/require.ts` and `loader/native.ts` both keep a relink chain for that
+ *      reason; this guard kept a bare save/restore.
+ *
+ * One proxy is not merely enough, it is what correctness requires: since #87 every guard reads
+ * `liveCtx`, whose identity never changes and whose fields the install stack re-points, so a
+ * single proxy already tracks whichever install is in force. The count only decides WHEN to put
+ * the real object back. `index.ts` therefore hands this `liveCtx`, and the closure below captures
+ * the FIRST caller's context — the same object by construction.
+ */
+let envGuardInstalls = 0;
+/** The proxy this process installed, so a repeat install can recognize its own work. */
+let envGuardProxy: NodeJS.ProcessEnv | null = null;
+/** The un-proxied `process.env` to put back when the last install goes. */
+let envGuardReal: NodeJS.ProcessEnv | null = null;
+
 /**
  * Replace `process.env` with the read-gating proxy. Returns a handle whose `uninstall`
- * restores the original object (only if `process.env` is still our proxy — so we do not
- * clobber a later replacement, mirroring the loader patch).
+ * restores the original object once the LAST install releases it (and only if `process.env` is
+ * still our proxy — so we do not clobber a later replacement, mirroring the loader patch).
  */
 export function installEnvGuard(ctx: ShimContext): EnvGuardHandle {
-  const realEnv = process.env;
-  const proxy = createEnvProxy(realEnv, ctx);
-  process.env = proxy;
-  // #89: hand the un-proxied reference to the shim runtime so the child_process shim can build a
-  // child's environment block WITHOUT enumerating this proxy. That enumeration — Node's
-  // `options.env || { ...process.env }` — is what the old process-wide gate suspension existed to
-  // let through; supplying the env explicitly deletes the need for it rather than narrowing it.
-  setUnproxiedEnv(realEnv);
+  if (envGuardProxy === null) {
+    const realEnv = process.env;
+    const proxy = createEnvProxy(realEnv, ctx);
+    envGuardReal = realEnv;
+    envGuardProxy = proxy;
+    process.env = proxy;
+    // #89: hand the un-proxied reference to the shim runtime so the child_process shim can build
+    // a child's environment block WITHOUT enumerating this proxy. That enumeration — Node's
+    // `options.env || { ...process.env }` — is what the old process-wide gate suspension existed
+    // to let through; supplying the env explicitly deletes the need for it rather than narrowing
+    // it. It must be the REAL object, never another guard's proxy — see (2) above.
+    setUnproxiedEnv(realEnv);
+  }
+  envGuardInstalls++;
+
+  let uninstalled = false;
   return {
     uninstall() {
-      if (process.env === proxy) process.env = realEnv;
+      if (uninstalled) return; // idempotent, like every other handle
+      uninstalled = true;
+      if (--envGuardInstalls > 0) return; // an outer install still wants the gate
+      if (envGuardReal !== null && process.env === envGuardProxy) process.env = envGuardReal;
+      envGuardProxy = null;
+      envGuardReal = null;
       setUnproxiedEnv(undefined);
     },
   };

@@ -18,11 +18,12 @@
  */
 import { patchRequire, type RequirePatchHandle } from "./loader/require.js";
 import { registerEsmHook, type EsmHookHandle } from "./loader/esm-hook.js";
-import { liveCtx } from "./loader/live-context.js";
+import { liveCtx, liveRegistry } from "./loader/live-context.js";
 import { installNativeGate, type NativeGateHandle } from "./loader/native.js";
 import { installEnvGuard, type EnvGuardHandle } from "./shims/env.js";
 import { installCompileGate, type CompileGateHandle } from "./shims/module.js";
 import {
+  globalEgressHardeningGaps,
   installGlobalEgressGuard,
   type GlobalEgressGuardHandle,
 } from "./shims/global-egress.js";
@@ -121,8 +122,85 @@ export interface InstallOptions {
    * monkey-patcher, which is exactly why this is opt-in rather than the default. It is also
    * **not** a sandbox: it does nothing about `process.getBuiltinModule("node:fs")` or the
    * other raw-builtin paths. Read `docs/threat-model.md` § hardened mode before enabling it.
+   *
+   * FAILS LOUDLY WHEN IT CANNOT BE APPLIED (#97). `install()` verifies, after wiring everything
+   * up, that the surfaces it is mediating on this call really are frozen/pinned, and THROWS
+   * (after rolling the partial install back) if any is not. From #74 until #94 this option was
+   * accepted and silently inert on the ESM path; a security option that is accepted and not
+   * applied is worse than one that is refused. See `hardeningGaps` for why the check cannot
+   * produce a false positive.
    */
   hardened?: boolean;
+}
+
+/**
+ * The one shim specifier hardened mode cannot freeze, and why it is skipped by the check below.
+ *
+ * `node:module`'s shim is a `Proxy` over the real `Module` class (see shims/module.ts — copying
+ * its own keys onto a plain object would break `new Module()`, `Module.prototype`, `instanceof`
+ * and every consumer that reaches an internal). `Object.freeze` on a Proxy forwards
+ * `[[PreventExtensions]]` to its TARGET, so freezing it would freeze a builtin process-wide —
+ * the exact side effect harden.ts refuses to take. It carries no capability grant either; it
+ * gates loader-hook REGISTRATION, and that gate lives in the `get` trap, which a caller cannot
+ * remove by assigning to the namespace.
+ */
+const UNFREEZABLE_SPECIFIERS: ReadonlySet<string> = new Set(["module", "node:module"]);
+
+/**
+ * FAIL LOUDLY ON A SECURITY OPTION capwall ACCEPTED BUT DID NOT APPLY (issue #97).
+ *
+ * From #74 until #94, `install(policy, mode, { hardened: true, esm: true })` produced UNFROZEN
+ * ESM shims: `applyTopOfStack` never mirrored `hardened` onto the live context the ESM registry
+ * is built from. The option was accepted, silently inert on one of the two mediated paths, for
+ * many merges. Nothing failed, because `hardened.test.ts` only ever exercised CJS.
+ *
+ * #90/#97 add a parameterized `{cjs, esm} × every option` suite so the same regression cannot
+ * land unnoticed again. This function is the stronger half that #97 proposes: rather than
+ * TESTING that hardening was applied, `install()` VERIFIES it, at startup, in the host process,
+ * and refuses to hand back a handle it cannot honor. Failing closed on a configuration it cannot
+ * satisfy is the right default for a security tool.
+ *
+ * WHY THIS CANNOT PRODUCE A FALSE POSITIVE — the property that made it safe to ship. It asserts
+ * an OBSERVED post-condition ("this object capwall just built is frozen"), never a prediction
+ * about what should have happened. It inspects only surfaces capwall itself created and only
+ * paths this install actually mediates:
+ *   - the CJS shim registry, always (hardened mode's primary surface);
+ *   - the ESM shim registry, only when `esm: true`;
+ *   - the egress globals, only those `installGlobalEgressGuard` actually replaced (a Node without
+ *     `WebSocket`, or a `fetch` some embedder made non-configurable, is skipped by the guard and
+ *     therefore skipped here).
+ * A spurious throw at install time breaks every host app, so the rule is: if capwall did not
+ * install it, this does not check it.
+ *
+ * COST. Under `hardened: true` only — the whole function is behind that flag — it forces the CJS
+ * registry into existence at install time rather than on the first mediated `require`. That is
+ * one-time startup work for the mode whose entire purpose is to spend compatibility for
+ * enforcement strength, and the ESM registry is already built eagerly by `registerEsmHook`.
+ *
+ * ON THROWING RATHER THAN WARNING. A warning is what the status quo effectively was — #97 went
+ * unnoticed for many merges precisely because nothing said anything. An operator who set
+ * `hardened: true` asked for a specific enforcement property; running on without it is the
+ * fail-open outcome. `install()` rolls the partial install back before throwing (see the call
+ * site), so a refused install leaves the process exactly as it found it rather than
+ * half-patched.
+ */
+function hardeningGaps(esm: boolean, globalEgress: boolean): string[] {
+  const gaps: string[] = [];
+  const checkRegistry = (path: "cjs" | "esm"): void => {
+    for (const [specifier, shim] of liveRegistry(path)) {
+      if (UNFREEZABLE_SPECIFIERS.has(specifier)) continue;
+      if (typeof shim !== "object" || shim === null) continue;
+      if (!Object.isFrozen(shim)) gaps.push(`${path}:${specifier}`);
+    }
+  };
+  checkRegistry("cjs");
+  if (esm) checkRegistry("esm");
+  // Only when THIS install asked for the egress globals. An install that passed
+  // `globalEgress: false` is not mediating them, so an un-pinned guard left by some other
+  // install is not a promise this one broke — and refusing to install over it would be exactly
+  // the spurious startup throw this check must never produce.
+  if (globalEgress) gaps.push(...globalEgressHardeningGaps());
+  return gaps;
 }
 
 /**
@@ -194,6 +272,20 @@ export function install(
   }
   if (options.esm) {
     handles.push(registerEsmHook(ctx));
+  }
+  // #97: a security option capwall accepted but could not apply is a startup error, not a silent
+  // no-op. Roll the partial install back FIRST — a host app that catches this must be left with
+  // an unpatched process, not a half-patched one — then throw. See `hardeningGaps`.
+  if (hardened) {
+    const gaps = hardeningGaps(options.esm === true, options.globalEgress !== false);
+    if (gaps.length > 0) {
+      for (const h of handles) h.uninstall();
+      throw new Error(
+        `capwall: install({ hardened: true }) could not harden ${gaps.length} mediated ` +
+          `surface(s) — ${gaps.join(", ")}. Refusing to run with a security option accepted ` +
+          `and not applied (issue #97); pass hardened: false to install without it.`,
+      );
+    }
   }
   return {
     uninstall() {
