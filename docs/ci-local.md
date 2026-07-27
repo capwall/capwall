@@ -46,6 +46,35 @@ The script streams the build context from `git ls-files --cached --others --excl
 - Uses the classic Docker builder (`DOCKER_BUILDKIT=0`) so it works without the `buildx` CLI plugin and streams each step's output live. Set `CI_BUILDKIT=1` to force BuildKit if you have it wired up.
 - `install`/`build`/`typecheck` layers cache when the source is unchanged; `test`/`lint` are forced to re-run every invocation (via a `CACHEBUST` arg) so `ci:local` always actually executes the tests.
 
+## Drift detection in CI (`capwall diff`)
+
+Separate from the four gates above, and about *your* project rather than about capwall:
+capwall ships a CI-facing subcommand for exactly this file's use case. `capwall diff` runs
+your target in observe mode, then reports every capability the run actually used that the
+committed `capabilities.json` would **deny** in enforce mode — a dependency that started
+doing something it never did before.
+
+```bash
+capwall diff -- node ./src/server.js            # human-readable
+capwall diff --json -- node ./src/server.js     # machine-readable
+capwall diff -p ./policies/prod.json -- npm test
+```
+
+| Exit code | Meaning |
+|---|---|
+| `0` | no drift — everything the run did is already granted |
+| `1` | drift found — one or more observed capabilities the policy would deny |
+| `2` | usage error, or the policy file is missing |
+
+`--json` writes the drift as a compact JSON array of `{pkg, kind, detail}` on the **last**
+line of stdout; the target's own stdout is inherited and may precede it, so parse the last
+line. Because a drifting dependency exits `1`, `capwall diff` can gate a merge directly.
+
+This repo uses it on itself: `packages/cli/test/express-app-policy.test.ts` asserts that
+`examples/express-app` reports no drift under its committed policy, in a scrubbed
+environment. That test exists because the claim silently became false once before (issue
+#57).
+
 ## Dev container
 
 `.devcontainer/devcontainer.json` gives a reproducible Node 22 dev environment (VS Code Dev Containers / GitHub Codespaces). On create it enables the pinned pnpm, installs, and builds. It includes the `docker-outside-of-docker` feature so you can run `pnpm ci:local` from inside the container too.

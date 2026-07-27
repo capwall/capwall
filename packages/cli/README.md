@@ -2,9 +2,14 @@
 
 The `capwall` command-line interface — the primary way users drive the observe→enforce loop.
 
-> **Status (roadmap M1–M3 done):** all four commands work for the `fs` capability on the
-> CJS path. `observe`/`enforce` launch the target with `@capwall/core/preload` injected via
-> `NODE_OPTIONS --import`. See [`../../docs/roadmap.md`](../../docs/roadmap.md).
+> **Status:** all **six** commands are implemented and work for every capability, on both the
+> CJS `require` and the ESM `import` paths. `observe`/`enforce`/`run`/`diff` launch the target
+> with `@capwall/core/preload` injected via `NODE_OPTIONS --import`. Milestone status is
+> tracked in one place, [`../../docs/roadmap.md`](../../docs/roadmap.md).
+>
+> Not published to npm yet (version `0.0.0`) — run it as
+> `node <clone>/packages/cli/dist/index.js` after `pnpm install && pnpm build`. See the root
+> [`README.md`](../../README.md) § Quickstart.
 
 ## Commands
 
@@ -31,8 +36,14 @@ capwall explain <package> <capability> [target]
 ```
 
 Common flags: `-p, --policy <path>` for `enforce`/`run`/`diff`/`explain` and `-o, --out <path>`
-for `observe`/`gen-policy` (both default to `./capabilities.json`). The project root is the
-CLI's working directory.
+for `observe`/`gen-policy` (both default to `./capabilities.json`). `diff` also takes
+`--json`, which writes the drift as a compact JSON array of `{pkg, kind, detail}` as the
+**last** line of stdout (the target's own stdout is inherited and may precede it). The project
+root is the CLI's working directory.
+
+`diff` is the CI-facing command: exit **0** = no drift, **1** = drift found, **2** = usage
+error or missing policy file. See [`docs/ci-local.md` § Drift detection in
+CI](../../docs/ci-local.md).
 
 `observe`, `enforce` and `diff` name the mode themselves (they set `CAPWALL_MODE`, which
 outranks everything); `run` takes it from the policy document. Full precedence table:
