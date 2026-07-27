@@ -172,8 +172,15 @@ Per-capability notes:
   are not gated (the app is the trust root, as for `process.env`); since #60 that requires a
   positively identified application frame, and Node's auto-bind `send` replay — which used to
   ride on the old fail-open, because Node re-invokes `send` from the socket's `'listening'`
-  event on a stack with no caller frame — is handled by state instead: the already-authorized
-  send is forwarded with the real method shadowing the guard, so the replay cannot re-enter it.
+  event on a stack with no caller frame — is handled by state instead. Since #86 that state is
+  a **single-use authorization pinned to one socket and one destination**: while an authorized
+  send is on the stack, the guarded `send` accessor yields a token good for exactly the host:port
+  the policy just allowed, once, on that socket; every other use of it falls back to the full
+  guard. So the replay is forwarded without a second check, and nothing that can be obtained
+  from that state can reach a destination the policy did not already allow. The `dgram`
+  destination is derived POSITIONALLY, mirroring Node's own argument normalization, because Node
+  accepts a port as a numeric string (`send(buf, "9999", host)`); a type-based derivation saw no
+  number, concluded there was no destination and skipped the gate entirely.
   Capability-bearing classes
   (`net.Socket`, `tls.TLSSocket`, `http.ClientRequest`, `http.Agent`, `dgram.Socket`) are
   guarded via a **guarded subclass** whose prototype method (or constructor) runs the check,
@@ -763,8 +770,18 @@ of enforcement **for the whole process** (the un-patching bullet above). Hardene
   `net.Socket.prototype.connect = evil` is otherwise the same one-line un-guard, one level
   down. Freezing a guarded class does **not** stop `class Mine extends fs.ReadStream {}` —
   that reads the frozen class and writes to a new one.
-- The guarded `send`/`connect` own-properties capwall installs on a `dgram` socket instance
-  (made non-writable/non-configurable; the socket itself is not frozen — it needs its state).
+- The guarded `send`/`connect` properties capwall installs for a `dgram` socket — on the
+  instance for a `createSocket()` result, on the guarded subclass's prototype for
+  `new dgram.Socket()`. The socket itself is never frozen (it needs its mutable state), so these
+  are pinned individually: installed as **accessors with no setter and `configurable: false`**,
+  which gives `socket.send = evil` the same outcome `writable: false` did (a `TypeError` under
+  `"use strict"`, a silent no-op in sloppy mode) and makes
+  `Object.defineProperty(socket, "send", …)` and `delete socket.send` fail. An accessor rather
+  than a pinned data property because the guard has to be able to choose what Node's own
+  internal `this.send` read yields, for one authorized call, WITHOUT redefining the property —
+  issue #86 was the collision between that need and the pin, and it made every allowed
+  `dgram.createSocket().send()` throw `Cannot redefine property: send` under hardened mode. An
+  accessor is computed per read, so there is nothing left to compete over.
 - The **guarded global egress surfaces** (#80): `globalThis.fetch`/`WebSocket`/`EventSource` are
   installed **non-writable**, so `globalThis.fetch = evil` fails, and the guarded wrapper /
   subclass is frozen. They stay **`configurable`** on purpose — a non-configurable global could
@@ -772,6 +789,23 @@ of enforcement **for the whole process** (the un-patching bullet above). Hardene
   `Object.defineProperty(globalThis, "fetch", …)` still un-gates them; that is the deliberate
   price of a restorable global, and it is the same class of escape as climbing past a guarded
   prototype.
+
+**It applies to `import` as well as `require`,** and that is now asserted rather than assumed.
+The #86 sibling audit found it had NOT: the ESM path built its shims from a context onto which
+`hardened` was never mirrored, so `CAPWALL_HARDENED=1` froze nothing at all on the path
+`capwall run` enables by **default**. The namespace half is moot under ESM (a module-namespace
+object rejects assignment on its own), but `net.Socket.prototype.connect = evil` and
+`dgram.Socket.prototype.send = evil` landed — silently, under the mode enabled to stop exactly
+that. #87's live-context rework closed it in passing, which is luck, not coverage: nothing in the
+suite crossed hardened mode with the ESM path, so it could have regressed as quietly as it
+arrived. `test/hardened.test.ts` now pins both states of the `CAPWALL_HARDENED` override on the
+ESM path.
+
+One consequence of `hardened` is worth stating plainly, because `Object.freeze` is irreversible
+and everything else about an install IS live: a shim reference a module already captured keeps
+the hardening of the install that first built it. A later install with a different `hardened`
+gets correctly-hardened shims for anything freshly handed out — the registry is memoized per
+hardened-ness — but it cannot un-freeze, or retroactively freeze, what is already held.
 
 Note the dependency on issue #64: while `fs.ReadStream`, `vm.Script` and
 `worker_threads.Worker` were construct-trap Proxies, hardened mode could not freeze them at
@@ -804,6 +838,15 @@ with a deny-all `enforce` policy:
   `process.env`, not a capwall-created namespace. Freezing it would break `process.env.X = y`
   for the whole process and freeze the real environment object, so it is left alone;
   `process.env = {…}` still un-gates env reads.
+- **Shadowing a guarded PROTOTYPE method with an own property on an instance.** The `dgram`
+  pin above is complete for a `createSocket()` result, where the guard is an own property of the
+  socket, but only half-complete for `new dgram.Socket()`, where it lives on the guarded
+  subclass's frozen prototype: assignment (`socket.send = evil`) fails, because assignment
+  consults the inherited setter-less accessor, but `Object.defineProperty(socket, "send", …)`
+  succeeds — `[[DefineOwnProperty]]` does not consult the prototype chain, and the socket cannot
+  be frozen. Closing it would mean freezing every socket, which a socket does not survive. This
+  is asserted, not assumed: `test/dgram.test.ts` pins both halves so the asymmetry stays a
+  recorded decision.
 - **Climbing PAST a guarded class**, exactly as documented under "Capability-bearing classes":
   `Object.getPrototypeOf(net.Socket.prototype).connect` still reaches the real method, and
   `new (Object.getPrototypeOf(fs.ReadStream.prototype).constructor)(deniedPath)` still reaches

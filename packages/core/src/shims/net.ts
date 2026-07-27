@@ -49,12 +49,16 @@
  *  - `http2`: `http2.connect(authority)`. Scheme-aware default port, matching Node: 80 for an
  *    `http:` authority (h2c/cleartext), 443 for `https:`.
  *  - `dgram`: socket `send`/`connect` (UDP), on both `createSocket()` results and
- *    `new dgram.Socket()`. A `send` on a *connected* socket (no destination args) is not
+ *    `new dgram.Socket()` — the same guards installed the same way on both, so the two paths
+ *    cannot drift (#86). The destination is derived POSITIONALLY, mirroring Node's own
+ *    argument normalization, because Node accepts a port as a numeric string — see
+ *    `deriveDgramSend`. A `send` on a *connected* socket (no destination args) is not
  *    re-gated (the `connect` was). Ops attributed to `<app>` are not gated (the app is the
  *    trust root) — but since #60 that means a positively-identified application frame, not
  *    "the stack walk found nothing", which is now `<unknown>` and IS gated. Node's auto-bind
  *    `send` replay, which used to ride on that fail-open, is handled by state instead — see
- *    `applyAuthorizedDgramSend`.
+ *    `forwardAuthorizedDgramSend` for the mechanism and why a stolen authorization is worth
+ *    nothing.
  *  - Inbound `server.listen` is deliberately NOT gated (egress, not binding).
  *  - IPC/unix-socket connects have no host:port and are approximated as `{ "<ipc>", 0 }`.
  *  - `dns` is NOT shimmed (a lookup moves no payload; DNS tunneling is out of scope).
@@ -122,7 +126,7 @@ import {
   type ShimContext,
   type ShimRegistry,
 } from "./runtime.js";
-import { guardedPropFlags, harden, hardenClass } from "./harden.js";
+import { defineGuardedAccessor, harden, hardenClass } from "./harden.js";
 import { guardedWebSocketClass } from "./global-egress.js";
 // The single-read URL pinning helpers live in their own module so the global egress guard
 // (#80) can share this exact implementation without an import cycle — see url-snapshot.ts.
@@ -870,90 +874,215 @@ function guardDgram(ctx: ShimContext, host: string, port: number): void {
   if (!decision.allowed) throw new CapabilityError(decision.reason, pkg);
 }
 
+/** A dgram destination derived from a call's arguments. */
+interface DgramTarget {
+  readonly host: string;
+  readonly port: number;
+}
+
+/**
+ * The ONE piece of state that means "capwall has already authorized this exact send", live
+ * only for the synchronous duration of the forward that authorized it. See
+ * {@link forwardAuthorizedDgramSend} for the whole mechanism and its security argument.
+ *
+ * It is a module-scoped `let` on purpose: nothing a dependency can reach names it, so unlike a
+ * flag parked on the socket (`socket.__capwallSending = true`) it cannot be set from outside.
+ */
+interface DgramAuthorization {
+  /** The socket the authorized send is running on — an authorization is never socket-portable. */
+  readonly socket: object;
+  /** The destination the policy actually allowed. A token can authorize NOTHING else. */
+  readonly host: string;
+  readonly port: number;
+  readonly realSend: AnyFn;
+  readonly guardedSend: AnyFn;
+}
+let dgramAuthorization: DgramAuthorization | null = null;
+
 /**
  * Forward an ALREADY-AUTHORIZED `send` so Node's auto-bind replay cannot re-enter the guard.
  *
- * `send` on an unbound socket makes Node bind it and defer the datagram by queueing
- * `this.send.bind(this, …)` — reading the property, i.e. capwall's wrapper — and re-invoking
+ * THE PROBLEM. `send` on an unbound socket makes Node bind the socket and defer the datagram:
+ * it evaluates `this.send` — capwall's guarded wrapper — binds it, queues it, and re-invokes
  * it from the socket's `'listening'` event, on a stack with no caller frame at all. That
  * replay used to attribute to `<app>` and be exempted; since #60 it attributes to
- * `<unknown>`, and re-guarding it would throw a `CapabilityError` for a send that was already
- * allowed, from inside Node's internals where the caller cannot catch it (the DoS regression
- * covered in `test/routing.test.ts`).
+ * `<unknown>`, and re-guarding it would throw a `CapabilityError` for a send the policy
+ * already allowed, from inside Node's internals where the caller cannot catch it (the DoS
+ * regression covered in `test/routing.test.ts`).
  *
- * Fixing this by state rather than by attribution is also the only sound option: the replay's
- * stack is byte-for-byte the same shape as `setTimeout(sock.send.bind(sock), 0, …)`, which is
- * precisely the laundering trick #60 is about, so no stack-based rule could tell the two
- * apart. Here we KNOW the send was authorized, because we just authorized it.
+ * WHY THIS CANNOT BE FIXED BY LOOKING AT THE STACK. The replay's stack is byte-for-byte the
+ * same shape as `setTimeout(sock.send.bind(sock), 0, …)` — precisely the laundering trick #60
+ * is about — so no stack-based rule can tell an authorized replay from an attack. The
+ * difference has to be carried as state, because only capwall knows it: here we KNOW the send
+ * was authorized, because we just authorized it, for a destination we can name.
  *
- * Mechanism: shadow `send` with the real method for the synchronous duration of the call, so
- * whatever Node captures for the replay is the unguarded method, then restore the wrapper.
- * This exposes the real `send` only within that synchronous window, and only to code that
- * could already reach it one prototype hop up (`Object.getPrototypeOf(sock).send`) — the
- * documented shim-un-patching residual, not a new one.
+ * THE MECHANISM. `send` is an ACCESSOR (see `defineGuardedAccessor`), so capwall chooses what
+ * Node's `this.send` read yields without ever redefining the property — which is what lets
+ * this coexist with hardened mode's pin (#86; the previous implementation redefined the
+ * property and therefore threw for every allowed send under `CAPWALL_HARDENED=1`). While an
+ * authorized forward is in progress the getter yields a **replay token** minted by
+ * {@link mintDgramReplayToken} instead of the guarded wrapper, and Node queues that token.
+ *
+ * WHY A STOLEN TOKEN IS WORTH NOTHING (the security question this design has to answer). The
+ * token is not a "we are authorized" boolean — it carries the authorization's CONTENT, and
+ * refuses to be anything else:
+ *  - it is bound to ONE socket (`this !== auth.socket` → falls back to the full guard);
+ *  - it is bound to ONE destination — the host:port the policy just allowed — so it can never
+ *    widen what was granted, no matter what arguments it is called with;
+ *  - it is single-use, so it cannot become a standing exemption;
+ *  - every rejected case delegates to the ordinary guarded wrapper rather than to the real
+ *    method, so there is no path through a token that skips a policy check;
+ *  - it exists only while an authorized forward is on the stack, and the only code that can
+ *    run inside that window is Node's own `send` — a dependency has to arrange to be called
+ *    from inside it (e.g. an accessor on an element of a buffer LIST argument) merely to
+ *    obtain a token whose whole power is "send once, to the address you were just granted".
+ * There is no path by which manufacturing state gets an unauthorized destination forwarded:
+ * the state does not say "allowed", it says "allowed to reach 127.0.0.1:9999, once".
+ *
+ * A further improvement over the previous implementation: the real, unguarded `send` is never
+ * installed on the socket at all, so the window in which it was readable as an own property is
+ * gone.
  */
-function applyAuthorizedDgramSend(receiver: unknown, realSend: AnyFn, args: unknown[]): unknown {
-  if (typeof receiver !== "object" || receiver === null) {
-    return realSend.apply(receiver, args); // odd receiver: nothing to shadow, just forward
+function forwardAuthorizedDgramSend(
+  receiver: unknown,
+  target: DgramTarget | null,
+  realSend: AnyFn,
+  guardedSend: AnyFn,
+  args: unknown[],
+): unknown {
+  if (target === null || typeof receiver !== "object" || receiver === null) {
+    // No destination (a connected-socket send — the `connect` was gated) or an odd receiver:
+    // nothing was authorized here and there is nothing to key an authorization on.
+    return realSend.apply(receiver, args);
   }
-  const socket = receiver as Record<string, unknown>;
-  const saved = Object.getOwnPropertyDescriptor(socket, "send");
-  Object.defineProperty(socket, "send", { value: realSend, writable: true, configurable: true });
+  const previous = dgramAuthorization; // restore, don't null: a send nested inside a send
+  dgramAuthorization = {
+    socket: receiver,
+    host: target.host,
+    port: target.port,
+    realSend,
+    guardedSend,
+  };
   try {
-    return realSend.apply(socket, args);
+    return realSend.apply(receiver, args);
   } finally {
-    if (saved) Object.defineProperty(socket, "send", saved);
-    else delete socket["send"];
+    dgramAuthorization = previous;
   }
 }
 
-/** `send(msg[, offset, length], port[, address][, cb])`: last number = port, last string = host.
- * Returns null for a connected-socket `send(msg[, cb])` (no destination → the connect was gated). */
-function deriveDgramSend(args: unknown[]): { host: string; port: number } | null {
-  let port: number | undefined;
-  let host: string | undefined;
-  for (let i = 1; i < args.length; i++) {
-    const a = args[i];
-    if (typeof a === "number") port = a;
-    else if (typeof a === "string") host = a;
-  }
+/** What the guarded `send` accessor yields: the replay token while an authorized forward for
+ * THIS socket is on the stack, the guarded wrapper at every other moment. A fresh token per
+ * read, so a token a dependency contrives to read cannot starve Node's replay of its own. */
+function readGuardedDgramSend(receiver: unknown, guardedSend: AnyFn): AnyFn {
+  const auth = dgramAuthorization;
+  if (auth !== null && auth.socket === receiver) return mintDgramReplayToken(auth);
+  return guardedSend;
+}
+
+/** One socket, one destination, one use — see {@link forwardAuthorizedDgramSend}. */
+function mintDgramReplayToken(auth: DgramAuthorization): AnyFn {
+  let spent = false;
+  return function replayAuthorizedSend(this: unknown, ...args: unknown[]): unknown {
+    const target = deriveDgramSend(args);
+    if (
+      spent ||
+      this !== auth.socket ||
+      target === null ||
+      target.host !== auth.host ||
+      target.port !== auth.port
+    ) {
+      // Not the replay this token was minted for, so there is no authorization to spend.
+      // Behave EXACTLY like the guarded method — attribute, evaluate, deny if denied.
+      return auth.guardedSend.apply(this, args);
+    }
+    spent = true;
+    // The replay can itself hit an unbound socket (it cannot in practice — Node flushes the
+    // queue from 'listening' — but the invariant should not depend on that), so forward
+    // through the same path, which arms a fresh authorization for the same destination.
+    return forwardAuthorizedDgramSend(this, target, auth.realSend, auth.guardedSend, args);
+  };
+}
+
+/**
+ * Derive the destination of `send(msg[, offset, length], port[, address][, cb])`, or null for
+ * a connected-socket `send(msg[, cb])` (no destination → the `connect` was gated).
+ *
+ * This mirrors Node's own POSITIONAL normalization in `dgram.Socket.prototype.send` rather
+ * than guessing from argument types, for two reasons:
+ *  1. SECURITY. Node accepts a port as a numeric STRING (`validatePort` coerces `"9999"`,
+ *     `" 9999 "`, even `"0x270f"`). A "last number argument is the port" rule sees no number
+ *     in `send(buf, "9999", "10.0.0.1")`, concludes there is no destination, and skips the
+ *     guard entirely — un-gated, unlogged UDP egress under a deny-all policy. Reading the port
+ *     from the position Node reads it from, and coercing it the way Node coerces it, closes
+ *     that. It also removes the mirror-image hazard, where a numeric-looking *address*
+ *     (`send(buf, 9999, "3232235777")`) would be mistaken for the port.
+ *  2. CORRECTNESS OF THE REPLAY MATCH. The replay re-enters with Node's normalized
+ *     `(list, port, address, callback)`. Deriving positionally makes the derivation a fixed
+ *     point — the replay's destination is identical to the one authorized — which is what
+ *     {@link mintDgramReplayToken} matches on.
+ */
+function deriveDgramSend(args: unknown[]): DgramTarget | null {
+  // Node: `if (address || (port && typeof port !== 'function'))` picks the 6-argument form
+  // `(buffer, offset, length, port, address, callback)`; otherwise the arguments shift down to
+  // `(buffer, port, address, callback)`.
+  const long = Boolean(args[4]) || (Boolean(args[3]) && typeof args[3] !== "function");
+  const rawPort = long ? args[3] : args[1];
+  const rawAddress = long ? args[4] : args[2];
+  const port = coercePort(rawPort);
   if (port === undefined) return null; // connected send — no destination args
-  return { host: host ?? "localhost", port };
+  return { host: typeof rawAddress === "string" ? rawAddress : "localhost", port };
 }
 
-/** `connect(port[, address][, cb])`. */
-function deriveDgramConnect(args: unknown[]): { host: string; port: number } {
-  const port = typeof args[0] === "number" ? args[0] : 0;
+/** `connect(port[, address][, cb])`. The port is coerced the way Node's `validatePort` does,
+ * for the same reason as in {@link deriveDgramSend} — a string port must not derive a
+ * different destination from the one Node dials. */
+function deriveDgramConnect(args: unknown[]): DgramTarget {
+  const port = coercePort(args[0]) ?? 0;
   const host = typeof args[1] === "string" ? args[1] : "localhost";
   return { host, port };
 }
 
+/** Build the guarded `send`: check the policy, then forward through the authorized path so
+ * Node's auto-bind replay is served by a token rather than by a second policy check. */
+function guardedDgramSend(ctx: ShimContext, realSend: AnyFn): AnyFn {
+  const guarded: AnyFn = function (this: unknown, ...args: unknown[]): unknown {
+    const target = deriveDgramSend(args);
+    if (target) guardDgram(ctx, target.host, target.port);
+    return forwardAuthorizedDgramSend(this, target, realSend, guarded, args);
+  };
+  return harden(ctx, guarded);
+}
+
+/** Build the guarded `connect`. No replay token: Node's `connect` on an unbound socket queues
+ * its INTERNAL `_connect` (`FunctionPrototypeBind(_connect, this, …)`), not `this.connect`, so
+ * the guard is never re-entered from the `'listening'` flush. Verified against Node 20 and 22
+ * and pinned by the unbound-connect regression in `test/routing.test.ts`, which would fail
+ * loudly (an uncatchable `CapabilityError` from Node's internals) if that ever changed. */
+function guardedDgramConnect(ctx: ShimContext, realConnect: AnyFn): AnyFn {
+  const guarded: AnyFn = function (this: unknown, ...args: unknown[]): unknown {
+    const target = deriveDgramConnect(args);
+    guardDgram(ctx, target.host, target.port);
+    return realConnect.apply(this, args);
+  };
+  return harden(ctx, guarded);
+}
+
 /** Install guarded `send`/`connect` on a dgram socket instance (used for createSocket results).
- * Under hardened mode (#17) these OWN properties are installed non-writable/non-configurable
- * (`guardedPropFlags`) so `socket.send = evil` cannot strip the guard off a socket capwall
+ * Under hardened mode (#17) these OWN properties are pinned non-configurable and setter-less
+ * (`defineGuardedAccessor`) so `socket.send = evil` cannot strip the guard off a socket capwall
  * handed out. The socket itself is never frozen — it needs its mutable internal state. */
 function guardDgramInstance(socket: Record<string, unknown>, ctx: ShimContext): void {
   const realSend = socket["send"];
   const realConnect = socket["connect"];
   if (typeof realSend === "function") {
-    Object.defineProperty(socket, "send", {
-      value: function (this: unknown, ...args: unknown[]) {
-        const t = deriveDgramSend(args);
-        if (t) guardDgram(ctx, t.host, t.port);
-        return applyAuthorizedDgramSend(this, realSend as AnyFn, args);
-      },
-      ...guardedPropFlags(ctx),
+    const guarded = guardedDgramSend(ctx, realSend as AnyFn);
+    defineGuardedAccessor(ctx, socket, "send", function (this: unknown): unknown {
+      return readGuardedDgramSend(this, guarded);
     });
   }
   if (typeof realConnect === "function") {
-    Object.defineProperty(socket, "connect", {
-      value: function (this: unknown, ...args: unknown[]) {
-        const t = deriveDgramConnect(args);
-        guardDgram(ctx, t.host, t.port);
-        return (realConnect as AnyFn).apply(this, args);
-      },
-      ...guardedPropFlags(ctx),
-    });
+    const guarded = guardedDgramConnect(ctx, realConnect as AnyFn);
+    defineGuardedAccessor(ctx, socket, "connect", () => guarded);
   }
 }
 
@@ -973,20 +1102,21 @@ export function createDgramShim(ctx: ShimContext): typeof import("node:dgram") {
   if (typeof RealDgramSocket === "function") {
     const Guarded = class extends (RealDgramSocket as AnyCtor) {};
     const proto = (RealDgramSocket as AnyCtor).prototype as Record<string, unknown>;
-    for (const method of ["send", "connect"] as const) {
-      const realMethod = proto[method];
-      if (typeof realMethod !== "function") continue;
-      Object.defineProperty(Guarded.prototype, method, {
-        value: function (this: unknown, ...args: unknown[]) {
-          const t = method === "send" ? deriveDgramSend(args) : deriveDgramConnect(args);
-          if (t) guardDgram(ctx, t.host, t.port);
-          return method === "send"
-            ? applyAuthorizedDgramSend(this, realMethod as AnyFn, args)
-            : (realMethod as AnyFn).apply(this, args);
-        },
-        writable: true,
-        configurable: true,
+    // The SAME guards and the SAME accessor installer as the `createSocket` path above — one
+    // mechanism, not two. #86 happened because the two dgram paths diverged (the instance one
+    // was pinned by hardened mode, the prototype one was not), so the interaction that broke
+    // the pinned path was invisible from the other.
+    const realSend = proto["send"];
+    if (typeof realSend === "function") {
+      const guarded = guardedDgramSend(ctx, realSend as AnyFn);
+      defineGuardedAccessor(ctx, Guarded.prototype, "send", function (this: unknown): unknown {
+        return readGuardedDgramSend(this, guarded);
       });
+    }
+    const realConnect = proto["connect"];
+    if (typeof realConnect === "function") {
+      const guarded = guardedDgramConnect(ctx, realConnect as AnyFn);
+      defineGuardedAccessor(ctx, Guarded.prototype, "connect", () => guarded);
     }
     defineGuardedClassIdentity(Guarded, RealDgramSocket as AnyCtor);
     hardenClass(ctx, Guarded); // hardened mode only (#17) — see harden.ts

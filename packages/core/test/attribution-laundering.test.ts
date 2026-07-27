@@ -36,7 +36,11 @@ interface RunResult {
 }
 
 /** Run one fixture vector under the built preload with `policyFile` in enforce mode. */
-function runVector(vector: string, policyFile: string): Promise<RunResult> {
+function runVector(
+  vector: string,
+  policyFile: string,
+  extraEnv: Record<string, string> = {},
+): Promise<RunResult> {
   return new Promise((resolve, reject) => {
     execFile(
       process.execPath,
@@ -49,6 +53,7 @@ function runVector(vector: string, policyFile: string): Promise<RunResult> {
           CAPWALL_POLICY_FILE: policyFile,
           CAPWALL_PROJECT_ROOT: APP_DIR,
           LAUNDER_FIXTURE_SECRET: SECRET_VALUE,
+          ...extraEnv,
         },
       },
       (err, stdout, stderr) => {
@@ -159,6 +164,22 @@ describe("#60 — a dependency cannot launder capability calls onto the <app> se
     expect(r.stdout).not.toContain("register=REGISTERED");
     expect(r.stderr).toContain("DENY '<unknown>' module.register()");
   });
+
+  // #86: the same vectors under CAPWALL_HARDENED=1. This axis was the hole that let #86 land —
+  // the dgram guard behaves differently under hardened mode (its `send` property is pinned), so
+  // "denied when not hardened" said nothing about "denied when hardened". The `native-detached`
+  // vector is the load-bearing one: it is literally `setTimeout(socket.send.bind(socket), …)`,
+  // whose stack is byte-identical to the auto-bind replay the #86 fix forwards, so if the fix's
+  // authorization were reachable by anything but the real replay, this is where it would show.
+  for (const { vector, expectedPkg } of VECTORS) {
+    it(`denies the UDP send for '${vector}' under CAPWALL_HARDENED=1 too`, async () => {
+      const r = await runVector(vector, denyAll, { CAPWALL_HARDENED: "1" });
+      expect(r.stderr).toContain(`DENY '${expectedPkg}' net 127.0.0.1:9`);
+      expect(r.stdout).not.toContain("udp=SENT");
+      // …and specifically NOT because hardened mode broke the send outright (#86's shape).
+      expect(r.stderr).not.toContain("Cannot redefine property");
+    });
+  }
 
   it("charges the dependency by name when it calls directly (unchanged behavior)", async () => {
     const r = await runVector("dep-direct", denyAll);
