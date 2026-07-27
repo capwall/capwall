@@ -11,7 +11,7 @@
 import { attributeCallerDetailed, type AttributionOptions } from "../attribution/index.js";
 import { evaluate, type CapabilityRequest, type Decision } from "../policy/evaluate.js";
 import { CapabilityError } from "../errors.js";
-import { hardenClass } from "./harden.js";
+import { hardenClass, isHardened } from "./harden.js";
 import type { Mode, Policy } from "@capwall/policy-schema";
 
 /** Callback capwall invokes on every decision (log sink in observe, collector for gen-policy). */
@@ -253,7 +253,7 @@ export function guardedConstructorSubclass<T extends AnyCtor>(
 
 /**
  * Expose a guarded VIEW of a pre-built builtin INSTANCE — the instance-shaped counterpart of
- * {@link guardedConstructorSubclass} (issue #65).
+ * {@link guardedConstructorSubclass} (issue #65; every trap below is issue #88).
  *
  * WHY THIS EXISTS. Each shim guards the capability-bearing FUNCTIONS and CLASSES on a builtin
  * namespace and copies the rest of the namespace through by value. But a namespace can also
@@ -280,9 +280,78 @@ export function guardedConstructorSubclass<T extends AnyCtor>(
  *   - Patching the method on the real instance mutates a process-global that outlives
  *     `uninstall()`. That is the constraint that kept real builtins unfrozen in #63; not an
  *     option.
- * A `Proxy` forwards reads AND writes to the one real agent, so pool state, `maxSockets`,
- * keep-alive, `agent.sockets`/`freeSockets` and `instanceof` all stay live and shared; only the
- * named methods are replaced.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────────────────────
+ * WHY A **VIRTUAL** TARGET (issue #88 — the part that was wrong until it was written down)
+ * ─────────────────────────────────────────────────────────────────────────────────────────────
+ * #65 proxied the REAL agent and implemented only a `get` trap. Every other operation therefore
+ * took its DEFAULT behaviour, which is "forward to the target" — and the target was a
+ * process-global builtin. So `http.globalAgent.createConnection = evil`,
+ * `Object.defineProperty(http.globalAgent, …)`, `delete http.globalAgent.createConnection` and
+ * `Object.freeze(http.globalAgent)` all landed on the real agent, through capwall's own guarded
+ * view, and `uninstall()` could not undo any of it. The freeze was the sharp end: it made every
+ * subsequent `http.request()` in the process throw `Cannot assign to read only property
+ * 'totalSocketCount'`. That is precisely the hazard `harden.ts` cites as the reason #64 converted
+ * the guarded CLASSES off Proxies, re-introduced one level down, at the instance.
+ *
+ * The guard itself always held — the `get` trap re-wraps whatever the underlying method
+ * currently is, so no authority was gained — but "a dependency can permanently wedge a
+ * process-global through capwall" is not a property a capability firewall may have.
+ *
+ * The fix is to stop making the real object the Proxy's target. The target here is an EMPTY,
+ * extensible, capwall-owned object that is never written to, never frozen, and never handed out;
+ * every trap forwards to `instance` EXPLICITLY, for the operations where forwarding is what the
+ * caller means, and refuses otherwise. Two properties fall out:
+ *
+ *  1. **A missing or future trap fails INERT, not through.** With a real target the default for
+ *     any trap capwall did not write was "mutate the process-global"; with a virtual target it is
+ *     "do nothing to the process-global". That is the difference between the #88 default and a
+ *     safe one, and it is why this is a target change rather than four more traps.
+ *  2. **The Proxy invariants can never fire.** An exotic-object invariant forces `get` to return
+ *     the target's ACTUAL value for a non-configurable, non-writable target property, and forces
+ *     `getOwnPropertyDescriptor` never to report a non-configurable descriptor the target does
+ *     not have. Against the real agent, one `Object.defineProperty(realAgent, "createConnection",
+ *     {writable: false, configurable: false})` from ANY un-mediated code (the app, or a dep that
+ *     went through `process.getBuiltinModule`) therefore turned every read of
+ *     `http.globalAgent.createConnection` in the process into a `TypeError` — un-shimmed Node
+ *     returns a value — and the only invariant-satisfying alternative would have been to hand
+ *     back the UNGUARDED pinned method. A target with no own properties, kept extensible for
+ *     life, satisfies every invariant unconditionally, so the guarded wrapper can always be
+ *     returned. `test/net.test.ts` pins both halves.
+ *
+ * WHAT EACH TRAP DOES, and the rule behind it. Operations on this view fall into three classes:
+ *
+ *  - **Live state** (`get`/`set` of a non-guarded key, `has`, `ownKeys`,
+ *    `getOwnPropertyDescriptor`, `getPrototypeOf`) — FORWARDED to the real instance. This is the
+ *    whole reason a view exists rather than a copy: `maxSockets`, `keepAlive`, `sockets`/
+ *    `freeSockets` and Node's own pool bookkeeping (Node writes those through `this` when the
+ *    agent is passed to a request) must stay shared and live. A `set` here does mutate a
+ *    process-global and does outlive `uninstall()` — deliberately, because that is also exactly
+ *    what un-shimmed `http.globalAgent.maxSockets = 100` does, and shadowing it would silently
+ *    detune the default request path (which pools through the REAL agent) while the caller
+ *    believed it had tuned it. capwall does not turn a shared pool into a private one.
+ *  - **Guarded methods** (the keys in `guards`) — a read always yields capwall's wrapper, and a
+ *    write is kept in a per-view SHADOW instead of being forwarded. Those keys are not pool
+ *    state, so nothing legitimate needs them shared; keeping the write local means a write and a
+ *    later read still agree (ordinary JS semantics, and the view's own consumers — including
+ *    Node, when this agent is passed to a request — see the replacement), the guard still wraps
+ *    whatever was installed, and the whole edit disappears with the view at `uninstall()`. The
+ *    divergence this buys is bounded and stated in docs/threat-model.md: a package that replaces
+ *    `createConnection` on the guarded view does not replace it for code holding the RAW agent.
+ *  - **Structural operations** (`defineProperty`, `deleteProperty`, `preventExtensions`,
+ *    `setPrototypeOf`) — REFUSED, for every key, guarded or not. These change an object's SHAPE
+ *    rather than its state; forwarded, each is an irreversible edit to a process-global
+ *    (`Object.freeze` / a non-writable pin on `totalSocketCount` / `delete agent.sockets` all
+ *    wedge the process's HTTP client), and none of them is something a dependency needs to do to
+ *    an agent. Refusing means the trap returns `false`, so the operation throws a `TypeError` at
+ *    the call site under strict mode — loud and local, where forwarding was silent and global.
+ *
+ * HARDENED MODE (#17) makes the guarded keys read-only as well: `set` refuses instead of
+ * shadowing, matching what `defineGuardedAccessor` does for a `dgram` socket's `send`. The view
+ * itself is never frozen — freezing it is `preventExtensions`, which is refused, and freezing the
+ * agent BEHIND it is the process-wide breakage above. `hardened` is read once, at build time,
+ * because that is when every other hardened decision is taken (a frozen object cannot be
+ * un-frozen, and `loader/live-context.ts` memoizes one registry per hardened-ness).
  *
  * `guards` is a `Map`, deliberately NOT a plain object: an object lookup would resolve
  * inherited keys, so `agent.constructor` would find `Object.prototype.constructor` and be
@@ -295,6 +364,7 @@ export function guardedConstructorSubclass<T extends AnyCtor>(
  * to stop.
  */
 export function guardedInstanceMethods<T extends object>(
+  ctx: ShimContext,
   instance: T,
   guards: ReadonlyMap<string, (realMethod: AnyFn) => AnyFn>,
 ): T {
@@ -302,24 +372,130 @@ export function guardedInstanceMethods<T extends object>(
   // (a fresh wrapper per read would break identity comparisons and defeat inline caches),
   // while still honoring a later legitimate replacement of the underlying method.
   const wrappers = new WeakMap<AnyFn, AnyFn>();
-  return new Proxy(instance, {
-    get(target, prop, receiver): unknown {
+  /** Writes to GUARDED keys, kept here instead of on the process-global. Per view, so it dies
+   * with the install. Never populated under hardened mode, where such writes are refused. */
+  const shadow = new Map<string, unknown>();
+  const pinned = isHardened(ctx);
+  /** The Proxy's target: capwall's own object, permanently empty and permanently extensible.
+   * Nothing reads it and nothing writes it — it exists so that no default trap behaviour and no
+   * Proxy invariant can reach `instance`. See the "VIRTUAL TARGET" section above. */
+  const virtualTarget = Object.create(null) as T;
+  /** The real object, seen as a plain `object`. Only a typing convenience: the `Reflect` helpers
+   * specialize on `T` and would otherwise demand `T`-keyed values from traps that legitimately
+   * deal in `unknown`. */
+  const underlying: object = instance;
+
+  /** The value this view exposes for `prop`: capwall's guarded wrapper for a guarded method,
+   * the underlying value untouched for everything else. */
+  const expose = (prop: string, value: unknown): unknown => {
+    const make = guards.get(prop);
+    if (make === undefined || typeof value !== "function") return value;
+    const real = value as AnyFn;
+    let wrapped = wrappers.get(real);
+    if (wrapped === undefined) {
+      wrapped = make(real);
+      wrappers.set(real, wrapped);
+    }
+    return wrapped;
+  };
+
+  return new Proxy(virtualTarget, {
+    get(_target, prop, receiver): unknown {
+      if (typeof prop !== "string") return Reflect.get(underlying, prop, receiver);
+      if (shadow.has(prop)) return expose(prop, shadow.get(prop));
       // Exactly ONE read of the underlying property. Reading it twice (once to test, once to
       // wrap) would re-invoke a caller-installed accessor and reopen the very TOCTOU shape the
       // net shim's option pinning closes — in the one place that must not create a new one.
-      const value: unknown = Reflect.get(target, prop, receiver);
-      if (typeof prop !== "string" || typeof value !== "function") return value;
-      const make = guards.get(prop);
-      if (make === undefined) return value;
-      const real = value as AnyFn;
-      let wrapped = wrappers.get(real);
-      if (wrapped === undefined) {
-        wrapped = make(real);
-        wrappers.set(real, wrapped);
-      }
-      return wrapped;
+      // `receiver` is the Proxy, so an accessor on the real prototype still sees the guarded
+      // view as `this` and its own reads/writes stay mediated.
+      return expose(prop, Reflect.get(underlying, prop, receiver));
     },
-  });
+
+    set(_target, prop, value): boolean {
+      if (typeof prop === "string" && guards.has(prop)) {
+        if (pinned) return false; // hardened (#17): the guarded surface is not replaceable
+        shadow.set(prop, value);
+        return true;
+      }
+      // Live pool state — forwarded. Deliberately WITHOUT a receiver: `Reflect.set(underlying,
+      // prop, value, thisProxy)` would perform the final `CreateDataProperty` on the RECEIVER,
+      // i.e. re-enter the `defineProperty` trap (which refuses), so an ordinary
+      // `agent.maxSockets = 8` would silently fail. Assigning with the real instance as its own
+      // receiver is what an un-shimmed write does.
+      return Reflect.set(underlying, prop, value);
+    },
+
+    /* Structural operations — refused, never forwarded. Each one applied to the real agent is an
+     * irreversible edit to a process-global that `uninstall()` cannot take back, and two of them
+     * (a non-writable pin, a delete of pool state) wedge the process's HTTP client exactly as
+     * `Object.freeze` did. Returning `false` surfaces as a `TypeError` at the caller under strict
+     * mode. Nothing legitimate reshapes an `Agent`. */
+    defineProperty(): boolean {
+      return false;
+    },
+    deleteProperty(_target, prop): boolean {
+      if (typeof prop === "string") {
+        if (pinned && guards.has(prop)) return false; // hardened: pinned, like `set`
+        shadow.delete(prop); // dropping capwall's OWN shadow is not a process-global mutation
+      }
+      // Report what ordinary `delete` would: success iff the key is no longer an own property of
+      // the view. False (→ TypeError under strict mode) when the underlying object still has it,
+      // because capwall will not delete it there.
+      return Reflect.getOwnPropertyDescriptor(underlying, prop) === undefined;
+    },
+    preventExtensions(): boolean {
+      return false; // `Object.freeze`/`seal`/`preventExtensions` on the view — see #88
+    },
+    setPrototypeOf(): boolean {
+      return false;
+    },
+
+    /* Reflection — forwarded, but normalized so it can never contradict `get` or trip an
+     * invariant. */
+    has(_target, prop): boolean {
+      return (typeof prop === "string" && shadow.has(prop)) || Reflect.has(underlying, prop);
+    },
+    ownKeys(): Array<string | symbol> {
+      const keys = Reflect.ownKeys(underlying);
+      if (shadow.size === 0) return keys;
+      // A duplicate key in the result is itself a TypeError, so union rather than concatenate.
+      return [...new Set<string | symbol>([...keys, ...shadow.keys()])];
+    },
+    getOwnPropertyDescriptor(_target, prop): PropertyDescriptor | undefined {
+      if (typeof prop === "string" && shadow.has(prop)) {
+        return {
+          value: expose(prop, shadow.get(prop)),
+          writable: !pinned,
+          enumerable: true,
+          configurable: true,
+        };
+      }
+      const desc = Reflect.getOwnPropertyDescriptor(underlying, prop);
+      if (desc === undefined) return undefined;
+      // The virtual target owns NO properties, so a Proxy may only report CONFIGURABLE
+      // descriptors here — reporting a non-configurable one for a property the target does not
+      // have is an invariant violation and throws. It is also the honest answer for this view:
+      // `defineProperty`/`deleteProperty` are refused above whatever the descriptor claims, so
+      // no caller can act on the difference.
+      desc.configurable = true;
+      if (typeof prop === "string" && guards.has(prop) && "value" in desc) {
+        // A descriptor read must not hand back the UNWRAPPED method that `get` guards.
+        desc.value = expose(prop, desc.value);
+        if (pinned) desc.writable = false;
+      }
+      return desc;
+    },
+    getPrototypeOf(): object | null {
+      // Keeps `instanceof http.Agent` and `Object.getPrototypeOf(agent) === http.Agent.prototype`
+      // answering exactly as they do for the real instance.
+      return Reflect.getPrototypeOf(underlying);
+    },
+    isExtensible(target): boolean {
+      // Must equal the target's real extensibility or the engine throws; the virtual target is
+      // never made non-extensible, so this is always `true`.
+      return Reflect.isExtensible(target);
+    },
+  }) as T;
 }
 
 /**

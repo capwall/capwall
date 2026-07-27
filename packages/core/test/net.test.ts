@@ -18,7 +18,7 @@ import * as nodePath from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { createHttp2Shim, createHttpShim, createHttpsShim, createNetShim, createTlsShim } from "../src/shims/net.js";
 import { loadPolicyFromObject, type Decision, type Policy } from "../src/index.js";
-import type { ShimContext } from "../src/shims/runtime.js";
+import { guardedInstanceMethods, type AnyFn, type ShimContext } from "../src/shims/runtime.js";
 
 const requireCjs = createRequire(import.meta.url);
 
@@ -1465,5 +1465,236 @@ describe("net shim — globalAgent is a guarded instance, not a copied-through r
     expect(() =>
       httpShim.request({ host: "evil.com", port: 80, agent: httpShim.globalAgent }),
     ).toThrowError(expect.objectContaining({ name: "CapabilityError" }));
+  });
+});
+
+/**
+ * ISSUE #88 — the #65 view was a `Proxy` over the REAL process-global agent with only a `get`
+ * trap, so every other operation took its DEFAULT behaviour: forward to the target. Writes,
+ * `defineProperty`, `delete` and `Object.freeze` therefore landed on the real
+ * `http.globalAgent`, through capwall's own guarded view, and `uninstall()` could not take any
+ * of it back.
+ *
+ * What that WAS and what it was NOT. The guard held throughout — the `get` trap re-wraps
+ * whatever the underlying method currently is, so replacing `createConnection` never bypassed
+ * the check and no authority was gained. What it was: a broken invariant capwall designed for
+ * twice (#63 kept the real builtins unfrozen so nothing outlives teardown; #64 converted the
+ * guarded classes OFF Proxies precisely so `Object.freeze` could not reach a builtin), plus two
+ * behaviour divergences capwall itself introduced —
+ *   - `Object.freeze(http.globalAgent)` froze the REAL agent, after which every `http.request()`
+ *     in the process died with `Cannot assign to read only property 'totalSocketCount'`;
+ *   - a non-configurable, non-writable `createConnection` on the real agent made the shim's own
+ *     read throw a proxy-invariant `TypeError` where un-shimmed Node returns a value.
+ *
+ * The fix (see `guardedInstanceMethods`) is a VIRTUAL Proxy target — an empty capwall-owned
+ * object — so no default trap behaviour and no Proxy invariant can reach the real agent, plus
+ * explicit traps that forward live pool state, shadow writes to guarded methods, and REFUSE
+ * every structural operation. This suite pins each half.
+ */
+describe("net shim — the guarded globalAgent view refuses to write through to the process-global (#88)", () => {
+  /** Everything about the REAL agent that a tampering attempt through the view could change. */
+  const snapshotRealAgent = (): Record<string, unknown> => ({
+    ownKeys: Reflect.ownKeys(http.globalAgent).map(String).sort().join(","),
+    ownCreateConnection: Object.getOwnPropertyDescriptor(http.globalAgent, "createConnection"),
+    createConnection: (http.globalAgent as unknown as Record<string, unknown>)["createConnection"],
+    frozen: Object.isFrozen(http.globalAgent),
+    extensible: Object.isExtensible(http.globalAgent),
+    prototype: Object.getPrototypeOf(http.globalAgent),
+  });
+
+  /** The guarded view, as the loose record a tampering dependency treats it as. */
+  const guardedView = (policy: Policy = emptyEnforcePolicy()): {
+    view: Record<string, unknown>;
+    decisions: Recorded[];
+  } => {
+    const { ctx, decisions } = makeCtx(policy, "enforce");
+    return { view: createHttpShim(ctx).globalAgent as unknown as Record<string, unknown>, decisions };
+  };
+
+  it("assigning a guarded method does not reach the real agent — and reads back, still guarded", () => {
+    const before = snapshotRealAgent();
+    const { view, decisions } = guardedView();
+    const evil = function evilConn(): string {
+      return "EVIL SOCKET";
+    };
+
+    view["createConnection"] = evil; // the PoC's step 1
+
+    // 1. The process-global is untouched: no own property, same inherited method, same shape.
+    expect(snapshotRealAgent()).toEqual(before);
+    // 2. ...but the write is not silently lost either — capwall's view honours it, so a write
+    //    and a subsequent read still agree (ordinary JS semantics for the object handed out).
+    const readBack = view["createConnection"];
+    expect(typeof readBack).toBe("function");
+    expect(readBack).not.toBe(evil); // wrapped, never the raw replacement
+    // 3. THE assertion: replacing the method does not remove the guard from it.
+    expect(() => (readBack as (o: unknown) => unknown)({ host: "evil.com", port: 8080 })).toThrowError(
+      expect.objectContaining({ name: "CapabilityError" }),
+    );
+    expect(decisions[0]!.decision.observed).toMatchObject({ host: "evil.com", port: 8080 });
+  });
+
+  it("Object.defineProperty through the view is refused, for guarded and ordinary keys alike", () => {
+    const before = snapshotRealAgent();
+    const { view } = guardedView();
+    // A forwarded defineProperty is not merely a write: `{writable: false}` on a field Node's
+    // own agent bookkeeping assigns to (`totalSocketCount`) wedges the process's HTTP client
+    // exactly as the freeze did, and nothing can undo it.
+    expect(() =>
+      Object.defineProperty(view, "createConnection", { value: () => "evil", configurable: true }),
+    ).toThrowError(TypeError);
+    expect(() =>
+      Object.defineProperty(view, "totalSocketCount", { value: 0, writable: false }),
+    ).toThrowError(TypeError);
+    expect(snapshotRealAgent()).toEqual(before);
+  });
+
+  it("delete through the view never removes a property from the real agent", () => {
+    const before = snapshotRealAgent();
+    const { view } = guardedView();
+    // `maxSockets` IS an own property of the real agent, so a forwarded delete would strip it
+    // process-wide. Refused — which under strict mode (this module) surfaces as a TypeError.
+    expect(() => delete view["maxSockets"]).toThrowError(TypeError);
+    // `createConnection` is inherited, so deleting it removes nothing either way: capwall
+    // reports what ordinary `delete` of a non-own property reports, and drops only its own
+    // shadow (installed here first, to prove the shadow is what goes away).
+    view["createConnection"] = () => "evil";
+    expect(delete view["createConnection"]).toBe(true);
+    expect(view["createConnection"]).toBe(view["createConnection"]); // back to the guarded real one
+    expect(snapshotRealAgent()).toEqual(before);
+  });
+
+  it("Object.freeze on the view is refused and leaves the process's HTTP client working", async () => {
+    const before = snapshotRealAgent();
+    const { view } = guardedView();
+
+    expect(() => Object.freeze(view)).toThrowError(TypeError);
+    expect(() => Object.seal(view)).toThrowError(TypeError);
+    expect(() => Object.preventExtensions(view)).toThrowError(TypeError);
+    expect(Object.isFrozen(view)).toBe(false);
+    expect(Object.isExtensible(view)).toBe(true);
+    // The real agent is neither frozen nor sealed...
+    expect(snapshotRealAgent()).toEqual(before);
+    expect(Object.isFrozen(http.globalAgent)).toBe(false);
+
+    // ...and the assertion that actually mattered in the report: an ordinary, un-shimmed
+    // request through the real global agent still completes. Before the fix this threw
+    // `TypeError: Cannot assign to read only property 'totalSocketCount'`, for every caller in
+    // the process, for the rest of its life.
+    const server = await startHttpEcho();
+    try {
+      const res = await collectResponse(http.get(`http://127.0.0.1:${server.port}/after-freeze`));
+      expect(res.body).toBe("echo:/after-freeze");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("Object.setPrototypeOf through the view is refused", () => {
+    const before = snapshotRealAgent();
+    const { view } = guardedView();
+    expect(() => Object.setPrototypeOf(view, null)).toThrowError(TypeError);
+    expect(Object.getPrototypeOf(view)).toBe(http.Agent.prototype);
+    expect(snapshotRealAgent()).toEqual(before);
+  });
+
+  it("a pinned method on the underlying object still READS, and is still guarded (proxy invariants)", () => {
+    // A Proxy `get` trap MUST return the target's actual value for a non-configurable,
+    // non-writable target property. With the real agent as the target, one
+    // `Object.defineProperty(realAgent, "createConnection", {writable: false, configurable:
+    // false})` from any un-mediated code therefore turned every read of
+    // `http.globalAgent.createConnection` in the process into a TypeError — un-shimmed Node
+    // returns the value — and the only invariant-satisfying alternative was to hand back the
+    // UNGUARDED pinned method. A virtual target has no own properties, so neither applies.
+    //
+    // Built on a THROWAWAY agent rather than the process-global one: a non-configurable
+    // property can never be removed again, so pinning one on `http.globalAgent` would corrupt
+    // the rest of this test process — which is itself a fair illustration of why the operation
+    // must never reach a process-global.
+    const { ctx } = makeCtx(emptyEnforcePolicy(), "enforce");
+    const sacrificial = new http.Agent();
+    try {
+      const pinnedMethod = function pinned(): string {
+        return "PINNED";
+      };
+      Object.defineProperty(sacrificial, "createConnection", {
+        value: pinnedMethod,
+        writable: false,
+        configurable: false,
+        enumerable: true,
+      });
+      const view = guardedInstanceMethods(
+        ctx,
+        sacrificial,
+        new Map<string, (real: AnyFn) => AnyFn>([
+          ["createConnection", (real) => (...args) => `guarded:${String(real(...args))}`],
+        ]),
+      ) as unknown as Record<string, unknown>;
+
+      // Reads (rather than throwing), and what comes back is capwall's wrapper.
+      const read = view["createConnection"];
+      expect(typeof read).toBe("function");
+      expect(read).not.toBe(pinnedMethod);
+      expect((read as () => string)()).toBe("guarded:PINNED");
+      // The same has to hold for a descriptor read, or the wrapper is one reflection call away.
+      const desc = Object.getOwnPropertyDescriptor(view, "createConnection");
+      expect(desc?.value).toBe(read);
+      expect(desc?.configurable).toBe(true); // a virtual target may report nothing else
+      // And freezing this view is refused too, so the pin cannot be compounded.
+      expect(() => Object.freeze(view)).toThrowError(TypeError);
+    } finally {
+      sacrificial.destroy();
+    }
+  });
+
+  it("keeps the reflection surface coherent with what `get` answers", () => {
+    const { view } = guardedView();
+    const evil = (): string => "evil";
+    view["createConnection"] = evil;
+    // A shadowed guarded key shows up everywhere a real own property would, always carrying the
+    // GUARDED wrapper — `Object.assign`/spread must not be a way to lift the raw function out.
+    expect("createConnection" in view).toBe(true);
+    expect(Object.keys(view)).toContain("createConnection");
+    const copied = { ...view } as Record<string, unknown>;
+    expect(copied["createConnection"]).toBe(view["createConnection"]);
+    expect(copied["createConnection"]).not.toBe(evil);
+    // Ordinary read-through is unchanged: same keys as the real agent, plus the shadow.
+    for (const key of Reflect.ownKeys(http.globalAgent)) {
+      expect(Reflect.ownKeys(view)).toContain(key);
+    }
+    expect(view["maxSockets"]).toBe((http.globalAgent as unknown as Record<string, unknown>)["maxSockets"]);
+  });
+
+  it("HARDENED (#17): a guarded method cannot be replaced at all, and the view is not frozen", () => {
+    const { ctx } = makeCtx(emptyEnforcePolicy(), "enforce");
+    ctx.hardened = true;
+    const before = snapshotRealAgent();
+    const view = createHttpShim(ctx).globalAgent as unknown as Record<string, unknown>;
+    const original = view["createConnection"];
+
+    // Strict mode: a refused `set` throws, exactly as writing to a frozen object does. The
+    // load-bearing assertion is the one after it — the ORIGINAL guarded method is still there.
+    expect(() => {
+      view["createConnection"] = () => "evil";
+    }).toThrowError(TypeError);
+    expect(view["createConnection"]).toBe(original);
+    expect(() => delete view["createConnection"]).toThrowError(TypeError);
+    expect(view["createConnection"]).toBe(original);
+    expect(() => (original as (o: unknown) => unknown)({ host: "evil.com", port: 80 })).toThrowError(
+      expect.objectContaining({ name: "CapabilityError" }),
+    );
+
+    // Hardened mode does NOT freeze the view: freezing it is `preventExtensions` (refused), and
+    // freezing the agent BEHIND it is the process-wide breakage this issue is about. Live pool
+    // state stays writable under hardened for the same reason — Node writes it through `this`.
+    expect(Object.isFrozen(view)).toBe(false);
+    const originalMaxSockets = view["maxSockets"];
+    try {
+      view["maxSockets"] = 5;
+      expect((http.globalAgent as unknown as Record<string, unknown>)["maxSockets"]).toBe(5);
+    } finally {
+      (http.globalAgent as unknown as Record<string, unknown>)["maxSockets"] = originalMaxSockets;
+    }
+    expect(snapshotRealAgent()).toEqual(before);
   });
 });

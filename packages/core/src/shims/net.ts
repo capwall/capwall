@@ -23,9 +23,11 @@
  * duplicates those onto the shim verbatim — real methods and all. `http.globalAgent` /
  * `https.globalAgent` are live `Agent` instances, so `http.globalAgent.createConnection({host,
  * port})` opened a socket with the guard never firing and NOTHING recorded, under a deny-all
- * enforce policy. They are now wrapped by {@link guardedInstanceMethods} (a Proxy — see there for
- * why an instance is the one place a Proxy is the right tool, and why patching the real agent is
- * forbidden). The audit behind #65 covered every object-valued export of every shimmed namespace;
+ * enforce policy. They are now wrapped by {@link guardedInstanceMethods} (a Proxy over a VIRTUAL
+ * target — see there for why an instance is the one place a Proxy is the right tool, why patching
+ * the real agent is forbidden, and why every structural operation on the view is refused rather
+ * than forwarded to the process-global agent, #88). The audit behind #65 covered every
+ * object-valued export of every shimmed namespace;
  * `globalAgent` on `http`/`https` was the only capability-bearing one. The rest are inert data
  * (`fs.constants`, `http.METHODS`/`STATUS_CODES`, `tls.rootCertificates`, `http2.constants`,
  * `vm.constants`, `worker_threads.resourceLimits`) or an already-shimmed sub-namespace
@@ -722,6 +724,7 @@ function wrapHttpModule<T extends object>(real: T, ctx: ShimContext, defaultPort
   const realGlobalAgent = realRecord["globalAgent"];
   if (typeof realGlobalAgent === "object" && realGlobalAgent !== null) {
     shim["globalAgent"] = guardedInstanceMethods(
+      ctx,
       realGlobalAgent,
       new Map([
         ["createConnection", (realMethod: AnyFn) => wrapFn(realMethod, agentConnectionResolver(defaultPort), ctx)],
@@ -730,7 +733,8 @@ function wrapHttpModule<T extends object>(real: T, ctx: ShimContext, defaultPort
   }
   // Freeze AFTER installing the guarded instance, so the frozen namespace pins it: a dep
   // cannot swap `http.globalAgent` for a raw Agent. `Object.freeze` here freezes the shim
-  // NAMESPACE only — never the Proxy value, whose target is the real process-global agent.
+  // NAMESPACE only — never the guarded view, which refuses `preventExtensions` outright (#88)
+  // and whose Proxy target is a capwall-owned object rather than the real agent anyway.
   return harden(ctx, shim) as unknown as T;
 }
 
