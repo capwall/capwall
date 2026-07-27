@@ -92,10 +92,13 @@ and a package compiling under its own name is not gated either; anything else ne
 identity-granting `compile` grant. See `shims/module.ts` § `installCompileGate`.
 
 **The corollary of "one shim per module surface" is that non-module surfaces are outside the
-mechanism.** `globalThis.fetch` and `globalThis.WebSocket` never route through a module load,
-so no shim ever sees them and they are neither gated nor logged — a real, open gap in egress
-coverage, written up in [`threat-model.md`](./threat-model.md) § Global egress surfaces
-(tracked as #80).
+mechanism.** `globalThis.fetch`, `globalThis.WebSocket` and `globalThis.EventSource` never
+route through a module load, so no shim can ever see them. They are instead guarded on
+`globalThis` itself (#80, `core/src/shims/global-egress.ts`), against the same `net` grant a
+module-surface egress call is checked against — a dependency does not gain anything by
+reaching for `fetch` instead of `http.request`. What that guard does and does not cover
+(redirect hops, `init.dispatcher`) is in [`threat-model.md`](./threat-model.md) § Global
+egress surfaces.
 
 One capability is deliberately NOT a shim: `native` (`.node` addon loads, S2/#49) lives in
 `core/src/loader/native.ts` and patches `process.dlopen`. There is no module to wrap — the
@@ -105,6 +108,55 @@ addon load funnels through, whether it arrives via `require`, `createRequire` fr
 same attribute→evaluate→forward/throw sequence as the shims, but is module-system-independent
 by construction. Gating only: capwall cannot confine an addon once it is loaded (see
 `threat-model.md`).
+
+### Process-patch lifecycle (`core/src/lifecycle/process-patch.ts`)
+
+Five of capwall's controls are not module shims at all — they replace a **process-level
+location**: `Module._load`, `process.dlopen`, `process.env`, `Module.prototype._compile`, and the
+egress globals `fetch`/`WebSocket`/`EventSource`. Those five share one rule, and #107 made it
+structural after #103 found three separate bugs that were all the same defect:
+
+> **Every process-level patch capwall installs is a reference-counted relink chain, never a bare
+> save/restore.**
+
+A bare save/restore assumes capwall is the only patcher of that location and that teardown is
+LIFO. Both assumptions stop being true the moment a second `install()` exists, and nothing in the
+type system catches the assumption. What it produced: an out-of-order `uninstall()` that left
+capwall's Proxy on `process.env` and capwall's wrapper on `globalThis.fetch` **permanently**
+(reading the deny-all torn-down policy forever); a nested install that captured the first guard's
+Proxy as the "un-proxied" environment and handed a *granted* `spawn` an empty child environment;
+and an `uninstall()` that could throw and strand every patch after it in the teardown loop.
+
+`lifecycle/process-patch.ts` provides the shape, in **two named primitives**, because the sites
+genuinely differ on one axis:
+
+- `defineRelinkedPatch` — **stacks**. Each install adds a link, every link's guard runs, and an
+  out-of-LIFO-order removal relinks around the removed layer. `Module._load` and `process.dlopen`
+  need this: two installs may hold different contexts.
+- `defineSharedPatch` / `definePropertyPatch` — **exactly one patch per process, reference
+  counted**; the count only decides *when* the original goes back. `Module.prototype._compile`
+  requires this and breaks loudly under the other one (#100): it identifies Node's own loader by
+  the caller frame one level up, so a second layer makes the inner patch see capwall's own frame
+  and gate **every** `require` in the process. `process.env` and the egress globals require it
+  too — a stacked Proxy double-gates and double-records every read.
+
+Two names rather than one helper with a `{ stack: false }` flag, because a flag is what a future
+patch site copies from its neighbour without reading.
+
+Every handle is idempotent, order-independent, and **never throws** — teardown failures are
+isolated so one unrestorable global cannot strand the other four patches. `definePropertyPatch`
+additionally reads the location *exactly once, while the patch is provably inactive*, and hands
+that value to the site: "the real underlying object" is not something a site has to get right, it
+is the only value a site is ever given. That is what makes the empty-child-environment bug
+structurally impossible rather than merely fixed.
+
+**Adding a new process-level patch is enforced, not remembered.**
+`test/process-patch-sites.test.ts` scans `packages/core/src` and fails on any write to
+`process.*`, `globalThis.*`, a `Module` prototype or a local alias of one outside
+`lifecycle/process-patch.ts`; asserts the registered sites match a reviewed inventory (which
+records *which sites stack*); and runs every registered site through the nested / out-of-order /
+double-uninstall lifecycle sequence automatically, so a new site is enrolled by the act of
+registering.
 
 ### Attribution (`core/src/attribution`)
 

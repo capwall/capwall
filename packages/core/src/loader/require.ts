@@ -26,9 +26,15 @@
  * after `install(tighterPolicy)` — fail-open with respect to the new policy, while a freshly
  * required `fs` correctly denied. See `live-context.ts` for the full reasoning; it is the same
  * defect #62 fixed for ESM.
+ *
+ * The `_load` RELINK CHAIN (fix #22) now lives in `lifecycle/process-patch.ts` — this file was
+ * one of the two sites that got it right by hand, and #107 made that shape the shared one so the
+ * next site cannot get it wrong. `_load` STACKS (`defineRelinkedPatch`): two installs may route
+ * to different registries, so each one's link must run.
  */
 import Module from "node:module";
 import { liveRegistry, popInstall, pushInstall } from "./live-context.js";
+import { defineRelinkedPatch, valueSlot } from "../lifecycle/process-patch.js";
 import type { ShimContext } from "../shims/runtime.js";
 
 /** Core modules capwall mediates; requiring any of these returns a shim once installed. */
@@ -69,30 +75,30 @@ export interface RequirePatchHandle {
   uninstall(): void;
 }
 
-type ModuleLoad = (request: string, parent: unknown, isMain: boolean) => unknown;
-interface ModuleInternals {
-  _load: ModuleLoad;
-}
+type ModuleLoad = (this: unknown, request: string, parent: unknown, isMain: boolean) => unknown;
 
 /**
- * One installed patch's link in the `_load` chain (fix #22). `next` is MUTABLE — not a
- * `const` closed over at install time — specifically so an out-of-LIFO-order `uninstall()`
- * can relink around a removed node instead of only ever restoring the bottom of the stack.
+ * The CJS loader patch, as a shared relink chain (`lifecycle/process-patch.ts`).
+ *
+ * `link.next` is read at CALL time, never captured in a `const` at install time — that is what
+ * lets an out-of-LIFO-order `uninstall()` relink around a removed middle layer instead of only
+ * ever restoring the bottom of the stack (#22).
  */
-interface ChainNode {
-  /** This node's patched `_load` function (identity used to detect "am I still active"). */
-  load: ModuleLoad;
-  /** What this node currently delegates to for non-mediated / unmatched requests. */
-  next: ModuleLoad;
-}
-
-/**
- * Every currently-installed patch, oldest first. A plain module-level array is enough to
- * relink around an out-of-order removal: the node immediately after the removed one (if any)
- * is exactly the node whose `next` pointed at it, because nodes are appended in install
- * order and only ever delegate to the node most recently installed before them.
- */
-const installChain: ChainNode[] = [];
+const loadPatch = defineRelinkedPatch<ModuleLoad>("Module._load", {
+  slot: valueSlot<ModuleLoad>("Module._load", () => Module as unknown as object, "_load"),
+  patch: (_ctx, link) =>
+    function (this: unknown, request, parent, isMain) {
+      // Fast path: only the fixed candidate set can possibly be shimmed; everything else is a
+      // plain delegate with no registry work. The registry itself is built on the first mediated
+      // require, so a process that never touches one never constructs a shim (and so never
+      // captures a real builtin).
+      if ((MEDIATED_CANDIDATES as Set<string>).has(request)) {
+        const reg = liveRegistry("cjs");
+        if (reg.has(request)) return reg.get(request);
+      }
+      return link.next.call(this, request, parent, isMain);
+    },
+});
 
 /**
  * Patch the CJS loader to return shimmed builtins for mediated modules.
@@ -104,61 +110,30 @@ const installChain: ChainNode[] = [];
  * every mediated surface in the process agrees on which policy is live.
  */
 export function patchRequire(ctx: ShimContext): RequirePatchHandle {
-  const moduleInternals = Module as unknown as ModuleInternals;
-
   // Activate this install BEFORE the patch goes live, so a require that lands between the two
   // can never be evaluated against the previous install's policy.
   pushInstall(ctx);
-
-  // `node` here is the mutable chain link this install owns; `patchedLoad` always delegates
-  // via `node.next` (read at CALL time), never a captured constant, so a later relink is
-  // visible to any request that arrives after it. `load` is filled in immediately below,
-  // before `node` is reachable from anywhere but this closure.
-  const node = { next: moduleInternals._load } as ChainNode;
-  const patchedLoad: ModuleLoad = function (this: unknown, request, parent, isMain) {
-    // Fast path: only the fixed candidate set can possibly be shimmed; everything else is a
-    // plain delegate with no registry work. The registry itself is built on the first mediated
-    // require, so a process that never touches one never constructs a shim (and so never
-    // captures a real builtin).
-    if ((MEDIATED_CANDIDATES as Set<string>).has(request)) {
-      const reg = liveRegistry("cjs");
-      if (reg.has(request)) return reg.get(request);
-    }
-    return node.next.call(this, request, parent, isMain);
-  };
-  node.load = patchedLoad;
-  installChain.push(node);
-  moduleInternals._load = patchedLoad;
+  let patch;
+  try {
+    patch = loadPatch.install(ctx);
+  } catch (err) {
+    // The loader refused the patch outright. Unwind the activation rather than leaving an
+    // install on the stack that no handle can ever pop.
+    popInstall(ctx);
+    throw err;
+  }
 
   let uninstalled = false;
   return {
     uninstall() {
       if (uninstalled) return; // idempotent
       uninstalled = true;
-      // Deactivate the policy even if the `_load` relink below bails out: a shim some module
-      // captured reads the live context on every call, so this — not the loader unpatching —
-      // is what stops the torn-down install's grants (and its `onDecision` sink) from being
-      // used. Popping first also means the two are never observed out of order.
+      // Deactivate the policy FIRST, before the `_load` relink: a shim some module captured
+      // reads the live context on every call, so this — not the loader unpatching — is what
+      // stops the torn-down install's grants (and its `onDecision` sink) from being used.
+      // Popping first also means the two are never observed out of order.
       popInstall(ctx);
-      const idx = installChain.indexOf(node);
-      if (idx === -1) return; // already removed (shouldn't happen given the guard above)
-      installChain.splice(idx, 1);
-      // Whatever remains at `idx` after the splice is the node installed immediately AFTER
-      // this one (if any) — the only node that could have `next === node.load` — so relink
-      // it straight to what this node was delegating to, skipping this node entirely. This
-      // is what makes out-of-LIFO-order uninstall safe: removing a MIDDLE layer doesn't leak
-      // it, because the layer above it is repointed regardless of removal order.
-      const nextNewer = installChain[idx];
-      if (nextNewer) {
-        nextNewer.next = node.next;
-      } else if (moduleInternals._load === node.load) {
-        // This was the topmost tracked node and nobody outside this module has since
-        // repatched `_load` — restore the loader to whatever this node delegated to.
-        moduleInternals._load = node.next;
-      }
-      // else: `_load` was reassigned by something outside this chain after us; that's an
-      // external patch we don't own and must not clobber (documented contract: safe only
-      // when all installs go through `patchRequire`).
+      patch.uninstall();
     },
   };
 }

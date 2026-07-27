@@ -56,6 +56,7 @@ import {
 } from "../attribution/index.js";
 import { CapabilityError } from "../errors.js";
 import { evaluate, type Decision } from "../policy/evaluate.js";
+import { defineRelinkedPatch, valueSlot } from "../lifecycle/process-patch.js";
 import { attributionOptionsFor, type ShimContext } from "../shims/runtime.js";
 
 export interface NativeGateHandle {
@@ -65,24 +66,6 @@ export interface NativeGateHandle {
 
 /** `process.dlopen(module, filename[, flags])`. */
 type Dlopen = (this: unknown, ...args: unknown[]) => unknown;
-
-interface ProcessWithDlopen {
-  dlopen: Dlopen;
-}
-
-/**
- * One installed patch's link in the `dlopen` chain. Mirrors `loader/require.ts`'s chain
- * (fix #22) for the same reason: tests install and uninstall overlapping windows, and an
- * out-of-LIFO-order `uninstall()` must relink around the removed node rather than restoring a
- * stale reference — which would either resurrect a dead gate or drop a live one.
- */
-interface ChainNode {
-  patched: Dlopen;
-  /** MUTABLE: read at call time so a later relink is visible to in-flight installs. */
-  next: Dlopen;
-}
-
-const installChain: ChainNode[] = [];
 
 /**
  * Recorded path for a `dlopen` call whose filename argument names no file capwall can read —
@@ -255,6 +238,34 @@ function gateNativeLoad(ctx: ShimContext, resolved: ResolvedAddon): void {
 }
 
 /**
+ * The `process.dlopen` gate, as a shared relink chain (`lifecycle/process-patch.ts`).
+ *
+ * This site STACKS (`defineRelinkedPatch`), like `Module._load` and unlike the `_compile` gate:
+ * each install carries its own `ctx`, so each install's gate must fire. Tests install and
+ * uninstall overlapping windows, and an out-of-LIFO-order `uninstall()` relinks around the
+ * removed link rather than restoring a stale reference — which would either resurrect a dead
+ * gate or drop a live one (#22, made structural by #107).
+ */
+const dlopenPatch = defineRelinkedPatch<Dlopen>("process.dlopen", {
+  slot: valueSlot<Dlopen>("process.dlopen", () => process, "dlopen"),
+  patch: (ctx, link) =>
+    function (this: unknown, ...args: unknown[]) {
+      const resolved = resolveAddon(args[1]); // the ONE string conversion (#99)
+      gateNativeLoad(ctx, resolved); // throws on enforce-deny, before the addon is mapped in
+      // Forward with the ORIGINAL arity. `process.dlopen`'s third parameter has a default
+      // (`RTLD_LAZY`); passing an explicit `undefined` in its place defeats the default and the
+      // real call fails with "invalid mode for dlopen()" — an accidental denial-of-service on
+      // every native package. Spreading `args` preserves arity exactly.
+      if (resolved.forward === undefined) return Reflect.apply(link.next, this, args);
+      // A non-string filename: forward the PINNED conversion so the file the OS loader opens is
+      // provably the one the gate decided about, not whatever a second `toString` returns.
+      const pinnedArgs = args.slice();
+      pinnedArgs[1] = resolved.forward;
+      return Reflect.apply(link.next, this, pinnedArgs);
+    },
+});
+
+/**
  * Install the native-addon load gate for the current process by patching `process.dlopen`.
  *
  * Called from `install()`; there is deliberately no opt-out flag. Unlike the `process.env`
@@ -263,46 +274,5 @@ function gateNativeLoad(ctx: ShimContext, resolved: ResolvedAddon): void {
  * gate against arbitrary compiled code is not one to make convenient to switch off.
  */
 export function installNativeGate(ctx: ShimContext): NativeGateHandle {
-  const proc = process as unknown as ProcessWithDlopen;
-
-  const node = { next: proc.dlopen } as ChainNode;
-  const patched: Dlopen = function (this: unknown, ...args: unknown[]) {
-    const resolved = resolveAddon(args[1]); // the ONE string conversion (#99)
-    gateNativeLoad(ctx, resolved); // throws on enforce-deny, before the addon is mapped in
-    // Forward with the ORIGINAL arity. `process.dlopen`'s third parameter has a default
-    // (`RTLD_LAZY`); passing an explicit `undefined` in its place defeats the default and the
-    // real call fails with "invalid mode for dlopen()" — an accidental denial-of-service on
-    // every native package. Spreading `args` preserves arity exactly.
-    if (resolved.forward === undefined) return Reflect.apply(node.next, this, args);
-    // A non-string filename: forward the PINNED conversion so the file the OS loader opens is
-    // provably the one the gate decided about, not whatever a second `toString` returns.
-    const pinnedArgs = args.slice();
-    pinnedArgs[1] = resolved.forward;
-    return Reflect.apply(node.next, this, pinnedArgs);
-  };
-  node.patched = patched;
-  installChain.push(node);
-  proc.dlopen = patched;
-
-  let uninstalled = false;
-  return {
-    uninstall() {
-      if (uninstalled) return; // idempotent
-      uninstalled = true;
-      const idx = installChain.indexOf(node);
-      if (idx === -1) return;
-      installChain.splice(idx, 1);
-      // Same relink argument as loader/require.ts: whatever now sits at `idx` is the node
-      // installed immediately after this one, i.e. the only node whose `next` can be this
-      // node's patched function, so repointing it removes this layer regardless of order.
-      const nextNewer = installChain[idx];
-      if (nextNewer) {
-        nextNewer.next = node.next;
-      } else if (proc.dlopen === node.patched) {
-        proc.dlopen = node.next;
-      }
-      // else: something outside this chain repatched `process.dlopen` after us — an external
-      // patch we do not own and must not clobber.
-    },
-  };
+  return dlopenPatch.install(ctx);
 }
