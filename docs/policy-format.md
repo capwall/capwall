@@ -12,7 +12,7 @@ types are exported from `@capwall/policy-schema`.
 {
   "$schema": "./packages/policy-schema/schema.json",
   "version": 1,               // policy format version
-  "mode": "enforce",          // default mode: "observe" | "enforce" (CLI flag overrides)
+  "mode": "enforce",          // optional: "observe" | "enforce" — see § Enforcement mode
   "default": { /* PackagePolicy applied to any package with no explicit entry */ },
   "packages": {
     "<package-name>": { /* PackagePolicy */ }
@@ -22,7 +22,40 @@ types are exported from `@capwall/policy-schema`.
 
 - **Deny-by-default.** In `enforce` mode, a package with no entry falls back to `default`;
   the recommended `default` grants nothing (see `capabilities.example.json`).
-- `mode` in the file is the default; the CLI (`capwall observe|enforce`) overrides it.
+
+## Enforcement mode
+
+`mode` is **optional**. It declares the mode capwall runs the target under when the caller
+did not name one — which is what `capwall run` is for:
+
+```bash
+capwall run -- node ./src/server.js     # mode comes from capabilities.json
+```
+
+That is the point of committing it: the mode lives in a reviewed file next to the grants it
+applies to, and promoting a project from on-ramp to enforcement is a one-word diff rather than
+a change to whatever invokes capwall.
+
+Precedence, highest first (implemented in `core/src/policy/mode.ts`, tested in
+`core/test/mode.test.ts`):
+
+| # | Source | When it applies |
+|---|---|---|
+| 1 | `CAPWALL_MODE` env var | Always wins. `capwall observe`, `capwall enforce` and `capwall diff` set it, so those subcommands ignore the file's `mode` by design. |
+| 2 | the file's `mode` | Used when nothing set `CAPWALL_MODE` — `capwall run`, or a bare `NODE_OPTIONS=--import @capwall/core/preload`. |
+| 3 | neither | capwall stays **inert**: no interception, nothing logged, nothing blocked. |
+
+Consequences worth knowing:
+
+- A policy that **omits** `mode` cannot switch capwall on. Omitted and `"observe"` are
+  different: `"observe"` means "mediate and log", omitted means "I am not deciding".
+- Because rule 1 is unconditional, `capwall observe -- …` on a policy declaring
+  `"mode": "enforce"` runs in **observe** — nothing is blocked. That is the safe direction and
+  it is deliberate (observe is how you regenerate a policy), but do not read a committed
+  `"mode": "enforce"` as proof that every capwall invocation enforces. Use `capwall run` if
+  you want the file to be the authority.
+- An unrecognized `CAPWALL_MODE` (a typo) is inert rather than falling back to the file.
+  `capwall run` refuses to launch in that case instead of running the target unmediated.
 
 ## `PackagePolicy`
 

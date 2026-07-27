@@ -51,7 +51,13 @@ export const PolicySchema = z
   .object({
     $schema: z.string().optional(),
     version: z.literal(1),
-    mode: z.enum(["observe", "enforce"]).default("observe"),
+    /**
+     * Enforcement mode this document declares. Deliberately OPTIONAL rather than defaulted:
+     * "declared observe" and "declares nothing" are different states, and only the former may
+     * switch capwall on. Consulted only when nothing set `CAPWALL_MODE` — see
+     * `resolveMode()` in @capwall/core and docs/policy-format.md § Enforcement mode.
+     */
+    mode: z.enum(["observe", "enforce"]).optional(),
     /** Applied to any package with no explicit entry in `packages`. */
     default: PackagePolicySchema.default({}),
     packages: z.record(z.string(), PackagePolicySchema).default({}),

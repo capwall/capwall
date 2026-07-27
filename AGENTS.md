@@ -65,7 +65,7 @@ Where each concern lives:
 | Stack-walk → owning package | `packages/core/src/attribution/index.ts` |
 | Policy types / load / evaluate | `packages/core/src/policy/{schema,load,evaluate}.ts` |
 | Policy schema + shared TS types | `packages/policy-schema` |
-| CLI (`observe`/`enforce`/`gen-policy`/`explain`) | `packages/cli/src/commands/*` |
+| CLI (`observe`/`enforce`/`run`/`diff`/`gen-policy`/`explain`) | `packages/cli/src/commands/*` |
 | SBOM → policy (stretch) | `packages/sbom-import` |
 
 The shims are the enforcement point: each wraps a core module, and on every

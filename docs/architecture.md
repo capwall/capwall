@@ -101,6 +101,8 @@ budget-exhausted fallback is distinguishable from a genuine app-root call: the d
 - `observe` — launch the target with capwall in observe mode; record capabilities; on exit,
   emit/merge a starter `capabilities.json`.
 - `enforce` — launch the target with capwall in enforce mode.
+- `run` — launch the target in the mode the policy document declares (`mode`), for projects
+  that want the committed file, not the command line, to be the authority.
 - `gen-policy` — (re)generate a policy from a prior observe trace.
 - `explain` — explain why a `(package, capability, target)` tuple would be allowed or denied.
 
