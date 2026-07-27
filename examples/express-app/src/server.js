@@ -2,13 +2,15 @@
 //
 // This minimal Express server exercises a couple of real capabilities so capwall has
 // something to observe:
-//   - net: express binds and serves on a port (net grant).
 //   - fs:  the /log route appends a line to ./logs/requests.log (fs:write grant).
+//   - env: this app and its dependency tree (express, debug, depd, mime) read process.env.
+// Binding a listening socket is NOT mediated — capwall's net shim covers egress, so an
+// inbound listener produces no net grant. See docs/threat-model.md.
 //
-// Run it under capwall (once the CLI is implemented):
-//   capwall observe -- node src/server.js     # records what express + this app do
-//   # review/tighten ../../capabilities.json, then:
-//   capwall enforce -- node src/server.js
+// Run it under capwall:
+//   capwall observe -o /tmp/observed.json -- node src/server.js   # draft policy
+//   # review it against the committed ./capabilities.json, then:
+//   capwall enforce -- node src/server.js                         # zero denials
 //
 // See ./README.md for the full walkthrough.
 const fs = require("node:fs");
@@ -31,6 +33,8 @@ app.get("/log", (_req, res) => {
 });
 
 app.listen(PORT, () => {
-  // net capability — binding/serving on a port.
+  // Inbound listener — not a mediated capability (the net shim covers egress). This is also
+  // where express reaches Node's cluster module, which is why the policy grants express
+  // env:NODE_CLUSTER_SCHED_POLICY.
   console.log(`express-app fixture listening on http://localhost:${PORT}`);
 });

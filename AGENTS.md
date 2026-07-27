@@ -33,7 +33,18 @@ evaluate, in both modes. Shims: `fs`, `net`/`http`/`https` (egress), `child_proc
 `process.env` (a read allowlist via a Proxy, installed in `install()`). `capwall observe`
 emits/merges a starter `capabilities.json` covering all capability kinds, and `capwall
 enforce` denies-by-default (`malicious-dep-demo` is blocked on both env and fs; `express-app`
-runs clean under its generated policy). Two stretch items also landed: **S1** SBOM/CBOM →
+runs clean — zero denials, `capwall diff` exits 0 — under the **observed-then-hand-reviewed**
+policy committed in that directory).
+
+Mind that qualifier. A raw `observe` policy is a draft, not a shippable artifact: its `env`
+entries are host-specific, because a package that merely enumerates `process.env` is recorded
+as reading every key the machine has (`examples/express-app/README.md` works the case;
+issues #57, #67). **When you add or change a capability shim, re-verify both committed
+example policies** — the express-app claim above silently became false when M4's env shim
+landed, and stayed false until #57. `packages/cli/test/express-app-policy.test.ts` gates it
+now.
+
+Two stretch items also landed: **S1** SBOM/CBOM →
 policy (`@capwall/sbom-import`) and **S4** the perf benchmark (`pnpm bench`; measured overhead
 is ~30x under the <1ms/req budget — see issue #34 on the cost model). The **ESM hook (M5)** is implemented (both static and dynamic `import` of mediated builtins are intercepted via a `module.register` hook; on by default under the CLI, `CAPWALL_ESM=0` to disable). Build order is
 authoritative in `docs/roadmap.md` and mirrored in § 4 below.
@@ -121,7 +132,11 @@ as the gate.
 - vitest, colocated in each package's `test/`.
 - Required regression: a **fixture-based test that a package NOT present in the policy is
   denied `fs` access in `enforce` mode** (deny-by-default), and merely logged in `observe`.
-- The `express-app` example must actually run under `capwall observe` and `capwall enforce`.
+- The `express-app` example must actually run under `capwall observe` and `capwall enforce`,
+  and must run **clean** under its own committed policy: zero `DENY` lines in enforce, and
+  `capwall diff` exiting 0. Gated by `packages/cli/test/express-app-policy.test.ts`, which
+  runs it in a scrubbed, deliberately noisy environment — a policy that only passes in your
+  shell is not a passing policy (#57).
 - Keep smoke tests trivial but real (the scaffold's `packages/core/test/core.test.ts`
   already asserts deny-by-default on the stub evaluator — extend, don't delete).
 

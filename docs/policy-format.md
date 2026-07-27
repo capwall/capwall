@@ -100,6 +100,64 @@ subprocess, worker, or vm context then does.
 An allowlist of `process.env` keys the package may read. This is the anti-exfiltration
 control: a package with `"env": ["NODE_ENV"]` reading `AWS_SECRET_ACCESS_KEY` is a violation.
 
+Matching is **exact string equality**, or the single literal `"*"`. There are no prefix or
+glob forms — `"DEBUG_*"` matches a key literally named `DEBUG_*`, nothing else.
+
+A denied env read is a **soft deny**: the value comes back `undefined` rather than throwing,
+so a dependency probing an optional variable degrades instead of crashing. The denial is
+still logged and still shows up in `capwall diff`. See `docs/threat-model.md`.
+
+#### When `["*"]` is the right call — and what it costs
+
+`["*"]` grants a package **every** environment variable, including ones that do not exist
+yet. Read that as: *this package may read every secret this process is ever given.* `env` is
+the primary exfiltration surface for the token-theft worms capwall exists to slow down
+(Shai-Hulud reads `NPM_TOKEN`, `GITHUB_TOKEN`, `AWS_*` straight out of `process.env`), so a
+`"*"` grant is the single largest capability you can hand a dependency in this format. Treat
+it the way you would treat `"net": { "hosts": ["*"] }` — occasionally correct, never casual.
+
+**Try these first, in order:**
+
+1. **List the concrete keys.** Most packages read a handful (`NODE_ENV`, `NO_DEPRECATION`).
+   `capwall observe` records them for you; keep the ones that come from the package's own
+   source, drop the rest.
+2. **Check whether the keys are actually stable.** Re-run `observe` in a different shell
+   (`env -i PATH=$PATH HOME=$HOME …`) and diff the two policies. Keys that appear in both
+   are the package's real needs; keys that appear in only one are your host leaking in.
+3. **Ask whether the package belongs in the production tree at all.** A dependency that
+   needs unrestricted env access is a dependency you are choosing to trust completely. Moving
+   it to `devDependencies`, or dropping it, is a stronger control than any policy entry.
+
+**Reach for `["*"]` only when the key set is not a property of the package's code.** The
+concrete case in this repo is `debug` (pulled in transitively by `express`), which does:
+
+```js
+Object.keys(process.env).filter((key) => /^debug_/i.test(key))
+```
+
+That enumeration is mediated key-by-key, so `debug` is recorded as reading *every variable
+present on the machine* — `SSH_AUTH_SOCK` on a laptop, `GITHUB_TOKEN` in CI, `PYENV_ROOT`
+wherever. No finite list is correct on the next machine, which makes a key-by-key grant
+non-reproducible in exactly the way ephemeral ports were for `net.ports` (issue #27). See
+[`../examples/express-app/README.md`](../examples/express-app/README.md) for the worked case.
+(That enumeration is recorded as a value read at all is arguably a shim limitation rather
+than a fact of life — issue #67. If it changes, packages that only *enumerate* will stop
+needing `"*"`, and these grants should be narrowed again.)
+
+**What you give up, stated plainly:** capwall stops reporting env drift for that package
+forever. If a future version of it starts reading `AWS_SECRET_ACCESS_KEY`, `capwall diff`
+will not flag it and `capwall enforce` will not deny it — the grant already covers keys that
+did not exist when you wrote it. You keep the package's `fs`, `net`, `child_process` and
+`worker_threads` limits, which is what still makes reading a secret hard to *act on*: with
+`"net": { "hosts": [] }` the package can see a token but has nowhere to send it. That
+containment is the reason a `"*"` env grant is survivable, not a reason it is free.
+
+**Scope it narrowly.** Put `["*"]` on the one package that needs it, never in `default` —
+a `default` of `{ "env": ["*"] }` silently grants it to every unlisted package, which is the
+opposite of deny-by-default. Because `capabilities.json` is strict JSON with no comment
+field, record *why* in the project's README or policy review notes; a bare `"*"` in a diff is
+indistinguishable from a careless one.
+
 ## Worked example
 
 ```jsonc
@@ -139,3 +197,26 @@ Do not hand-write from scratch. Run `capwall observe -- <your start command>` to
 starter `capabilities.json` scoped to what each package actually did, then **tighten** it (in
 particular, narrow `"*"` hosts and remove capabilities that only appeared in incidental code
 paths). Re-running `observe` merges into the existing file rather than overwriting it.
+
+The output of `observe` is a **starting point, not the answer.** It records what happened on
+*your* machine in *that* run, and two categories of entry will not reproduce elsewhere:
+
+- **Ephemeral values** — a dynamically-assigned port, or an env key that only exists in your
+  shell. Replace them with `"*"` (see `net.ports` above and `env` above) or delete them.
+- **Incidental code paths** — a capability used once during a code path you happened to
+  exercise. Keep it only if it is a real requirement.
+
+Because the merge is additive, a re-run will happily append fresh host-specific noise on top
+of grants you deliberately widened (a `"*"` env grant does not stop concrete keys from being
+merged in beside it). When you have a reviewed policy you want to keep, observe into a
+scratch file and diff by hand:
+
+```bash
+capwall observe -o /tmp/observed.json -- node src/server.js
+diff <(jq -S . capabilities.json) <(jq -S . /tmp/observed.json)
+```
+
+Once the policy is committed, `capwall diff -- <your start command>` is the ongoing check: it
+exits non-zero when a run uses a capability the committed policy does not grant. Wiring that
+into CI is what keeps a policy from silently going stale as dependencies change (this repo
+gates `examples/express-app` that way — `packages/cli/test/express-app-policy.test.ts`).
