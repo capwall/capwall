@@ -17,6 +17,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const APP = path.join(here, "fixtures", "esm", "app.mjs");
 const APP_DIR = path.dirname(APP);
+/** #59 regression entry: a dep that reaches builtins via its own subpath-imports map. */
+const LAUNDER_APP = path.join(APP_DIR, "launder-app.mjs");
 const PRELOAD = createRequire(import.meta.url).resolve("../dist/preload.js");
 
 interface RunResult {
@@ -25,12 +27,12 @@ interface RunResult {
   stderr: string;
 }
 
-function runApp(env: Record<string, string>): Promise<RunResult> {
+function runApp(env: Record<string, string>, entry: string = APP): Promise<RunResult> {
   const nodeOptions = `--import ${pathToFileURL(PRELOAD).href}`;
   return new Promise((resolve, reject) => {
     execFile(
       process.execPath,
-      [APP],
+      [entry],
       {
         cwd: APP_DIR,
         env: { ...process.env, NODE_OPTIONS: nodeOptions, CAPWALL_PROJECT_ROOT: APP_DIR, ...env },
@@ -95,5 +97,44 @@ describe("M5 ESM loader hook — static import of node:fs is mediated", () => {
     const r = await runApp({ CAPWALL_MODE: "enforce", CAPWALL_POLICY_FILE: denyPolicy, CAPWALL_ESM: "0" });
     expect(r.stdout).toContain("READ_OK:esm fixture data");
     expect(r.code).toBe(0);
+  });
+});
+
+describe("#59 — a specifier that RESOLVES to a mediated builtin is mediated, however spelled", () => {
+  // esm-launder-dep never writes `fs` or `child_process` as a specifier: it maps private
+  // `#…` specifiers onto the bare builtin names in its OWN package.json `imports` field
+  // (plain, documented Node metadata — bare targets work, `"node:fs"` targets are rejected by
+  // Node). Against the pre-fix hook, which classified on the specifier STRING, every route
+  // below reached the raw builtin and produced no capwall log line at all.
+  const ROUTES = ["bare-fs", "cond-fs", "pat-fs"] as const;
+
+  it("denies every subpath-imports route to fs under a deny-all policy", async () => {
+    const r = await runApp(
+      { CAPWALL_MODE: "enforce", CAPWALL_POLICY_FILE: denyPolicy },
+      LAUNDER_APP,
+    );
+    for (const route of ROUTES) {
+      expect(r.stdout, `route ${route} reached the raw builtin`).toContain(
+        `LAUNDER:${route}:BLOCKED:esm-launder-dep`,
+      );
+    }
+    expect(r.stdout).not.toMatch(/LAUNDER:[a-z-]+:RAW/);
+  });
+
+  it("denies the subpath-imports route to child_process too", async () => {
+    const r = await runApp(
+      { CAPWALL_MODE: "enforce", CAPWALL_POLICY_FILE: denyPolicy },
+      LAUNDER_APP,
+    );
+    expect(r.stdout).toContain("LAUNDER:bare-cp:BLOCKED:esm-launder-dep");
+  });
+
+  it("records the laundered read in observe mode, attributed to the laundering package", async () => {
+    // The pre-fix bypass was SILENT — invisible to `observe` and therefore to `capwall diff`.
+    // Attribution must survive the indirection, so the trace names esm-launder-dep.
+    const r = await runApp({ CAPWALL_MODE: "observe" }, LAUNDER_APP);
+    expect(r.stdout).toContain("LAUNDER:bare-fs:RAW:esm launder data");
+    expect(r.stderr).toMatch(/observe: recorded fs:read .* for 'esm-launder-dep'/);
+    expect(r.stderr).toMatch(/observe: recorded child_process for 'esm-launder-dep'/);
   });
 });
