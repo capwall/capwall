@@ -75,7 +75,21 @@ export interface RequirePatchHandle {
   uninstall(): void;
 }
 
-type ModuleLoad = (this: unknown, request: string, parent: unknown, isMain: boolean) => unknown;
+/**
+ * `Module._load`'s shape — VARIADIC, for the reason #128 gives about `Module.prototype._compile`.
+ *
+ * This site had the same latent defect and was found by the sweep that fix asked for. It used to
+ * be `(request, parent, isMain)`, which matches `Module._load.length` — but `.length` stops at the
+ * first defaulted parameter, and on Node ≥22 the real signature is
+ *
+ *   Module._load = function(request, parent, isMain, options = kEmptyObject)
+ *
+ * where `options.shouldSkipModuleHooks` is what keeps a `require` issued from INSIDE the
+ * module-customization hook chain from re-entering that chain. Node passes four arguments on
+ * every call (measured on v22.22.3); today the fourth is usually `undefined`, so re-stating the
+ * arity was invisible rather than harmless. Forward the list verbatim so it stays that way.
+ */
+type ModuleLoad = (this: unknown, ...args: unknown[]) => unknown;
 
 /**
  * The CJS loader patch, as a shared relink chain (`lifecycle/process-patch.ts`).
@@ -87,16 +101,17 @@ type ModuleLoad = (this: unknown, request: string, parent: unknown, isMain: bool
 const loadPatch = defineRelinkedPatch<ModuleLoad>("Module._load", {
   slot: valueSlot<ModuleLoad>("Module._load", () => realModule as unknown as object, "_load"),
   patch: (_ctx, link) =>
-    function (this: unknown, request, parent, isMain) {
+    function (this: unknown, ...args: unknown[]) {
       // Fast path: only the fixed candidate set can possibly be shimmed; everything else is a
       // plain delegate with no registry work. The registry itself is built on the first mediated
       // require, so a process that never touches one never constructs a shim (and so never
       // captures a real builtin).
-      if ((MEDIATED_CANDIDATES as Set<string>).has(request)) {
+      const request = args[0];
+      if (typeof request === "string" && (MEDIATED_CANDIDATES as Set<string>).has(request)) {
         const reg = liveRegistry("cjs");
         if (reg.has(request)) return reg.get(request);
       }
-      return link.next.call(this, request, parent, isMain);
+      return Reflect.apply(link.next, this, args);
     },
 });
 
