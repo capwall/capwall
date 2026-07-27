@@ -674,15 +674,16 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
   neither closed by it:
   - A dependency that ships a directory named after a granted package inside its own tree
     (`node_modules/evil/node_modules/lodash/…`, e.g. via `bundledDependencies`) and runs code
-    from it is charged to that name. No `eval`, no `vm`, no `fs` write.
+    from it is charged to that name. No `eval`, no `vm`, no `fs` write. **Issue #92.**
   - `new (require("node:module"))(…)._compile(src, "…/node_modules/lodash/x.js")` compiles code
     with a caller-chosen filename, and the resulting frames report it. The `node:module` shim
-    gates hook registration, not compilation.
+    gates hook registration, not compilation. **Issue #93.**
 
-  Both let a dependency **name** a granted package. They are tracked separately from #84 because
-  the fix is different in kind — verifying package identity against the installed tree, rather
-  than declining to read a self-reported string — and a partial fix here would look like a fix
-  without being one.
+  Both let a dependency **name** a granted package, under deny-by-default `enforce`, with no log
+  line. They are tracked separately from #84 because the fix is different in kind — verifying
+  package identity against the installed tree, rather than declining to read a self-reported
+  string — and a partial fix here would look like a fix without being one. Until they are
+  closed, treat a package name in a policy as identifying *a path*, not a verified publisher.
 - **Deep stacks past the attribution frame budget** — the walk inspects at most `maxFrames`
   frames (default 25). When the owning dependency's frame is deeper (long promise chains,
   dynamically-compiled or deeply-nested wrappers, `async_hooks`-heavy frameworks), the walk
