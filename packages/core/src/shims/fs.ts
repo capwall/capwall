@@ -46,7 +46,11 @@
  *    `install(…, { hardened: true })` / `CAPWALL_HARDENED=1` to freeze it instead — see
  *    `harden.ts` for exactly which surfaces that covers and which it does not.
  */
-import realFs from "node:fs";
+// The real `fs` comes from `../real-builtins.cjs`, never a static `import … from "node:fs"` —
+// that import would put `node:fs` in the ESM cache before capwall's loader hook registers and
+// leave the hook's re-mediation backstop dead (#78). `node:path`/`node:util`/`node:url`/
+// `node:stream` are NOT mediated, so they stay ordinary imports.
+import { realFs } from "../real-builtins.cjs";
 import * as path from "node:path";
 import { types } from "node:util";
 import { fileURLToPath } from "node:url";

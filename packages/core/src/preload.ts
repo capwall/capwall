@@ -36,7 +36,11 @@
  * `pkg` may be `<app>` (application code) or `<unknown>` (a call capwall could not attribute
  * to any source file — see the attribution module and issue #60).
  */
-import { appendFileSync, readFileSync } from "node:fs";
+// capwall's own fs, captured through `./real-builtins.cjs` rather than a static
+// `import … from "node:fs"`: the preload is the FIRST thing in the target process, so an ESM
+// import here would cache `node:fs` raw before the loader hook exists and leave the hook's
+// re-mediation backstop dead for the rest of the process (#78).
+import { realFs } from "./real-builtins.cjs";
 import {
   install,
   loadPolicyFromObject,
@@ -54,7 +58,7 @@ function readPolicy(file: string | undefined, projectRoot: string): Policy {
     // without a policy denies everything by default, so the CLI requires the file instead.
     return loadPolicyFromObject({ version: 1 }, { projectRoot });
   }
-  const json: unknown = JSON.parse(readFileSync(file, "utf8"));
+  const json: unknown = JSON.parse(realFs.readFileSync(file, "utf8"));
   return loadPolicyFromObject(json, { projectRoot });
 }
 
@@ -158,9 +162,9 @@ if (active) {
       if (seen.has(key)) return;
       seen.add(key);
       // Note: this runs inside the shim's guard, but uses capwall's own real-fs reference
-      // (ESM import above), so it is not itself mediated or attributed.
+      // (the `real-builtins.cjs` capture above), so it is not itself mediated or attributed.
       if (traceFile) {
-        appendFileSync(traceFile, JSON.stringify({ pkg, req }) + "\n");
+        realFs.appendFileSync(traceFile, JSON.stringify({ pkg, req }) + "\n");
       }
       if (mode === "observe") {
         process.stderr.write(`[capwall] ${decision.reason}\n`);

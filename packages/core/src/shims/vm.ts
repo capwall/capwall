@@ -24,7 +24,7 @@
  *    `node:sqlite`" under "what capwall does NOT stop"); gating the `vm` module narrows one
  *    door without claiming to lock the house.
  */
-import realVm from "node:vm";
+import { realVm } from "../real-builtins.cjs"; // never `import … from "node:vm"` — see #78
 import {
   guard,
   guardedConstructorSubclass,

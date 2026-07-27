@@ -157,19 +157,23 @@ export async function load(
     // load chain still descends to us in both cases, even though the synchronous resolve chain
     // runs first.
     //
-    // HOW FAR THIS ACTUALLY REACHES TODAY (measured, not assumed). A `node:` URL already
+    // HOW FAR THIS ACTUALLY REACHES (measured, not assumed — #78). A `node:` URL already
     // resident in the ESM module cache is served from cache and the load chain is never
-    // consulted, and capwall's own shims capture their real modules with static ESM
-    // `import realFs from "node:fs"` — so every mediated builtin is already cached raw by the
-    // time the hook registers. That makes this branch a LATENT backstop for the mediated set
-    // as shipped, not an active one; it fires for any mediated specifier capwall does not
-    // itself import, and for whatever resolution route a future Node adds. Capturing the real
-    // modules through `createRequire()` instead would make it fire for the whole set — a CJS
-    // require does NOT populate the ESM cache (verified) — but that touches every shim's
-    // bootstrap and is tracked as follow-up work rather than smuggled in here. The gate that
-    // actually stops #61's PoC is `shims/module.ts`. See docs/threat-model.md.
+    // consulted at all, so this branch only exists for a specifier capwall itself has kept OUT
+    // of that cache. From #74 until #78 it did the opposite: the shims captured their real
+    // modules with static ESM `import realFs from "node:fs"`, every mediated builtin was cached
+    // raw before `module.register()` ran, and this was dead code for the whole mediated set.
+    // Since #78 the capture goes through a CommonJS `require` (`src/real-builtins.cts`), which
+    // populates the CJS cache and leaves the ESM cache untouched, and this branch fires for all
+    // twelve mediated builtins — verified end-to-end in `test/esm.test.ts` § #78 against a hook
+    // registered ahead of capwall's, including one that declares `format: "builtin"`.
     //
-    // Residual either way: a hostile hook that short-circuits `load` as well never lets us run.
+    // What still bounds it, honestly: this is capwall's second layer, not its first. `resolve`
+    // classifying on the RESOLVED URL is what closes #59. A hostile hook that short-circuits
+    // `load` as well as `resolve` never lets this run, and a host process that ESM-imported a
+    // mediated builtin BEFORE capwall installed has already cached it raw — the `--import`
+    // preload exists so that window is empty. The gate that actually stops #61's PoC is
+    // `shims/module.ts`. See docs/threat-model.md § ESM.
     const mediated = mediatedSpecifierForUrl(url);
     if (mediated !== null) {
       // Loud, because reaching here is never normal: in a clean run capwall's own `resolve`

@@ -90,7 +90,12 @@ be revoked.
 
 **ESM known limits** (documented, not silent):
 - A module that captured a raw builtin **before** capwall installed is not re-bound (same as
-  CJS — install via the `--import` preload so capwall registers first).
+  CJS — install via the `--import` preload so capwall registers first). Such an import also
+  leaves the builtin's `node:` URL in the ESM module cache, which is what disables the `load`
+  backstop described below for that one specifier: a cached URL is served from cache without the
+  load hook chain being consulted. capwall's own bootstrap no longer does this to itself (#78,
+  `core/src/real-builtins.cts`); a host process that imports `node:fs` before calling `install()`
+  still does.
 - The set of mediated specifiers is fixed at install time; a mediated builtin not in the shim
   registry is not intercepted (the registry covers the capabilities above).
 - Unregistering the ESM hook is best-effort (Node cannot fully remove a registered hook), so ESM
@@ -141,15 +146,25 @@ What it does **not** do, plainly:
   loader tooling, and it still would not beat a hook that short-circuits `load` as well as
   `resolve`, which nothing in-process can.
 - As defense in depth the `load` hook **re-mediates** any raw `node:<mediated>` URL it is
-  handed and warns once per specifier, since capwall's own `resolve` never emits one. Measured
-  reach, so this is not read as more than it is: a `node:` URL already resident in the ESM
-  module cache is served from cache and the load chain is never consulted — and capwall's own
-  shims capture their real modules with a static ESM `import`, so every mediated builtin is
-  already cached raw before the hook registers. Today this branch is therefore a **latent**
-  backstop for the mediated set, active only for specifiers capwall does not itself import and
-  for resolution routes a future Node might add. Capturing the real modules through
-  `createRequire()` would make it active for the whole set (a CJS `require` does not populate
-  the ESM cache — verified); that is follow-up work, not something this change claims.
+  handed and warns once per specifier, since capwall's own `resolve` never emits one. As of
+  **#78 this fires**, for all twelve mediated builtins, and is exercised end-to-end: a loader
+  hook registered ahead of capwall's short-circuits every one of them straight to its `node:`
+  URL (with `shortCircuit: true, format: "builtin"`, the strongest form) and each import comes
+  back as the shim, denying under a deny-all policy.
+  Whether it fires at all is decided by one thing — whether the URL is already in Node's ESM
+  module cache, because a cached URL is served from cache and the load chain is never consulted.
+  From #74 until #78 it was **dead code**: capwall's own shims captured their real modules with
+  static ESM `import`s, so every mediated builtin was cached raw before `module.register()` ran.
+  Those captures now go through a CommonJS `require` (`core/src/real-builtins.cts`), which
+  populates the CJS cache and leaves the ESM cache untouched. `test/real-builtins.test.ts`
+  fails the build if any file in `core/src` re-introduces such an import, because a single one
+  silently retires the backstop for that specifier.
+  This is still the **second** layer — `resolve` classifying on the RESOLVED URL is what closes
+  #59 — and it does not reach two cases: a hostile hook that short-circuits `load` as well as
+  `resolve` never lets capwall run at all, and a host process that ESM-imported a mediated
+  builtin **before** capwall installed has already cached it raw (the `--import` preload exists
+  so that window is empty; a programmatic embedder that calls `install()` late does not get this
+  guarantee).
 
 Net: a dependency doing this opportunistically is now stopped and logged. A dependency that
 knows about capwall has routes left. Treat ESM mediation as effective against packages that do

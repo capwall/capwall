@@ -13,11 +13,16 @@
  * captured a raw builtin before capwall installed is not re-bound; unregistering an ESM hook
  * is best-effort (Node cannot fully remove a registered hook).
  */
-import { register } from "node:module";
-import { createRequire } from "node:module";
+// `node:module` is itself mediated, so capwall reaches `register()` through the CJS capture in
+// `real-builtins.cjs` rather than a static ESM import. An `import { register } from "node:module"`
+// here would put `node:module` in the ESM module cache moments before this very function
+// registers the hook — and a URL already in that cache never consults the load chain, which is
+// precisely what left the hook's re-mediation backstop dead (#78). `node:url`/`node:path` are not
+// mediated and stay ordinary imports.
+import { realModule } from "../real-builtins.cjs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import * as path from "node:path";
-import { pushEsmContext, popEsmContext, esmSpecifiers } from "./esm-runtime.js";
+import { pushEsmContext, popEsmContext, esmExportNames } from "./esm-runtime.js";
 import type { ShimContext } from "../shims/runtime.js";
 
 export interface EsmHookHandle {
@@ -36,25 +41,18 @@ export function registerEsmHook(ctx: ShimContext): EsmHookHandle {
   // source.
   pushEsmContext(ctx);
 
-  // Enumerate each mediated builtin's export names on the main thread (the loader thread must
-  // not import them — that would recurse through `resolve` and loop). Shim keys equal the real
-  // module's keys (the shims copy every own key), so this yields the right ESM named exports.
-  const requireCjs = createRequire(import.meta.url);
-  const exportsBySpecifier: Record<string, string[]> = {};
-  for (const spec of esmSpecifiers()) {
-    try {
-      const real = requireCjs(spec) as Record<string, unknown>;
-      exportsBySpecifier[spec] = Object.keys(real);
-    } catch {
-      exportsBySpecifier[spec] = [];
-    }
-  }
-
   if (!hookRegistered) {
+    // Enumerate each mediated specifier's export names on the main thread (the loader thread
+    // must not import them — that would recurse through `resolve` and loop). See
+    // `esmExportNames`. Only on the FIRST install, since that is the only one whose payload is
+    // ever shipped; a later install cannot change the set anyway (the registry is memoized).
+    const exportsBySpecifier = esmExportNames();
     const here = path.dirname(fileURLToPath(import.meta.url));
     const hooksUrl = pathToFileURL(path.join(here, "esm-hooks.js")).href;
     const bridgeUrl = pathToFileURL(path.join(here, "esm-runtime.js")).href;
-    register(hooksUrl, {
+    // The REAL `register`, never the `node:module` shim — capwall's own hook registration must
+    // not be attributed and gated by #61's own gate.
+    realModule.register(hooksUrl, {
       parentURL: import.meta.url,
       data: { bridgeUrl, exports: exportsBySpecifier },
     });

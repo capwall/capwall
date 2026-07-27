@@ -198,12 +198,14 @@ function processWrites(file: string, source: string): Finding[] {
   return findings;
 }
 
+/** `.cts`/`.mts` too — `src/real-builtins.cts` (#78) is source like any other and must not escape
+ *  the scan on a filename technicality. */
 function tsFilesUnder(dir: string): string[] {
   const out: string[] = [];
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) out.push(...tsFilesUnder(full));
-    else if (entry.name.endsWith(".ts")) out.push(full);
+    else if (/\.[cm]?ts$/.test(entry.name)) out.push(full);
   }
   return out.sort();
 }
