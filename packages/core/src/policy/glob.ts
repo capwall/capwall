@@ -88,3 +88,116 @@ export function matchesGlob(pattern: string, candidatePath: string): boolean {
   if (pattern === "*" || pattern === "**") return true;
   return compile(pattern).test(candidatePath);
 }
+
+/*
+ * ───────────────────────────────────────────────────────────────────────────────────────────
+ * NODE-GLOB REACH ANALYSIS (issue #106)
+ * ───────────────────────────────────────────────────────────────────────────────────────────
+ *
+ * Everything above is capwall's OWN glob dialect — the one a policy author writes. What follows
+ * answers a different question about a DIFFERENT dialect: given a pattern handed to Node's
+ * `fs.glob` (Node ≥22, minimatch-flavoured and considerably richer than the above), how far from
+ * the directory it starts in can the resulting walk get?
+ *
+ * It lives here rather than in `shims/fs.ts` because it is glob-syntax knowledge, and next to the
+ * matcher so the two dialects' differences are visible in one file instead of being rediscovered.
+ * It is deliberately PURE SYNTAX: no path resolution, no `node:path`, no filesystem. The shim
+ * resolves what this returns against the call's pinned `cwd`, because separator normalization and
+ * `path.resolve` already live there.
+ */
+
+/**
+ * Characters that make a pattern SEGMENT magic — i.e. it can expand to something other than the
+ * literal text it contains, so the literal prefix stops before it.
+ *
+ * `{`/`}` are magic too but are handled separately ({@link bracesAreSegmentLocal}), because a
+ * brace group is the one construct that can span segment boundaries. `!`, `+` and `@` are NOT
+ * here: they are extglob openers only in front of a `(`, which is already in the set, and
+ * treating a bare `@` as magic would truncate the prefix of every ordinary
+ * `node_modules/@scope/pkg/**` for nothing.
+ */
+const NODE_GLOB_MAGIC = /[*?[\]()]/;
+
+/**
+ * True when every brace group in `s` is confined to a single path segment — no `/` and no `..`
+ * inside any group — and every group is balanced.
+ *
+ * WHY THIS IS THE LOAD-BEARING CHECK. Brace expansion happens before matching, so
+ * `{/etc,/tmp}/*.conf` reaches `/etc` no matter what `cwd` is, and `{.,..}/*.conf` reaches the
+ * parent — both verified against real `fs.globSync` on Node 22. A "literal prefix" derived by
+ * stopping at the first magic character says `cwd` for both, which would be a gate on the wrong
+ * directory: fail-OPEN, and the reason the prefix-only rule sketched in #106 is not what shipped.
+ * A group with neither `/` nor `..` in it can only ever name alternatives WITHIN one segment, so
+ * it cannot move the walk's root.
+ */
+/** Brace-group content that could move the walk's root: a separator, or a parent reference. */
+const ESCAPING_BRACE_CONTENT = /\/|\.\./;
+
+function bracesAreSegmentLocal(s: string): boolean {
+  let depth = 0;
+  let start = -1;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (c === "}") {
+      depth--;
+      if (depth < 0) return false; // unbalanced — not analyzable, so not bounded
+      if (depth === 0 && ESCAPING_BRACE_CONTENT.test(s.slice(start + 1, i))) return false;
+    }
+  }
+  return depth === 0;
+}
+
+/**
+ * The literal leading path prefix of a Node glob `pattern` — the deepest directory the pattern
+ * cannot escape — or `null` when its reach **cannot be bounded**.
+ *
+ * The return value is a `/`-separated, un-resolved path fragment for the caller to resolve
+ * against the call's `cwd`: `""` means "the cwd itself", `"/"`/`"C:/"` mean the filesystem root,
+ * and anything else is a relative or absolute fragment (which MAY contain `..` — a leading `..`
+ * is exact, not an escape, because `path.resolve` accounts for it precisely).
+ *
+ * `null` is the fail-closed answer, and the caller must translate it into the filesystem ROOT,
+ * not into "no restriction". Three constructs produce it, each verified to be a real escape (or
+ * an un-analyzable one) against `fs.globSync` on Node 22:
+ *
+ *  - a `..` SEGMENT after the first magic segment. `**` matches ZERO segments as well as many,
+ *    so a pattern of `**` then `..` then `*.conf` is also just `../*.conf`, which walks the
+ *    parent of `cwd`.
+ *  - a brace group that spans a `/` or contains `..` — see {@link bracesAreSegmentLocal}.
+ *  - a backslash anywhere. On POSIX that is minimatch's ESCAPE character, so the segmentation
+ *    above is no longer reliable; capwall does not model it and refuses to guess. (The fs shim
+ *    normalizes `\` to `/` before calling this on win32, where it is a separator instead, so
+ *    that case never reaches here.)
+ *
+ * NOT modelled, deliberately, because none of them moves the walk's ROOT: `*`/`?`/character
+ * classes/extglobs (all confined to one segment), `**` (descends only), and a leading `!`
+ * (selects a different set under the same root).
+ */
+export function nodeGlobPrefix(pattern: string): string | null {
+  if (pattern.includes("\\")) return null;
+  const segments = pattern.split("/");
+  let firstMagic = segments.length;
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i]!;
+    if (NODE_GLOB_MAGIC.test(seg) || seg.includes("{") || seg.includes("}")) {
+      firstMagic = i;
+      break;
+    }
+  }
+  const rest = segments.slice(firstMagic);
+  if (rest.includes("..")) return null;
+  if (!bracesAreSegmentLocal(rest.join("/"))) return null;
+
+  const prefix = segments.slice(0, firstMagic).join("/");
+  // An absolute pattern whose FIRST segment is magic (`/*.conf`, `/**`) splits to `["", "*…"]`,
+  // so the joined prefix is the empty string — which would otherwise read as "the cwd" and gate
+  // the wrong directory entirely. Its root is `/`.
+  if (prefix === "" && pattern.startsWith("/")) return "/";
+  // A bare Windows drive segment is not a directory to `path.resolve`: `resolve("D:/x", "C:")`
+  // yields the process's CURRENT directory on drive C, not `C:/`. Make it a root explicitly.
+  if (DRIVE_SEGMENT.test(prefix)) return prefix + "/";
+  return prefix;
+}

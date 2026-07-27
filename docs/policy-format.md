@@ -181,6 +181,21 @@ Path globs, resolved relative to the project root. Grants are additive.
 
 - `read` / `write` are evaluated independently (a read-only package gets `write: []`).
 - Globs follow standard `**` / `*` semantics. A missing array means no access of that kind.
+- **Directory listing is `read` on the directory.** `readdir("./data")` needs a grant matching
+  `./data`, and so does `fs.glob`/`globSync`/`fs.promises.glob` (Node ≥22): a glob is checked as
+  one `fs.read` on the directory its pattern's walk is rooted at, resolved against `options.cwd`,
+  one decision per pattern. Because `dir/**` also matches `dir` itself, a subtree grant is what
+  makes globbing inside it work:
+
+  ```jsonc
+  "fs": { "read": ["./data/**"] }   // globSync("**/*.json", { cwd: "./data" }) → allowed
+  "fs": { "read": ["./data/*.json"] } // …the same call → DENIED: ./data itself is not granted
+  ```
+
+  A pattern whose reach capwall cannot bound — a `..` after a `**`, or a brace group spanning a
+  `/` (`{/etc,/tmp}/*`) — is checked against the **filesystem root** instead, so it is denied
+  unless the policy grants everything. Those shapes really do escape their literal prefix in
+  Node; see docs/threat-model.md § `fs.glob` semantics.
 - **Note (see threat-model):** already-open fds and symlink tricks can escape path
   confinement; globs bound *ordinary* access, not a determined attacker.
 

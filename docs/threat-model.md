@@ -169,10 +169,57 @@ Per-capability notes:
   through capwall's check and were therefore **not gated at all** (#99). A URL argument is
   converted once and the resulting **string** is what is forwarded, so a shadowed `pathname`
   accessor cannot make Node open a file other than the one that was guarded.
-  **Not yet mediated:** `fs.glob` / `fs.globSync` / `fs.promises.glob` (Node ≥22 only). Their
-  argument is a *pattern* rather than a path, so gating them needs a policy decision about how a
-  pattern is matched against `fs.read` grants rather than a table entry; until then a package
-  can enumerate directory contents through them un-gated. Tracked as #106.
+  **Directory enumeration through a pattern** — `fs.glob` / `fs.globSync` / `fs.promises.glob`,
+  Node ≥22 only — is mediated as of #106. Until then all three were absent from the shim's tables
+  and a dependency could list any directory on the machine under a deny-all `enforce` policy with
+  **no decision recorded and nothing denied**. Absent on Node 20, where the wrapper is a clean
+  no-op (asserted, not skipped). See "`fs.glob` semantics" below for what the grant means, what a
+  glob can still learn, and the residuals.
+- **`fs.glob` semantics (#106).** A glob is an ENUMERATION, and capwall already had a shape for
+  that: `readdir` is gated as `fs.read` on the DIRECTORY, not on each entry it returns. `glob` is
+  `readdir` with a filter and a recursion rule, so it is gated the same way — **one `fs.read`
+  decision per pattern, on the directory that pattern's walk is rooted at.** A grant of
+  `fs.read: ["./data/**"]` therefore permits globbing anywhere inside `./data` (capwall's matcher
+  deliberately matches `dir/**` against `dir` itself), and grants nothing outside it. An array of
+  patterns is one decision per pattern; `enforce` denies the whole call on the first pattern that
+  is not granted, so a partially-granted call enumerates nothing.
+
+  The guarded directory is derived by taking the pattern's literal leading segments and resolving
+  them against `options.cwd`. **Where that derivation cannot be proven sound, the guarded
+  directory is the filesystem ROOT**, which no reasonable policy grants. This is not defensive
+  padding: measured against real `fs.globSync` on Node 22, three ordinary-looking patterns escape
+  their literal prefix — `**` followed by `..` (because `**` also matches *zero* segments),
+  `{.,..}/…`, and a brace group with absolute alternatives such as `{/etc,/tmp}/*.conf`, which
+  reaches `/etc` whatever `cwd` says. #106's own suggestion — "gate the non-magic prefix" — would
+  therefore have been **fail-open**. A brace group is treated as unbounded unless it contains
+  neither `/` nor `..` (in which case it can only name alternatives within one segment), and a
+  backslash — minimatch's POSIX escape character — makes a pattern unbounded rather than guessed
+  at. `options.cwd` is read **exactly once** and the single answer is what Node receives, on the
+  same pinning rule as every other capability-relevant option (#26/#56/#89); a URL `cwd` is
+  converted once and the converted *string* is forwarded.
+
+  **Why not check each result path**, which would be more precise:
+  - It cannot be done before the walk, and *the walk is the leak*. `options.exclude` is a
+    caller-supplied function Node invokes with entries as it discovers them (verified: a `**` walk
+    handed it all 35 entries of the directory being walked), so a dependency reads the listing
+    through its own callback regardless of what capwall does with the return value.
+  - Filtering results is a **soft deny on a value-returning API** — the caller is told the files do
+    not exist. capwall does that in exactly one place (`exists`, whose contract is boolean).
+  - One decision per result would make `observe` output, and every generated policy, a property of
+    the machine's filesystem rather than of the package — the reproducibility failure #67 fixed
+    for `Object.keys(process.env)`.
+
+  **What a glob can still learn, stated plainly:** everything under a directory the package
+  already holds a read grant on. `fs.read: ["./data/**"]` lets it enumerate the whole `./data`
+  subtree in one call — but that grant already permitted reading every file in it, and a recursive
+  `readdir` already produced the same listing. *Residuals:* the grant is on the base directory
+  only, so a grant that names files rather than a subtree (`["./data/*.json"]`) denies globbing in
+  `./data` outright (fail-closed, and the fix is to grant the directory); and a policy that grants
+  `"*"` or `"/**"` grants unbounded patterns too, by construction. One further detail worth
+  knowing: Node `require`s its vendored **minimatch** lazily, from inside the first glob in the
+  process, and that module reads `__MINIMATCH_TESTING_PLATFORM__` at module scope. capwall forces
+  that load once, under the same key-scoped authorization `child_process` uses for
+  `NODE_V8_COVERAGE`, so the read is never charged to whichever dependency happened to glob first.
 - **`net`/`http`/`https`/`tls`/`http2`/`dgram`** — **egress only**. Mediated: `net.connect`/
   `createConnection` **and** `new net.Socket().connect()`; `http(s).request`/`get` **and**
   `new http.ClientRequest()`; `http(s).Agent#createConnection`, on both a caller-built agent and

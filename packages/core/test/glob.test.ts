@@ -1,6 +1,6 @@
 /** Glob matching + policy-loader glob normalization for fs grants. */
 import { describe, expect, it } from "vitest";
-import { matchesGlob } from "../src/policy/glob.js";
+import { matchesGlob, nodeGlobPrefix } from "../src/policy/glob.js";
 import { evaluate } from "../src/policy/evaluate.js";
 import { loadPolicyFromObject } from "../src/policy/load.js";
 
@@ -174,5 +174,82 @@ describe("policy glob normalization against projectRoot", () => {
       path: "/proj/logs/app.log",
     });
     expect(d.allowed).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// nodeGlobPrefix (#106) — reach analysis for NODE's glob dialect, not capwall's.
+//
+// Pure syntax: no filesystem and no `node:path`, so this runs identically on Node 20 (where
+// `fs.glob` does not exist) and on Node 22. The corresponding "…and Node really does escape
+// like that" evidence lives in fs-glob.test.ts, which can only run where the API exists.
+// ---------------------------------------------------------------------------------------
+describe("nodeGlobPrefix — bounded patterns", () => {
+  it("returns the literal leading segments before the first magic segment", () => {
+    expect(nodeGlobPrefix("data/*.txt")).toBe("data");
+    expect(nodeGlobPrefix("data/sub/**")).toBe("data/sub");
+    expect(nodeGlobPrefix("/etc/*.conf")).toBe("/etc");
+    expect(nodeGlobPrefix("/etc/default/x.conf")).toBe("/etc/default/x.conf");
+  });
+
+  it('an empty prefix means "the cwd itself", which is not the same as the root', () => {
+    expect(nodeGlobPrefix("**")).toBe("");
+    expect(nodeGlobPrefix("*.txt")).toBe("");
+    expect(nodeGlobPrefix("")).toBe("");
+  });
+
+  it("an ABSOLUTE pattern whose first segment is magic is rooted at /, never at the cwd", () => {
+    // The regression this guards: `["", "**"].slice(0, 1).join("/")` is the empty string, which
+    // would read as "the cwd" and gate a directory the walk never starts in — fail-open.
+    expect(nodeGlobPrefix("/**")).toBe("/");
+    expect(nodeGlobPrefix("/*.conf")).toBe("/");
+  });
+
+  it("keeps a leading .. in the prefix, where path.resolve accounts for it exactly", () => {
+    expect(nodeGlobPrefix("../data/*.txt")).toBe("../data");
+    expect(nodeGlobPrefix("data/../secrets/*")).toBe("data/../secrets");
+  });
+
+  it("segment-local magic does not move the root", () => {
+    expect(nodeGlobPrefix("data/{a,b}/*.txt")).toBe("data");
+    expect(nodeGlobPrefix("data/[ab]/*")).toBe("data");
+    expect(nodeGlobPrefix("data/@(a|b)/*")).toBe("data");
+    expect(nodeGlobPrefix("data/?ab/*")).toBe("data");
+  });
+
+  it("does not treat a bare @ / + / ! as magic — @scope prefixes stay in the prefix", () => {
+    expect(nodeGlobPrefix("node_modules/@scope/pkg/**")).toBe("node_modules/@scope/pkg");
+    expect(nodeGlobPrefix("a+b/!c/**")).toBe("a+b/!c");
+  });
+
+  it("a bare Windows drive prefix is turned into a root", () => {
+    // `path.win32.resolve("D:/x", "C:")` is the CURRENT directory on drive C, not `C:/`.
+    expect(nodeGlobPrefix("C:/**")).toBe("C:/");
+    expect(nodeGlobPrefix("C:/proj/*.ts")).toBe("C:/proj");
+  });
+});
+
+describe("nodeGlobPrefix — UNBOUNDED patterns (null ⇒ the shim gates the filesystem root)", () => {
+  it("a .. segment after the first magic segment escapes upward", () => {
+    // `**` matches zero segments too, so the first of these is just `../*.conf` — verified
+    // against real fs.globSync on Node 22 in fs-glob.test.ts.
+    expect(nodeGlobPrefix("**/../*.conf")).toBeNull();
+    expect(nodeGlobPrefix("*/../../etc/*")).toBeNull();
+  });
+
+  it("a brace group that spans a / or contains .. escapes", () => {
+    expect(nodeGlobPrefix("{/etc,/tmp}/*.conf")).toBeNull();
+    expect(nodeGlobPrefix("{.,..}/*.conf")).toBeNull();
+    expect(nodeGlobPrefix("data/{../..,b}/*")).toBeNull();
+    expect(nodeGlobPrefix("{1..3}/*")).toBeNull();
+  });
+
+  it("an unbalanced brace is not analyzable, so it is not bounded", () => {
+    expect(nodeGlobPrefix("data/{a,b/*")).toBeNull();
+    expect(nodeGlobPrefix("data/a,b}/*")).toBeNull();
+  });
+
+  it("a backslash (minimatch's POSIX escape) is refused rather than guessed at", () => {
+    expect(nodeGlobPrefix("data/\\*.txt")).toBeNull();
   });
 });
