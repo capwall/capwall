@@ -10,11 +10,26 @@
  * subclass** whose prototype method (or constructor) runs the guard, NOT a construct-trap
  * Proxy. A Proxy only wraps the class object, so `(new net.Socket()).constructor` and
  * `net.Socket.prototype.connect` reach the real, unguarded class/method — a trivial bypass a
- * review demonstrated. A subclass guards the prototype method itself and, via a
- * `Symbol.hasInstance` override, keeps `instanceof` working for BOTH real and guarded
- * instances. Residual (documented in threat-model.md): climbing two prototype levels
+ * review demonstrated. A subclass guards the prototype method itself and, via the shared
+ * {@link defineGuardedClassIdentity}, keeps `instanceof` working for BOTH real and guarded
+ * instances WITHOUT leaking that answer down the static chain to a dependency's own
+ * `class Mine extends net.Socket {}` (#71). Residual (documented in threat-model.md): climbing
+ * two prototype levels
  * (`Object.getPrototypeOf(Object.getPrototypeOf(sock)).connect`) reaches the real method —
  * determined-attacker territory, the same class as un-patching.
+ *
+ * GUARDING INSTANCES, NOT ONLY CLASSES (issue #65). A builtin namespace also exposes pre-built
+ * INSTANCES that carry the same capability its classes do, and the copy loop in each `create*Shim`
+ * duplicates those onto the shim verbatim — real methods and all. `http.globalAgent` /
+ * `https.globalAgent` are live `Agent` instances, so `http.globalAgent.createConnection({host,
+ * port})` opened a socket with the guard never firing and NOTHING recorded, under a deny-all
+ * enforce policy. They are now wrapped by {@link guardedInstanceMethods} (a Proxy — see there for
+ * why an instance is the one place a Proxy is the right tool, and why patching the real agent is
+ * forbidden). The audit behind #65 covered every object-valued export of every shimmed namespace;
+ * `globalAgent` on `http`/`https` was the only capability-bearing one. The rest are inert data
+ * (`fs.constants`, `http.METHODS`/`STATUS_CODES`, `tls.rootCertificates`, `http2.constants`,
+ * `vm.constants`, `worker_threads.resourceLimits`) or an already-shimmed sub-namespace
+ * (`fs.promises`).
  *
  * Under opt-in HARDENED MODE (#17) each guarded subclass and its prototype are frozen, so
  * `net.Socket.prototype.connect = evil` fails instead of silently removing the guard for the
@@ -23,7 +38,8 @@
  *
  * Coverage & limits (kept in sync with docs/threat-model.md):
  *  - `net`: `connect`/`createConnection` and `new net.Socket().connect()`.
- *  - `http`/`https`: `request`/`get`, `new ClientRequest()`, and `Agent.createConnection`.
+ *  - `http`/`https`: `request`/`get`, `new ClientRequest()`, `Agent.createConnection`, and the
+ *    `globalAgent` instance's `createConnection`.
  *    Shimming `net` alone does NOT mediate HTTP: Node's own HTTP client loads `net` through
  *    the internal bootstrap loader, which never hits `Module._load`, so each egress module is
  *    shimmed separately (a dependency could otherwise bypass the control by choosing another).
@@ -94,12 +110,19 @@ import realDgram from "node:dgram";
 import { APP_ROOT, attributeCaller } from "../attribution/index.js";
 import { evaluate } from "../policy/evaluate.js";
 import { CapabilityError } from "../errors.js";
-import { attributionOptionsFor, guard, type ShimContext, type ShimRegistry } from "./runtime.js";
+import {
+  attributionOptionsFor,
+  defineGuardedClassIdentity,
+  guard,
+  guardedInstanceMethods,
+  type AnyFn,
+  type ShimContext,
+  type ShimRegistry,
+} from "./runtime.js";
 import { guardedPropFlags, harden, hardenClass } from "./harden.js";
 
 export type { DecisionSink, ShimContext } from "./runtime.js";
 
-type AnyFn = (...args: unknown[]) => unknown;
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type AnyCtor = new (...args: any[]) => any;
 
@@ -634,8 +657,10 @@ function wrapFn(orig: AnyFn, resolve: (args: unknown[]) => ResolvedCall, ctx: Sh
 
 /**
  * Expose a guarded SUBCLASS of `RealClass` whose prototype `method` runs `resolve`+guard
- * before delegating to the real method with the PINNED args. `Symbol.hasInstance` is
- * overridden so `instanceof` matches any instance of the real class (guarded or not).
+ * before delegating to the real method with the PINNED args. Class identity (`name` and the
+ * receiver-checking `Symbol.hasInstance`) comes from the shared
+ * {@link defineGuardedClassIdentity} — see there for why the receiver check is load-bearing
+ * (#71).
  */
 function guardedSubclassMethod(
   RealClass: AnyCtor,
@@ -661,11 +686,7 @@ function guardedSubclassMethod(
     writable: true,
     configurable: true,
   });
-  Object.defineProperty(Guarded, Symbol.hasInstance, {
-    value: (x: unknown) => x instanceof RealClass,
-    configurable: true,
-  });
-  Object.defineProperty(Guarded, "name", { value: RealClass.name, configurable: true });
+  defineGuardedClassIdentity(Guarded, RealClass);
   // Hardened mode (#17): freeze the SUBCLASS's prototype, closing
   // `net.Socket.prototype.connect = evil` — otherwise a one-line removal of the guard for
   // every caller in the process. No-op by default.
@@ -694,11 +715,7 @@ function guardedClientRequestClass(RealClass: AnyCtor, ctx: ShimContext, default
       super(...resolved.args); // pinned/synthesized args, never the original
     }
   };
-  Object.defineProperty(Guarded, Symbol.hasInstance, {
-    value: (x: unknown) => x instanceof RealClass,
-    configurable: true,
-  });
-  Object.defineProperty(Guarded, "name", { value: RealClass.name, configurable: true });
+  defineGuardedClassIdentity(Guarded, RealClass);
   hardenClass(ctx, Guarded); // hardened mode only (#17) — see harden.ts
   return Guarded;
 }
@@ -727,8 +744,22 @@ export function createNetShim(ctx: ShimContext): typeof import("node:net") {
 }
 
 /**
- * Build a shimmed `http`/`https` module: `request`/`get`, `new ClientRequest()`, and
- * `Agent.createConnection` are guarded. `server.listen` is untouched.
+ * Resolver for `Agent#createConnection`, shared by the guarded `Agent` SUBCLASS (a dependency
+ * building its own agent) and the guarded `globalAgent` INSTANCE (#65) so both gate identically —
+ * a divergence between the two would be a bypass that reads as a refactor.
+ *
+ * It resolves through the NET flavor, not the http one: by the time Node calls
+ * `agent.createConnection` it has already rewritten http's `socketPath` into `path` and blanked
+ * the request `path`, so what arrives is a net-style options bag.
+ */
+function agentConnectionResolver(defaultPort: number): (args: unknown[]) => ResolvedCall {
+  return (args) => resolveNetCall(args, defaultPort);
+}
+
+/**
+ * Build a shimmed `http`/`https` module: `request`/`get`, `new ClientRequest()`,
+ * `Agent.createConnection`, and the `globalAgent` INSTANCE are guarded. `server.listen` is
+ * untouched.
  */
 function wrapHttpModule<T extends object>(real: T, ctx: ShimContext, defaultPort: number): T {
   const shim: Record<string, unknown> = {};
@@ -747,16 +778,31 @@ function wrapHttpModule<T extends object>(real: T, ctx: ShimContext, defaultPort
   // Agent.createConnection is Node's internal net.createConnection, captured at bootstrap —
   // it never routes through Module._load, so a bare Agent's createConnection is un-gated egress.
   if (typeof realRecord["Agent"] === "function") {
-    // `Agent#createConnection` receives NET-style options (Node has already rewritten http's
-    // `socketPath` into `path` and blanked the request `path` by this point), so it resolves
-    // through the net flavor.
     shim["Agent"] = guardedSubclassMethod(
       realRecord["Agent"] as AnyCtor,
       "createConnection",
-      (a) => resolveNetCall(a, defaultPort),
+      agentConnectionResolver(defaultPort),
       ctx,
     );
   }
+  // ISSUE #65 — the CLASS guard above was not enough. `globalAgent` is a live `Agent` INSTANCE,
+  // which the copy loop above duplicated onto the shim verbatim, REAL `createConnection` and
+  // all: `http.globalAgent.createConnection({host, port})` connected with no guard and no log
+  // line, under a deny-all enforce policy, from any dependency. Guard the exposed instance;
+  // never the process-global one it wraps (see `guardedInstanceMethods` for why a Proxy, and
+  // why patching the real agent is off the table).
+  const realGlobalAgent = realRecord["globalAgent"];
+  if (typeof realGlobalAgent === "object" && realGlobalAgent !== null) {
+    shim["globalAgent"] = guardedInstanceMethods(
+      realGlobalAgent,
+      new Map([
+        ["createConnection", (realMethod: AnyFn) => wrapFn(realMethod, agentConnectionResolver(defaultPort), ctx)],
+      ]),
+    );
+  }
+  // Freeze AFTER installing the guarded instance, so the frozen namespace pins it: a dep
+  // cannot swap `http.globalAgent` for a raw Agent. `Object.freeze` here freezes the shim
+  // NAMESPACE only — never the Proxy value, whose target is the real process-global agent.
   return harden(ctx, shim) as unknown as T;
 }
 
@@ -984,14 +1030,7 @@ export function createDgramShim(ctx: ShimContext): typeof import("node:dgram") {
         configurable: true,
       });
     }
-    Object.defineProperty(Guarded, Symbol.hasInstance, {
-      value: (x: unknown) => x instanceof (RealDgramSocket as AnyCtor),
-      configurable: true,
-    });
-    Object.defineProperty(Guarded, "name", {
-      value: (RealDgramSocket as { name: string }).name,
-      configurable: true,
-    });
+    defineGuardedClassIdentity(Guarded, RealDgramSocket as AnyCtor);
     hardenClass(ctx, Guarded); // hardened mode only (#17) — see harden.ts
     shim["Socket"] = Guarded;
   }

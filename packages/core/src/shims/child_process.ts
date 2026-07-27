@@ -23,9 +23,12 @@
  */
 import realChildProcess from "node:child_process";
 import {
+  defineGuardedClassIdentity,
   guard,
   resumeEnvGate,
   suspendEnvGate,
+  type AnyCtor,
+  type AnyFn,
   type ShimContext,
   type ShimRegistry,
 } from "./runtime.js";
@@ -43,8 +46,6 @@ const GATED_METHODS = [
   "execSync",
   "execFileSync",
 ] as const;
-
-type AnyFn = (...args: unknown[]) => unknown;
 
 /** Run `fn` with the env gate suspended so Node's env-block copy reaches the child intact. */
 function spawnWithEnv<T>(fn: () => T): T {
@@ -84,11 +85,12 @@ export function createChildProcessShim(ctx: ShimContext): typeof import("node:ch
   // Gate the ChildProcess class: `new ChildProcess().spawn(options)` is the low-level launch
   // primitive. A guarded SUBCLASS guards `ChildProcess.prototype.spawn` itself — a
   // construct-trap Proxy would be bypassable via `(new ChildProcess()).constructor` and
-  // `ChildProcess.prototype.spawn.call(...)`. Symbol.hasInstance keeps `instanceof` working.
+  // `ChildProcess.prototype.spawn.call(...)`. `defineGuardedClassIdentity` keeps `instanceof`
+  // working for real instances WITHOUT leaking that answer down the static chain to a
+  // dependency's own `class Mine extends ChildProcess {}` (#71).
   const RealChildProcess = real["ChildProcess"];
   if (typeof RealChildProcess === "function") {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const RealCP = RealChildProcess as new (...a: any[]) => object;
+    const RealCP = RealChildProcess as AnyCtor;
     const realSpawn = (RealCP.prototype as Record<string, unknown>)["spawn"];
     const Guarded = class extends RealCP {};
     if (typeof realSpawn === "function") {
@@ -101,14 +103,7 @@ export function createChildProcessShim(ctx: ShimContext): typeof import("node:ch
         configurable: true,
       });
     }
-    Object.defineProperty(Guarded, Symbol.hasInstance, {
-      value: (x: unknown) => x instanceof RealCP,
-      configurable: true,
-    });
-    Object.defineProperty(Guarded, "name", {
-      value: (RealCP as { name: string }).name,
-      configurable: true,
-    });
+    defineGuardedClassIdentity(Guarded, RealCP);
     // Hardened mode (#17): freeze the subclass + its prototype so
     // `ChildProcess.prototype.spawn = evil` fails instead of removing the gate. See harden.ts.
     hardenClass(ctx, Guarded);

@@ -11,6 +11,7 @@ import Module, { createRequire } from "node:module";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as http from "node:http";
+import * as https from "node:https";
 import * as http2 from "node:http2";
 import * as os from "node:os";
 import * as nodePath from "node:path";
@@ -1284,5 +1285,185 @@ describe("net shim — ordinary call shapes behave exactly like un-shimmed Node"
       (tlsShim.connect as unknown as (...a: unknown[]) => unknown)(port, "127.0.0.1", {}, { host: "192.0.2.1" }),
     ).toThrowError(expect.objectContaining({ name: "CapabilityError" }));
     expect(decisions[0]!.decision.observed).toMatchObject({ host: "127.0.0.1", port });
+  });
+});
+
+/**
+ * ISSUE #65 — `http.globalAgent`/`https.globalAgent` are live `Agent` INSTANCES that the shim's
+ * copy loop duplicated onto the shimmed namespace verbatim, REAL `createConnection` and all:
+ *
+ *     http.globalAgent.createConnection({ host, port })   // connected; no guard, no log line
+ *
+ * Un-gated egress for any dependency, and SILENT — `observe` and `capwall diff` never saw it.
+ *
+ * The fix is a guarded Proxy VIEW of the one real agent, which puts the compatibility bar very
+ * high: `globalAgent` is on the default path for nearly every HTTP call (it is what
+ * `http.request()` pools through), and it is a shared, mutable, process-global object that
+ * applications routinely tune (`http.globalAgent.maxSockets = N`). So this suite asserts the
+ * escape is closed AND that ordinary use is untouched: round-trips, keep-alive pooling,
+ * read/write-through to the one real agent, identity, and — the constraint that ruled out
+ * patching the real instance in the first place — that the process-global is never mutated.
+ */
+describe("net shim — globalAgent is a guarded instance, not a copied-through real Agent (#65)", () => {
+  it("http.globalAgent.createConnection is DENIED under deny-by-default, and RECORDED", () => {
+    const { ctx, decisions } = makeCtx(emptyEnforcePolicy(), "enforce");
+    const httpShim = createHttpShim(ctx);
+    expect(() =>
+      (httpShim.globalAgent as unknown as { createConnection: (o: unknown) => unknown }).createConnection({
+        host: "evil.com",
+        port: 8080,
+      }),
+    ).toThrowError(expect.objectContaining({ name: "CapabilityError" }));
+    // The `observe`/`diff` half of the bug: before the fix this list was EMPTY, so a silent
+    // exfiltration channel was invisible to the trace-to-policy workflow as well as to enforce.
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]!.decision.observed).toMatchObject({ kind: "net", host: "evil.com", port: 8080 });
+  });
+
+  it("https.globalAgent.createConnection is denied too, defaulting to port 443", () => {
+    const { ctx, decisions } = makeCtx(emptyEnforcePolicy(), "enforce");
+    const httpsShim = createHttpsShim(ctx);
+    expect(() =>
+      (httpsShim.globalAgent as unknown as { createConnection: (o: unknown) => unknown }).createConnection({
+        host: "evil.com",
+      }),
+    ).toThrowError(expect.objectContaining({ name: "CapabilityError" }));
+    expect(decisions[0]!.decision.observed).toMatchObject({ host: "evil.com", port: 443 });
+  });
+
+  it("a unix socket reached through globalAgent is gated as <ipc>, like every other IPC connect", () => {
+    const { ctx, decisions } = makeCtx(emptyEnforcePolicy(), "enforce");
+    const httpShim = createHttpShim(ctx);
+    expect(() =>
+      (httpShim.globalAgent as unknown as { createConnection: (o: unknown) => unknown }).createConnection({
+        path: "/var/run/docker.sock",
+      }),
+    ).toThrowError(expect.objectContaining({ name: "CapabilityError" }));
+    expect(decisions[0]!.decision.observed).toMatchObject({ host: "<ipc>", port: 0 });
+  });
+
+  it("observe mode records the call instead of blocking it", () => {
+    const port = 9;
+    const { ctx, decisions } = makeCtx(emptyEnforcePolicy(), "observe");
+    const httpShim = createHttpShim(ctx);
+    const socket = (
+      httpShim.globalAgent as unknown as { createConnection: (o: unknown) => net.Socket }
+    ).createConnection({ host: "127.0.0.1", port });
+    socket.on("error", () => {}); // discard the inevitable ECONNREFUSED
+    socket.destroy();
+    expect(decisions[0]!.decision.allowed).toBe(true);
+    expect(decisions[0]!.decision.observed).toMatchObject({ host: "127.0.0.1", port });
+  });
+
+  it("does not mutate the process-global real agent — the constraint that ruled out patching it", () => {
+    // #63 left the real builtins unfrozen precisely so capwall never leaves a mutation behind
+    // after `uninstall()`. A guarded VIEW satisfies that; patching `realHttp.globalAgent
+    // .createConnection` (or `Agent.prototype.createConnection`) would not, and would leak the
+    // guard to every consumer of the raw builtin, capwall-mediated or not.
+    const beforeMethod = http.globalAgent.createConnection;
+    const beforeProtoMethod = (http.Agent.prototype as unknown as Record<string, unknown>)["createConnection"];
+    const beforeOwnKeys = Reflect.ownKeys(http.globalAgent).map(String).sort().join(",");
+
+    const { ctx } = makeCtx(emptyEnforcePolicy(), "enforce");
+    const httpShim = createHttpShim(ctx);
+    expect(() =>
+      (httpShim.globalAgent as unknown as { createConnection: (o: unknown) => unknown }).createConnection({
+        host: "evil.com",
+        port: 80,
+      }),
+    ).toThrowError(expect.objectContaining({ name: "CapabilityError" }));
+
+    expect(http.globalAgent.createConnection).toBe(beforeMethod);
+    expect((http.Agent.prototype as unknown as Record<string, unknown>)["createConnection"]).toBe(beforeProtoMethod);
+    expect(Reflect.ownKeys(http.globalAgent).map(String).sort().join(",")).toBe(beforeOwnKeys);
+    // The shim hands out its OWN view; the real module keeps the real agent.
+    expect(httpShim.globalAgent).not.toBe(http.globalAgent);
+    expect(https.globalAgent).not.toBe(http.globalAgent);
+  });
+
+  it("keeps the identity and shape a dependency can observe", () => {
+    const { ctx } = makeCtx(emptyEnforcePolicy(), "enforce");
+    const httpShim = createHttpShim(ctx);
+    const agent = httpShim.globalAgent;
+
+    // Stable across reads — a fresh wrapper per read would break `===` and WeakMap keying.
+    expect(httpShim.globalAgent).toBe(agent);
+    // ...and so is the guarded method itself (memoized per underlying function).
+    const asRecord = agent as unknown as Record<string, unknown>;
+    expect(asRecord["createConnection"]).toBe(asRecord["createConnection"]);
+    // `instanceof` answers correctly against BOTH the guarded Agent class and the real one.
+    expect(agent instanceof httpShim.Agent).toBe(true);
+    expect(agent instanceof http.Agent).toBe(true);
+    expect(Object.getPrototypeOf(agent)).toBe(http.Agent.prototype);
+    // Node's own ClientRequest rejects an agent whose `addRequest` is not a function.
+    expect(typeof asRecord["addRequest"]).toBe("function");
+    // Read-through of the fields Node's own ClientRequest consults on the agent it is given.
+    expect(asRecord["defaultPort"]).toBe(80);
+    expect(asRecord["protocol"]).toBe("http:");
+  });
+
+  it("reads and writes pass through to the ONE real agent (maxSockets tuning still works)", () => {
+    // The single most common thing applications do with globalAgent. A fresh guarded Agent, or
+    // an `Object.create(realAgent)` view, would silently swallow this write — the request path
+    // would keep using the untuned real agent while the app believed it had tuned it.
+    const { ctx } = makeCtx(emptyEnforcePolicy(), "enforce");
+    const agent = createHttpShim(ctx).globalAgent;
+    const original = http.globalAgent.maxSockets;
+    try {
+      agent.maxSockets = 7;
+      expect(http.globalAgent.maxSockets).toBe(7); // write-through
+      http.globalAgent.maxSockets = 11;
+      expect(agent.maxSockets).toBe(11); // read-through
+    } finally {
+      http.globalAgent.maxSockets = original;
+    }
+  });
+
+  it("an ordinary http.get with no agent still round-trips identically to un-shimmed Node", async () => {
+    // The regression that would break everything: the default request path pools through
+    // globalAgent, so this is the canary for the whole fix.
+    const server = await startHttpEcho();
+    const url = `http://127.0.0.1:${server.port}/default-agent`;
+    const baseline = await collectResponse(http.get(url));
+    const { ctx } = makeCtx(grantedPolicy(server.port), "enforce");
+    const shimmed = await collectResponse(createHttpShim(ctx).get(url));
+    await server.close();
+    expect(shimmed).toEqual(baseline);
+    expect(server.seen[1]).toEqual(server.seen[0]);
+  });
+
+  it("passing the guarded globalAgent explicitly keeps keep-alive pooling: the socket is reused", async () => {
+    const server = await startHttpEcho();
+    const { ctx, decisions } = makeCtx(grantedPolicy(server.port), "enforce");
+    const agent = createHttpShim(ctx).globalAgent;
+    // `keepAlive` is not on @types/node's `Agent`, but it is the property Node's agent reads.
+    const agentRecord = agent as unknown as Record<string, unknown>;
+    const originalKeepAlive = agentRecord["keepAlive"];
+    try {
+      agentRecord["keepAlive"] = true;
+      const send = async (path: string): Promise<net.Socket | null> => {
+        const req = createHttpShim(ctx).request({ host: "127.0.0.1", port: server.port, path, agent });
+        req.end();
+        await collectResponse(req);
+        return req.socket;
+      };
+      const first = await send("/pool-1");
+      const second = await send("/pool-2");
+      expect(first).not.toBeNull();
+      expect(second).toBe(first); // one pooled connection served both requests
+      expect(decisions.every((d) => d.decision.allowed)).toBe(true);
+    } finally {
+      agent.destroy();
+      agentRecord["keepAlive"] = originalKeepAlive;
+      await server.close();
+    }
+  });
+
+  it("a request that pools through the guarded globalAgent to a DENIED host is stopped", () => {
+    const { ctx } = makeCtx(grantedPolicyFor("127.0.0.1", 80), "enforce");
+    const httpShim = createHttpShim(ctx);
+    expect(() =>
+      httpShim.request({ host: "evil.com", port: 80, agent: httpShim.globalAgent }),
+    ).toThrowError(expect.objectContaining({ name: "CapabilityError" }));
   });
 });
