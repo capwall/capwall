@@ -7,11 +7,10 @@
  * Coverage & limits (kept in sync with docs/threat-model.md):
  *  - Gated: the code-execution/compilation entry points — `runInNewContext`,
  *    `runInThisContext`, `runInContext`, `compileFunction`, the `Script` class (construction,
- *    via a construct-trap `Proxy`, exactly like `fs.ts`'s `wrapPathClass`), its deprecated
- *    `createScript` alias (same bypass class as `Script`, wrapped for the same reason
- *    `fs.ts` wraps `FileReadStream` alongside `ReadStream`), and — defensively, only if
- *    present (they live behind Node's `--experimental-vm-modules` flag) —
- *    `SourceTextModule` / `SyntheticModule`.
+ *    via a guarded SUBCLASS — see below), its deprecated `createScript` alias (same bypass
+ *    class as `Script`, wrapped for the same reason `fs.ts` wraps `FileReadStream` alongside
+ *    `ReadStream`), and — defensively, only if present (they live behind Node's
+ *    `--experimental-vm-modules` flag) — `SourceTextModule` / `SyntheticModule`.
  *  - NOT gated: `createContext`, `isContext`, `measureMemory`, `constants`. A context object
  *    alone cannot run anything — it only becomes capability-relevant once code is compiled or
  *    run *in* it, which is exactly the entry points above. Gating `createContext` too would
@@ -26,12 +25,17 @@
  *    door without claiming to lock the house.
  */
 import realVm from "node:vm";
-import { guard, type ShimContext, type ShimRegistry } from "./runtime.js";
+import {
+  guard,
+  guardedConstructorSubclass,
+  type AnyCtor,
+  type ShimContext,
+  type ShimRegistry,
+} from "./runtime.js";
 
 export type { DecisionSink, ShimContext, ShimRegistry } from "./runtime.js";
 
 type AnyFn = (...args: unknown[]) => unknown;
-type CtorClass = abstract new (...a: never[]) => unknown;
 
 /** Function-kind entry points gated as plain calls (guard, then delegate). */
 const GATED_FUNCTIONS = [
@@ -45,9 +49,11 @@ const GATED_FUNCTIONS = [
 ] as const;
 
 /**
- * Class-kind entry points gated via a construct-trap `Proxy` (guard happens BEFORE the
- * instance is created). `Script` is always present; `SourceTextModule`/`SyntheticModule`
- * only exist under `--experimental-vm-modules`, so each is wrapped only if present.
+ * Class-kind entry points gated via a guarded SUBCLASS whose constructor runs the check
+ * before `super(...)` — i.e. before the code is compiled or the module record is created.
+ * `Script` is always present; `SourceTextModule`/`SyntheticModule` only exist under Node's
+ * `--experimental-vm-modules` flag, so each is wrapped only if present (their absence must
+ * not throw at install time).
  */
 const GATED_CLASSES = ["Script", "SourceTextModule", "SyntheticModule"] as const;
 
@@ -71,16 +77,18 @@ export function createVmShim(ctx: ShimContext): typeof import("node:vm") {
   }
 
   /**
-   * Wrap a `vm` class (`Script`, `SourceTextModule`, `SyntheticModule`) so `new Vm.X(...)`
-   * is gated at construction. Uses a construct-trap Proxy so `instanceof` and class identity
-   * are preserved — identical approach to `fs.ts`'s `wrapPathClass`.
+   * Wrap a `vm` class (`Script`, `SourceTextModule`, `SyntheticModule`) so `new vm.X(...)`
+   * is gated at construction.
+   *
+   * A guarded SUBCLASS, not a construct-trap Proxy (#64): a Proxy forwards `.prototype` to its
+   * target, so `new (vm.Script.prototype.constructor)(code)` compiled and ran code with the
+   * guard never firing — unguarded code evaluation for any dependency. `Symbol.hasInstance` on
+   * the subclass keeps `instanceof` honest for real instances too (see
+   * {@link guardedConstructorSubclass}).
    */
-  function wrapClass<T extends CtorClass>(RealClass: T): T {
-    return new Proxy(RealClass, {
-      construct(target, argArray, newTarget) {
-        check(); // throws on enforce-deny, before the instance exists
-        return Reflect.construct(target, argArray as never[], newTarget);
-      },
+  function wrapClass(RealClass: AnyCtor): AnyCtor {
+    return guardedConstructorSubclass(RealClass, () => {
+      check(); // throws on enforce-deny, before super() compiles anything
     });
   }
 
@@ -100,7 +108,7 @@ export function createVmShim(ctx: ShimContext): typeof import("node:vm") {
   for (const name of GATED_CLASSES) {
     const RealClass = realRecord[name];
     if (typeof RealClass === "function") {
-      shim[name] = wrapClass(RealClass as CtorClass);
+      shim[name] = wrapClass(RealClass as AnyCtor);
     }
   }
 

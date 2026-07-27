@@ -11,8 +11,11 @@
  *  - The path-taking read/write families below are wrapped (sync, callback, and
  *    `fs.promises` variants), PLUS the path-taking stream constructors `ReadStream` /
  *    `WriteStream` (a dependency can `new fs.ReadStream(path)` instead of
- *    `createReadStream` — both must be mediated). Purely fd-based operations (`read`,
- *    `write`, `ftruncate`, `fchmod`, …) are NOT mediated — fd escapes are out-of-scope.
+ *    `createReadStream` — both must be mediated). Those classes are guarded via a guarded
+ *    SUBCLASS, not a construct-trap Proxy: a Proxy forwards `.prototype` to its target, so
+ *    `new (fs.ReadStream.prototype.constructor)(deniedPath)` reached the real class and read
+ *    the file unguarded (#64). Purely fd-based operations (`read`, `write`, `ftruncate`,
+ *    `fchmod`, …) are NOT mediated — fd escapes are out-of-scope.
  *  - Denials are delivered via the SAME channel the real API would use, so idiomatic
  *    (try/catch-free) callback code is not crashed by an uncaught synchronous throw:
  *      - `*Sync` methods throw `CapabilityError` synchronously (matches real sync `fs`).
@@ -39,7 +42,13 @@ import realFs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Readable, Writable } from "node:stream";
-import { guard, type ShimContext, type ShimRegistry } from "./runtime.js";
+import {
+  guard,
+  guardedConstructorSubclass,
+  type AnyCtor,
+  type ShimContext,
+  type ShimRegistry,
+} from "./runtime.js";
 import { CapabilityError } from "../errors.js";
 
 export type { DecisionSink, ShimContext } from "./runtime.js";
@@ -222,7 +231,6 @@ function accessSpecs(args: unknown[]): PathSpec[] {
 }
 
 type AnyFn = (...args: unknown[]) => unknown;
-type PathClass = abstract new (...a: never[]) => unknown;
 
 /**
  * How a denial is DELIVERED for a given method (fix #16). The guard DECISION is identical in
@@ -362,19 +370,19 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
   }
 
   /**
-   * Wrap a path-taking stream constructor (`ReadStream`/`WriteStream`) so
-   * `new fs.ReadStream(path)` is mediated exactly like `createReadStream(path)`. Uses a
-   * construct-trap Proxy so `instanceof` and the class identity are preserved.
+   * Guard a path-taking stream constructor (`ReadStream`/`WriteStream`) so
+   * `new fs.ReadStream(path)` is mediated exactly like `createReadStream(path)`.
+   *
+   * This is a guarded SUBCLASS, not a construct-trap Proxy (#64). A Proxy left the real class
+   * reachable as `fs.ReadStream.prototype.constructor`, which is an unguarded read of any path
+   * on disk — see {@link guardedConstructorSubclass} for the full rationale and the residual.
+   * Denial is a synchronous throw here (unlike `createReadStream`, which returns a stream that
+   * emits `'error'`): a real stream constructor also throws synchronously on a bad argument,
+   * so the shapes match. Documented in docs/threat-model.md.
    */
-  function wrapPathClass<T extends abstract new (...a: never[]) => unknown>(
-    RealClass: T,
-    access: Access,
-  ): T {
-    return new Proxy(RealClass, {
-      construct(target, argArray, newTarget) {
-        check(access, argArray[0]); // throws on enforce-deny, before the stream exists
-        return Reflect.construct(target, argArray as never[], newTarget);
-      },
+  function guardPathClass(RealClass: AnyCtor, access: Access): AnyCtor {
+    return guardedConstructorSubclass(RealClass, (args) => {
+      check(access, args[0]); // throws on enforce-deny, before super() opens anything
     });
   }
 
@@ -458,15 +466,25 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
   // `createReadStream` (a dependency using the class directly must not bypass the policy).
   const shimRecord = shim as unknown as Record<string, unknown>;
   const realRecord = realFs as unknown as Record<string, unknown>;
-  // ReadStream + its deprecated alias FileReadStream (identical class); same for write.
-  for (const name of ["ReadStream", "FileReadStream"]) {
-    if (typeof realRecord[name] === "function") {
-      shimRecord[name] = wrapPathClass(realRecord[name] as PathClass, "read");
-    }
-  }
-  for (const name of ["WriteStream", "FileWriteStream"]) {
-    if (typeof realRecord[name] === "function") {
-      shimRecord[name] = wrapPathClass(realRecord[name] as PathClass, "write");
+  // ReadStream + its deprecated alias FileReadStream; same for write. On every supported Node
+  // the alias is the SAME class object (`fs.FileReadStream === fs.ReadStream`), so one guarded
+  // subclass is built per real class and shared across its names — that preserves the identity
+  // relation a dependency can observe, which two independent wrappers would silently break.
+  const guardedStreamClasses = new Map<unknown, AnyCtor>();
+  const streamClassGroups: ReadonlyArray<readonly [readonly string[], Access]> = [
+    [["ReadStream", "FileReadStream"], "read"],
+    [["WriteStream", "FileWriteStream"], "write"],
+  ];
+  for (const [names, access] of streamClassGroups) {
+    for (const name of names) {
+      const RealClass = realRecord[name];
+      if (typeof RealClass !== "function") continue; // alias absent on this Node — skip
+      let Guarded = guardedStreamClasses.get(RealClass);
+      if (Guarded === undefined) {
+        Guarded = guardPathClass(RealClass as AnyCtor, access);
+        guardedStreamClasses.set(RealClass, Guarded);
+      }
+      shimRecord[name] = Guarded;
     }
   }
 

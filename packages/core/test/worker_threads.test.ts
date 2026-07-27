@@ -4,10 +4,11 @@
  * Builds the shim directly via its factory with a fake ShimContext (the loader registry
  * isn't wired for these two shims yet, so no `require()` interception here). Constructing a
  * real, successfully-running worker is heavy for a unit test, so the "granted" case instead
- * constructs with an intentionally bad module path: if the guard denies, the Proxy throws
- * CapabilityError synchronously and no OS thread is ever created; if the guard allows, Node's
- * own `Reflect.construct` runs and the worker fails to LOAD (MODULE_NOT_FOUND) asynchronously
- * — proving the guard was passed without needing a real, working worker script.
+ * constructs with an intentionally bad module path: if the guard denies, the guarded subclass
+ * throws CapabilityError synchronously — before `super(...)`, so no OS thread is ever created;
+ * if the guard allows, the real `Worker` constructor runs and the worker fails to LOAD
+ * (MODULE_NOT_FOUND) asynchronously — proving the guard was passed without needing a real,
+ * working worker script.
  */
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -91,15 +92,34 @@ describe("worker_threads shim — enforce mode with a grant", () => {
     expect((err as { code?: string }).code).toBe("MODULE_NOT_FOUND");
   }, 10_000);
 
-  it("preserves instanceof / class identity through the construct-trap Proxy", () => {
+  it("preserves instanceof / class identity through the guarded subclass", () => {
     const { ctx } = makeCtx(grantedEnforcePolicy(), "enforce");
     const shim = createWorkerThreadsShim(ctx);
     const worker = new shim.Worker(BAD_MODULE);
     try {
       expect(worker).toBeInstanceOf(realWorkerThreads.Worker);
+      expect(worker).toBeInstanceOf(shim.Worker);
+      // #64: the class is capwall's own subclass, and the `.prototype.constructor` walk lands
+      // back on it — with the old construct-trap Proxy this was the REAL Worker, i.e. an
+      // unguarded spawn into a fresh, unshimmed Node context.
+      expect(shim.Worker).not.toBe(realWorkerThreads.Worker);
+      expect(shim.Worker.prototype.constructor).toBe(shim.Worker);
+      expect(shim.Worker.name).toBe("Worker");
     } finally {
       void worker.terminate();
     }
+  });
+
+  it("denies a spawn attempted through Worker.prototype.constructor (#64)", () => {
+    const { ctx, decisions } = makeCtx(emptyEnforcePolicy(), "enforce");
+    const shim = createWorkerThreadsShim(ctx);
+    // Cast is typing-only: `.prototype.constructor` is declared as `Function`.
+    const Escaped = shim.Worker.prototype.constructor as new (spec: string) => unknown;
+    expect(() => new Escaped(BAD_MODULE)).toThrowError(
+      expect.objectContaining({ name: "CapabilityError" }),
+    );
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]!.decision.allowed).toBe(false);
   });
 });
 
