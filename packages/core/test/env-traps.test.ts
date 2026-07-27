@@ -1,11 +1,16 @@
 /**
  * Regression tests for the `process.env` Proxy TRAPS, as opposed to the read policy itself
- * (that lives in env.test.ts).
+ * (that lives in env.test.ts). Two bugs, both proxy-semantics rather than policy:
  *
- * #66 — with no `set` trap, `proxy.K = v` on a key the target ALREADY has completes as
- * `receiver.[[DefineOwnProperty]](K, {[[Value]]: v})`, a partial descriptor that Node's
- * `process.env` handler rejects with `ERR_INVALID_OBJECT_DEFINE_PROPERTY`. Any dependency
- * writing to an already-set env var crashed the host app. These tests fail on `main`.
+ *  - #66 — with no `set` trap, `proxy.K = v` on a key the target ALREADY has completes as
+ *    `receiver.[[DefineOwnProperty]](K, {[[Value]]: v})`, a partial descriptor that Node's
+ *    `process.env` handler rejects with `ERR_INVALID_OBJECT_DEFINE_PROPERTY`. Any dependency
+ *    writing to an already-set env var crashed the host app. These tests fail on `main`.
+ *
+ *  - #67 — `Object.keys` / `for..in` call `[[GetOwnProperty]]` once per key (to read
+ *    `[[Enumerable]]`), so the gated `getOwnPropertyDescriptor` trap recorded enumeration as a
+ *    value read of EVERY key in the environment. These tests pin the fix: enumeration records
+ *    nothing, value reads still record, and the descriptor hole stays shut.
  *
  * Method: every assertion that should agree with plain Node is checked against the SAME fixture
  * code run OUTSIDE the capwall window (`unshimmed()`), so the baseline is real `process.env`
@@ -33,6 +38,12 @@ interface EnvFixture {
   defineEnv(key: string, value: string): void;
   definePartialEnv(key: string, value: string): void;
   hasEnv(key: string): boolean;
+  envKeys(): string[];
+  envForInKeys(): string[];
+  envOwnPropertyNames(): string[];
+  envJson(): string;
+  envSpread(): Record<string, string | undefined>;
+  envEntries(): Array<[string, string | undefined]>;
 }
 
 function loadFixtureFresh(): EnvFixture {
@@ -77,7 +88,7 @@ function recordedEnvKeys(decisions: Recorded[]): string[] {
 const EXISTING = "FIXTURE_TRAPS_EXISTING";
 const SECRET = "FIXTURE_TRAPS_SECRET";
 const FRESH = "FIXTURE_TRAPS_FRESH";
-const ALL_KEYS = [EXISTING, SECRET, FRESH];
+const ALL_KEYS = [EXISTING, SECRET, FRESH, "FIXTURE_TRAPS_HOST_A", "FIXTURE_TRAPS_HOST_B"];
 
 beforeEach(() => {
   process.env[EXISTING] = "orig";
@@ -203,10 +214,105 @@ describe("env shim — the other traps match un-shimmed process.env", () => {
     expect(result).toBe(unshimmed((dep) => dep.hasEnv(SECRET)));
     expect(recordedEnvKeys(decisions)).toEqual([]);
   });
+});
 
-  it("getOwnPropertyDescriptor still hides a denied value (unchanged by this fix)", () => {
+describe("env shim — enumeration is a NAME-level operation: ungated, unrecorded (#67)", () => {
+  it("Object.keys returns the un-shimmed key set and records NOTHING", () => {
+    const baseline = unshimmed((dep) => dep.envKeys()).sort();
+    const { result, decisions } = withCapwall(enforce([]), "enforce", (dep) => dep.envKeys());
+    expect(result.sort()).toEqual(baseline);
+    expect(result).toContain(SECRET); // the NAME is still visible — documented behavior
+    expect(recordedEnvKeys(decisions)).toEqual([]); // ...but it is not a recorded value read
+  });
+
+  it("for..in returns the un-shimmed key set and records NOTHING", () => {
+    const baseline = unshimmed((dep) => dep.envForInKeys()).sort();
+    const { result, decisions } = withCapwall(enforce([]), "enforce", (dep) => dep.envForInKeys());
+    expect(result.sort()).toEqual(baseline);
+    expect(recordedEnvKeys(decisions)).toEqual([]);
+  });
+
+  it("Object.getOwnPropertyNames returns the un-shimmed key set and records NOTHING", () => {
+    const baseline = unshimmed((dep) => dep.envOwnPropertyNames()).sort();
+    const { result, decisions } = withCapwall(enforce([]), "enforce", (dep) =>
+      dep.envOwnPropertyNames(),
+    );
+    expect(result.sort()).toEqual(baseline);
+    expect(recordedEnvKeys(decisions)).toEqual([]);
+  });
+
+  it("what observe records is a property of the PACKAGE, not of the host environment", () => {
+    // The #67 headline: the same enumerating package on two machines must produce the same
+    // policy. Before the fix this recorded every key the host happened to export.
+    const enumerateWith = (extraKey: string): string[] => {
+      process.env[extraKey] = "host-specific";
+      try {
+        const { decisions } = withCapwall(enforce([]), "observe", (dep) => dep.envKeys());
+        return recordedEnvKeys(decisions);
+      } finally {
+        delete process.env[extraKey];
+      }
+    };
+    expect(enumerateWith("FIXTURE_TRAPS_HOST_A")).toEqual(enumerateWith("FIXTURE_TRAPS_HOST_B"));
+    expect(enumerateWith("FIXTURE_TRAPS_HOST_A")).toEqual([]);
+  });
+});
+
+describe("env shim — value reads stay gated AND recorded (#67 must not weaken the gate)", () => {
+  it("JSON.stringify omits denied values and records every key it actually read", () => {
+    const { result, decisions } = withCapwall(enforce([]), "enforce", (dep) => dep.envJson());
+    const parsed = JSON.parse(result) as Record<string, unknown>;
+    // Denied values come back undefined, and JSON.stringify drops undefined-valued properties.
+    expect(Object.hasOwn(parsed, SECRET)).toBe(false);
+    expect(recordedEnvKeys(decisions)).toContain(SECRET); // a real value read — correctly logged
+
+    const baseline = JSON.parse(unshimmed((dep) => dep.envJson())) as Record<string, unknown>;
+    expect(baseline[SECRET]).toBe("s3cr3t"); // un-shimmed would have leaked it
+  });
+
+  it("JSON.stringify passes through values the dependency IS granted", () => {
+    const { result } = withCapwall(enforce([SECRET]), "enforce", (dep) => dep.envJson());
+    expect((JSON.parse(result) as Record<string, unknown>)[SECRET]).toBe("s3cr3t");
+  });
+
+  it("spread keeps the key but hides the denied value, and records it", () => {
+    const { result, decisions } = withCapwall(enforce([]), "enforce", (dep) => dep.envSpread());
+    expect(Object.hasOwn(result, SECRET)).toBe(true); // CopyDataProperties creates the property
+    expect(result[SECRET]).toBeUndefined();
+    expect(recordedEnvKeys(decisions)).toContain(SECRET);
+    expect(unshimmed((dep) => dep.envSpread())[SECRET]).toBe("s3cr3t");
+  });
+
+  it("Object.entries hides the denied value and records it", () => {
+    const { result, decisions } = withCapwall(enforce([]), "enforce", (dep) => dep.envEntries());
+    expect(result.find(([k]) => k === SECRET)?.[1]).toBeUndefined();
+    expect(recordedEnvKeys(decisions)).toContain(SECRET);
+  });
+
+  it("getOwnPropertyDescriptor STILL hides the value — the exfiltration hole stays shut", () => {
+    // The reason the descriptor trap is gated at all. #67 dropped its RECORDING, never its
+    // hiding: this must keep failing for an attacker.
     const { result } = withCapwall(enforce([]), "enforce", (dep) => dep.readEnvDescriptor(SECRET));
     expect(result?.value).toBeUndefined();
     expect(unshimmed((dep) => dep.readEnvDescriptor(SECRET))?.value).toBe("s3cr3t");
+  });
+
+  it("the hidden descriptor stays enumerable, so Object.keys still lists the key", () => {
+    const { result } = withCapwall(enforce([]), "enforce", (dep) => dep.readEnvDescriptor(SECRET));
+    expect(result?.enumerable).toBe(true);
+    expect(result?.configurable).toBe(true);
+  });
+
+  it("getOwnPropertyDescriptor of a GRANTED key matches un-shimmed exactly", () => {
+    const { result } = withCapwall(enforce([SECRET]), "enforce", (dep) =>
+      dep.readEnvDescriptor(SECRET),
+    );
+    expect(result).toEqual(unshimmed((dep) => dep.readEnvDescriptor(SECRET)));
+  });
+
+  it("a direct read is still denied and still recorded", () => {
+    const { result, decisions } = withCapwall(enforce([]), "enforce", (dep) => dep.readEnv(SECRET));
+    expect(result).toBeUndefined();
+    expect(recordedEnvKeys(decisions)).toEqual([SECRET]);
   });
 });

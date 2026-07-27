@@ -187,6 +187,24 @@ Per-capability notes:
   enumerable** to a denied dependency (`Object.keys`, `in`, `for..in`); only VALUES are hidden
   — names are not the secret, and hiding them would break feature-detection.
 
+  **Name-level vs value-level (#67).** The gate applies to *values*, and only value-yielding
+  operations are recorded. Everything that hands a dependency a value goes through `[[Get]]` —
+  `env.K`, destructuring, `JSON.stringify(env)`, `{...env}`, `Object.entries`/`Object.values` —
+  and is gated **and** written to the trace. Name-level operations — `in`, `Object.keys`,
+  `for..in`, `Object.getOwnPropertyNames` — are neither gated nor recorded. The
+  `getOwnPropertyDescriptor` trap straddles both: `Object.keys` and `for..in` call it once per
+  key just to read `[[Enumerable]]`, and it cannot distinguish that from a genuine descriptor
+  read (identical arguments, identical caller stack). It therefore **hides** the value for a
+  denied key (unconditionally — that is the security property) but does **not record**.
+  *Residual:* a `getOwnPropertyDescriptor(env, k).value` read attempt is blocked but no longer
+  appears in the audit trail. Recording it instead would log every `for..in` as a value read of
+  every key in the environment, which made `observe` output a property of the host machine
+  rather than of the package and printed `DENY '<pkg>' env:AWS_SECRET_ACCESS_KEY` for mere
+  enumeration. The available discriminators (an `ownKeys`-primed "enumeration epoch" heuristic;
+  returning an accessor descriptor so only an explicit `desc.get()` records) are spoofable by
+  the attacker they target or catch only an attacker who has already adapted to capwall, and a
+  spoofable heuristic inside the anti-exfiltration control is worse than a documented gap.
+
   **Writes are NOT mediated (#66).** `env` grants are a *read* allowlist; a dependency may set,
   delete, and `defineProperty` on `process.env` freely, exactly as un-shimmed. The proxy's `set`
   trap exists only to restore ordinary assignment semantics — without it, assignment to an

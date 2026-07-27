@@ -133,9 +133,19 @@ subprocess, worker, or vm context then does.
 An allowlist of `process.env` keys the package may read. This is the anti-exfiltration
 control: a package with `"env": ["NODE_ENV"]` reading `AWS_SECRET_ACCESS_KEY` is a violation.
 
-**Reads only.** `env` grants nothing about writes; `process.env.K = v`,
-`delete process.env.K` and `Object.defineProperty(process.env, …)` are unmediated for every
-package (see [threat-model](./threat-model.md) for why, and the residual it leaves).
+Scope, precisely:
+
+- **Reads only.** `env` grants nothing about writes; `process.env.K = v`, `delete process.env.K`
+  and `Object.defineProperty(process.env, …)` are unmediated for every package (see
+  [threat-model](./threat-model.md) for why, and the residual it leaves).
+- **Values only, not names.** A denied read is a *soft deny*: the value comes back `undefined`
+  rather than throwing, so a dependency probing an optional var is not crashed. Key **names**
+  stay visible — `"K" in process.env`, `Object.keys(process.env)`, `for..in` and
+  `Object.getOwnPropertyNames` are ungated, and are **not** recorded in `observe` either. Only
+  operations that actually yield a value (`process.env.K`, `JSON.stringify(process.env)`,
+  `{...process.env}`, `Object.entries`) are gated and recorded. That is why a package that
+  enumerates the environment — `debug` does — generates a policy listing only the keys it really
+  reads, and that policy is the same on every machine (#67).
 
 Matching is **exact string equality**, or the single literal `"*"`. There are no prefix or
 glob forms — `"DEBUG_*"` matches a key literally named `DEBUG_*`, nothing else.
