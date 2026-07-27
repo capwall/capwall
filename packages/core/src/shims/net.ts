@@ -38,8 +38,9 @@
  *
  * Coverage & limits (kept in sync with docs/threat-model.md):
  *  - `net`: `connect`/`createConnection` and `new net.Socket().connect()`.
- *  - `http`/`https`: `request`/`get`, `new ClientRequest()`, `Agent.createConnection`, and the
- *    `globalAgent` instance's `createConnection`.
+ *  - `http`/`https`: `request`/`get`, `new ClientRequest()`, `Agent.createConnection`, the
+ *    `globalAgent` instance's `createConnection`, and (Node ≥22) the `http.WebSocket`
+ *    re-export of the global `WebSocket` class — see `shims/global-egress.ts` (#80).
  *    Shimming `net` alone does NOT mediate HTTP: Node's own HTTP client loads `net` through
  *    the internal bootstrap loader, which never hits `Module._load`, so each egress module is
  *    shimmed separately (a dependency could otherwise bypass the control by choosing another).
@@ -85,7 +86,9 @@
  *     second time — a dep granted one TCP endpoint could reach any unix socket by returning
  *     `undefined` on read #1 and `/var/run/docker.sock` on read #2.
  *  3. URL instances passed to `http(s).request`/`get`/`new ClientRequest()` or as an
- *     `http2.connect` authority — `snapshotUrl` reads every field Node would otherwise
+ *     `http2.connect` authority — `snapshotUrl` (now shared, in `shims/url-snapshot.ts`, with
+ *     the global egress guard so the two cannot drift apart) reads every field Node would
+ *     otherwise
  *     re-derive from the URL EXACTLY ONCE, and the URL itself is never forwarded: `http(s)`
  *     gets a synthesized plain options object built from that one-time snapshot
  *     (`urlSnapshotToOptions`, a deliberate re-implementation of Node's internal
@@ -120,6 +123,16 @@ import {
   type ShimRegistry,
 } from "./runtime.js";
 import { guardedPropFlags, harden, hardenClass } from "./harden.js";
+import { guardedWebSocketClass } from "./global-egress.js";
+// The single-read URL pinning helpers live in their own module so the global egress guard
+// (#80) can share this exact implementation without an import cycle — see url-snapshot.ts.
+import {
+  bracketIpv6,
+  coercePort,
+  snapshotUrl,
+  stripIpv6Brackets,
+  type UrlSnapshot,
+} from "./url-snapshot.js";
 
 export type { DecisionSink, ShimContext } from "./runtime.js";
 
@@ -187,37 +200,6 @@ interface ResolvedCall {
   host: string;
   port: number;
   args: unknown[];
-}
-
-/**
- * A `URL` keeps an IPv6 literal BRACKETED (`new URL("http://[::1]/").hostname === "[::1]"`),
- * but everything that actually dials strips them: Node's `urlToHttpOptions` and
- * `http2.connect` both hand `::1` to `net`/`dns`. capwall guards the UNBRACKETED form so a
- * policy author writes `::1` (the same spelling `net.connect({host})` and the policy's exact
- * host match use) — and so the guarded host is the string Node resolves. Forgetting this made
- * every IPv6 http(s) URL fail with `ENOTFOUND [::1]` once capwall started synthesizing options.
- */
-function stripIpv6Brackets(hostname: string): string {
-  return hostname.length > 2 && hostname.startsWith("[") && hostname.endsWith("]")
-    ? hostname.slice(1, -1)
-    : hostname;
-}
-
-/** Inverse of {@link stripIpv6Brackets}, for the one place brackets are required: composing a
- * URL/authority STRING. `http://::1:8080` is not a parseable URL; `http://[::1]:8080` is. */
-function bracketIpv6(host: string): string {
-  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-}
-
-/** Coerce an ALREADY-READ raw `port` value to a number; `undefined` when it names no port.
- * Reads nothing — the caller performed the single read. */
-function coercePort(raw: unknown): number | undefined {
-  if (typeof raw === "number") return raw;
-  if (typeof raw === "string" && raw !== "") {
-    const n = Number(raw);
-    if (Number.isFinite(n)) return n;
-  }
-  return undefined;
 }
 
 /**
@@ -395,41 +377,6 @@ function resolveTlsCall(args: unknown[]): ResolvedCall {
   }
   if (ipc) return { host: IPC_HOST, port: 0, args: out };
   return { host: host ?? "localhost", port: port ?? 443, args: out };
-}
-
-/**
- * Fields Node's own `urlToHttpOptions` (and http2's authority parsing) derive from a URL,
- * captured with EACH property read exactly once. A caller-supplied `URL` instance can carry an
- * OWN shadowed accessor for any of these (e.g.
- * `Object.defineProperty(url, "port", { get(){ return firstCall ? granted : evil; } })`) that
- * legally returns a different value on a second read — reading twice (once to guard, once when
- * building what gets forwarded) is exactly the TOCTOU this closes (issue #26, URL-argument
- * follow-up). Every consumer below builds its guarded target AND its forwarded args from this
- * ONE snapshot; the URL itself is never consulted again.
- */
-interface UrlSnapshot {
-  protocol: string;
-  hostname: string;
-  port: string;
-  pathname: string;
-  search: string;
-  hash: string;
-  href: string;
-  username: string;
-  password: string;
-}
-function snapshotUrl(u: URL): UrlSnapshot {
-  return {
-    protocol: u.protocol,
-    hostname: u.hostname,
-    port: u.port, // read once — reused for both the "has a port" check and Number(...) below
-    pathname: u.pathname,
-    search: u.search,
-    hash: u.hash,
-    href: u.href,
-    username: u.username,
-    password: u.password,
-  };
 }
 
 /**
@@ -791,6 +738,17 @@ function wrapHttpModule<T extends object>(real: T, ctx: ShimContext, defaultPort
   // line, under a deny-all enforce policy, from any dependency. Guard the exposed instance;
   // never the process-global one it wraps (see `guardedInstanceMethods` for why a Proxy, and
   // why patching the real agent is off the table).
+  // ISSUE #80 — Node ≥22 re-exports the GLOBAL `WebSocket` class onto the `http` namespace, and
+  // the copy loop above duplicates it through unguarded. While `globalThis.WebSocket` was itself
+  // un-mediated, shimming this copy bought nothing (the global was right there). Now that the
+  // global IS guarded, `require("http").WebSocket` is the remaining one-liner, so it gets the
+  // same guarded subclass — built through the shared factory so repeated shim builds do not mint
+  // new classes. Absent on Node 20 (and on 22 without `--experimental-websocket`), hence the
+  // presence check.
+  const realWebSocket = realRecord["WebSocket"];
+  if (typeof realWebSocket === "function") {
+    shim["WebSocket"] = guardedWebSocketClass(ctx, realWebSocket as AnyCtor);
+  }
   const realGlobalAgent = realRecord["globalAgent"];
   if (typeof realGlobalAgent === "object" && realGlobalAgent !== null) {
     shim["globalAgent"] = guardedInstanceMethods(

@@ -13,6 +13,11 @@
  *   CAPWALL_TRACE_FILE    where to append the JSONL decision trace (optional)
  *   CAPWALL_PROJECT_ROOT  project root for attribution/glob resolution (default: cwd)
  *   CAPWALL_ESM           "0" disables the ESM loader hook (default: on)
+ *   CAPWALL_GLOBAL_EGRESS "0" disables the global egress guard — globalThis.fetch/WebSocket/
+ *                         EventSource (default: on, issue #80). Those are globals, not module
+ *                         exports, so they are the one surface capwall reaches by writing to
+ *                         globalThis; the switch exists for a process where that write is
+ *                         unacceptable.
  *   CAPWALL_MAX_FRAMES    attribution stack-walk frame budget (default: 25, see issue #15)
  *   CAPWALL_HARDENED      "1" enables hardened mode — freeze the shims so a dependency
  *                         cannot monkey-patch away mediation (default: off; BREAKS
@@ -133,6 +138,9 @@ if (active) {
     // disable (leaves the CJS `require` path unaffected). The preload is loaded via --import,
     // which runs before the target's entry point, so the ESM hook is registered in time.
     esm: process.env["CAPWALL_ESM"] !== "0",
+    // Mediate globalThis.fetch / WebSocket / EventSource (#80), on by default — they are the
+    // cheapest exfiltration primitive in modern Node and nothing else in capwall sees them.
+    globalEgress: process.env["CAPWALL_GLOBAL_EGRESS"] !== "0",
     // Opt-in hardened mode (#17): freeze the shims. Off unless CAPWALL_HARDENED is exactly
     // "1" — it is a breaking change for graceful-fs-style patchers, so it never defaults on.
     hardened: process.env["CAPWALL_HARDENED"] === "1",
