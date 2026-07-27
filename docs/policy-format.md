@@ -91,7 +91,8 @@ Every field is optional; an omitted capability means **not granted**.
   "child_process": false,     // boolean gate: may this package spawn subprocesses?
   "worker_threads": false,    // boolean gate: may this package start worker threads?
   "env": ["<KEY>", "<KEY>", ...],   // allowlist of process.env keys it may read
-  "vm": false                 // boolean gate: may this package use node:vm?
+  "vm": false,                // boolean gate: may this package use node:vm?
+  "native": false             // boolean gate: may this package load a .node addon?
 }
 ```
 
@@ -146,6 +147,104 @@ Path globs, resolved relative to the project root. Grants are additive.
 These are **gates**, not confinement (see threat-model § gating vs confinement): `true`
 allows the package to spawn/spin-up/eval; capwall does **not** confine what the resulting
 subprocess, worker, or vm context then does.
+
+### `native` — native (`.node`) addon load gate
+
+```jsonc
+"native": true    // may this package load compiled code into the process?
+```
+
+A boolean gate on a **load-time decision**: may this package `dlopen` a native addon at all.
+It is the highest-consequence grant in the format, because a native addon is not one more
+capability — it is the capability that makes the others moot. Compiled code in the process has
+raw libc: it opens files, opens sockets and reads the environment without touching a single
+shimmed JS builtin. Granting `native` to a package means every other limit in its entry stops
+being a limit *for that package*.
+
+**capwall gates the load; it does not confine the addon.** There is no sandbox here and none
+is planned — see [`threat-model.md`](threat-model.md) § Native `.node` addons.
+
+#### Why a boolean and not a path list
+
+`fs` grants name paths, so the obvious question is why `native` does not. Because an addon's
+path is a build artifact, not a property of the package:
+
+| how it was built | where the `.node` lives |
+|---|---|
+| compiled locally by `node-gyp` | `build/Release/<name>.node` |
+| prebuilt, `node-gyp-build`/`prebuildify` | `prebuilds/<platform>-<arch>/<name>.node`, sometimes ABI-suffixed (`node.abi115.node`) |
+| `node-pre-gyp` | `lib/binding/<napi_vN>-<platform>-<arch>/<name>.node` |
+
+An `observe` run on a linux/x64 laptop records exactly one of those. On a maintainer's arm64
+mac, or after a Node major bump changes the ABI tag, the recorded path does not exist and the
+grant does not match — a policy that only enforces on the machine that generated it. That is
+the same non-reproducibility that made concrete `net.ports` useless for ephemeral ports
+(issue #27) and host-specific `env` keys useless across machines (issue #57), and the fix
+there was a wildcard. A path list here would be a list of `"*"`s.
+
+It would also buy no containment even if it did reproduce: a package that ships
+`build/Release/a.node` can ship `b.node` in the same release. Constraining *which* file inside
+a package may load only constrains a party that was never adversarial. The question worth
+answering — and the only one a load-time gate can answer — is whether this package may bring
+compiled code into the process at all.
+
+The addon path is still **recorded**: `capwall observe` logs it, the trace carries it, and
+`capwall diff` prints it (`native ./node_modules/foo/build/Release/foo.node`). You see which
+addon loaded; you decide at package granularity.
+
+#### Two packages are charged for one load
+
+Almost no native package `require`s its own `.node` directly. They go through a shared
+resolver — `bindings`, `node-gyp-build`, `@mapbox/node-pre-gyp` — and the first two call
+`require` from *their own* source file. Under capwall's usual nearest-frame attribution the
+load would be charged to the resolver, so an `observe` run would emit
+`"node-gyp-build": { "native": true }`: one grant that every native package in the tree then
+loads through, handed to you by the tool.
+
+So a `.node` load is charged to **both** the caller (nearest package frame) and the addon's
+**owner** — the principal the `.node` file itself belongs to:
+
+| where the addon file is | owner |
+|---|---|
+| under `node_modules/<pkg>/…` | `<pkg>` |
+| under the project root, outside `node_modules` (e.g. `./build/Release/`) | `<app>` — the project's own build output |
+| anywhere else (a temp dir, a cache dir, a downloaded payload) | `<unknown>` — deny-by-default like any other principal |
+
+That third row matters: charging a `.node` written to a temp dir to `<app>` would hand it the
+trust root's grants, which is the same fail-open issue #60 closed for the stack walk. A stray
+addon is `<unknown>`, so granting `<app>` does not cover it.
+
+Both subjects must be granted or the load is denied. In the common case they are the same package and
+there is one grant; where a resolver is involved you will see two, and `observe` emits both,
+so the round-trip still needs no hand editing:
+
+```jsonc
+"packages": {
+  "node-gyp-build": { "native": true },   // the resolver may perform loads
+  "better-sqlite3": { "native": true }    // ...and this package's addon may be loaded
+}
+```
+
+Read the resolver's grant as "this helper is allowed to be a native loader" — on its own it
+unlocks nothing, because the owner still has to be granted separately.
+
+#### A denied load throws
+
+Unlike a denied `env` read (a soft deny returning `undefined`), a denied `.node` load throws
+`CapabilityError` synchronously, matching the other boolean gates and matching real Node,
+which also throws synchronously when `dlopen` fails. The resolver wrappers `require` inside a
+`try`/`catch`, so they see a denial as "this candidate did not load" and move on to the next
+one — but a package with no fallback will fail to initialize, and that usually means the app
+crashes at startup. That is the intended failure mode: handing back an addon-less module
+object would turn a policy gap into a mysterious error far from its cause. Run `observe` until
+coverage is stable before flipping to `enforce`.
+
+**Upgrading an existing policy.** `native` is deny-by-default like every other capability, and
+a `capabilities.json` generated before it existed contains no `native` entries — so a tree with
+native dependencies (`bcrypt`, `better-sqlite3`, `sharp`, `esbuild`…) that enforced cleanly
+before will start failing at startup. Re-run `capwall observe`, or `capwall diff`, to see which
+packages need the grant before flipping back to `enforce`. This is the same upgrade step every
+new capability has required (compare the `env` shim landing in M4 — issue #57).
 
 ### `env` — environment-variable read allowlist
 
@@ -242,7 +341,8 @@ indistinguishable from a careless one.
     "child_process": false,
     "worker_threads": false,
     "env": [],
-    "vm": false
+    "vm": false,
+    "native": false
   },
   "packages": {
     "express": {

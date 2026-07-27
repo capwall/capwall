@@ -77,7 +77,8 @@ lands; capwall assumes one got through and *contains what it can do at runtime*.
    call-stack / module path.
 2. **Declarative per-package capability policy** — `capabilities.json` mapping each package
    to allowed `fs` (read/write path globs), `net` (hosts/ports), `child_process`,
-   `worker_threads`, `env` (key allowlist), `vm`. Compact, a handful of entries per dep.
+   `worker_threads`, `env` (key allowlist), `vm`, `native` (may it load a `.node` addon —
+   a load-time gate, never confinement). Compact, a handful of entries per dep.
 3. **Two modes: `observe` and `enforce`** — observe logs violations without blocking (the
    on-ramp); enforce denies-by-default and throws.
 4. **Auto-policy generation from a trace run** — `capwall observe` runs the target's
@@ -86,9 +87,10 @@ lands; capwall assumes one got through and *contains what it can do at runtime*.
 5. **Capability shims for the core surface** — `node:fs`, `node:net`/`node:http(s)`,
    `node:child_process`, `node:worker_threads`, `process.env`, `node:vm`.
 
-**Stretch (post-MVP, not yet built):** SBOM/CBOM import (CycloneDX → policy,
-NodeShield-compatible) in `packages/sbom-import`; full ESM parity; native-addon
-attribution; a CI observed-vs-declared diff report.
+**Stretch (post-MVP):** SBOM/CBOM import (CycloneDX → policy, NodeShield-compatible) in
+`packages/sbom-import`; native-addon (`.node`) load attribution and gating; a CI
+observed-vs-declared diff report (`capwall diff`); full ESM parity. See
+[`docs/roadmap.md`](./docs/roadmap.md) for status.
 
 ---
 

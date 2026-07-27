@@ -52,6 +52,11 @@ function describeRequest(req: CapabilityRequest): string {
       return "worker_threads";
     case "vm":
       return "vm";
+    // The path is informational only (the grant is a boolean), but drift is far more
+    // actionable with it: "some dep started loading native code" is a very different report
+    // from "dep X loaded ./node_modules/X/build/Release/X.node".
+    case "native":
+      return `native ${req.path}`;
   }
 }
 

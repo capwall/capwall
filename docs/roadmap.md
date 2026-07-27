@@ -51,6 +51,12 @@ Get the full **observe → policy → enforce** loop working end-to-end on **one
 
 ### S2 — native-addon attribution
 - Attribute (and gate) `.node` addon loads. Confinement remains a non-goal.
+- Implemented as a `process.dlopen` patch (`core/src/loader/native.ts`) — the one JS-reachable
+  chokepoint every addon load passes through, including a direct `process.dlopen` call and the
+  `bindings`/`node-gyp-build`/`node-pre-gyp` resolver chains. The `native` grant is a boolean,
+  not a path list, because addon paths are platform/arch/ABI build artifacts (see
+  `docs/policy-format.md` § `native`). A load is charged to both the caller and the addon's
+  owning package, so a shared resolver's grant is not a tree-wide skeleton key.
 
 ### S3 — CI observed-vs-declared diff
 - A CI action that runs observe and diffs against the committed policy, flagging new
@@ -70,6 +76,6 @@ Get the full **observe → policy → enforce** loop working end-to-end on **one
 | M4 | all core shims | net/cp/worker/env/vm enforced | ✅ done |
 | M5 | ESM parity | ESM path reaches CJS parity | ✅ done |
 | S1 | SBOM/CBOM import | @capwall/sbom-import | ✅ done |
-| S2 | native-addon attribution | `.node` loads attributed + gated | ⬜ [#49](https://github.com/williamzujkowski/capwall/issues/49) |
+| S2 | native-addon attribution | `.node` loads attributed + gated | ✅ done |
 | S3 | CI observed-vs-declared diff | `capwall diff` flags drift | ✅ done |
 | S4 | perf benchmark | pnpm bench, <1ms/req validated | ✅ done |

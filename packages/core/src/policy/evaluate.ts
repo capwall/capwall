@@ -21,7 +21,15 @@ export type CapabilityRequest =
   | { kind: "child_process" }
   | { kind: "worker_threads" }
   | { kind: "env"; key: string }
-  | { kind: "vm" };
+  | { kind: "vm" }
+  /**
+   * A native (`.node`) addon load (roadmap S2, issue #49). `path` is the addon file as
+   * resolved at load time; it is carried for OBSERVABILITY ONLY — logs, the observe trace,
+   * `capwall diff` — and is deliberately NOT consulted by {@link isGranted}, because the
+   * grant is a boolean. See `PackagePolicy.native` for why a path-shaped grant would be
+   * non-reproducible across platform/arch/ABI.
+   */
+  | { kind: "native"; path: string };
 
 /** The outcome of evaluating a request. `reason` is human-readable for `explain`/logs. */
 export interface Decision {
@@ -94,6 +102,11 @@ export function isGranted(grant: PackagePolicy, req: CapabilityRequest): boolean
       return own(grant, "worker_threads") === true;
     case "vm":
       return own(grant, "vm") === true;
+    // `req.path` is intentionally ignored: the grant is a boolean gate on "may this package
+    // bring compiled code into the process", not an allowlist of addon files. Matching the
+    // path would make every generated policy machine-specific (see PackagePolicy.native).
+    case "native":
+      return own(grant, "native") === true;
     case "env":
       return (own(grant, "env") ?? []).some((k) => k === "*" || k === req.key);
     case "fs": {
@@ -126,6 +139,8 @@ function describe(req: CapabilityRequest): string {
       return `net ${req.host}:${req.port}`;
     case "env":
       return `env:${req.key}`;
+    case "native":
+      return `native ${req.path}`;
     default:
       return req.kind;
   }

@@ -47,6 +47,7 @@ array as a lightweight capability bill-of-materials (CBOM):
 | `capwall:child_process`    | `"true"` / `"false"`                    | `child_process`   |
 | `capwall:worker_threads`   | `"true"` / `"false"`                    | `worker_threads`  |
 | `capwall:vm`                | `"true"` / `"false"`                   | `vm`              |
+| `capwall:native`            | `"true"` / `"false"`                   | `native`          |
 | `capwall:env`               | comma-separated env key names, or `*`  | `env`             |
 
 A property name may repeat (values from repeated properties concatenate); a single value

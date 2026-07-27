@@ -62,6 +62,10 @@
         "vm": {
           "type": "boolean",
           "description": "Gate: may this package use node:vm?"
+        },
+        "native": {
+          "type": "boolean",
+          "description": "Gate: may this package load a native (.node) addon? Boolean, not a path list, because addon paths are platform/arch/ABI-specific build artifacts and would not reproduce across machines. Gating only — once an addon loads, capwall cannot confine it."
         }
       }
     }

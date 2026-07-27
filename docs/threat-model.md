@@ -14,7 +14,9 @@ in-process attacker.
 
 As of roadmap **M5**, all core capability surfaces are mediated on **both the CJS `require`
 path and the ESM `import` path**: `fs`, `net`/`http`/`https`/`tls`/`http2`/`dgram`,
-`child_process`, `worker_threads`, `vm`, and `process.env`. ESM interception uses a
+`child_process`, `worker_threads`, `vm`, and `process.env`. Roadmap **S2** adds `native`, a
+load-time gate on `.node` addons that is module-system-independent (it patches
+`process.dlopen`, not a loader). ESM interception uses a
 `module.register()` loader hook (`loader/esm-hook.ts` + `esm-hooks.ts` + `esm-runtime.ts`)
 that rewrites mediated builtin specifiers to a synthetic module re-exporting the same shims
 the CJS path uses; it covers **static AND dynamic** `import` (`import { readFile } from
@@ -189,6 +191,11 @@ Per-capability notes:
   `worker_threads.Worker`, `vm.Script`, and (only when `--experimental-vm-modules` makes them
   exist) `vm.SourceTextModule`/`vm.SyntheticModule` — are guarded subclasses, so the class is
   gated as well as the module function.
+- **`native` (`.node` addons)** — a **load-time gate, not a runtime sandbox** (roadmap S2,
+  issue #49). capwall decides whether a package may load a native addon at all; it does not,
+  and will not, confine what that addon does once loaded. Read the whole of § Native `.node`
+  addons below before granting it — of every capability in the format, this is the one whose
+  limits matter most.
 - **`process.env`** — a read allowlist enforced via a `Proxy` on `process.env` (`get` **and**
   `getOwnPropertyDescriptor` traps, so `Object.getOwnPropertyDescriptor(process.env, k).value`
   cannot leak a value a direct read denies). Reads attributed to `<app>` pass through ungated
@@ -414,6 +421,8 @@ When a package's declared capabilities are tight, capwall denies (in `enforce` m
 - Read `process.env` keys outside its allowlist (e.g. exfiltrating `AWS_SECRET_ACCESS_KEY`
   from a package with no reason to see it).
 - Use `vm` when not permitted.
+- Load a native `.node` addon when not permitted (**gating** the load only — read
+  § Native `.node` addons before granting it).
 
 The **trace→policy DX** makes those policies practical to author: run once in `observe`,
 emit a starter policy scoped to what each package *actually* did, tighten it, enforce.
@@ -506,8 +515,8 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
   a dependency can deliberately deepen its own stack past whatever budget is configured, which
   now costs it its grants rather than gaining it the app's. Raising the budget costs throughput
   on every mediated call (issue #15).
-- **Native `.node` addons** — arbitrary compiled code; capwall can gate *whether* an addon
-  loads but cannot confine what it does once loaded.
+- **Native `.node` addons** — arbitrary compiled code. Since S2 (#49) capwall **gates the
+  load**; it does not confine the addon. Full treatment in § Native `.node` addons below.
 - **Subprocess internals** — capwall can gate *whether* a `child_process` spawn happens, but
   once a child process runs it is outside capwall's process and outside its confinement.
 
@@ -597,6 +606,86 @@ other legitimate `fs` monkey-patcher. Enabling hardened mode is a deliberate tra
 `graceful-fs`-class compatibility — the no-SES-tax property that is capwall's whole adoption
 argument — and gain the closure of the reassignment escape only. Try it in `observe` mode
 first; a load-time `TypeError` from a patcher is what failure looks like.
+
+## Native `.node` addons
+
+**What the gate does: a load-time decision. What it does not do: any confinement
+whatsoever.** Those are the terms, and they are not softened anywhere in this project.
+
+capwall attributes every native-addon load and evaluates it against the `native` capability
+(deny-by-default in `enforce`, recorded in `observe`). The answer it produces is exactly one
+bit: *may this package bring compiled code into this process*. Once the answer is yes and
+`dlopen` returns, capwall's view ends. The addon runs with the process's full ambient
+authority — it calls `open(2)`, `connect(2)` and reads `environ` directly, never touching a
+shimmed JS builtin — and none of that is visible to capwall, let alone controllable by it.
+This is the deliberate scope, not a gap awaiting a fix: confining native code would require a
+different mechanism entirely (an OS sandbox — seccomp, a container, a jail), which is a layer
+below capwall and is where that job belongs.
+
+So: **a granted addon is an unconditional grant of everything.** A package with
+`"native": true` and `"net": { "hosts": [] }` is not a package that cannot reach the network.
+It is a package whose *JavaScript* cannot reach the network, and which you have separately
+allowed to load code that can. Grant `native` the way you would decide to trust a package
+completely, because that is what it is.
+
+The value the gate does provide is real but narrow, and worth stating precisely:
+
+- **You know.** A `.node` load was previously invisible — unattributed and ungated. It now
+  appears in the observe log, in the trace, and in `capwall diff`, named to a package and a
+  file. A dependency that *starts* shipping or downloading an addon is drift you will see.
+- **You decide.** Deny-by-default means a package that had no native code when you reviewed
+  it cannot silently acquire some in a later version and have it load. That is the
+  supply-chain shape capwall exists for: the compromised update, not the addon that was
+  always there.
+
+### Coverage
+
+The gate is a patch on `process.dlopen`, which is the single JS-reachable chokepoint every
+addon load passes through: `Module._extensions[".node"]`'s entire body is
+`return process.dlopen(module, path.toNamespacedPath(filename))` (verified against Node 20.20,
+22.22 and 24.18). Consequently it covers `require("./build/Release/foo.node")`, a **direct**
+`process.dlopen(...)` call that bypasses the module system entirely, and the resolver wrappers
+real native packages use — `bindings` and `node-gyp-build` both end at a plain `require()` of
+the `.node` file, and `@mapbox/node-pre-gyp` only resolves a path that the consuming package
+then requires. Gating the literal `require` specifier alone would have left the direct `dlopen`
+call open and made the gate decorative.
+
+Being a `process.dlopen` patch rather than a loader hook also makes it module-system-independent
+for free: it is on whether or not the ESM hook is registered, and it does not care that Node
+itself refuses `import("./foo.node")` outright (`ERR_UNKNOWN_FILE_EXTENSION` — the only route
+from ESM is `createRequire`, which lands back in the CJS `.node` extension handler and so back
+here).
+
+Because those resolvers call `require` from their own source file, the nearest stack frame is
+the resolver, not the package whose addon is loading. A `.node` load is therefore charged to
+**both** the caller and the principal the addon file belongs to — the owning package, `<app>`
+for the project's own build output, `<unknown>` for a file under neither — and both must be
+granted. See `docs/policy-format.md` § `native` for what that means for a policy. Without the
+caller subject, an `observe` run would hand you `"node-gyp-build": { "native": true }`, a
+single grant unlocking native loads tree-wide; without the `<unknown>` case, a `.node` written
+to a temp dir and dlopened would be charged to `<app>` and ride on the trust root's grants —
+the same fail-open #60 closed for the stack walk, arriving by a different route.
+
+### Known non-coverage, stated rather than implied
+
+- A **`worker_threads.Worker`** is a fresh Node context with its own `process` object, so the
+  patch does not exist inside it. Workers are gated separately by `worker_threads`; a package
+  granted that gate can load an addon inside a worker un-gated.
+- A dependency that captured `process.dlopen` **before capwall installed** keeps an un-gated
+  reference — the same pre-install-capture residual as every shim. Install via the `--import`
+  preload.
+- `process.dlopen` is a writable property of `process`, so **un-patching it** is as cheap as
+  un-patching any other shim, and the same caveat applies: capwall does not claim to stop
+  in-process code that goes looking for the raw primitive.
+- Node's experimental `require.addon()` is a C++-side loader that may not route through
+  `process.dlopen`. It is absent on Node 20.20, 22.22 and 24.18 as shipped, and
+  `node-gyp-build` prefers it when present (`typeof runtimeRequire.addon === "function"`) —
+  so it is a live upgrade risk, not a hypothetical. Recheck this hook when it stabilizes.
+- An addon already loaded into the process **before** capwall installed is not unloaded and
+  not re-gated. The gate is about loads, and only about loads that happen after it is on.
+- **Hardened mode (#17) does not help here.** It freezes shim objects; `process.dlopen` is a
+  property of `process`, which capwall does not freeze (freezing `process` would break far more
+  than it protects). Hardening and this gate are independent controls.
 
 ## Comparison to other threat models
 

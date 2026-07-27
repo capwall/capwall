@@ -11,8 +11,8 @@ import { parseCycloneDx, sbomToPolicy } from "../src/index.js";
  * A minimal CycloneDX SBOM with three components:
  *  - "express": annotated with capwall:* CBOM properties (fs, net, env) — should seed grants.
  *  - "left-pad": no properties at all — should get an empty grant `{}`.
- *  - "pino": annotated with only a boolean gate + duplicate/repeated fs:read properties,
- *    to exercise accumulation across repeated property names.
+ *  - "pino": annotated with boolean gates (including the native-addon gate, #49) + duplicate/
+ *    repeated fs:read properties, to exercise accumulation across repeated property names.
  */
 const fixtureSbom = {
   bomFormat: "CycloneDX",
@@ -46,6 +46,8 @@ const fixtureSbom = {
         { name: "capwall:fs:write", value: "./logs/**" },
         { name: "capwall:fs:read", value: "./config/pino.json" },
         { name: "capwall:child_process", value: "false" },
+        // The native-addon load gate (#49) — boolean, like the other gates.
+        { name: "capwall:native", value: "true" },
       ],
     },
   ],
@@ -77,6 +79,7 @@ describe("parseCycloneDx", () => {
     expect(pino?.grant).toEqual({
       fs: { read: ["./config/pino.json"], write: ["./logs/**"] },
       child_process: false,
+      native: true,
     });
   });
 
@@ -147,6 +150,7 @@ describe("sbomToPolicy", () => {
     expect(policy.packages["left-pad"]).toEqual({});
     expect(policy.packages["express"]?.net?.hosts).toEqual(["*"]);
     expect(policy.packages["pino"]?.child_process).toBe(false);
+    expect(policy.packages["pino"]?.native).toBe(true);
   });
 
   it("respects an explicit mode option", () => {

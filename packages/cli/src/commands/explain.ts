@@ -12,12 +12,17 @@ const HELP = `usage: capwall explain [--policy <file>] <package> <capability> [t
 
 Capabilities and their targets:
   fs:read <path> | fs:write <path> | net <host:port> | env <KEY>
-  child_process | worker_threads | vm
+  child_process | worker_threads | vm | native [addon-path]
+
+  'native' gates whether the package may load a .node addon at all. Its optional
+  [addon-path] target is echoed in the answer for readability only — the grant is a
+  boolean, so the path does not change the verdict (see docs/policy-format.md).
 
 Examples:
   capwall explain pino fs:write ./logs/app.log
   capwall explain express net localhost:3000
   capwall explain sneaky-dep env AWS_SECRET_ACCESS_KEY
+  capwall explain better-sqlite3 native
 `;
 
 function buildRequest(
@@ -50,6 +55,11 @@ function buildRequest(
       return { kind: "worker_threads" };
     case "vm":
       return { kind: "vm" };
+    case "native":
+      // Target optional and NOT resolved against the project root: it is a display string,
+      // not a matched target (isGranted ignores it). `<any addon>` keeps the printed reason
+      // honest about that when the caller omits it.
+      return { kind: "native", path: target ?? "<any addon>" };
     default:
       return `unknown capability '${capability}' (see capwall explain --help)`;
   }
