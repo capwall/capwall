@@ -12,6 +12,7 @@ import { registerNetShim } from "./net.js";
 import { registerChildProcessShim } from "./child_process.js";
 import { registerWorkerThreadsShim } from "./worker_threads.js";
 import { registerVmShim } from "./vm.js";
+import { registerModuleShim } from "./module.js";
 import type { ShimContext, ShimRegistry } from "./runtime.js";
 
 export function buildShimRegistry(ctx: ShimContext): ShimRegistry {
@@ -21,6 +22,10 @@ export function buildShimRegistry(ctx: ShimContext): ShimRegistry {
   registerChildProcessShim(reg, ctx);
   registerWorkerThreadsShim(reg, ctx);
   registerVmShim(reg, ctx);
+  // `node:module` is not a capability in the policy sense — it is mediated so that a
+  // dependency cannot register a loader hook AHEAD of capwall's and un-mediate the ESM
+  // import path process-wide (#61). See shims/module.ts for the full reasoning.
+  registerModuleShim(reg, ctx);
   // Note: the process.env read shim is NOT a require()-routed module — it is installed
   // separately via installEnvGuard() in index.ts install().
   return reg;

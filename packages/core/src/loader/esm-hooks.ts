@@ -41,6 +41,8 @@ interface InitData {
 
 let bridgeUrl = "";
 let exportsBySpecifier: Record<string, string[]> = {};
+/** Specifiers already warned about in `load`'s re-mediation path — one line each, not per import. */
+const reMediationWarned = new Set<string>();
 
 export async function initialize(data: InitData): Promise<void> {
   bridgeUrl = data.bridgeUrl;
@@ -150,12 +152,41 @@ export async function load(
     // us (Node runs the most recently registered hook first, and the synchronous
     // `registerHooks` chain runs entirely before the asynchronous `register` chain). Rather
     // than hand back the raw builtin, re-mediate: serve the same shim-backed synthetic source
-    // we would have served had our `resolve` seen it. Verified to hold against a hostile
-    // resolve short-circuit registered via BOTH `module.register()` and
-    // `module.registerHooks()` — the load chain still descends to us in both cases.
-    // Residual: a hostile hook that short-circuits `load` as well never lets us run (#61).
+    // we would have served had our `resolve` seen it. This holds against a hostile resolve
+    // short-circuit registered via BOTH `module.register()` and `module.registerHooks()` — the
+    // load chain still descends to us in both cases, even though the synchronous resolve chain
+    // runs first.
+    //
+    // HOW FAR THIS ACTUALLY REACHES TODAY (measured, not assumed). A `node:` URL already
+    // resident in the ESM module cache is served from cache and the load chain is never
+    // consulted, and capwall's own shims capture their real modules with static ESM
+    // `import realFs from "node:fs"` — so every mediated builtin is already cached raw by the
+    // time the hook registers. That makes this branch a LATENT backstop for the mediated set
+    // as shipped, not an active one; it fires for any mediated specifier capwall does not
+    // itself import, and for whatever resolution route a future Node adds. Capturing the real
+    // modules through `createRequire()` instead would make it fire for the whole set — a CJS
+    // require does NOT populate the ESM cache (verified) — but that touches every shim's
+    // bootstrap and is tracked as follow-up work rather than smuggled in here. The gate that
+    // actually stops #61's PoC is `shims/module.ts`. See docs/threat-model.md.
+    //
+    // Residual either way: a hostile hook that short-circuits `load` as well never lets us run.
     const mediated = mediatedSpecifierForUrl(url);
-    if (mediated !== null) return synthesize(mediated);
+    if (mediated !== null) {
+      // Loud, because reaching here is never normal: in a clean run capwall's own `resolve`
+      // has already rewritten every mediated specifier, so `load` sees only `capwall-esm:`
+      // URLs. This is capwall's only in-band signal that something else is ahead of it in the
+      // hook chain — the situation the shim gate in shims/module.ts exists to prevent, which a
+      // hook registered before capwall (or reached via `process.getBuiltinModule`) can still
+      // create. Once per specifier so a hot import loop cannot spam the log.
+      if (!reMediationWarned.has(mediated)) {
+        reMediationWarned.add(mediated);
+        process.stderr.write(
+          `[capwall] WARN another module-customization hook resolved '${mediated}' straight to the raw builtin; ` +
+            `capwall re-mediated it at load time, but it is no longer first in the hook chain\n`,
+        );
+      }
+      return synthesize(mediated);
+    }
     return nextLoad(url, context);
   }
 

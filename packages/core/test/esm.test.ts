@@ -19,6 +19,8 @@ const APP = path.join(here, "fixtures", "esm", "app.mjs");
 const APP_DIR = path.dirname(APP);
 /** #59 regression entry: a dep that reaches builtins via its own subpath-imports map. */
 const LAUNDER_APP = path.join(APP_DIR, "launder-app.mjs");
+/** #61 regression entry: a dep that tries to register a loader hook ahead of capwall's. */
+const HOOKJACK_APP = path.join(APP_DIR, "hookjack-app.mjs");
 const PRELOAD = createRequire(import.meta.url).resolve("../dist/preload.js");
 
 interface RunResult {
@@ -136,5 +138,52 @@ describe("#59 — a specifier that RESOLVES to a mediated builtin is mediated, h
     expect(r.stdout).toContain("LAUNDER:bare-fs:RAW:esm launder data");
     expect(r.stderr).toMatch(/observe: recorded fs:read .* for 'esm-launder-dep'/);
     expect(r.stderr).toMatch(/observe: recorded child_process for 'esm-launder-dep'/);
+  });
+});
+
+describe("#61 — a dependency cannot register a loader hook ahead of capwall's", () => {
+  it("refuses module.registerHooks()/register() from a dependency in enforce", async () => {
+    const r = await runApp(
+      { CAPWALL_MODE: "enforce", CAPWALL_POLICY_FILE: denyPolicy },
+      HOOKJACK_APP,
+    );
+    // `registerHooks` is Node >=22.15; on an older runtime the API is simply absent, which is
+    // not a bypass. `register` (Node >=20.6) is always present, so it always asserts.
+    expect(r.stdout).toMatch(/HOOKJACK:registerHooks:(BLOCKED:esm-hookjack-dep|UNSUPPORTED)/);
+    expect(r.stdout).toContain("HOOKJACK:register:BLOCKED:esm-hookjack-dep");
+    expect(r.stderr).toMatch(/DENY 'esm-hookjack-dep' module\.register/);
+  });
+
+  it("keeps an innocent third package's node:fs import mediated", async () => {
+    // The point of the finding: hook-jacking de-mediates EVERY package, not just the
+    // attacker. esm-victim-dep is an ordinary package doing `import * as fs from "node:fs"`,
+    // imported only after the jacking attempt. Pre-fix it read its file through the raw
+    // builtin under a deny-all policy, with no capwall log line at all.
+    const r = await runApp(
+      { CAPWALL_MODE: "enforce", CAPWALL_POLICY_FILE: denyPolicy },
+      HOOKJACK_APP,
+    );
+    expect(r.stdout).toContain("HOOKJACK:victim:BLOCKED:esm-victim-dep");
+    expect(r.stdout).not.toContain("HOOKJACK:victim:RAW");
+  });
+
+  it("warns loudly instead of blocking in observe mode (observe never denies)", async () => {
+    const r = await runApp({ CAPWALL_MODE: "observe" }, HOOKJACK_APP);
+    expect(r.stdout).toContain("HOOKJACK:register:REGISTERED");
+    expect(r.stderr).toMatch(/WARN 'esm-hookjack-dep' called module\.register/);
+    expect(r.code).toBe(0);
+  });
+
+  it("CAPWALL_ALLOW_LOADER_HOOKS=1 permits it, still warning", async () => {
+    const r = await runApp(
+      {
+        CAPWALL_MODE: "enforce",
+        CAPWALL_POLICY_FILE: denyPolicy,
+        CAPWALL_ALLOW_LOADER_HOOKS: "1",
+      },
+      HOOKJACK_APP,
+    );
+    expect(r.stdout).toContain("HOOKJACK:register:REGISTERED");
+    expect(r.stderr).toMatch(/WARN 'esm-hookjack-dep' called module\.register.*CAPWALL_ALLOW_LOADER_HOOKS=1/);
   });
 });
