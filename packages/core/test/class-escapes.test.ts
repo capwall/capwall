@@ -41,7 +41,9 @@ import * as realNet from "node:net";
 import * as realTls from "node:tls";
 import * as realHttp from "node:http";
 import * as realHttps from "node:https";
+import * as realHttp2 from "node:http2";
 import * as realDgram from "node:dgram";
+import * as realModule from "node:module";
 import * as realVm from "node:vm";
 import * as realChildProcess from "node:child_process";
 import * as realWorkerThreads from "node:worker_threads";
@@ -68,6 +70,7 @@ interface FixtureDep {
   spawnViaChildProcessPrototypeConstructorEscape(): unknown;
   connectViaHttpGlobalAgent(host: string, port: number): void;
   connectViaHttpsGlobalAgent(host: string, port: number): void;
+  tamperWithGlobalAgent(): Record<string, { ok: boolean; value?: unknown; error?: string }>;
   readViaStreamClass(): Promise<string>;
   writeViaStreamClass(target: string): Promise<boolean>;
   readViaOwnReadStreamSubclass(target: string): Promise<string>;
@@ -392,6 +395,97 @@ describe("#65 — pre-built capability-bearing INSTANCES are guarded, not copied
   });
 });
 
+/**
+ * ISSUE #88 — the same guarded view, one operation over: #65 gave it a `get` trap and nothing
+ * else, so `set`/`defineProperty`/`deleteProperty`/`preventExtensions` took their DEFAULT
+ * behaviour and forwarded to the Proxy's target — the real, process-global `Agent`. A dependency
+ * could therefore mutate a process-global through capwall's own guarded view, `uninstall()` could
+ * not take it back, and `Object.freeze(http.globalAgent)` broke the HTTP client for the whole
+ * process. The guard itself always held (the `get` trap re-wraps whatever the underlying method
+ * currently is), so this is a broken design invariant and a capwall-introduced DoS lever rather
+ * than an escalation — which is exactly why it belongs next to #64/#65: the same reasoning that
+ * moved the guarded CLASSES off Proxies had not been applied at the instance site.
+ *
+ * The mechanism-level assertions live in `test/net.test.ts`; this is the end-to-end half, run
+ * from a real dependency through the loader, plus the part only an install/uninstall cycle can
+ * show — that nothing survives teardown.
+ */
+describe("#88 — a dependency cannot mutate the process-global agent through the guarded view", () => {
+  interface Attempt {
+    ok: boolean;
+    value?: unknown;
+    error?: string;
+  }
+
+  /** Every own-property fact about the real agent that a forwarded operation would change. */
+  const snapshotRealAgent = (): Record<string, unknown> => ({
+    ownKeys: Reflect.ownKeys(realHttp.globalAgent).map(String).sort().join(","),
+    ownCreateConnection: Object.getOwnPropertyDescriptor(realHttp.globalAgent, "createConnection"),
+    createConnection: (realHttp.globalAgent as unknown as Record<string, unknown>)["createConnection"],
+    frozen: Object.isFrozen(realHttp.globalAgent),
+    extensible: Object.isExtensible(realHttp.globalAgent),
+    prototype: Object.getPrototypeOf(realHttp.globalAgent),
+  });
+
+  it("the PoC's write/defineProperty/delete/freeze leave the real agent untouched, before AND after uninstall()", () => {
+    const before = snapshotRealAgent();
+    const originalMaxSockets = (realHttp.globalAgent as unknown as Record<string, unknown>)["maxSockets"];
+    let report: Record<string, Attempt>;
+    try {
+      report = withCapwall(denyAll(), "enforce", (dep) => dep.tamperWithGlobalAgent());
+
+      // The write is accepted into capwall's per-view shadow (ordinary JS semantics for the
+      // object the dependency was handed) — and goes no further.
+      expect(report["write"]).toMatchObject({ ok: true, value: "function" });
+      // Structural operations are refused. In a CJS package's sloppy mode a refused `delete`
+      // returns false rather than throwing, while `Object.defineProperty`/`freeze`/
+      // `setPrototypeOf` throw whatever the mode.
+      expect(report["defineProperty"]).toMatchObject({ ok: false, error: "TypeError" });
+      expect(report["freeze"]).toMatchObject({ ok: false, error: "TypeError" });
+      expect(report["setProto"]).toMatchObject({ ok: false, error: "TypeError" });
+      expect(report["deleteState"]).toMatchObject({ ok: true, value: false });
+      // Deleting the guarded key drops only capwall's shadow; the real agent never had an own
+      // `createConnection`, so `true` is also what un-shimmed Node reports.
+      expect(report["deleteGuarded"]).toMatchObject({ ok: true, value: true });
+      // The ONE deliberate exception: live pool state is shared, so tuning still lands.
+      expect(report["tunePool"]).toMatchObject({ ok: true, value: 3 });
+      expect((realHttp.globalAgent as unknown as Record<string, unknown>)["maxSockets"]).toBe(3);
+    } finally {
+      (realHttp.globalAgent as unknown as Record<string, unknown>)["maxSockets"] = originalMaxSockets;
+    }
+
+    // `withCapwall` has already uninstalled by here — the point of the whole issue. Everything
+    // except the deliberate pool write is gone, because it never happened.
+    expect(snapshotRealAgent()).toEqual(before);
+    expect(Object.isFrozen(realHttp.globalAgent)).toBe(false);
+  });
+
+  it("the process's own HTTP client still works afterwards", async () => {
+    // The observable consequence of the old behaviour: after a dependency froze the view, every
+    // `http.request()` in the process — capwall-mediated or not — threw `Cannot assign to read
+    // only property 'totalSocketCount'`. This is the un-shimmed client, after the tampering.
+    withCapwall(denyAll(), "enforce", (dep) => dep.tamperWithGlobalAgent());
+    const srv = realHttp.createServer((_req, res) => res.end("ok"));
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+    const addr = srv.address();
+    const port = addr && typeof addr === "object" ? addr.port : 0;
+    try {
+      const body = await new Promise<string>((resolve, reject) => {
+        const req = realHttp.get(`http://127.0.0.1:${port}/`, (res) => {
+          let out = "";
+          res.setEncoding("utf8");
+          res.on("data", (c: string) => (out += c));
+          res.on("end", () => resolve(out));
+        });
+        req.on("error", reject);
+      });
+      expect(body).toBe("ok");
+    } finally {
+      await new Promise<void>((r) => srv.close(() => r()));
+    }
+  });
+});
+
 describe("#64 — ordinary (non-adversarial) shapes still work under a grant", () => {
   const grantFs = (): Policy =>
     loadPolicyFromObject(
@@ -452,5 +546,109 @@ describe("#64 — ordinary (non-adversarial) shapes still work under a grant", (
       // subclass and would make ANY real stream `instanceof Sub` — it must not.
       createdNotInstanceOfSub: true,
     });
+  });
+});
+
+/**
+ * ISSUE #96 — every guarded wrapper capwall builds restores the REAL function's `name` before
+ * handing it out, because a shim that renames the ecosystem's functions is a divergence nobody
+ * asked for and hardened mode FREEZES the wrapper, making a wrong name permanent. One site had
+ * drifted (`http2.connect`, whose guard is assigned through a computed member, which does not
+ * trigger JS name inference, so it reported `""`), and the audit that followed found a second
+ * (`dgram.createSocket`) and a third (the `dgram` socket `send`/`connect` guards, which reported
+ * `"guarded"` from `const guarded = function …`).
+ *
+ * It drifted precisely because nothing checked the set AS A WHOLE, so the test is a SWEEP rather
+ * than a list of the three: every function-valued export capwall replaces, in every shimmed
+ * namespace, compared against the real one. A new wrapper is covered the day it is added.
+ */
+const SHIM_NAMESPACES: ReadonlyArray<{ specifier: string; real: Record<string, unknown> }> = [
+  { specifier: "fs", real: realFs as unknown as Record<string, unknown> },
+  { specifier: "fs/promises", real: realFs.promises as unknown as Record<string, unknown> },
+  { specifier: "net", real: realNet as unknown as Record<string, unknown> },
+  { specifier: "tls", real: realTls as unknown as Record<string, unknown> },
+  { specifier: "http", real: realHttp as unknown as Record<string, unknown> },
+  { specifier: "https", real: realHttps as unknown as Record<string, unknown> },
+  { specifier: "http2", real: realHttp2 as unknown as Record<string, unknown> },
+  { specifier: "dgram", real: realDgram as unknown as Record<string, unknown> },
+  { specifier: "vm", real: realVm as unknown as Record<string, unknown> },
+  { specifier: "child_process", real: realChildProcess as unknown as Record<string, unknown> },
+  { specifier: "worker_threads", real: realWorkerThreads as unknown as Record<string, unknown> },
+  { specifier: "module", real: realModule as unknown as Record<string, unknown> },
+];
+
+describe("#96 — every guarded function reports the REAL function's name", () => {
+  it("name parity across every replaced export of every shim namespace", () => {
+    const reg = buildShimRegistry({
+      policy: denyAll(),
+      mode: "enforce",
+      onDecision: () => {},
+      projectRoot: here,
+    });
+    let checked = 0;
+    for (const { specifier, real } of SHIM_NAMESPACES) {
+      const shim = reg.get(specifier) as Record<string, unknown> | undefined;
+      expect(shim, `${specifier} shim is registered`).toBeDefined();
+      for (const key of Object.keys(shim!)) {
+        const shimValue = shim![key];
+        const realValue = real[key];
+        if (typeof shimValue !== "function" || typeof realValue !== "function") continue;
+        if (shimValue === realValue) continue; // copied through untouched — nothing to compare
+        expect(
+          (shimValue as { name: string }).name,
+          `${specifier}.${key} reports the real function's name`,
+        ).toBe((realValue as { name: string }).name);
+        checked++;
+      }
+    }
+    // A rename or a registry change must not make this pass vacuously. The count is the number
+    // of guarded wrappers + guarded classes across every shim — 128 on Node 22, a handful fewer
+    // where `fs.glob`/`vm.SourceTextModule` are absent — so the floor is set below the range
+    // the supported Node versions produce, not at the exact figure.
+    expect(checked).toBeGreaterThanOrEqual(100);
+  });
+
+  it("...and for the guarded functions that live on an INSTANCE, which a namespace sweep misses", () => {
+    // Both #96 sites the sweep above cannot see: a method installed on an object capwall hands
+    // back from a factory (`dgram.createSocket()`) and a method on a guarded instance VIEW
+    // (`http.globalAgent`, #65). `dgram`'s real `send`/`connect` report `""` — Node assigns them
+    // through a member expression too — so parity here means matching that, not prettifying it.
+    const reg = buildShimRegistry({
+      policy: denyAll(),
+      mode: "enforce",
+      onDecision: () => {},
+      projectRoot: here,
+    });
+    const dgramShim = reg.get("dgram") as unknown as typeof realDgram;
+    const socket = dgramShim.createSocket("udp4") as unknown as Record<string, unknown>;
+    const realSocket = realDgram.createSocket("udp4") as unknown as Record<string, unknown>;
+    try {
+      for (const key of ["send", "connect"]) {
+        expect((socket[key] as { name: string }).name, `dgram socket ${key}`).toBe(
+          (realSocket[key] as { name: string }).name,
+        );
+      }
+    } finally {
+      // Never bound, so there is no handle to leak; close defensively and ignore the throw a
+      // never-bound socket produces on some Node versions.
+      for (const s of [socket, realSocket]) {
+        try {
+          (s["close"] as () => void).call(s);
+        } catch {
+          /* not running */
+        }
+      }
+    }
+    for (const specifier of ["http", "https"]) {
+      const shim = reg.get(specifier) as Record<string, unknown>;
+      const agent = shim["globalAgent"] as Record<string, unknown>;
+      const realAgent = (specifier === "http" ? realHttp : realHttps).globalAgent as unknown as Record<
+        string,
+        unknown
+      >;
+      expect((agent["createConnection"] as { name: string }).name, `${specifier}.globalAgent`).toBe(
+        (realAgent["createConnection"] as { name: string }).name,
+      );
+    }
   });
 });

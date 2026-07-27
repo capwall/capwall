@@ -23,9 +23,11 @@
  * duplicates those onto the shim verbatim — real methods and all. `http.globalAgent` /
  * `https.globalAgent` are live `Agent` instances, so `http.globalAgent.createConnection({host,
  * port})` opened a socket with the guard never firing and NOTHING recorded, under a deny-all
- * enforce policy. They are now wrapped by {@link guardedInstanceMethods} (a Proxy — see there for
- * why an instance is the one place a Proxy is the right tool, and why patching the real agent is
- * forbidden). The audit behind #65 covered every object-valued export of every shimmed namespace;
+ * enforce policy. They are now wrapped by {@link guardedInstanceMethods} (a Proxy over a VIRTUAL
+ * target — see there for why an instance is the one place a Proxy is the right tool, why patching
+ * the real agent is forbidden, and why every structural operation on the view is refused rather
+ * than forwarded to the process-global agent, #88). The audit behind #65 covered every
+ * object-valued export of every shimmed namespace;
  * `globalAgent` on `http`/`https` was the only capability-bearing one. The rest are inert data
  * (`fs.constants`, `http.METHODS`/`STATUS_CODES`, `tls.rootCertificates`, `http2.constants`,
  * `vm.constants`, `worker_threads.resourceLimits`) or an already-shimmed sub-namespace
@@ -722,6 +724,7 @@ function wrapHttpModule<T extends object>(real: T, ctx: ShimContext, defaultPort
   const realGlobalAgent = realRecord["globalAgent"];
   if (typeof realGlobalAgent === "object" && realGlobalAgent !== null) {
     shim["globalAgent"] = guardedInstanceMethods(
+      ctx,
       realGlobalAgent,
       new Map([
         ["createConnection", (realMethod: AnyFn) => wrapFn(realMethod, agentConnectionResolver(defaultPort), ctx)],
@@ -730,7 +733,8 @@ function wrapHttpModule<T extends object>(real: T, ctx: ShimContext, defaultPort
   }
   // Freeze AFTER installing the guarded instance, so the frozen namespace pins it: a dep
   // cannot swap `http.globalAgent` for a raw Agent. `Object.freeze` here freezes the shim
-  // NAMESPACE only — never the Proxy value, whose target is the real process-global agent.
+  // NAMESPACE only — never the guarded view, which refuses `preventExtensions` outright (#88)
+  // and whose Proxy target is a capwall-owned object rather than the real agent anyway.
   return harden(ctx, shim) as unknown as T;
 }
 
@@ -785,7 +789,7 @@ export function createHttp2Shim(ctx: ShimContext): typeof import("node:http2") {
     shim[key] = (realHttp2 as unknown as Record<string, unknown>)[key];
   }
   const realConnect = realHttp2.connect as unknown as AnyFn;
-  shim["connect"] = function (this: unknown, ...args: unknown[]): unknown {
+  const guardedConnect: AnyFn = function (this: unknown, ...args: unknown[]): unknown {
     const authority = args[0];
     let host = "localhost";
     let port = 443;
@@ -819,7 +823,13 @@ export function createHttp2Shim(ctx: ShimContext): typeof import("node:http2") {
     if (pinnedAuthority !== undefined) out[0] = pinnedAuthority; // a STRING, never the original
     return realConnect.apply(this, out);
   };
-  harden(ctx, shim["connect"] as object);
+  // ISSUE #96 — every guarded wrapper capwall hands out reports the REAL function's `name`, and
+  // this one did not: assigning through a computed member (`shim["connect"] = function …`) does
+  // not trigger JS name inference, so `http2.connect.name` was `""`. Cosmetic on its own, except
+  // that the `harden` below FREEZES the wrapper under hardened mode, making the empty name
+  // permanent for any consumer doing feature detection on it. Set it BEFORE the freeze.
+  Object.defineProperty(guardedConnect, "name", { value: realConnect.name, configurable: true });
+  shim["connect"] = harden(ctx, guardedConnect);
   return harden(ctx, shim) as unknown as typeof import("node:http2");
 }
 
@@ -948,7 +958,7 @@ function readGuardedDgramSend(receiver: unknown, guardedSend: AnyFn): AnyFn {
 /** One socket, one destination, one use — see {@link forwardAuthorizedDgramSend}. */
 function mintDgramReplayToken(auth: DgramAuthorization): AnyFn {
   let spent = false;
-  return function replayAuthorizedSend(this: unknown, ...args: unknown[]): unknown {
+  const token: AnyFn = function replayAuthorizedSend(this: unknown, ...args: unknown[]): unknown {
     const target = deriveDgramSend(args);
     if (
       spent ||
@@ -967,6 +977,11 @@ function mintDgramReplayToken(auth: DgramAuthorization): AnyFn {
     // through the same path, which arms a fresh authorization for the same destination.
     return forwardAuthorizedDgramSend(this, target, auth.realSend, auth.guardedSend, args);
   };
+  // The token IS what `socket.send` reads back while an authorized forward is on the stack, so
+  // it carries the same `name` as the wrapper it stands in for (#96) — a value that changed
+  // mid-flight would be a capwall-introduced divergence in the one window it is observable.
+  Object.defineProperty(token, "name", { value: auth.guardedSend.name, configurable: true });
+  return token;
 }
 
 /**
@@ -1016,6 +1031,11 @@ function guardedDgramSend(ctx: ShimContext, realSend: AnyFn): AnyFn {
     if (target) guardDgram(ctx, target.host, target.port);
     return forwardAuthorizedDgramSend(this, target, realSend, guarded, args);
   };
+  // #96, same rule as every other wrapper: report the REAL method's name, whatever it is — for
+  // `dgram` that is the empty string, because Node assigns `Socket.prototype.send = function …`
+  // through a member expression and so gets no name inference either. Parity with Node, not a
+  // prettier name; `const guarded = …` would otherwise have leaked "guarded" to every consumer.
+  Object.defineProperty(guarded, "name", { value: realSend.name, configurable: true });
   return harden(ctx, guarded);
 }
 
@@ -1030,6 +1050,7 @@ function guardedDgramConnect(ctx: ShimContext, realConnect: AnyFn): AnyFn {
     guardDgram(ctx, target.host, target.port);
     return realConnect.apply(this, args);
   };
+  Object.defineProperty(guarded, "name", { value: realConnect.name, configurable: true }); // #96
   return harden(ctx, guarded);
 }
 
@@ -1059,11 +1080,15 @@ export function createDgramShim(ctx: ShimContext): typeof import("node:dgram") {
     shim[key] = (realDgram as unknown as Record<string, unknown>)[key];
   }
   const realCreate = realDgram.createSocket as unknown as AnyFn;
-  shim["createSocket"] = harden(ctx, function (this: unknown, ...args: unknown[]): unknown {
+  const guardedCreateSocket: AnyFn = function (this: unknown, ...args: unknown[]): unknown {
     const socket = realCreate.apply(this, args) as Record<string, unknown>;
     guardDgramInstance(socket, ctx);
     return socket;
-  });
+  };
+  // Same `name` restoration as every other wrapper (#96) — this site had the identical drift as
+  // `http2.connect`, for the identical reason (assignment through a computed member).
+  Object.defineProperty(guardedCreateSocket, "name", { value: realCreate.name, configurable: true });
+  shim["createSocket"] = harden(ctx, guardedCreateSocket);
   const RealDgramSocket = (realDgram as unknown as Record<string, unknown>)["Socket"];
   if (typeof RealDgramSocket === "function") {
     const Guarded = class extends (RealDgramSocket as AnyCtor) {};

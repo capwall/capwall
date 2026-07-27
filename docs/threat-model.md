@@ -359,8 +359,8 @@ methods intact. `http.globalAgent`/`https.globalAgent` were exactly that: any de
 call `http.globalAgent.createConnection({host, port})` and connect under a deny-all `enforce`
 policy, with **no log line** — the unlogged part being the worse half, since egress is the
 payload step of the attack class capwall exists to contain and `observe`/`capwall diff` could
-not surface it. Both are now wrapped in a guarded **view**: a `Proxy` that forwards every read
-and write to the one real agent (so the shared, process-global connection pool, `maxSockets`,
+not surface it. Both are now wrapped in a guarded **view**: a `Proxy` that forwards live agent
+state to the one real agent (so the shared, process-global connection pool, `maxSockets`,
 keep-alive, `agent.sockets` and `instanceof` all keep working — `globalAgent` is on the default
 path for nearly every HTTP call) and replaces only `createConnection`, which is gated with the
 same resolver the guarded `Agent` subclass uses.
@@ -371,6 +371,51 @@ that a proxied class's `.prototype.constructor` is the real class, and an instan
 would be a *different* pool (so `http.globalAgent.maxSockets = N` would silently stop affecting
 real requests), and patching the real instance's method would mutate a **process-global that
 outlives `uninstall()`**, which is the same constraint that keeps real builtins unfrozen.
+
+**What that view refuses, and the one thing it deliberately still forwards (#88).** The first
+version of the view had a `get` trap and nothing else, so every other operation took its default
+behaviour — forward to the Proxy's target, which was the real process-global agent. The guard
+itself held (the `get` trap re-wraps whatever the underlying method currently is, so replacing
+`createConnection` never bypassed a check), but a dependency could permanently reshape a
+process-global *through capwall*, `uninstall()` could not take it back, and
+`Object.freeze(http.globalAgent)` wedged the HTTP client for the whole process. That is the same
+hazard that moved the guarded classes off Proxies in #64, at the one site where the reasoning had
+not been re-applied. The view's Proxy target is now an **empty object capwall owns**, so no
+default trap behaviour and no Proxy invariant can reach the real agent, and each operation is
+answered deliberately:
+
+- **Live agent state** — `get`/`set` of any key that is not a guarded method, plus `has`,
+  `ownKeys`, `getOwnPropertyDescriptor` and `getPrototypeOf` — is **forwarded**. This is the one
+  place capwall's guarded view still writes to a process-global, and it is the reason the view
+  exists at all: `http.globalAgent.maxSockets = 100` has to keep tuning the pool that Node's
+  default request path actually uses. Un-shimmed Node does exactly the same thing, so capwall
+  neither adds nor removes a hazard here; shadowing the write instead would silently detune the
+  real request path while the caller believed otherwise.
+- **Guarded methods** (`createConnection`) — a read always yields capwall's wrapper, and a write
+  is kept in a **per-view shadow** rather than forwarded. Those keys are not pool state, so
+  nothing legitimate needs them shared. A write and a later read still agree, the guard still
+  wraps whatever was installed, and the edit disappears with the view at `uninstall()`. The cost
+  is a bounded divergence: a package that replaces `createConnection` on the view does not
+  replace it for code holding the raw agent.
+- **Structural operations** — `defineProperty`, `deleteProperty`, `preventExtensions`
+  (`Object.freeze`/`seal`) and `setPrototypeOf` — are **refused**, for every key. Each one
+  forwarded is an irreversible edit to a process-global, and two of them (a non-writable pin on a
+  field Node's own bookkeeping assigns to, a delete of pool state) wedge the process's HTTP client
+  exactly as the freeze did. A refusal surfaces as a `TypeError` at the call site under strict
+  mode — loud and local, where forwarding was silent and global. This is a **deliberate deviation
+  from un-shimmed Node**, which permits all four.
+
+The virtual target also settles a Proxy-invariant problem the first version could not. A `get`
+trap must return the target's actual value for a non-configurable, non-writable target property,
+so with the real agent as the target a single
+`Object.defineProperty(realAgent, "createConnection", {writable: false, configurable: false})`
+from any un-mediated code turned every read of `http.globalAgent.createConnection` in the process
+into a `TypeError` — where un-shimmed Node returns a value — and the only invariant-satisfying
+alternative would have been to hand back the **unguarded** pinned method. A target with no own
+properties satisfies every invariant unconditionally, so the guarded wrapper is always what comes
+back. One consequence to know about: because the target owns nothing, the view must report every
+property as `configurable: true`, whatever the underlying object says. Nothing can act on the
+difference — `defineProperty` and `deleteProperty` are refused regardless.
 
 The audit behind #65 walked every object-valued export of every shimmed namespace on Node 20 and
 22. `http.globalAgent` and `https.globalAgent` were the only capability-bearing ones; the rest
@@ -829,6 +874,13 @@ of enforcement **for the whole process** (the un-patching bullet above). Hardene
   issue #86 was the collision between that need and the pin, and it made every allowed
   `dgram.createSocket().send()` throw `Cannot redefine property: send` under hardened mode. An
   accessor is computed per read, so there is nothing left to compete over.
+- The guarded `createConnection` on the `http(s).globalAgent` **view** (#65/#88): under hardened
+  mode a write to it is refused outright instead of being kept in the per-view shadow, so
+  `http.globalAgent.createConnection = evil` gets the same `TypeError`-under-strict-mode outcome
+  as a frozen property. The view itself is **not** frozen and never can be — freezing it is
+  `preventExtensions`, which it refuses, and freezing the agent behind it breaks the process's
+  HTTP client. Live pool state stays writable under hardened mode for the same reason: Node's own
+  agent bookkeeping writes it through `this`.
 - The **guarded global egress surfaces** (#80): `globalThis.fetch`/`WebSocket`/`EventSource` are
   installed **non-writable**, so `globalThis.fetch = evil` fails, and the guarded wrapper /
   subclass is frozen. They stay **`configurable`** on purpose — a non-configurable global could
@@ -876,11 +928,12 @@ with a deny-all `enforce` policy:
   and builtins loaded from a context capwall has not patched. These never touch a shim object,
   so freezing shim objects is irrelevant to them. **This alone makes hardened mode
   defense-in-depth, not a boundary.**
-- **`http.globalAgent` / `https.globalAgent` (issue #65)** — the shim's `Agent` **class** is
-  guarded, but `globalAgent` is a real `Agent` instance passed through untouched, so
-  `http.globalAgent.createConnection({host, port})` is un-gated egress with or without
-  hardened mode. Freezing cannot fix this: the object is a builtin instance, not a capwall
-  object, and the missing guard is the problem, not a writable property.
+- **The real `http.globalAgent` / `https.globalAgent` behind the guarded view.** The view
+  capwall hands out is guarded (#65) and, under hardened mode, its `createConnection` cannot be
+  replaced at all (#88). The **real** agent underneath is never frozen — freezing it is the
+  process-wide breakage #88 is about — so code that reaches it another way (see
+  `process.getBuiltinModule` above) reaches an unguarded `createConnection`. Freezing could not
+  fix that anyway: the missing guard would be the problem, not a writable property.
 - **Replacing `process.env` wholesale** — the env read allowlist is a `Proxy` over the live
   `process.env`, not a capwall-created namespace. Freezing it would break `process.env.X = y`
   for the whole process and freeze the real environment object, so it is left alone;

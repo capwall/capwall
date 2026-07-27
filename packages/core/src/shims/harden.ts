@@ -36,11 +36,17 @@
  * WHAT IT DELIBERATELY DOES **NOT** FREEZE, and why (this list is the honest half — read it
  * before assuming a surface is protected; it is mirrored in docs/threat-model.md):
  *  - **Real builtins passed through a shim namespace** (`fs.Stats`, `fs.constants`,
- *    `net.Server`, `http.globalAgent`, …). Freezing those mutates process-global objects that
- *    outlive `uninstall()` and are shared with code capwall never mediated — an SES-shaped
- *    side effect capwall explicitly does not take. They are not guard-bearing, so freezing
- *    them would buy nothing anyway. (`http.globalAgent` is guard-RELEVANT but is a real
- *    instance, not a capwall object — that gap is issue #65, and freezing would not fix it.)
+ *    `net.Server`, …). Freezing those mutates process-global objects that outlive `uninstall()`
+ *    and are shared with code capwall never mediated — an SES-shaped side effect capwall
+ *    explicitly does not take. They are not guard-bearing, so freezing them would buy nothing
+ *    anyway.
+ *  - **The `http(s).globalAgent` VIEW** (#65) and the real agent behind it. The view is a Proxy,
+ *    and `Object.freeze` on a Proxy forwards `[[PreventExtensions]]` to its target — which is
+ *    why the view REFUSES that trap outright (#88) rather than relying on nobody calling it: a
+ *    forwarded freeze wedged the process's HTTP client for every caller, capwall-mediated or
+ *    not. What hardened mode does do there is make the guarded `createConnection` unwritable on
+ *    the view; see `guardedInstanceMethods`. The agent's live pool state stays writable under
+ *    hardened mode by necessity — Node's own bookkeeping assigns to it through `this`.
  *  - **`process.env`** — the env guard is a `Proxy` over the live `process.env` object, not a
  *    capwall-created namespace; freezing it would break `process.env.X = y` for the whole
  *    process and freeze the real environment object. Replacing `process.env` wholesale
