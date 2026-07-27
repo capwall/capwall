@@ -70,5 +70,6 @@ Get the full **observe → policy → enforce** loop working end-to-end on **one
 | M4 | all core shims | net/cp/worker/env/vm enforced | ✅ done |
 | M5 | ESM parity | ESM path reaches CJS parity | ✅ done |
 | S1 | SBOM/CBOM import | @capwall/sbom-import | ✅ done |
+| S2 | native-addon attribution | `.node` loads attributed + gated | ⬜ [#49](https://github.com/williamzujkowski/capwall/issues/49) |
+| S3 | CI observed-vs-declared diff | `capwall diff` flags drift | ✅ done |
 | S4 | perf benchmark | pnpm bench, <1ms/req validated | ✅ done |
-| S2,S3 | stretch | native-addon attr; drift diff | — |
