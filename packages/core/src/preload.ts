@@ -17,6 +17,14 @@
  *   CAPWALL_HARDENED      "1" enables hardened mode — freeze the shims so a dependency
  *                         cannot monkey-patch away mediation (default: off; BREAKS
  *                         graceful-fs — see docs/threat-model.md § hardened mode)
+ *   CAPWALL_ALLOW_LOADER_HOOKS
+ *                         "1" lets a DEPENDENCY call module.register/registerHooks, which is
+ *                         otherwise application-only (#61). Read in shims/module.ts, not
+ *                         here; still warns loudly. Default: off.
+ *
+ * That is the complete set — capwall reads no other CAPWALL_* variable. They are also never
+ * gated or recorded by the env shim, being capwall's own plumbing rather than the target's
+ * environment. The same table is in packages/core/README.md § Environment variables.
  *
  * Trace format: one JSON object per line, `{ "pkg": string, "req": CapabilityRequest }`,
  * deduplicated per process. `capwall gen-policy` aggregates this into a capabilities.json.

@@ -80,6 +80,17 @@ payload from a path-less frame — the fail-open that
 [`threat-model.md`](threat-model.md) § attribution laundering describes. The preload prints a
 warning at startup when a policy grants `<unknown>`.
 
+Stated plainly, because it is the whole point of the sentinel: before issue #60, "capwall
+could not attribute this call" and "this is the application" were the same value, so
+unattributable calls silently inherited `<app>`'s exemptions from the `process.env` and
+`dgram` gates. Splitting `<unknown>` out closed that. **Writing `"<unknown>": { "env": ["*"] }`
+— or any comparably wide grant — re-opens it by hand**, for every call capwall cannot place.
+List the observed keys instead.
+
+A third place `<unknown>` shows up is `native`: a `.node` file that lives under neither
+`node_modules` nor the project root (a temp dir, a download cache) is owned by `<unknown>`,
+so `<app>`'s grants do not cover it. See § `native` below.
+
 ## `PackagePolicy`
 
 Every field is optional; an omitted capability means **not granted**.
@@ -87,7 +98,7 @@ Every field is optional; an omitted capability means **not granted**.
 ```jsonc
 {
   "fs":  { "read": ["<glob>", ...], "write": ["<glob>", ...] },
-  "net": { "hosts": ["<host|glob>", ...], "ports": [<number>, ...] },
+  "net": { "hosts": ["<exact-host>" | "*", ...], "ports": [<number> | "*", ...] },
   "child_process": false,     // boolean gate: may this package spawn subprocesses?
   "worker_threads": false,    // boolean gate: may this package start worker threads?
   "env": ["<KEY>", "<KEY>", ...],   // allowlist of process.env keys it may read
@@ -116,12 +127,18 @@ Path globs, resolved relative to the project root. Grants are additive.
 
 ```jsonc
 "net": {
-  "hosts": ["api.example.com", "*.internal", "*"],  // "*" = any host
-  "ports": [443, 3000]                              // empty/omitted = no port allowed
+  "hosts": ["api.example.com", "*"],   // exact hostname, or the single literal "*" = any host
+  "ports": [443, 3000]                 // empty/omitted = no port allowed
 }
 ```
 
-- `hosts` matches hostnames (glob `*` supported); an empty list denies all hosts.
+- `hosts` matching is **exact string equality, or the single literal `"*"`**. There are no
+  partial globs: `"*.internal"` matches a host literally named `*.internal`, and nothing
+  else — it does **not** match `api.internal`. (`packages/core/src/policy/evaluate.ts`
+  implements exactly this; partial host globs are a possible follow-up, not a shipped
+  feature.) An empty list denies all hosts. The failure mode is over-restriction — a
+  `"*.internal"` entry denies rather than over-grants — but a policy written expecting glob
+  semantics will surface as unexplained denials in `enforce`.
 - An IPv6 literal is written **unbracketed** — `"::1"`, not `"[::1]"` — because that is the
   form Node actually dials (it strips the brackets a URL keeps on `.hostname` before handing
   the address to `net`/`dns`), and therefore the form capwall observes and matches. A URL like

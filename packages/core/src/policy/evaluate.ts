@@ -3,8 +3,10 @@
  *
  * Given a policy, the active mode, the attributed owning package, and a capability request,
  * decide whether the operation is allowed. All logic here is REAL and tested: deny-by-default,
- * the boolean/env gates, and `fs` path-glob matching (see `./glob.ts`). Host-glob matching for
- * `net` is still a conservative exact/`*` check pending the net shim (roadmap M4).
+ * the boolean/env gates, and `fs` path-glob matching (see `./glob.ts`). NOTE the asymmetry:
+ * `fs` paths match by glob, but `net` HOSTS match by exact equality or the single literal
+ * `"*"` — partial host globs (`"*.internal"`) are NOT implemented and are documented as
+ * unimplemented in docs/policy-format.md § net. Do not describe them as supported.
  *
  * Semantics:
  *  - `enforce` mode: deny-by-default. A package with no matching grant is DENIED.
@@ -120,8 +122,9 @@ export function isGranted(grant: PackagePolicy, req: CapabilityRequest): boolean
     case "net": {
       const net = own(grant, "net");
       if (!net) return false;
-      // Host matching is exact or the "*" wildcard. Host GLOBS (e.g. "*.internal") are a
-      // follow-up (tracked separately); the net shim (M4) is wired against this exact/`*` gate.
+      // Host matching is exact, or the single literal "*". Partial host GLOBS (e.g.
+      // "*.internal") are a possible follow-up and are NOT implemented — docs/policy-format.md
+      // § net says so explicitly, so keep the two in step if this ever changes.
       const hostOk = net.hosts.some((h) => h === "*" || h === req.host);
       // A `"*"` port grants any port — needed for deps that connect to a dynamically-assigned
       // (ephemeral) port, where a concrete observed port won't match on the next run (#27).

@@ -39,8 +39,8 @@ other fixture `node_modules/` dirs are) specifically so its calls resolve a real
    the same GC/scheduler jitter, and the per-iteration `shimmed − baseline` delta is capwall's
    added latency for that call. This is the number the PASS/FAIL gate uses.
 2. **Attribution only.** `attributeCaller()` called directly from a `bench-dep` frame (no fs
-   call attached), to see how much of scenario 1 attribution alone accounts for. AGENTS.md §5
-   says this should dominate.
+   call attached), to see how much of scenario 1 attribution alone accounts for. This was
+   originally expected to dominate; measurement says otherwise (see "What it found" below).
 3. **Evaluate only.** `evaluate(policy, mode, pkg, req)` — a pure function, no stack walk — to
    show the (expected: small) policy-lookup contribution.
 4. **net connect, denied.** `bench-dep` is never granted `net`, so the net shim throws
@@ -51,6 +51,20 @@ other fixture `node_modules/` dirs are) specifically so its calls resolve a real
 5. **Path→package cache, cold vs warm.** `packageForPath()` called with a unique, never-seen
    path each time (guaranteed miss) vs the same path repeated (guaranteed hit after the
    first), to quantify the documented memoization optimization.
+
+## What it found (issue #34)
+
+The original assumption — recorded in `AGENTS.md` § 5 and in `docs/architecture.md`'s Risks
+list — was that attribution stack-walking would **dominate** the hot path. It does not.
+Scenario 2 comes out at roughly half of scenario 1's added latency (issue #34 measured ~40%;
+runs since have landed around half — it is machine-dependent), and the remainder is the shim
+wrapper's own dispatch. `evaluate()` (scenario 3) is negligible, sub-microsecond. So if you
+are looking for headroom, profile the wrapper as well as the walk. The path→package cache is
+still worth having on its own terms — scenario 5 shows ~20x cold-vs-warm.
+
+The absolute added latency measures well under the 1ms/call budget, but the ratio is a
+property of the machine, not of capwall. Run it yourself rather than quoting a number from
+here.
 
 ## How to read the output
 

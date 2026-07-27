@@ -3,10 +3,15 @@
 The capwall interception engine and policy evaluator. This is where module-load
 interception, the capability shims, package attribution, and policy evaluation live.
 
-> **Status (roadmap M1–M3 done):** the CJS require patch, stack-walk attribution, the `fs`
-> shim, and policy load/evaluate are real and tested. The other shims (net, child_process,
-> worker_threads, env, vm) and the ESM hook are still stubs marked `// TODO(capwall):`.
-> See [`../../AGENTS.md`](../../AGENTS.md) and
+> **Status:** everything in this package is implemented and tested — the CJS require patch,
+> the ESM loader hook, stack-walk attribution, policy load/mode/evaluate, the `process.dlopen`
+> native-addon gate, and every capability shim (`fs`; `net`/`http`/`https`/`tls`/`http2`/
+> `dgram`; `child_process`; `worker_threads`; `vm`; `process.env`; plus `node:module`, which
+> is mediated to protect the ESM path rather than as a policy capability). Per-milestone
+> status lives in one place, [`../../docs/roadmap.md`](../../docs/roadmap.md); what the
+> mediation is worth against which adversary lives in
+> [`../../docs/threat-model.md`](../../docs/threat-model.md). See also
+> [`../../AGENTS.md`](../../AGENTS.md) and
 > [`../../docs/architecture.md`](../../docs/architecture.md).
 
 ## API
@@ -19,13 +24,21 @@ const handle = install(policy, "observe", {
   projectRoot: process.cwd(),
   onDecision: (pkg, decision) => console.log(pkg, decision.reason),
 }); // or "enforce"
-// handle.uninstall() restores the loader (tests/teardown).
+// handle.uninstall() removes the interception again — see the caveat below.
 ```
 
-`install(policy, mode)` patches the CJS loader so subsequent `require("fs")` (and
-`fs/promises`) return capwall's shim, which attributes each call to its owning package and
-evaluates it against the policy. The CLI installs this automatically in child processes via
-`@capwall/core/preload` (a `NODE_OPTIONS --import` entry configured by `CAPWALL_*` env vars).
+`install(policy, mode)` turns four things on: the CJS loader patch (so a subsequent
+`require("fs")`, `require("node:net")`, … returns capwall's shim), the `process.dlopen`
+native-addon gate, the `process.env` read guard, and — when `esm: true`, which the CLI
+sets — the ESM loader hook, so `import` of a mediated builtin lands on the same shims. Each
+shim attributes its calls to the owning package and evaluates them against the policy. The
+CLI installs all of this automatically in child processes via `@capwall/core/preload` (a
+`NODE_OPTIONS --import` entry configured by `CAPWALL_*` env vars).
+
+`handle.uninstall()` is for tests and teardown, and is **best-effort on the ESM path only** —
+Node cannot fully remove a registered loader hook, so teardown there is fail-closed rather
+than reversible (see [`../../docs/threat-model.md`](../../docs/threat-model.md) § ESM known
+limits).
 
 ## Configuration
 
@@ -48,13 +61,18 @@ yourself when wiring the preload by hand.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `CAPWALL_MODE` | *(unset — capwall stays inert)* | `observe` or `enforce`. Required to activate. |
+| `CAPWALL_MODE` | *(unset)* | `observe` or `enforce`, and it outranks everything. When unset, the mode comes from the policy document's own `mode` field (that is what `capwall run` relies on); if neither declares one, capwall stays **inert**. An unrecognized value is inert too, not a fall-through. Full precedence table: [`docs/policy-format.md` § Enforcement mode](../../docs/policy-format.md#enforcement-mode). |
 | `CAPWALL_POLICY_FILE` | *(none)* | Path to `capabilities.json`. Optional in observe; required in enforce (enforce with no policy denies everything). |
 | `CAPWALL_TRACE_FILE` | *(none)* | Append the JSONL decision trace here, for `capwall gen-policy`. |
 | `CAPWALL_PROJECT_ROOT` | `process.cwd()` | Project root for attribution and glob resolution. |
 | `CAPWALL_ESM` | on | `0` disables the ESM loader hook (the CJS path is unaffected). |
 | `CAPWALL_MAX_FRAMES` | `25` | Attribution frame budget — see below. |
 | `CAPWALL_HARDENED` | off | `1` (exactly) enables hardened mode — see below. Any other value leaves it off. |
+| `CAPWALL_ALLOW_LOADER_HOOKS` | off | `1` (exactly) lets a **dependency** call `module.register`/`registerHooks`, which is otherwise application-only (#61). Still warns loudly. See [`docs/threat-model.md` § Loader-hook registration](../../docs/threat-model.md). |
+
+That is the complete list — capwall reads no other `CAPWALL_*` variable. Note that
+`CAPWALL_*` keys are never gated or recorded by the `env` shim (they are capwall's own
+plumbing, not the target's environment).
 
 ### Hardened mode (`hardened: true` / `CAPWALL_HARDENED=1`)
 
@@ -143,17 +161,33 @@ outcomes.
 ## Layout
 
 ```
-src/index.ts            install(policy, mode) entry point
-src/preload.ts          --import entry for child processes (CAPWALL_* env config)
-src/loader/require.ts   CJS require/loader patch (live; fs only so far)
-src/loader/esm-hook.ts  ESM module.register loader hook (stub, M5)
-src/shims/fs.ts         fs shim (live); net/child_process/worker/env/vm are stubs (M4)
-src/attribution/        stack-walk → owning package (nearest-package policy, memoized)
-src/policy/*.ts         schema (re-export), load (glob normalization), evaluate, glob
-test/                   evaluator, attribution, glob, and fixture-based e2e slice tests
+src/index.ts               install(policy, mode, options) entry point + public re-exports
+src/preload.ts             --import entry for child processes (CAPWALL_* env config)
+src/errors.ts              CapabilityError
+src/loader/require.ts      CJS require/Module._load patch; MEDIATED_MODULES lives here
+src/loader/esm-hook.ts     ESM module.register() registration (main-thread side)
+src/loader/esm-hooks.ts    the loader-thread resolve/load hooks themselves
+src/loader/esm-runtime.ts  main-thread bridge the synthetic ESM modules re-export from
+src/loader/native.ts       process.dlopen patch — the `native` .node load gate (S2)
+src/shims/index.ts         registry assembly: specifier → shim module object
+src/shims/runtime.ts       shared guard()/attribution plumbing every shim uses
+src/shims/fs.ts            fs + fs/promises
+src/shims/net.ts           net, http, https, tls, http2, dgram (six separate shims)
+src/shims/child_process.ts child_process
+src/shims/worker_threads.ts worker_threads
+src/shims/vm.ts            vm
+src/shims/env.ts           process.env read guard (a Proxy, not a require-routed module)
+src/shims/module.ts        node:module — gates register/registerHooks (#61)
+src/shims/harden.ts        opt-in hardened mode (freeze what capwall created)
+src/attribution/           stack-walk → owning package (nearest-package policy, memoized)
+src/policy/*.ts            load (glob normalization), mode (precedence), evaluate, glob
+test/                      evaluator, attribution, shims, ESM, hardened, native, e2e slices
 ```
 
-## Build order
+Policy types and the Zod schema are **not** here — they live in `@capwall/policy-schema` and
+are imported from there directly.
 
-Follow [`../../docs/roadmap.md`](../../docs/roadmap.md): `fs` observe slice → trace→policy →
-enforce → remaining shims → ESM.
+## Roadmap
+
+[`../../docs/roadmap.md`](../../docs/roadmap.md) is the authoritative build order and the one
+place milestone status is tracked.

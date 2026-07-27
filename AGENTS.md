@@ -26,11 +26,19 @@ that — see § 8.
 
 ## 2. Current state
 
-**Roadmap M1–M4 are implemented (all core shims, CJS path).** Working end-to-end:
-`Module._load` patch → stack-walk attribution (nearest-package policy) → shims → policy
-evaluate, in both modes. Shims: `fs`, `net`/`http`/`https` (egress), `child_process`,
-`worker_threads`, `vm` (via the require registry in `core/src/shims/index.ts`), and
-`process.env` (a read allowlist via a Proxy, installed in `install()`). `capwall observe`
+**The roadmap is complete: M1–M5 and S1–S4 are all implemented.** `docs/roadmap.md`'s
+milestone table is the single source of truth for that — this section describes *what exists*,
+not *how far along it is*, so it does not need editing every milestone.
+
+Working end-to-end on **both** the CJS `require` and the ESM `import` paths:
+`Module._load` patch / `module.register` hook → stack-walk attribution (nearest-package
+policy) → shims → policy evaluate, in both modes. Shims: `fs`; the six egress modules
+`net`/`http`/`https`/`tls`/`http2`/`dgram` (registered **separately** — one shim never covers
+another, see `docs/threat-model.md` for why that is a security property and not a style
+choice); `child_process`; `worker_threads`; `vm`; and `node:module` (gating loader-hook
+registration, #61) — all via the require registry in `core/src/shims/index.ts` — plus
+`process.env` (a read allowlist via a Proxy, installed in `install()`) and the `native`
+`.node` load gate (a `process.dlopen` patch, `core/src/loader/native.ts`). `capwall observe`
 emits/merges a starter `capabilities.json` covering all capability kinds, and `capwall
 enforce` denies-by-default (`malicious-dep-demo` is blocked on both env and fs; `express-app`
 runs clean — zero denials, `capwall diff` exits 0 — under the **observed-then-hand-reviewed**
@@ -45,9 +53,10 @@ landed, and stayed false until #57. `packages/cli/test/express-app-policy.test.t
 now.
 
 The stretch items also landed: **S1** SBOM/CBOM →
-policy (`@capwall/sbom-import`), **S4** the perf benchmark (`pnpm bench`; measured overhead
-is ~30x under the <1ms/req budget — see issue #34 on the cost model), **S3** the
-observed-vs-declared drift diff (`capwall diff`), and **S2** the native-addon load gate
+policy (`@capwall/sbom-import`), **S4** the perf benchmark (`pnpm bench`; measured per-call
+overhead is tens of microseconds, well inside the <1ms/req budget — see issue #34 on the cost
+model), **S3** the observed-vs-declared drift diff (`capwall diff`), and **S2** the
+native-addon load gate
 (`native` capability, `core/src/loader/native.ts` — a `process.dlopen` patch; gating only,
 never confinement, see `docs/threat-model.md` § Native `.node` addons). The **ESM hook (M5)**
 is implemented (both static and dynamic `import` of mediated builtins are intercepted via a `module.register` hook; on by default under the CLI, `CAPWALL_ESM=0` to disable). Shims are handed out
@@ -56,6 +65,22 @@ is implemented (both static and dynamic `import` of mediated builtins are interc
 see `core/src/shims/harden.ts` and threat-model.md § Hardened mode for what it does and does
 not close. Build order is
 authoritative in `docs/roadmap.md` and mirrored in § 4 below.
+
+**Nothing is published to npm.** All four packages are `version: 0.0.0` and neither
+`@capwall/cli` nor `@capwall/core` exists on the registry, so every user-facing doc must show
+the run-from-a-clone path (`pnpm install && pnpm build`, then
+`node packages/cli/dist/index.js …`) rather than an install command that 404s. Revisit every
+such spot at first publish.
+
+**A third principal, `<unknown>` (#60).** Unattributable calls no longer collapse into the
+exempt `<app>` sentinel — they charge `<unknown>`, an ordinary deny-by-default principal that
+a policy can grant explicitly. Any doc that describes attribution as two-valued is stale; see
+`docs/threat-model.md` § attribution outcomes and `docs/policy-format.md` § Two sentinel keys.
+
+**Known open gap: global egress.** `globalThis.fetch` and `globalThis.WebSocket` are not
+module surfaces, so the loader-interception mechanism never sees them. They are un-mediated
+and un-logged. Do not describe capwall's egress control without that qualifier — see
+`docs/threat-model.md` § Global egress surfaces (tracked as #80).
 
 ## 3. Architecture orientation
 
@@ -68,9 +93,11 @@ Where each concern lives:
 |---|---|
 | Public API — `install(policy, mode)` | `packages/core/src/index.ts` |
 | CJS `require` patch | `packages/core/src/loader/require.ts` |
-| ESM loader hook (`module.register`) | `packages/core/src/loader/esm-hook.ts` |
+| ESM loader hook (`module.register`) | `packages/core/src/loader/{esm-hook,esm-hooks,esm-runtime}.ts` |
 | Native `.node` load gate (`process.dlopen`) | `packages/core/src/loader/native.ts` |
-| Core-API capability shims | `packages/core/src/shims/{fs,net,child_process,worker_threads,env,vm}.ts` |
+| Core-API capability shims | `packages/core/src/shims/{fs,net,child_process,worker_threads,env,vm}.ts` (`net.ts` registers all six egress modules) |
+| Loader-hook registration gate (`node:module`) | `packages/core/src/shims/module.ts` |
+| Shared shim plumbing / opt-in hardened mode | `packages/core/src/shims/{runtime,harden}.ts` |
 | Stack-walk → owning package | `packages/core/src/attribution/index.ts` |
 | Policy load / mode resolution / evaluate | `packages/core/src/policy/{load,mode,evaluate}.ts` |
 | Policy schema + shared TS types (imported directly, never restated in core) | `packages/policy-schema` |
@@ -102,8 +129,10 @@ Do not start step *n+1* until step *n* has passing tests and a clean typecheck.
 
 - **TypeScript strict + `exactOptionalPropertyTypes`.** Config is in `tsconfig.base.json`;
   each package extends it. Also on: `noUncheckedIndexedAccess`, `noImplicitOverride`.
-- **CJS-first.** The CJS `require` path is the primary target; ESM fast-follows (step 5).
-  Source is authored in TS and compiled with `tsc` per package.
+- **CJS-first.** The CJS `require` path is the primary target and was built first; the ESM
+  `import` path reached parity in M5 and is on by default under the CLI. New capability work
+  still lands CJS-first, then gets ESM coverage — but "ESM is not done yet" is no longer a
+  true statement about the repo. Source is authored in TS and compiled with `tsc` per package.
 - **pnpm workspace.** Packages reference each other with `workspace:*`. No new **runtime**
   dependencies without justification in the PR description — every dep is attack surface for
   a supply-chain tool. Dev deps (vitest, typescript) are fine.
@@ -113,11 +142,14 @@ Do not start step *n+1* until step *n* has passing tests and a clean typecheck.
   `no-explicit-any`, misuse patterns) and the pedantic/style rules are deliberately off. If a
   new rule would mean reformatting the codebase, it does not belong here.
 - **Performance.** Keep the hot path (attribution + policy lookup per intercepted call) with
-  the **<1ms/req** target in mind — the S4 benchmark (`pnpm bench`) measures ~30x headroom.
-  The cost splits roughly evenly between **attribution stack-walking (~40%)** and the **shim
-  wrapper's own dispatch (~55%)** — not attribution-dominant as originally assumed (see issue
-  #34); policy `evaluate()` is negligible. Cache module→package resolution (the path→package
-  cache gives ~20x cold-vs-warm); if you need more headroom, profile the shim wrapper too.
+  the **<1ms/req** target in mind — the S4 benchmark (`pnpm bench`) measures added latency in
+  the tens of microseconds, comfortably inside it. The cost splits roughly evenly between
+  **attribution stack-walking** and the **shim wrapper's own dispatch** — not
+  attribution-dominant as originally assumed (see issue #34); policy `evaluate()` is
+  negligible. The exact split is machine-dependent (#34 measured ~40/~55; runs since have
+  landed nearer 50/50) — re-measure rather than quoting it. Cache module→package resolution
+  (the path→package cache gives ~20x cold-vs-warm); if you need more headroom, profile the
+  shim wrapper too.
 - **License hygiene.** capwall is MIT. **Do NOT** pull in non-compete / source-available
   code (e.g. PolyForm-licensed Socket code). Prefer permissive (MIT/BSD/Apache-2.0) deps
   only.
@@ -150,8 +182,9 @@ as the gate.
   `capwall diff` exiting 0. Gated by `packages/cli/test/express-app-policy.test.ts`, which
   runs it in a scrubbed, deliberately noisy environment — a policy that only passes in your
   shell is not a passing policy (#57).
-- Keep smoke tests trivial but real (the scaffold's `packages/core/test/core.test.ts`
-  already asserts deny-by-default on the stub evaluator — extend, don't delete).
+- Keep smoke tests trivial but real (`packages/core/test/core.test.ts` asserts the
+  evaluator's deny-by-default semantics and observe-mode pass-through — extend, don't
+  delete).
 
 ## 8. Threat-model guardrails
 

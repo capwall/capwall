@@ -18,7 +18,11 @@ export const FsCapabilitySchema = z
   })
   .strict();
 
-/** Network egress capability: allowed hosts (glob `*` supported) and numeric ports. */
+/**
+ * Network egress capability. `hosts` entries match by EXACT string equality or the single
+ * literal `"*"` (any host) — there are no partial globs, so `"*.internal"` does not match
+ * `api.internal`. `ports` are numeric, or the literal `"*"` for any port (#27).
+ */
 export const NetCapabilitySchema = z
   .object({
     hosts: z.array(z.string()).default([]),

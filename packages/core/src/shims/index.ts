@@ -2,10 +2,17 @@
  * Shim registry assembly. `buildShimRegistry(ctx)` returns a `specifier → module object`
  * map the CJS loader consumes: requiring a registered specifier hands back the shim.
  *
- * Adding a capability shim (roadmap M4) is two lines: import its `register*Shim` and call it
- * here. Each shim owns which specifiers it claims; the loader stays generic. Non-registered
- * mediated specifiers (see `loader/require.ts` MEDIATED_MODULES) simply pass through
- * un-shimmed until their shim lands.
+ * Adding a capability shim is two lines: import its `register*Shim` and call it here. Each
+ * shim owns which specifiers it claims; the loader stays generic. Every specifier in
+ * `loader/require.ts` MEDIATED_MODULES is currently claimed by a shim registered below —
+ * keep it that way, since a mediated-but-unregistered specifier passes through un-shimmed
+ * (silently, with no log line).
+ *
+ * Note that `registerNetShim` claims SIX specifiers (net, http, https, tls, http2, dgram),
+ * not one. That is deliberate and load-bearing: Node's HTTP client reaches `net` through the
+ * internal bootstrap loader, which never hits `Module._load`, so shimming `net` does not
+ * cover `http` — and a dependency could otherwise pick `tls` or `dgram` to sidestep a
+ * net-only shim. A new egress surface needs its own registration. See docs/threat-model.md.
  */
 import { registerFsShim } from "./fs.js";
 import { registerNetShim } from "./net.js";
