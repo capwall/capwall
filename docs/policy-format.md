@@ -150,9 +150,8 @@ Scope, precisely:
 Matching is **exact string equality**, or the single literal `"*"`. There are no prefix or
 glob forms — `"DEBUG_*"` matches a key literally named `DEBUG_*`, nothing else.
 
-A denied env read is a **soft deny**: the value comes back `undefined` rather than throwing,
-so a dependency probing an optional variable degrades instead of crashing. The denial is
-still logged and still shows up in `capwall diff`. See `docs/threat-model.md`.
+A denied env read is still logged and still shows up in `capwall diff`. See
+`docs/threat-model.md`.
 
 #### When `["*"]` is the right call — and what it costs
 
@@ -175,21 +174,24 @@ it the way you would treat `"net": { "hosts": ["*"] }` — occasionally correct,
    needs unrestricted env access is a dependency you are choosing to trust completely. Moving
    it to `devDependencies`, or dropping it, is a stronger control than any policy entry.
 
-**Reach for `["*"]` only when the key set is not a property of the package's code.** The
-concrete case in this repo is `debug` (pulled in transitively by `express`), which does:
+**Reach for `["*"]` only when the key set is not a property of the package's code.** Note
+that *enumeration is no longer such a case*. A package that does
 
 ```js
 Object.keys(process.env).filter((key) => /^debug_/i.test(key))
 ```
 
-That enumeration is mediated key-by-key, so `debug` is recorded as reading *every variable
-present on the machine* — `SSH_AUTH_SOCK` on a laptop, `GITHUB_TOKEN` in CI, `PYENV_ROOT`
-wherever. No finite list is correct on the next machine, which makes a key-by-key grant
-non-reproducible in exactly the way ephemeral ports were for `net.ports` (issue #27). See
-[`../examples/express-app/README.md`](../examples/express-app/README.md) for the worked case.
-(That enumeration is recorded as a value read at all is arguably a shim limitation rather
-than a fact of life — issue #67. If it changes, packages that only *enumerate* will stop
-needing `"*"`, and these grants should be narrowed again.)
+used to be recorded as reading *every variable present on the machine* — `SSH_AUTH_SOCK` on a
+laptop, `GITHUB_TOKEN` in CI — because the enumeration was mediated key-by-key, and no finite
+list was correct on the next machine. That was a shim limitation, and it is fixed (issue #67):
+enumerating key *names* is not a value read, so only the keys a package really reads are
+recorded and the generated list is the same on every machine.
+[`../examples/express-app/README.md`](../examples/express-app/README.md) walks the case that
+motivated it — `debug`, which went from a bare `"*"` back to five concrete keys.
+
+What is left in this category is a package whose key set genuinely varies at runtime — one
+that derives variable names from user input or from a remote config. If you cannot point at
+the lines of the package's own source that name the keys, `"*"` may be the honest answer.
 
 **What you give up, stated plainly:** capwall stops reporting env drift for that package
 forever. If a future version of it starts reading `AWS_SECRET_ACCESS_KEY`, `capwall diff`

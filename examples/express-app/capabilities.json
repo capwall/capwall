@@ -15,7 +15,11 @@
     },
     "debug": {
       "env": [
-        "*"
+        "DEBUG",
+        "DEBUG_COLORS",
+        "DEBUG_DEPTH",
+        "DEBUG_FD",
+        "DEBUG_SHOWHIDDEN"
       ]
     },
     "depd": {

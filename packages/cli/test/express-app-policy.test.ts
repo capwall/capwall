@@ -108,10 +108,22 @@ describe("examples/express-app committed policy (#57)", () => {
     expect(policy.packages["express"]?.env).toContain("NODE_ENV");
     expect(policy.packages["depd"]?.env).toContain("NO_DEPRECATION");
     expect(policy.packages["mime"]?.env).toContain("DEBUG_MIME");
-    // `debug` enumerates the whole environment (Object.keys(process.env)), so the only
-    // host-independent grant is the wildcard — see examples/express-app/README.md and
-    // docs/policy-format.md § env for the trade-off this buys.
-    expect(policy.packages["debug"]?.env).toEqual(["*"]);
+    // `debug` enumerates the whole environment (Object.keys(process.env)) but only READS
+    // `DEBUG_*`. That enumeration used to be recorded as a value read of every key, which
+    // forced a bare `["*"]` grant here; since #67 it is not, so the grant is back to concrete
+    // keys. Asserted exactly — a regression in the enumeration fix would show up as this list
+    // re-acquiring host-specific keys, and asserting the exact set is what catches that.
+    expect(policy.packages["debug"]?.env).toEqual([
+      "DEBUG",
+      "DEBUG_COLORS",
+      "DEBUG_DEPTH",
+      "DEBUG_FD",
+      "DEBUG_SHOWHIDDEN",
+    ]);
+    // No package in the committed policy holds a wildcard env grant (#67 removed the last one).
+    for (const [name, grant] of Object.entries(policy.packages)) {
+      expect(grant.env ?? [], `'${name}' should not need a wildcard env grant`).not.toContain("*");
+    }
   });
 
   it("runs under `capwall enforce` with zero denials, in a scrubbed environment", async () => {
