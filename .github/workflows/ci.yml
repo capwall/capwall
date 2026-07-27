@@ -39,5 +39,7 @@ jobs:
       - name: Test
         run: pnpm test
 
+      # oxlint over the whole repo (.oxlintrc.json) — a defect gate distinct from Typecheck,
+      # not a second `tsc` pass. See docs/ci-local.md § the fast path.
       - name: Lint
         run: pnpm lint

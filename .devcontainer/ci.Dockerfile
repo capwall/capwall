@@ -25,8 +25,9 @@ RUN pnpm install --frozen-lockfile=false
 RUN pnpm build
 RUN pnpm typecheck
 
-# ci.yml steps: Test → Lint. CACHEBUST forces these to re-run on every invocation even when
-# nothing changed, so `ci:local` always actually executes the tests (not a cached layer).
+# ci.yml steps: Test → Lint (oxlint, whole repo, .oxlintrc.json). CACHEBUST forces these to
+# re-run on every invocation even when nothing changed, so `ci:local` always actually executes
+# the tests (not a cached layer).
 ARG CACHEBUST=0
 RUN echo "run ${CACHEBUST}" && pnpm test
 RUN pnpm lint

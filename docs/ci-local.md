@@ -8,10 +8,19 @@ The gates are plain pnpm scripts — run them directly on your machine:
 
 ```bash
 pnpm install
-pnpm -r build && pnpm -r typecheck && pnpm -r test && pnpm -r lint
+pnpm build && pnpm typecheck && pnpm test && pnpm lint
 ```
 
 This is what you should run while iterating. It uses whatever Node you have installed.
+
+The four gates are genuinely four different checks:
+
+| Gate | Runs | Catches |
+|---|---|---|
+| `build` | `tsc` emit, per package | Type errors in `src/`; produces `dist/`, which the CLI and ESM tests run against. |
+| `typecheck` | `tsc --noEmit` over src **and** tests | Type errors the build never sees — `build` does not compile `test/`. |
+| `test` | vitest, per package | Behaviour. |
+| `lint` | [oxlint](https://oxc.rs) once over the whole repo, config in `.oxlintrc.json` | Defects `tsc` does not check — unused bindings, unreachable/duplicate code, `no-explicit-any`, misuse patterns. It is **not** a style gate; see the config's comments for why the pedantic rules are off. |
 
 ## The CI-faithful path (Docker matrix)
 

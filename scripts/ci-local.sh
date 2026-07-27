@@ -19,7 +19,7 @@ cd "$(git rev-parse --show-toplevel)"
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "error: docker is not installed or not on PATH." >&2
-  echo "Install Docker, or run the gates directly: pnpm -r build && pnpm -r typecheck && pnpm -r test && pnpm -r lint" >&2
+  echo "Install Docker, or run the gates directly: pnpm build && pnpm typecheck && pnpm test && pnpm lint" >&2
   exit 127
 fi
 if ! docker info >/dev/null 2>&1; then
