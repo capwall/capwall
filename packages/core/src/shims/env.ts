@@ -27,12 +27,48 @@
  * where a denied *operation with side effects* throws — hiding a return value has no analog
  * there.)
  *
- * Only string-key reads are mediated. Symbol keys, and the write / `has` / `delete` /
- * `ownKeys` traps, forward straight through so `process.env` keeps its normal semantics
- * (values coerced to strings, assignment reaching the real environment, `in`, `for..in`).
- * Key NAMES therefore remain enumerable to a denied dependency (`Object.keys`, `in`); only
- * VALUES are hidden — names are not the secret, and hiding them would break benign
- * feature-detection. This is documented in docs/threat-model.md.
+ * NAME-LEVEL vs VALUE-LEVEL (the rule the traps below implement):
+ *
+ *   - VALUE-level operations — anything that hands the dependency an actual value — go through
+ *     `[[Get]]`, i.e. the `get` trap. That covers `env.K`, destructuring, `JSON.stringify(env)`,
+ *     `{...env}`, `Object.entries`/`Object.values` (all of which do `[[OwnPropertyKeys]]` →
+ *     `[[GetOwnProperty]]` → `[[Get]]` per key). These are GATED and RECORDED.
+ *   - NAME-level operations — which reveal only that a key exists — are UNGATED and UNRECORDED:
+ *     `in` (`has`), `Object.keys`, `for..in`, `Object.getOwnPropertyNames` (`ownKeys`). Names are
+ *     not the secret, and hiding them would break benign feature-detection. Documented in
+ *     docs/threat-model.md.
+ *
+ * The `getOwnPropertyDescriptor` trap straddles the two, and that is the subtlety (#67).
+ * `Object.getOwnPropertyDescriptor(env, k).value` is a value read, but `Object.keys(env)` and
+ * `for..in` ALSO call `[[GetOwnProperty]]` once per key — purely to read `[[Enumerable]]` — and
+ * the trap cannot tell the two apart: it receives an identical `(target, key)` and an identical
+ * caller stack. So the trap splits the difference along the axis that matters:
+ *
+ *   - it still HIDES the value for a denied key (`value: undefined`), unconditionally, because
+ *     that is the security property — otherwise the descriptor is a one-line exfiltration hole
+ *     around the `get` trap; but
+ *   - it does NOT RECORD, because a recording there is indistinguishable from enumeration, and
+ *     an enumeration recorded as "read the value of every key" is a false positive on the one
+ *     capability where false positives are most expensive: it made `observe` output a property
+ *     of the *machine* rather than of the package (a `for..in` recorded 83 keys, including
+ *     `SSH_AUTH_SOCK` and `AWS_SECRET_ACCESS_KEY`, on the maintainer's laptop), and it printed
+ *     `DENY 'debug' env:AWS_SECRET_ACCESS_KEY` for what was an enumeration. A security log that
+ *     cries wolf trains operators to ignore it.
+ *
+ * Nothing that actually yields a value to the dependency loses its audit record: every such path
+ * routes through `get`, which stays gated and recorded. What the trace gives up is the *failed*
+ * `getOwnPropertyDescriptor(...).value` attempt — still blocked, just no longer logged. That is
+ * a deliberate, bounded trade: the alternative discriminators (an `ownKeys`-primed "enumeration
+ * epoch" heuristic; returning an accessor descriptor so only an explicit `desc.get()` records)
+ * are either spoofable by the attacker they target or only catch an attacker who has adapted to
+ * capwall, and a spoofable heuristic inside the anti-exfiltration control is worse than a
+ * documented gap. See docs/threat-model.md § residuals.
+ *
+ * WRITES ARE NOT MEDIATED (#66). The `set` trap exists only to restore ordinary object
+ * semantics, not to gate anything — see the comment on the trap itself. `has` / `deleteProperty`
+ * / `defineProperty` / `ownKeys` need no trap at all: they forward to the target and already
+ * match un-shimmed `process.env` exactly (verified in test/env-traps.test.ts against the real
+ * object, including that a partial `Object.defineProperty` descriptor throws either way).
  *
  * `CAPWALL_*` keys (capwall's own preload plumbing) are never gated or recorded — they are
  * implementation detail, not app secrets, and gating them would pollute generated policies
@@ -42,7 +78,7 @@
  * child_process shim so a spawned child inherits a real environment), all reads pass through.
  */
 import { APP_ROOT, attributeCaller } from "../attribution/index.js";
-import { evaluate } from "../policy/evaluate.js";
+import { evaluate, type Decision } from "../policy/evaluate.js";
 import { attributionOptionsFor, isEnvGateSuspended, type ShimContext } from "./runtime.js";
 
 export interface EnvGuardHandle {
@@ -56,34 +92,99 @@ export function createEnvProxy(
   ctx: ShimContext,
 ): NodeJS.ProcessEnv {
   /**
-   * Shared gate for a single string key: returns true if the reading dependency is DENIED
-   * this key (caller then hides the value). Returns false (allow) for symbol keys, suspended
-   * gate, `CAPWALL_*` plumbing, `<app>`/internal reads, and granted keys. Records the
-   * decision for real dependency reads.
+   * Attribute + evaluate a single key read, WITHOUT reporting it. Returns `null` when the read
+   * is exempt entirely — symbol keys, a suspended gate, `CAPWALL_*` plumbing, and reads
+   * attributed to `<app>` (app code and Node internals; see header) — and otherwise the
+   * attributed package plus its decision.
+   *
+   * Deciding and recording are separated because the two gated traps need different halves of
+   * it: `get` decides AND records, `getOwnPropertyDescriptor` decides but must not record (see
+   * the #67 discussion in the header). Nothing here mutates state, so calling it without
+   * reporting is safe.
    */
-  function denied(key: string | symbol): boolean {
-    if (typeof key !== "string") return false;
-    if (isEnvGateSuspended()) return false;
-    if (key.startsWith("CAPWALL_")) return false;
+  function decide(key: string | symbol): { pkg: string; decision: Decision } | null {
+    if (typeof key !== "string") return null;
+    if (isEnvGateSuspended()) return null;
+    if (key.startsWith("CAPWALL_")) return null;
+    // Shared frame budget with every other attribution site (#15/#58) — a shim that quietly
+    // kept the default while the rest honored a raised cap would attribute the same call to a
+    // different package depending on which capability it touched.
     const pkg = attributeCaller(attributionOptionsFor(ctx));
     // App code and Node internals (both attribute to <app>) are not gated — see header.
-    if (pkg === APP_ROOT) return false;
-    const decision = evaluate(ctx.policy, ctx.mode, pkg, { kind: "env", key });
-    ctx.onDecision(pkg, decision);
-    return !decision.allowed; // soft deny — caller hides the value, never throws
+    if (pkg === APP_ROOT) return null;
+    return { pkg, decision: evaluate(ctx.policy, ctx.mode, pkg, { kind: "env", key }) };
+  }
+
+  /**
+   * VALUE-read gate: decides, REPORTS the decision (observe log / gen-policy trace / audit
+   * trail), and returns true when the caller must hide the value. Soft deny — never throws.
+   */
+  function deniedValueRead(key: string | symbol): boolean {
+    const outcome = decide(key);
+    if (outcome === null) return false;
+    ctx.onDecision(outcome.pkg, outcome.decision);
+    return !outcome.decision.allowed;
+  }
+
+  /**
+   * Same decision, deliberately NOT reported (#67). Used only by the descriptor trap, which
+   * fires once per key for every `Object.keys` / `for..in` as well as for a genuine descriptor
+   * read and cannot distinguish them. Hiding still happens; only the recording is dropped.
+   */
+  function deniedUnrecorded(key: string | symbol): boolean {
+    const outcome = decide(key);
+    return outcome !== null && !outcome.decision.allowed;
   }
 
   return new Proxy(realEnv, {
     get(target, key, receiver) {
-      if (denied(key)) return undefined;
+      if (deniedValueRead(key)) return undefined;
       return Reflect.get(target, key, receiver);
     },
-    // Close the Object.getOwnPropertyDescriptor(process.env, k).value exfiltration path: a
-    // denied key's descriptor reports value: undefined (property still "present" and
-    // enumerable, but the value is hidden — matching the get trap).
+    /**
+     * Restores ordinary assignment semantics; it mediates nothing (#66).
+     *
+     * With NO `set` trap, `proxy.K = v` falls through to the target's `[[Set]]` with
+     * `receiver` = the PROXY. When the target already has the own property, the spec finishes
+     * the assignment as `receiver.[[DefineOwnProperty]](K, { [[Value]]: v })` — a *partial*
+     * descriptor — which reaches Node's `process.env` `defineProperty` handler and is rejected
+     * with `ERR_INVALID_OBJECT_DEFINE_PROPERTY`. Absent keys take the `CreateDataProperty` path
+     * instead (a complete descriptor), which is why *new* keys worked and *existing* ones threw.
+     * Net effect before this trap: any dependency writing to an env var the process already had
+     * crashed the host app (`debug`'s `process.env.DEBUG = namespaces` is the common trigger) —
+     * a hard failure capwall itself introduced, with no security benefit.
+     *
+     * Forwarding with `receiver` defaulting to the target skips the `defineProperty` hop, so the
+     * write lands as a plain `[[Set]]` on the real environment, exactly as un-shimmed.
+     *
+     * Writes are intentionally NOT gated or recorded. The policy vocabulary (`env: [key…]`)
+     * expresses a READ allowlist and has no write-grant concept; gating writes under it would
+     * either forbid every dependency write (a far larger blast radius than the bug being fixed)
+     * or silently conflate "may read K" with "may set K". Soft deny does not compose with writes
+     * either: a silently dropped write leaves the dependency believing it succeeded, and a
+     * throwing write reintroduces the crash. Recording writes would be worse than useless —
+     * `gen-policy` merges every observed `{kind:"env"}` into the package's READ allowlist, so an
+     * observed write would silently widen read access. The residual (a dependency can set
+     * `NODE_OPTIONS` / `LD_PRELOAD` / `HTTP_PROXY` to influence other code) is documented in
+     * docs/threat-model.md; its payoff is realized at spawn time, and spawning is already a
+     * gated capability.
+     */
+    set(target, key, value) {
+      return Reflect.set(target, key, value);
+    },
+    /**
+     * Closes the `Object.getOwnPropertyDescriptor(process.env, k).value` exfiltration path: a
+     * denied key's descriptor reports `value: undefined`, so it can never hand back a value the
+     * `get` trap denies. The property stays "present" and enumerable, matching the name-level
+     * rule in the header.
+     *
+     * Deliberately uses the NON-recording decision (#67): this trap also fires once per key for
+     * `Object.keys` / `for..in`, which read only `[[Enumerable]]`, and recording there logged
+     * mere enumeration as a value read of every secret in the environment.
+     */
     getOwnPropertyDescriptor(target, key) {
       const desc = Reflect.getOwnPropertyDescriptor(target, key);
-      if (desc && denied(key)) {
+      if (desc && deniedUnrecorded(key)) {
         return { ...desc, value: undefined };
       }
       return desc;

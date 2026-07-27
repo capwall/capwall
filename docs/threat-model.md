@@ -187,6 +187,37 @@ Per-capability notes:
   enumerable** to a denied dependency (`Object.keys`, `in`, `for..in`); only VALUES are hidden
   — names are not the secret, and hiding them would break feature-detection.
 
+  **Name-level vs value-level (#67).** The gate applies to *values*, and only value-yielding
+  operations are recorded. Everything that hands a dependency a value goes through `[[Get]]` —
+  `env.K`, destructuring, `JSON.stringify(env)`, `{...env}`, `Object.entries`/`Object.values` —
+  and is gated **and** written to the trace. Name-level operations — `in`, `Object.keys`,
+  `for..in`, `Object.getOwnPropertyNames` — are neither gated nor recorded. The
+  `getOwnPropertyDescriptor` trap straddles both: `Object.keys` and `for..in` call it once per
+  key just to read `[[Enumerable]]`, and it cannot distinguish that from a genuine descriptor
+  read (identical arguments, identical caller stack). It therefore **hides** the value for a
+  denied key (unconditionally — that is the security property) but does **not record**.
+  *Residual:* a `getOwnPropertyDescriptor(env, k).value` read attempt is blocked but no longer
+  appears in the audit trail. Recording it instead would log every `for..in` as a value read of
+  every key in the environment, which made `observe` output a property of the host machine
+  rather than of the package and printed `DENY '<pkg>' env:AWS_SECRET_ACCESS_KEY` for mere
+  enumeration. The available discriminators (an `ownKeys`-primed "enumeration epoch" heuristic;
+  returning an accessor descriptor so only an explicit `desc.get()` records) are spoofable by
+  the attacker they target or catch only an attacker who has already adapted to capwall, and a
+  spoofable heuristic inside the anti-exfiltration control is worse than a documented gap.
+
+  **Writes are NOT mediated (#66).** `env` grants are a *read* allowlist; a dependency may set,
+  delete, and `defineProperty` on `process.env` freely, exactly as un-shimmed. The proxy's `set`
+  trap exists only to restore ordinary assignment semantics — without it, assignment to an
+  already-set key crashed the host app with `ERR_INVALID_OBJECT_DEFINE_PROPERTY`. *Residual:* a
+  dependency can set `NODE_OPTIONS`, `LD_PRELOAD`, `NODE_EXTRA_CA_CERTS` or proxy variables to
+  influence other code. In-process this is largely inert (`NODE_OPTIONS` is consumed at startup,
+  before any dependency runs); its payoff is in a **child process**, and spawning is already a
+  gated capability, so the spawn is the control point. A proxy variable that redirects egress is
+  still subject to the `net` gate, which guards the target actually connected to. Gating writes
+  would require write-grant vocabulary the policy language does not have, and soft deny does not
+  compose with writes (a silently dropped write leaves the dependency believing it succeeded; a
+  throwing write reintroduces the crash). Tracked as a policy-language question, not a bug.
+
 **Capability-bearing classes are guarded subclasses, not Proxies.** Where a capability can be
 reached through a class rather than a module function, capwall replaces the class with a
 **subclass it owns**, whose constructor (or prototype method) runs the check before delegating,
