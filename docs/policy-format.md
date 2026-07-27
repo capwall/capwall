@@ -65,6 +65,14 @@ Path globs, resolved relative to the project root. Grants are additive.
 ```
 
 - `hosts` matches hostnames (glob `*` supported); an empty list denies all hosts.
+- An IPv6 literal is written **unbracketed** — `"::1"`, not `"[::1]"` — because that is the
+  form Node actually dials (it strips the brackets a URL keeps on `.hostname` before handing
+  the address to `net`/`dns`), and therefore the form capwall observes and matches. A URL like
+  `http://[::1]:8080/` matches a `"::1"` host entry.
+- A unix-domain-socket / named-pipe connect (`net.connect({path})`, `http.request({socketPath})`,
+  `http2` over a pipe) has no host:port pair and is recorded coarsely as the pseudo-target
+  `<ipc>` on port `0`. Granting `{"hosts": ["<ipc>"], "ports": [0]}` therefore grants **every**
+  local socket, not one — see the IPC note in `docs/threat-model.md`.
 - `ports` is an allowlist of numeric ports. A literal `"*"` entry grants **any** port —
   use it for a dependency that connects to a dynamically-assigned (ephemeral) port, where a
   concrete observed port would not match on the next run. `capwall observe` records concrete

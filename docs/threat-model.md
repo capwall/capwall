@@ -54,16 +54,44 @@ Per-capability notes:
   guarded via a **guarded subclass** whose prototype method (or constructor) runs the check,
   so `new Cls()`, `(instance).constructor`, `Cls.prototype.constructor`, and
   `Cls.prototype.method.call(...)` are all covered (a construct-trap Proxy would not be — see
-  "Capability-bearing classes" below). **Not covered:** `dns` lookups (a lookup
-  moves no payload; DNS tunneling is a determined-attacker technique out of scope); reaching
-  the real prototype by climbing past the guarded subclass (two levels from an instance,
+  "Capability-bearing classes" below). The getter-based TOCTOU tracked as #26 and
+  #56 — a package with a narrow net grant supplying an options object (or a `URL` instance)
+  whose destination-deciding fields were accessor properties returning the granted value when
+  capwall derived the guarded target and a different value when Node itself re-read them — is
+  **closed**, with the guarantee scoped as follows.
+
+  capwall never forwards a caller's options object or `URL`. It reads each destination-deciding
+  field exactly once — `host`/`hostname`/`port`/`path` for `net`/`tls`/`http2` options,
+  `host`/`hostname`/`port`/`socketPath`/`defaultPort` for `http(s)` options, and the nine URL
+  fields Node's `urlToHttpOptions` derives — and forwards a clone carrying those single reads as
+  plain data properties, or (for a `URL`) a synthesized options object / authority string built
+  from that one snapshot. **Every** own accessor on a forwarded object is additionally flattened
+  to a value during the clone, on every key, not just the listed ones. So the object Node reads
+  contains no getters at all: for the fields above, Node observes exactly the value that was
+  guarded; for any other field, Node observes a value that cannot change between reads. #56 was
+  the case that motivated the second rule — `path` (the unix-socket destination) was not on the
+  first version's list, so its accessor rode into the clone live, and a package granted one TCP
+  endpoint could reach an arbitrary unix socket by returning `undefined` on the read capwall saw
+  and `/var/run/docker.sock` on the read Node made.
+
+  **Still open, deliberately.** (a) IPC is modelled COARSELY: every unix-socket/named-pipe
+  connect is the single pseudo-target `<ipc>:0`, so a package granted `<ipc>` may reach **any**
+  local socket, not the one it was observed using. Granting `<ipc>` is close to granting local
+  IPC wholesale — review it as such. (b) `options.createConnection` (`http(s)`/`http2`) lets the
+  caller supply the function that opens the socket; capwall guards the target it derived, but a
+  function that ignores its options and dials elsewhere is only re-gated if the module it uses
+  to dial is itself capwall-mediated — the same class as the pre-install capture residual below.
+  (c) `dns` lookups are not mediated (a lookup moves no payload; DNS tunneling is a
+  determined-attacker technique out of scope), so a granted host name resolving to an attacker's
+  address is not caught here. (d) Reaching the real prototype by climbing past the guarded
+  subclass (two levels from an instance,
   `Object.getPrototypeOf(Object.getPrototypeOf(sock)).connect`, or equivalently one hop from
-  the class object, `net.Socket.prototype.__proto__.connect` — the same class as the general
-  shim un-patching residual, in-process code deliberately climbing above the guard); and a
-  getter-based TOCTOU on `{host,port}` options for a
-  package that *already holds a narrow net grant* (the derived target is read separately from
-  the value Node connects to — tracked as #26). These are documented residuals, not silent
-  gaps.
+  the class object, `net.Socket.prototype.__proto__.connect`) — the same class as the general
+  shim un-patching residual, in-process code deliberately climbing above the guard. These are
+  documented residuals, not silent gaps.
+
+  An IPv6 literal is guarded, recorded, and matched **unbracketed** (`::1`, the form Node
+  dials); see `docs/policy-format.md`.
 - **`child_process`, `worker_threads`, `vm`** — boolean **gates** (may this package spawn /
   start a worker / use `vm` at all). Gating, not confinement: capwall does not constrain what
   the subprocess/worker/vm-context does once started (see § gating vs confinement). The
