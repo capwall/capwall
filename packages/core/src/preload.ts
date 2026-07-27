@@ -5,7 +5,10 @@
  *
  * Configured entirely through environment variables (the only channel available to a
  * preload):
- *   CAPWALL_MODE          "observe" | "enforce" (required to activate; absent = inert)
+ *   CAPWALL_MODE          "observe" | "enforce" — wins over the policy's own `mode`. When
+ *                         absent, the mode comes from the policy document's `mode` field;
+ *                         if neither declares one, capwall stays inert. See
+ *                         `policy/mode.ts` for the full precedence rules.
  *   CAPWALL_POLICY_FILE   path to capabilities.json (optional in observe mode)
  *   CAPWALL_TRACE_FILE    where to append the JSONL decision trace (optional)
  *   CAPWALL_PROJECT_ROOT  project root for attribution/glob resolution (default: cwd)
@@ -16,7 +19,8 @@
  * deduplicated per process. `capwall gen-policy` aggregates this into a capabilities.json.
  */
 import { appendFileSync, readFileSync } from "node:fs";
-import { install, loadPolicyFromObject, resolveMaxFrames, type Policy } from "./index.js";
+import { install, loadPolicyFromObject, resolveMaxFrames, type Mode, type Policy } from "./index.js";
+import { resolveMode } from "./policy/mode.js";
 
 function readPolicy(file: string | undefined, projectRoot: string): Policy {
   if (!file) {
@@ -28,11 +32,29 @@ function readPolicy(file: string | undefined, projectRoot: string): Policy {
   return loadPolicyFromObject(json, { projectRoot });
 }
 
-const mode = process.env["CAPWALL_MODE"];
-if (mode === "observe" || mode === "enforce") {
+interface Activation {
+  mode: Mode;
+  policy: Policy;
+  projectRoot: string;
+}
+
+/** Decide whether capwall turns on here, and under which mode. `undefined` = stay inert. */
+function activation(): Activation | undefined {
+  const envMode = process.env["CAPWALL_MODE"];
+  const policyFile = process.env["CAPWALL_POLICY_FILE"];
+  // Neither channel present => nothing can supply a mode, so don't even touch the filesystem:
+  // a NODE_OPTIONS left over in a shell must not start mediating unrelated processes.
+  if (envMode === undefined && policyFile === undefined) return undefined;
   const projectRoot = process.env["CAPWALL_PROJECT_ROOT"] ?? process.cwd();
+  const policy = readPolicy(policyFile, projectRoot);
+  const resolved = resolveMode(envMode, policy.mode);
+  return resolved ? { mode: resolved.mode, policy, projectRoot } : undefined;
+}
+
+const active = activation();
+if (active) {
+  const { mode, policy, projectRoot } = active;
   const traceFile = process.env["CAPWALL_TRACE_FILE"];
-  const policy = readPolicy(process.env["CAPWALL_POLICY_FILE"], projectRoot);
 
   // Env is a string channel, so validate before handing the value to install(): a typo like
   // CAPWALL_MAX_FRAMES=abc must degrade to the default (with a warning), never abort the

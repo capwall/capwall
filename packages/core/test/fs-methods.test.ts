@@ -108,7 +108,8 @@ const simpleReadCases: Array<{ name: string; run: (dep: FixtureDep) => unknown }
   { name: "watchDir (fs.watch)", run: (dep) => dep.watchDir(FIXTURE) },
 ];
 
-describe.each(simpleReadCases)("fs method coverage — $name (#23)", ({ name, run }) => {
+// `$name` in the title is interpolated by vitest from the case object, so only `run` is bound.
+describe.each(simpleReadCases)("fs method coverage — $name (#23)", ({ run }) => {
   it(`denies by default and records a single read decision`, () => {
     const { decisions } = withCapwall(emptyEnforcePolicy(), "enforce", (dep) => {
       expect(() => run(dep)).toThrowError(expect.objectContaining({ name: "CapabilityError" }));

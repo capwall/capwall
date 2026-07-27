@@ -63,9 +63,9 @@ Where each concern lives:
 | ESM loader hook (`module.register`) | `packages/core/src/loader/esm-hook.ts` |
 | Core-API capability shims | `packages/core/src/shims/{fs,net,child_process,worker_threads,env,vm}.ts` |
 | Stack-walk → owning package | `packages/core/src/attribution/index.ts` |
-| Policy types / load / evaluate | `packages/core/src/policy/{schema,load,evaluate}.ts` |
-| Policy schema + shared TS types | `packages/policy-schema` |
-| CLI (`observe`/`enforce`/`gen-policy`/`explain`) | `packages/cli/src/commands/*` |
+| Policy load / mode resolution / evaluate | `packages/core/src/policy/{load,mode,evaluate}.ts` |
+| Policy schema + shared TS types (imported directly, never restated in core) | `packages/policy-schema` |
+| CLI (`observe`/`enforce`/`run`/`diff`/`gen-policy`/`explain`) | `packages/cli/src/commands/*` |
 | SBOM → policy (stretch) | `packages/sbom-import` |
 
 The shims are the enforcement point: each wraps a core module, and on every
@@ -99,7 +99,10 @@ Do not start step *n+1* until step *n* has passing tests and a clean typecheck.
   dependencies without justification in the PR description — every dep is attack surface for
   a supply-chain tool. Dev deps (vitest, typescript) are fine.
 - **vitest** for tests; **`tsc --noEmit`** for typecheck (see § 6 — build alone is not
-  enough).
+  enough); **oxlint** (`pnpm lint`, config in `.oxlintrc.json`) for lint. Lint is a *defect*
+  gate, not a style gate — it is configured to catch what `tsc` cannot (unused bindings,
+  `no-explicit-any`, misuse patterns) and the pedantic/style rules are deliberately off. If a
+  new rule would mean reformatting the codebase, it does not belong here.
 - **Performance.** Keep the hot path (attribution + policy lookup per intercepted call) with
   the **<1ms/req** target in mind — the S4 benchmark (`pnpm bench`) measures ~30x headroom.
   The cost splits roughly evenly between **attribution stack-walking (~40%)** and the **shim
@@ -114,10 +117,11 @@ Do not start step *n+1* until step *n* has passing tests and a clean typecheck.
 
 A feature is done only when **all** of:
 
-- Tests pass: `pnpm -r test`.
-- Typecheck is clean over **src *and* tests**: `pnpm -r typecheck` (which runs
+- Tests pass: `pnpm test`.
+- Typecheck is clean over **src *and* tests**: `pnpm typecheck` (which runs
   `tsc --noEmit`). Note: `pnpm build` (per-package `tsc` emit) does **not** type-check test
   files — a green build is not a green typecheck. Run the typecheck.
+- Lint is clean: `pnpm lint` (oxlint, whole repo, one pass).
 - Once `enforce` exists: the `malicious-dep-demo` fixture is **blocked in `enforce` mode**
   and **allowed (only logged) in `observe` mode**.
 

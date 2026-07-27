@@ -12,12 +12,14 @@ import { runEnforce } from "./commands/enforce.js";
 import { runGenPolicy } from "./commands/gen-policy.js";
 import { runExplain } from "./commands/explain.js";
 import { runDiff } from "./commands/diff.js";
+import { runRun } from "./commands/run.js";
 
 const USAGE = `capwall — runtime per-package capability firewall for Node.js
 
 Usage:
   capwall observe   -- <command...>          run in observe mode; emit a starter policy
   capwall enforce   -- <command...>          run in enforce mode; deny-by-default
+  capwall run       -- <command...>          run in the mode the policy file declares
   capwall gen-policy [--from <trace>]         (re)generate policy from a trace
   capwall explain <package> <capability> [target]
   capwall diff -- <command...>                observe, then diff vs committed policy (CI drift check)
@@ -47,6 +49,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return runObserve(rest, target);
     case "enforce":
       return runEnforce(rest, target);
+    case "run":
+      return runRun(rest, target);
     case "gen-policy":
       return runGenPolicy(rest);
     case "explain":

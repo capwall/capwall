@@ -1,0 +1,44 @@
+{
+  // oxlint (MIT, dev-only, one prebuilt binary and zero npm dependencies) is the repo's ONLY
+  // linter, and `pnpm lint` is its only invocation — see docs/ci-local.md. It exists to catch
+  // defects tsc cannot see; it is deliberately NOT a style gate, so that a lint failure always
+  // means something is wrong rather than something is differently-shaped.
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["eslint", "typescript", "unicorn", "oxc", "import", "promise", "node"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error",
+    "perf": "error"
+    // pedantic/restriction stay off on purpose: on this codebase they produce ~500 findings,
+    // essentially all style (no-console in a CLI, no-plusplus, no-inline-comments). Turning
+    // them on would mean either a mass reformat or a wall of disables.
+  },
+  "rules": {
+    // The shims hand raw builtin arguments to the policy evaluator. `unknown` forces those to
+    // be narrowed at the boundary; `any` would let an attacker-controlled shape through
+    // untyped. Currently zero violations — this keeps it that way.
+    "typescript/no-explicit-any": "error",
+    // The main thing tsc does NOT check (noUnusedLocals/noUnusedParameters are off, because
+    // they fail a build on a work-in-progress edit; a lint gate is the right place for this).
+    "eslint/no-unused-vars": [
+      "error",
+      { "argsIgnorePattern": "^_", "varsIgnorePattern": "^_", "caughtErrorsIgnorePattern": "^_" }
+    ],
+
+    // `Module._load` is the CJS interception point — the mechanism this project is built on.
+    "eslint/no-underscore-dangle": "off",
+    // Sequential awaits in tests and in the CLI's child-process handling are the intent.
+    "eslint/no-await-in-loop": "off",
+    // Style-only on arrays we just created: `[...new Set(x)].sort()` mutates nothing shared.
+    "unicorn/no-array-sort": "off",
+    // The bench harness preallocates sample buffers with `new Array(n)` on purpose.
+    "unicorn/no-new-array": "off",
+    // Helpers defined inside a `describe` are how vitest suites are written — the scoping is
+    // for readability, and "recreated on every call" is meaningless for a helper called once
+    // per test. Flagging it would push shared state out to module scope, which is worse.
+    "unicorn/consistent-function-scoping": "off"
+  },
+  // node_modules/ is ignored by default, which also covers the committed vendored fixtures
+  // under packages/*/test/fixtures/node_modules — deliberately odd code that must stay odd.
+  "ignorePatterns": ["**/dist/**", "**/coverage/**"]
+}

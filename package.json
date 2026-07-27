@@ -14,15 +14,16 @@
     "build": "pnpm -r --filter './packages/*' run build",
     "typecheck": "pnpm -r run typecheck",
     "test": "pnpm -r run test",
-    "lint": "pnpm -r run lint",
+    "lint": "oxlint",
     "bench": "node scripts/bench/bench.mjs",
     "ci:local": "bash scripts/ci-local.sh",
     "ci:local:22": "bash scripts/ci-local.sh 22"
   },
   "devDependencies": {
+    "@types/node": "^20.14.0",
+    "oxlint": "1.75.0",
     "typescript": "^5.6.0",
-    "vitest": "^3.2.6",
-    "@types/node": "^20.14.0"
+    "vitest": "^3.2.6"
   },
   "pnpm": {
     "overrides": {

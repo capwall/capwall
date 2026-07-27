@@ -12,8 +12,7 @@
     "mode": {
       "type": "string",
       "enum": ["observe", "enforce"],
-      "default": "observe",
-      "description": "Default enforcement mode; the CLI flag overrides it."
+      "description": "Enforcement mode this policy declares, used by `capwall run` and by a bare @capwall/core/preload. An explicit CAPWALL_MODE (which `capwall observe` / `capwall enforce` / `capwall diff` set) always wins. Omitted = no declared mode: a modeless invocation stays inert."
     },
     "default": {
       "$ref": "#/definitions/packagePolicy",

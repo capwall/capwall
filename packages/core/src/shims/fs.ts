@@ -317,15 +317,17 @@ function armDenyStream(stream: Readable | Writable, err: CapabilityError): void 
   immediate.unref();
 }
 
-function denyReadStream(err: CapabilityError, path: unknown): Readable {
+// `streamPath`, not `path`: the module-scope `node:path` import is what the rest of this file
+// resolves paths with, and shadowing it inside a path-security shim is a trap worth avoiding.
+function denyReadStream(err: CapabilityError, streamPath: unknown): Readable {
   const stream = new Readable({ read() {} }) as Readable & { path?: unknown };
-  stream.path = path;
+  stream.path = streamPath;
   armDenyStream(stream, err);
   return stream;
 }
-function denyWriteStream(err: CapabilityError, path: unknown): Writable {
+function denyWriteStream(err: CapabilityError, streamPath: unknown): Writable {
   const stream = new Writable({ write(_chunk, _enc, cb) { cb(); } }) as Writable & { path?: unknown };
-  stream.path = path;
+  stream.path = streamPath;
   armDenyStream(stream, err);
   return stream;
 }

@@ -111,6 +111,10 @@ capwall observe -- node ./src/server.js
 # 4. ENFORCE: run for real. Anything not in the policy is denied by default and throws.
 capwall enforce -- node ./src/server.js
 
+# Or let the committed policy decide: `capwall run` uses its "mode" field, so promoting a
+# project from observe to enforce is a one-word diff in a reviewed file.
+capwall run -- node ./src/server.js
+
 # Explain why a given call was allowed/denied:
 capwall explain pino fs:write ./logs/app.log
 ```
@@ -142,7 +146,7 @@ relying on capwall for anything.
 
 ```
 packages/core            @capwall/core          interception engine + policy evaluator
-packages/cli             @capwall/cli           capwall observe|enforce|gen-policy|explain
+packages/cli             @capwall/cli           capwall observe|enforce|run|diff|gen-policy|explain
 packages/policy-schema   @capwall/policy-schema  capabilities.json schema + TS types
 packages/sbom-import     @capwall/sbom-import    STRETCH: CycloneDX/CBOM → policy
 examples/express-app                             observe→enforce walkthrough fixture
