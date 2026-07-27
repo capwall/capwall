@@ -70,6 +70,10 @@ describe("capwall diff", () => {
             "trace-dep": {
               fs: { read: ["./node_modules/trace-dep/data.txt"], write: [] },
             },
+            // Node's own ESM loader reads this from a stack with no caller frame, so it
+            // attributes to `<unknown>` (#60) and is real drift until it is granted. This is
+            // the documented escape hatch in use — an explicit line, not a silent exemption.
+            "<unknown>": { env: ["WATCH_REPORT_DEPENDENCIES"] },
           },
         },
         null,
@@ -115,7 +119,17 @@ describe("capwall diff", () => {
     appDir = await freshAppDir();
     await writeFile(
       path.join(appDir, "capabilities.json"),
-      JSON.stringify({ version: 1, mode: "enforce", default: {}, packages: {} }, null, 2),
+      JSON.stringify(
+        {
+          version: 1,
+          mode: "enforce",
+          default: {},
+          // Granted so the only drift left is trace-dep's — see the note above on `<unknown>`.
+          packages: { "<unknown>": { env: ["WATCH_REPORT_DEPENDENCIES"] } },
+        },
+        null,
+        2,
+      ),
     );
 
     const r = await runCli(["diff", "--json", "--", "node", "main.js"], appDir);

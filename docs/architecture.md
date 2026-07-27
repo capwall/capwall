@@ -77,13 +77,31 @@ keep helper grants tight. Files not under any `node_modules` attribute to the ap
 **Frame budget.** The walk inspects at most `maxFrames` frames (default 25) to bound the
 hot-path cost. If the owning dependency's frame sits deeper — long promise chains,
 dynamically-compiled or deeply-nested wrappers, `async_hooks`-heavy frameworks — the walk
-exhausts its budget and falls back to `<app>`, i.e. **mis-attributes** the call (issue #15).
-The budget is configurable per install (`install(policy, mode, { attribution: { maxFrames } })`)
-and via `CAPWALL_MAX_FRAMES` for the preload; invalid values warn and fall back to the default
-rather than throwing, because capwall must not crash a host process over a config typo. A
-budget-exhausted fallback is distinguishable from a genuine app-root call: the decision carries
-`attributionTruncated: true` (the preload warns once on stderr). See
+exhausts its budget and **mis-attributes** the call (issue #15), landing on `<unknown>` (before
+#60, on `<app>`). The budget is configurable per install (`install(policy, mode, { attribution:
+{ maxFrames } })`) and via `CAPWALL_MAX_FRAMES` for the preload; invalid values warn and fall
+back to the default rather than throwing, because capwall must not crash a host process over a
+config typo. A budget-exhausted fallback is distinguishable from any other unattributable call:
+the decision carries `attributionTruncated: true` (the preload warns once on stderr), which is
+the signal to raise the budget. See
 [`../packages/core/README.md`](../packages/core/README.md) § Configuration.
+
+**Three outcomes, not two (#60).** The walk returns a package name, `<app>`, or `<unknown>`:
+
+| Outcome | When | Treated as |
+|---|---|---|
+| `<pkg>` | a frame under `node_modules/<pkg>` | that package's grants |
+| `<app>` | a real source file **not** under `node_modules`, with no opaque frame above it | the trust root — exempt from the `process.env` and `dgram` gates |
+| `<unknown>` | no qualifying frame at all, or app code reached only through opaque code | an ordinary untrusted principal — deny-by-default in enforce, recorded in observe, grantable by an explicit `"<unknown>"` policy entry |
+
+An **opaque** frame is user-controlled code with no filesystem identity: a `data:`/`blob:`
+module, `eval`/`new Function` output whose origin cannot be trusted, a bundler `sourceURL`,
+`node -e`/stdin. `node:*` internals and native frames are *neutral* — skipped, as before.
+`<app>` is never inferred by falling off the end of the walk, because `<app>` carries
+exemptions and "we could not tell" must not inherit them. For `eval`/`new Function` V8 still
+reports where the code was compiled, so those are charged to the compiling package by name;
+only V8's own `eval at … (path:line:col)` form is trusted, since `//# sourceURL=` is
+attacker-controlled.
 
 **This is THE core research risk.** See Risks below.
 

@@ -94,10 +94,12 @@ before turning it on, and roll it out under `observe` first.
 Attribution walks the call stack for the nearest dependency frame and charges that package.
 The walk inspects at most `maxFrames` frames. **If the owning dependency's frame sits deeper
 than that** — long promise chains, deeply-nested or dynamically-compiled wrappers,
-`async_hooks`-heavy frameworks — the walk runs out of budget and falls back to `<app>`, which
-is a **mis-attribution**: the app is the trust root and usually holds broad grants, so a call
-that should have been denied can be allowed (and, conversely, a dependency's granted call can
-be denied under `<app>`'s deny-by-default).
+`async_hooks`-heavy frameworks — the walk runs out of budget and falls back to `<unknown>`,
+which is a **mis-attribution**: the call is denied by default in enforce even though a real,
+possibly well-granted package owns it. (Before #60 it fell back to `<app>`, the trust root,
+so the same mis-attribution could wrongly *allow* the call instead. Failing closed is the
+better default, but it means a deep-stack framework can surface as unexplained denials —
+raise the budget rather than granting `<unknown>`.)
 
 ```bash
 CAPWALL_MAX_FRAMES=100 capwall enforce -- node ./src/server.js
@@ -119,8 +121,24 @@ Notes:
   real stack, not "just in case".
 - When the walk *does* exhaust its budget, the decision handed to `onDecision` carries
   `attributionTruncated: true` and the preload prints a one-time stderr warning, so a capped
-  `<app>` attribution is distinguishable from a genuine app-root call. Enforcement behavior is
-  unchanged by the flag — it is observability, not a new deny path.
+  `<unknown>` attribution is distinguishable from any other unattributable call. The flag does
+  not change the outcome — it tells you *which* knob fixes it (this budget), rather than the
+  `<unknown>` grant.
+
+## Policy principals
+
+A grant is keyed by package name, or by one of two sentinels:
+
+| Key | Meaning |
+|---|---|
+| `"<app>"` | the application's own code — a real source file not under `node_modules`. Exempt from the `process.env` and `dgram` gates (it is the trust root). |
+| `"<unknown>"` | a call capwall could not attribute to any source file: no qualifying frame on the stack, or app code reached only through a `data:`/`eval`/bundled frame. **Not** exempt — deny-by-default in enforce, recorded in observe. |
+
+`<unknown>` exists because "we could not attribute this" must not silently mean "this is the
+app" (issue #60). Grant it only as narrowly as an `observe` run shows you need — Node's ESM
+loader produces one unattributable `env` read per process, and `capwall observe` emits that
+grant for you. See [`../../docs/threat-model.md`](../../docs/threat-model.md) § attribution
+outcomes.
 
 ## Layout
 

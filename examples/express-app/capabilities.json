@@ -13,6 +13,11 @@
         ]
       }
     },
+    "<unknown>": {
+      "env": [
+        "WATCH_REPORT_DEPENDENCIES"
+      ]
+    },
     "debug": {
       "env": [
         "DEBUG",

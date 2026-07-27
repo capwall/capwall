@@ -171,10 +171,11 @@ export function guardedConstructorSubclass<T extends AnyCtor>(
 export function guard(ctx: ShimContext, req: CapabilityRequest): string {
   const { pkg, budgetExhausted } = attributeCallerDetailed(attributionOptionsFor(ctx));
   const decision = evaluate(ctx.policy, ctx.mode, pkg, req);
-  // A budget-exhausted `<app>` attribution is a possible mis-attribution (#15): flag it for
-  // the sink so an operator can spot it and raise CAPWALL_MAX_FRAMES. The decision itself is
-  // untouched — enforcement behavior does not change, only its observability. The copy is
-  // taken only on the rare flagged path, so the hot path allocates nothing extra.
+  // A budget-exhausted `<unknown>` attribution is a possible mis-attribution (#15): flag it
+  // for the sink so an operator can spot it and raise CAPWALL_MAX_FRAMES rather than reaching
+  // for an `<unknown>` grant. The decision itself is untouched — since #60 the outcome is
+  // already fail-closed, and the flag only says WHY. The copy is taken only on the rare
+  // flagged path, so the hot path allocates nothing extra.
   ctx.onDecision(pkg, budgetExhausted ? { ...decision, attributionTruncated: true } : decision);
   if (!decision.allowed) throw new CapabilityError(decision.reason, pkg);
   return pkg;

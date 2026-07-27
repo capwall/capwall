@@ -24,12 +24,14 @@
  *    That is the pre-existing, path-independent residual `docs/threat-model.md` already names,
  *    and it defeats this gate exactly as it defeats every other shim.
  *  - A hook registered BEFORE capwall installs is already ahead of it.
- *  - The gate allows `<app>` because the application is the trust root, so it inherits
- *    whatever `attributeCaller` fails open to. Issue #60 (a `data:` URL ES module detached by
- *    one async hop leaves no filesystem frame on the stack, so attribution returns `<app>`)
- *    therefore walks straight past this gate exactly as it walks past the `process.env` and
- *    `dgram` gates — verified, not assumed. That is one bug in attribution, not three in the
- *    gates; when #60 lands, this gate is fixed with them.
+ *  - The gate allows `<app>` because the application is the trust root, so it inherits whatever
+ *    `attributeCaller` resolves to. That used to be a fail-open: issue #60 (a `data:` URL ES
+ *    module detached by one async hop leaves no filesystem frame on the stack, so attribution
+ *    returned `<app>`) walked straight past this gate exactly as it walked past the
+ *    `process.env` and `dgram` gates. It was one bug in attribution, not three in the gates,
+ *    and fixing it there fixed this gate with them: an unattributable registration now
+ *    attributes to `<unknown>`, which is not the trust root and does not pass. Verified, not
+ *    assumed — see `test/attribution-laundering.test.ts`.
  *  - capwall does not re-assert first position after an allowed registration. It could
  *    (joining the synchronous chain regains the front), but doing so would silently override
  *    the application's own loader tooling — and it still would not beat a hook that
@@ -65,8 +67,10 @@ function guardRegistration(ctx: ShimContext, api: string): void {
   // depth could attribute the same call to a different package than `guard` would.
   const pkg = attributeCaller(attributionOptionsFor(ctx));
   // The application is the trust root — same rule as the env guard, where `<app>` reads pass
-  // through. Node-internal frames also attribute to `<app>`, which is what we want: capwall's
-  // own registration and Node's internals must not trip this.
+  // through. Since #60 this is a POSITIVE identification (a real application source file on the
+  // stack), so a registration capwall cannot attribute is `<unknown>` and falls through to the
+  // gate below rather than being waved past. capwall's own hook registration is unaffected: it
+  // calls the REAL `node:module` binding it imported before installing, never this shim.
   if (pkg === APP_ROOT) return;
 
   const what = `module.${api}() — a module-customization hook is registered process-wide and Node runs the newest hook first, so this can un-mediate ESM imports for EVERY package`;

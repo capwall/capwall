@@ -20,9 +20,19 @@
  *
  * Trace format: one JSON object per line, `{ "pkg": string, "req": CapabilityRequest }`,
  * deduplicated per process. `capwall gen-policy` aggregates this into a capabilities.json.
+ * `pkg` may be `<app>` (application code) or `<unknown>` (a call capwall could not attribute
+ * to any source file — see the attribution module and issue #60).
  */
 import { appendFileSync, readFileSync } from "node:fs";
-import { install, loadPolicyFromObject, resolveMaxFrames, type Mode, type Policy } from "./index.js";
+import {
+  install,
+  loadPolicyFromObject,
+  resolveMaxFrames,
+  UNATTRIBUTED,
+  type Mode,
+  type PackagePolicy,
+  type Policy,
+} from "./index.js";
 import { resolveMode } from "./policy/mode.js";
 
 function readPolicy(file: string | undefined, projectRoot: string): Policy {
@@ -33,6 +43,19 @@ function readPolicy(file: string | undefined, projectRoot: string): Policy {
   }
   const json: unknown = JSON.parse(readFileSync(file, "utf8"));
   return loadPolicyFromObject(json, { projectRoot });
+}
+
+/**
+ * Is this `<unknown>` grant wider than the one shape every policy legitimately needs — a
+ * concrete list of `env` keys? Any other capability, or an `env: ["*"]` wildcard, hands
+ * unnamed code authority it should not have (#60).
+ */
+function isBroadGrant(grant: PackagePolicy): boolean {
+  return Object.entries(grant).some(([capability, value]) => {
+    if (value === undefined) return false;
+    if (capability !== "env") return true; // fs / net / child_process / worker_threads / vm
+    return Array.isArray(value) && value.includes("*");
+  });
 }
 
 interface Activation {
@@ -64,10 +87,35 @@ if (active) {
   // host app and never reach Error.stackTraceLimit as NaN — see resolveMaxFrames (#15).
   const maxFrames = resolveMaxFrames(process.env["CAPWALL_MAX_FRAMES"], "CAPWALL_MAX_FRAMES");
 
-  // A budget-exhausted attribution means capwall may have charged a dependency's call to
-  // <app> (issue #15) — warn ONCE per process rather than per call, since a deep-stack
-  // framework would otherwise flood stderr with an identical line.
+  // A budget-exhausted attribution means the real owner may sit past the cap (issue #15) —
+  // warn ONCE per process rather than per call, since a deep-stack framework would otherwise
+  // flood stderr with an identical line.
   let warnedTruncated = false;
+
+  // The `<unknown>` escape hatch (#60) applies to EVERY call capwall could not attribute,
+  // which includes a dependency deliberately running its payload from a `data:` module or an
+  // `eval`. An ALLOWED decision is not logged in enforce mode, so the hatch would otherwise be
+  // silent — hence a one-time note at startup.
+  //
+  // But only for a BROAD grant. Every run under the CLI produces one unattributable env read
+  // (Node's own ESM loader reads WATCH_REPORT_DEPENDENCIES from a stack with no caller frame),
+  // so a concrete `env` key list under `<unknown>` is the normal, expected shape — warning on
+  // it would fire on essentially every correctly-authored policy and train operators to ignore
+  // the line, the same cry-wolf failure #67 removed from the env trace. What is worth saying
+  // out loud is authority that unnamed code should never hold: a capability other than `env`,
+  // or an `env: ["*"]` wildcard.
+  // Enforce only: in observe nothing is denied anyway, so the warning would just be noise.
+  const unknownGrant =
+    mode === "enforce" && Object.hasOwn(policy.packages, UNATTRIBUTED)
+      ? policy.packages[UNATTRIBUTED]
+      : undefined;
+  if (unknownGrant !== undefined && isBroadGrant(unknownGrant)) {
+    process.stderr.write(
+      `[capwall] policy grants '${UNATTRIBUTED}' beyond a concrete env key list — EVERY call ` +
+        `capwall cannot attribute to a package is allowed under it, including code running ` +
+        `from a data:/eval frame (see docs/threat-model.md § attribution outcomes)\n`,
+    );
+  }
 
   const seen = new Set<string>();
   install(policy, mode, {
@@ -84,9 +132,9 @@ if (active) {
       if (decision.attributionTruncated && !warnedTruncated) {
         warnedTruncated = true;
         process.stderr.write(
-          `[capwall] attribution hit the ${maxFrames}-frame budget and fell back to '<app>'; ` +
-            `some calls may be attributed to the wrong package. ` +
-            `Raise CAPWALL_MAX_FRAMES if a deep dependency stack is involved.\n`,
+          `[capwall] attribution hit the ${maxFrames}-frame budget and fell back to ` +
+            `'${UNATTRIBUTED}' (denied by default in enforce); the owning package may sit ` +
+            `past the cap. Raise CAPWALL_MAX_FRAMES if a deep dependency stack is involved.\n`,
         );
       }
       const req = decision.observed;

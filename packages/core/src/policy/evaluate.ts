@@ -30,10 +30,11 @@ export interface Decision {
   /** The request as observed, for trace→policy generation in observe mode. */
   observed: CapabilityRequest;
   /**
-   * Set (by the shim runtime, not by `evaluate`) when attribution fell back to `<app>` only
-   * because it ran out of stack frames — i.e. the reported package may be WRONG and the real
-   * owner is beyond `maxFrames` (issue #15). Absent on every normally-attributed decision.
-   * Observability only: the allow/deny outcome above is already final.
+   * Set (by the shim runtime, not by `evaluate`) when attribution fell back to `<unknown>`
+   * only because it ran out of stack frames — i.e. a real package owns this call and sits
+   * beyond `maxFrames` (issue #15). Absent on every normally-attributed decision.
+   * Observability only: the allow/deny outcome above is already final, and since #60 that
+   * outcome is deny-by-default rather than the trust root's grants.
    */
   attributionTruncated?: boolean;
 }
