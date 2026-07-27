@@ -712,12 +712,26 @@ exception it would never see from real `fs`:
   so the shim's sync throw there is a deliberate loud-failure choice — `watchFile`'s listener
   is `(curr, prev)`, not error-first, so there is no faithful channel to deliver the denial
   through.
-- **Buffer path arguments** are decoded with `latin1` (byte-exact — fix #19) before the policy
-  check, so the checked path matches the bytes forwarded to real `fs` even for non-UTF-8
-  bytes. Trade-off: a **valid non-ASCII UTF-8 path passed as a Buffer** decodes to a different
-  (latin1) string than the UTF-8 string a policy glob is authored in, so it may **false-deny**
-  (fail-closed — never a false-allow). Uncommon (needs a non-ASCII filename supplied as a
-  Buffer); the encoding strategy is tracked for reconsideration (issue).
+- **Byte path arguments** (any `Uint8Array`, `Buffer` included) are decoded with `latin1`
+  (byte-exact — fix #19). **Re-examined and confirmed under #41**, on this reasoning rather than on
+  inertia: `latin1` is a *bijection* between byte sequences and strings, so the string that was
+  matched against policy determines the bytes that reach the real `fs` uniquely, and "the author
+  believes a path is denied but it matches" is **unreachable** — no second byte sequence shares
+  the matched string. `utf8` is not injective (every invalid subsequence collapses to a single
+  U+FFFD), so many distinct byte paths share one string: granting the path an `observe` run
+  recorded would silently grant all of them, and the audit trail could not say which file was
+  read. A **false-allow in an anti-exfiltration control is the failure that matters**; a
+  false-deny is loud and fail-closed. The residual cost is exactly that false-deny: a **valid
+  non-ASCII UTF-8 path passed as bytes** (`Buffer.from("./data/café.txt")`) decodes to a different
+  string than the UTF-8 one a policy glob is authored in, so it is refused. Uncommon, pinned by
+  test, and not going to change silently. The third option #41 raised — normalizing *both* sides
+  into byte space so a `café` grant matches `café` bytes — works, and was rejected on DX: it turns
+  every non-ASCII path in an `observe` trace and in a generated policy into a latin1 byte-string,
+  making the common case (a non-ASCII path passed as an ordinary string) unreadable in order to
+  fix the rare one. The bytes capwall checked are also the bytes it forwards: the real `fs`
+  receives capwall's own **copy**, not the caller's live array, because Node reads
+  `options.encoding` before it opens the path — so a getter there can rewrite the array in place
+  between the two (verified in plain Node), which is the byte-path flavor of the #26/#56 pin.
 - **`exists`/`existsSync`** remain the bespoke non-throwing existence probes: a denial reads
   as "does not exist" (`false` / `cb(false)`), never an error at all.
 

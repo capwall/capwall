@@ -196,6 +196,10 @@ Path globs, resolved relative to the project root. Grants are additive.
   `/` (`{/etc,/tmp}/*`) — is checked against the **filesystem root** instead, so it is denied
   unless the policy grants everything. Those shapes really do escape their literal prefix in
   Node; see docs/threat-model.md § `fs.glob` semantics.
+- **A path given as bytes** (`Buffer`/`Uint8Array`) is decoded byte-exactly (`latin1`), so a
+  **non-ASCII** filename supplied that way will not match a glob you authored as UTF-8 text. It
+  fails closed — the read is refused, never silently allowed. Write the grant against the
+  latin1-decoded spelling the denial message prints, or pass the path as a string.
 - **Note (see threat-model):** already-open fds and symlink tricks can escape path
   confinement; globs bound *ordinary* access, not a determined attacker.
 

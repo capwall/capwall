@@ -216,8 +216,8 @@ interface ResolvedPathArg {
   target: string;
   /**
    * What to hand the real `fs` instead of the caller's argument. Identical to the caller's value
-   * for the string and `Uint8Array` shapes (neither has an accessor surface Node could re-read);
-   * the CONVERTED PATH STRING for a file-URL argument, which is the pin — see {@link coercePath}.
+   * for a string (immutable, nothing to re-read); the CONVERTED PATH STRING for a file-URL
+   * argument and a private COPY for a byte path — both pins. See {@link coercePath}.
    */
   forward: unknown;
 }
@@ -253,21 +253,56 @@ interface ResolvedPathArg {
  * stores exactly that string internally anyway (`this.path = toPathIfFileURL(path)`), so this is
  * a pin, not a behavior change.
  *
- * Fix #19: a Buffer path is decoded with `"latin1"`, not `"utf8"`. `latin1` maps every byte
- * 1:1 to a code point (U+0000–U+00FF), so the decode round-trips exactly — including
- * non-UTF-8 bytes, which a `utf8` decode would lossily collapse to U+FFFD. That lossiness
- * previously meant the STRING checked against policy could differ from the bytes actually
- * forwarded to real `fs` (the byte array is forwarded verbatim, unchanged by this function).
- * `/` is 0x2F, which is the same code point in latin1 as in ASCII/UTF-8, so segment-splitting
- * on `path.sep` below is unaffected.
+ * ─────────────────────────────────────────────────────────────────────────────────────────────
+ * WHY A BYTE PATH IS DECODED `latin1` AND NOT `utf8` (#19, re-examined and CONFIRMED under #41)
+ * ─────────────────────────────────────────────────────────────────────────────────────────────
+ * A POSIX path is BYTES; a policy glob is a JS STRING. Something has to bridge them, and both
+ * candidate decodes are lossy in one direction:
+ *
+ *  - `latin1` (this) maps every byte 1:1 onto U+0000–U+00FF, so it is a BIJECTION between byte
+ *    sequences and strings. Cost: a policy author who writes `"./data/café.txt"` (UTF-8 in the
+ *    JSON, so `é` is U+00E9 in the loaded string) does not match the latin1 decoding of those
+ *    same bytes (`cafÃ©`), so a valid non-ASCII UTF-8 path passed as a Buffer FALSE-DENIES.
+ *  - `utf8` (what #19 replaced) matches that author's intent, but is NOT injective: every
+ *    maximal invalid subsequence collapses to a single U+FFFD, so MANY distinct byte paths
+ *    decode to the SAME string.
+ *
+ * The asymmetry is what decides it, not the frequency of either case. Under `latin1` the
+ * checked string determines the forwarded bytes UNIQUELY, so "the author believes a path is
+ * denied but it matches" is not merely unlikely — it is unreachable, because no second byte
+ * sequence shares the string that was matched. Under `utf8` it is reachable: granting the one
+ * path an `observe` run recorded (`…/na<U+FFFD>ve.txt`) silently grants every other file whose
+ * name differs only in the bytes that collapsed, and that aliasing is also what makes the audit
+ * trail unable to say which file was actually read. A false-deny is a loud, fail-closed error; a
+ * false-allow in an anti-exfiltration control is the failure that matters.
+ *
+ * The third option #41 raises — normalize BOTH sides into byte space, by UTF-8-encoding policy
+ * globs and string paths so a `café` grant matches `café` bytes — was rejected on DX, not on
+ * security: it works, but it makes every non-ASCII path in an `observe` trace and in a generated
+ * policy a latin1 byte-string, so the COMMON case (a non-ASCII path passed as an ordinary
+ * string, readable today) becomes mojibake to fix the RARE one (a non-ASCII path passed as a
+ * byte array). Keeping the mismatch confined to the rare case is the better trade.
+ *
+ * `/` is 0x2F, the same code point in latin1 as in ASCII/UTF-8, so segment-splitting on
+ * `path.sep` below is unaffected either way.
+ *
+ * ONE branch covers every byte path, deliberately. Node's `validatePath` accepts
+ * `isUint8Array(path)`; capwall tested `Buffer.isBuffer` and skipped the gate for everything
+ * else (#108). A second, narrower predicate alongside the correct one is how that gap happened,
+ * so there is now no second predicate to drift — a `Buffer` IS a `Uint8Array` and takes the
+ * same branch. The forwarded value is a private COPY of those bytes, on the same pinning rule as
+ * the URL case: the caller keeps a reference to the array it passed, and capwall will not check
+ * one byte sequence and hand Node an array whose contents could since have changed.
  */
 function coercePath(arg: unknown): ResolvedPathArg | null {
   let p: string;
   let forward: unknown = arg;
   if (typeof arg === "string") p = arg;
-  else if (Buffer.isBuffer(arg)) p = arg.toString("latin1");
-  else if (types.isUint8Array(arg)) p = Buffer.from(arg).toString("latin1");
-  else if (isNodeUrlLike(arg)) {
+  else if (types.isUint8Array(arg)) {
+    const pinned = Buffer.from(arg); // copies (Buffer.from(<TypedArray>) always does)
+    p = pinned.toString("latin1");
+    forward = pinned; // THE PIN — the bytes that were checked, not the caller's live array
+  } else if (isNodeUrlLike(arg)) {
     try {
       p = fileURLToPath(arg as URL);
     } catch {
