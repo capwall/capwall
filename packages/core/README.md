@@ -51,7 +51,8 @@ limits).
 | `env` | `true` | Gate `process.env` reads by dependencies against the `env` allowlist. |
 | `esm` | `false` (`true` under the CLI) | Also register the ESM loader hook. |
 | `attribution.maxFrames` | `25` | Frames the attribution stack walk may inspect — see below. |
-| `hardened` | `false` | **Opt-in.** Freeze the shim surfaces so a dependency cannot monkey-patch away mediation. **Breaks `graceful-fs`** — see below. |
+| `globalEgress` | `true` | Mediate `globalThis.fetch` / `WebSocket` / `EventSource` against the same `net` grant (#80). Writing to `globalThis` is the heaviest thing capwall does; set `false` if that write is unacceptable in your process. |
+| `hardened` | `false` | **Opt-in.** Freeze the shim surfaces so a dependency cannot monkey-patch away mediation. Throws at `install()` if it cannot be applied (#97). **Breaks `graceful-fs`** — see below. |
 
 ### Environment variables (the preload channel)
 
@@ -92,6 +93,14 @@ surfaces capwall created:
   individually (a socket cannot be frozen; it needs its state).
 
 All of it applies to `import` as well as `require`.
+
+**If capwall cannot apply it, `install()` throws (issue #97).** After wiring everything up, a
+hardened install verifies that the shim registries it just built really are frozen and that the
+egress globals it just replaced really are non-writable; if any is not, the partial install is
+rolled back and `install()` throws, naming the surface. A security option that is accepted and
+silently inert is worse than one that is refused — `hardened: true` was exactly that on the ESM
+path for many merges. The check inspects only surfaces capwall itself installed on paths that
+call is mediating, so it never fires for an option capwall did honor.
 
 Real builtins are never frozen — that would be a process-global side effect outliving
 `uninstall()`. Subclassing a guarded class (`class Mine extends fs.ReadStream {}`) still works.
@@ -185,6 +194,10 @@ src/shims/harden.ts        opt-in hardened mode (freeze what capwall created)
 src/attribution/           stack-walk → owning package (nearest-package policy, memoized)
 src/policy/*.ts            load (glob normalization), mode (precedence), evaluate, glob
 test/                      evaluator, attribution, shims, ESM, hardened, native, e2e slices
+test/composition-matrix.test.ts     cross-subsystem pairs (the shared-state inventory is its header)
+test/hardened-allowed.test.ts       hardened x granted x denied, every guarded surface
+test/lifecycle-matrix.test.ts       install -> capture -> uninstall -> reinstall, every shim
+test/install-option-parity.test.ts  {cjs, esm} x every install option
 ```
 
 Policy types and the Zod schema are **not** here — they live in `@capwall/policy-schema` and
