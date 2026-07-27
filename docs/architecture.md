@@ -53,9 +53,10 @@ package's slice of the policy.
 ### Capability shims (`core/src/shims`)
 
 One shim per core surface: `fs`; the six egress modules `net`, `http`, `https`, `tls`,
-`http2`, `dgram` (all six evaluated against the one `net` capability, and all six registered
-separately by `shims/net.ts`); `child_process`; `worker_threads`; `env` (a `process.env`
-accessor guard); `vm`. Each shim wraps the real API; on every capability-sensitive call it
+`http2`, `dgram` (all six evaluated against the one `net` capability — or, for a unix-socket /
+named-pipe destination, the `ipc` capability keyed on the socket path (#72) — and all six
+registered separately by `shims/net.ts`); `child_process`; `worker_threads`; `env` (a
+`process.env` accessor guard); `vm`. Each shim wraps the real API; on every capability-sensitive call it
 (1) asks `attribution` for the owning package, (2) asks `policy/evaluate` for a decision, then
 (3) forwards to the real API, logs, or throws. Shims must preserve the real API's signatures
 and error semantics so correct code is unaffected.

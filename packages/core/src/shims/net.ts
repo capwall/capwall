@@ -62,7 +62,9 @@
  *    `forwardAuthorizedDgramSend` for the mechanism and why a stolen authorization is worth
  *    nothing.
  *  - Inbound `server.listen` is deliberately NOT gated (egress, not binding).
- *  - IPC/unix-socket connects have no host:port and are approximated as `{ "<ipc>", 0 }`.
+ *  - IPC/unix-socket connects have no host:port; they are guarded as the separate `ipc`
+ *    capability carrying the concrete socket path / named pipe (#72), canonicalized by
+ *    `policy/ipc.ts`. Before that they all collapsed onto one `<ipc>:0` pseudo-target.
  *  - `dns` is NOT shimmed (a lookup moves no payload; DNS tunneling is out of scope).
  *
  * GETTER-TOCTOU CLOSED (issues #26 and #56). Every resolve function below reads the fields
@@ -117,7 +119,10 @@ import realTls from "node:tls";
 import realHttp2 from "node:http2";
 import realDgram from "node:dgram";
 import { APP_ROOT, attributeCaller } from "../attribution/index.js";
-import { evaluate } from "../policy/evaluate.js";
+import { evaluate, type CapabilityRequest } from "../policy/evaluate.js";
+// #72 — IPC destinations carry their concrete socket path now, canonicalized here (once, at the
+// point of observation) exactly as `shims/fs.ts` canonicalizes an fs argument.
+import { canonicalIpcPath, UNKNOWN_IPC_PATH } from "../policy/ipc.js";
 import { CapabilityError } from "../errors.js";
 import {
   attributionOptionsFor,
@@ -148,7 +153,12 @@ export type { DecisionSink, ShimContext } from "./runtime.js";
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type AnyCtor = new (...args: any[]) => any;
 
-/** Sentinel host for IPC/unix-domain-socket connects, which have no host:port pair. */
+/**
+ * Legacy sentinel host for IPC/unix-domain-socket connects, which have no host:port pair.
+ * Since #72 an IPC connect is guarded as its own `ipc` capability carrying the socket path;
+ * this string survives only as the `ResolvedCall.host` filler and as the pre-#72 policy token
+ * (`net.hosts: ["<ipc>"]` = all IPC, still honored — see `policy/evaluate.ts`).
+ */
 const IPC_HOST = "<ipc>";
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -173,7 +183,8 @@ function isPinnableOptions(v: unknown): v is Record<string, unknown> {
  * so each is read exactly once and pinned (see the module header's PINNING INVARIANT):
  *  - `path` — a unix-domain socket or Windows named pipe. A STRING here makes the connect an
  *    IPC connect and makes Node ignore `host`/`port` entirely; capwall models that as the
- *    gated pseudo-target `<ipc>:0`. Its omission from the old skip list was issue #56.
+ *    gated `ipc` capability, keyed on the path itself since #72. Its omission from the old
+ *    skip list was issue #56.
  *  - `host` — the TCP destination Node dials.
  *  - `port` — the TCP port.
  *  - `hostname` — NOT read by `net`/`tls` (verified against Node 20/22: `net.connect({hostname:
@@ -192,7 +203,7 @@ const NET_TARGET_KEYS: readonly string[] = ["host", "hostname", "port", "path"];
  *    redirect the endpoint and is deliberately NOT pinned — pinning it would corrupt the
  *    request line.
  *  - `socketPath` is http's unix-socket field — the true `path` equivalent, so it IS pinned,
- *    and a string here yields the same `<ipc>:0` pseudo-target `net` uses (before this it was
+ *    and a string here yields the same path-keyed `ipc` capability `net` uses (before this it was
  *    not modelled at all: a package granted `localhost:80` could reach `/var/run/docker.sock`).
  *  - `defaultPort` participates in Node's port resolution — `_http_client.js` computes
  *    `port = options.port || options.defaultPort || agent.defaultPort || <scheme default>` —
@@ -206,6 +217,33 @@ interface ResolvedCall {
   host: string;
   port: number;
   args: unknown[];
+  /**
+   * Set — and only set — when this call is an IPC connect (#72): the unix-socket / named-pipe
+   * destination, canonicalized. `host`/`port` then still carry the legacy `<ipc>:0` pseudo-
+   * target but nothing reads them; {@link targetRequest} is the one place that decides.
+   */
+  ipcPath?: string;
+}
+
+/**
+ * The capability request for a resolved call. IPC is its own capability carrying the concrete
+ * socket path (#72) instead of collapsing to the single `<ipc>:0` pseudo-target that made a
+ * grant for one socket a grant for the Docker socket.
+ */
+function targetRequest(call: ResolvedCall): CapabilityRequest {
+  if (call.ipcPath !== undefined) return { kind: "ipc", path: call.ipcPath };
+  return { kind: "net", host: call.host, port: call.port };
+}
+
+/** Build the IPC half of a {@link ResolvedCall}. `raw` is undefined when the call's shape hid
+ * the destination — recorded as `<unknown>`, which only an all-IPC grant covers (fail closed). */
+function ipcCall(raw: string | undefined, args: unknown[]): ResolvedCall {
+  return {
+    host: IPC_HOST,
+    port: 0,
+    args,
+    ipcPath: raw === undefined ? UNKNOWN_IPC_PATH : canonicalIpcPath(raw),
+  };
 }
 
 /**
@@ -222,6 +260,8 @@ interface PinnedNetOptions {
    * no `path` key at all — the distinction matters because Node's `ObjectAssign` merge lets an
    * overlay's `path: undefined` overwrite a base's real path. */
   ipc: boolean | undefined;
+  /** The socket path this object supplies, from the SAME single read as `ipc` (#72). */
+  ipcPath: string | undefined;
   /** The clone to forward: same fields, every one a data property, no accessor anywhere. */
   pinned: Record<string, unknown>;
 }
@@ -257,6 +297,7 @@ function pinNetOptions(src: Record<string, unknown>): PinnedNetOptions {
     host: typeof rawHost === "string" ? rawHost : undefined,
     port: coercePort(rawPort),
     ipc: hasPath ? typeof rawPath === "string" : undefined,
+    ipcPath: typeof rawPath === "string" ? rawPath : undefined,
     pinned,
   };
 }
@@ -267,7 +308,7 @@ function pinNetOptions(src: Record<string, unknown>): PinnedNetOptions {
  *   - `(options[, cb])` — TCP `{host?, port}`, or IPC `{path}`
  *   - `(port[, host][, ...])` — TCP positional (primitives already: no getter surface)
  *   - `(path[, cb])` — IPC positional string
- * IPC connects are approximated as `{host: "<ipc>", port: 0}`.
+ * IPC connects resolve to the `ipc` capability, carrying the canonicalized socket path (#72).
  */
 function resolveNetCall(args: unknown[], defaultPort = 0): ResolvedCall {
   const first = args[0];
@@ -276,7 +317,7 @@ function resolveNetCall(args: unknown[], defaultPort = 0): ResolvedCall {
     return { host, port: first, args };
   }
   if (typeof first === "string") {
-    return { host: IPC_HOST, port: 0, args }; // positional path form — IPC
+    return ipcCall(first, args); // positional path form — IPC
   }
   if (isPlainObject(first)) {
     // Any object is the options bag here, including a `URL` (nonsensical but legal — Node
@@ -285,12 +326,12 @@ function resolveNetCall(args: unknown[], defaultPort = 0): ResolvedCall {
     const p = pinNetOptions(first);
     const out = args.slice();
     out[0] = p.pinned;
-    if (p.ipc === true) return { host: IPC_HOST, port: 0, args: out };
+    if (p.ipc === true) return ipcCall(p.ipcPath, out);
     // `hostname` is deliberately NOT a fallback: Node's net/tls ignore it and dial `localhost`,
     // so honoring it would guard a host the socket never reaches (a false-allow).
     return { host: p.host ?? "localhost", port: p.port ?? defaultPort, args: out };
   }
-  return { host: IPC_HOST, port: 0, args };
+  return ipcCall(undefined, args);
 }
 
 /**
@@ -328,26 +369,36 @@ function resolveTlsCall(args: unknown[]): ResolvedCall {
   let host: string | undefined;
   let port: number | undefined;
   let ipc = false;
+  // Tracked alongside `ipc` so the guarded socket PATH follows the same merge order as the
+  // ipc flag itself (#72) — the last object to speak to `path` decides both.
+  let ipcPath: string | undefined;
   const first = args[0];
   if (typeof first === "number") {
     port = first;
     if (typeof args[1] === "string") host = args[1];
   } else if (typeof first === "string") {
     ipc = true; // positional path form
+    ipcPath = first;
   }
   const base = pins[0];
   if (base) {
     host = base.host ?? host;
     port = base.port ?? port;
-    if (base.ipc !== undefined) ipc = base.ipc;
+    if (base.ipc !== undefined) {
+      ipc = base.ipc;
+      ipcPath = base.ipcPath;
+    }
   }
   const overlay = pins[1] ?? pins[2];
   if (overlay) {
     host = overlay.host ?? host;
     port = overlay.port ?? port;
-    if (overlay.ipc !== undefined) ipc = overlay.ipc; // ObjectAssign overwrites, even with undefined
+    if (overlay.ipc !== undefined) {
+      ipc = overlay.ipc; // ObjectAssign overwrites, even with undefined
+      ipcPath = overlay.ipcPath;
+    }
   }
-  if (ipc) return { host: IPC_HOST, port: 0, args: out };
+  if (ipc) return ipcCall(ipcPath, out);
   return { host: host ?? "localhost", port: port ?? 443, args: out };
 }
 
@@ -475,7 +526,7 @@ function agentDefaultPort(opts: Record<string, unknown>): number | undefined {
  * sole options arg, with `hostname`/`port` pinned — Node never touches the url again.
  *
  * `socketPath` (http's unix-socket field, the `path` equivalent — see {@link HTTP_TARGET_KEYS})
- * makes the call an IPC connect, guarded as `<ipc>:0` exactly like `net.connect({path})`.
+ * makes the call an IPC connect, guarded on the socket path exactly like `net.connect({path})`.
  */
 function resolveHttpCall(args: unknown[], defaultPort: number): ResolvedCall {
   const first = args[0];
@@ -557,7 +608,7 @@ function resolveHttpCall(args: unknown[], defaultPort: number): ResolvedCall {
     outArgs[0] = forwarded;
   }
 
-  if (typeof socketPath === "string") return { host: IPC_HOST, port: 0, args: outArgs };
+  if (typeof socketPath === "string") return ipcCall(socketPath, outArgs);
   return { host: finalHost, port: finalPort, args: outArgs };
 }
 
@@ -567,7 +618,7 @@ function resolveHttpCall(args: unknown[], defaultPort: number): ResolvedCall {
 function wrapFn(orig: AnyFn, resolve: (args: unknown[]) => ResolvedCall, ctx: ShimContext): AnyFn {
   const wrapped: AnyFn = function (this: unknown, ...args: unknown[]) {
     const call = resolve(args);
-    guard(ctx, { kind: "net", host: call.host, port: call.port }); // throws on enforce-deny, before any socket opens
+    guard(ctx, targetRequest(call)); // throws on enforce-deny, before any socket opens
     return orig.apply(this, call.args); // pinned clone, never the original
   };
   Object.defineProperty(wrapped, "name", { value: orig.name, configurable: true });
@@ -597,7 +648,7 @@ function guardedSubclassMethod(
       const call = resolve(args);
       let forwardArgs = args;
       if (call) {
-        guard(ctx, { kind: "net", host: call.host, port: call.port });
+        guard(ctx, targetRequest(call));
         forwardArgs = call.args; // pinned clone, never the original
       }
       return (realMethod as AnyFn).apply(this, forwardArgs);
@@ -618,7 +669,7 @@ function guardedSubclassMethod(
 function wrapHttpFn(orig: AnyFn, defaultPort: number, ctx: ShimContext): AnyFn {
   const wrapped: AnyFn = function (this: unknown, ...args: unknown[]) {
     const resolved = resolveHttpCall(args, defaultPort);
-    guard(ctx, { kind: "net", host: resolved.host, port: resolved.port }); // before any socket opens
+    guard(ctx, targetRequest(resolved)); // before any socket opens
     return orig.apply(this, resolved.args); // pinned/synthesized args, never the original
   };
   Object.defineProperty(wrapped, "name", { value: orig.name, configurable: true });
@@ -630,7 +681,7 @@ function guardedClientRequestClass(RealClass: AnyCtor, ctx: ShimContext, default
   const Guarded = class extends RealClass {
     constructor(...args: unknown[]) {
       const resolved = resolveHttpCall(args, defaultPort);
-      guard(ctx, { kind: "net", host: resolved.host, port: resolved.port }); // before super()
+      guard(ctx, targetRequest(resolved)); // before super()
       super(...resolved.args); // pinned/synthesized args, never the original
     }
   };
@@ -794,6 +845,7 @@ export function createHttp2Shim(ctx: ShimContext): typeof import("node:http2") {
     let host = "localhost";
     let port = 443;
     let ipc = false;
+    let ipcPath: string | undefined;
     let pinnedAuthority: string | undefined;
     try {
       const u = authority instanceof URL ? authority : new URL(String(authority));
@@ -817,9 +869,12 @@ export function createHttp2Shim(ctx: ShimContext): typeof import("node:http2") {
       out[1] = p.pinned;
       if (p.host !== undefined) host = p.host;
       if (p.port !== undefined) port = p.port;
-      if (p.ipc === true) ipc = true;
+      if (p.ipc === true) {
+        ipc = true;
+        ipcPath = p.ipcPath;
+      }
     }
-    guard(ctx, ipc ? { kind: "net", host: IPC_HOST, port: 0 } : { kind: "net", host, port });
+    guard(ctx, targetRequest(ipc ? ipcCall(ipcPath, out) : { host, port, args: out }));
     if (pinnedAuthority !== undefined) out[0] = pinnedAuthority; // a STRING, never the original
     return realConnect.apply(this, out);
   };

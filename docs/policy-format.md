@@ -99,6 +99,7 @@ Every field is optional; an omitted capability means **not granted**.
 {
   "fs":  { "read": ["<glob>", ...], "write": ["<glob>", ...] },
   "net": { "hosts": ["<host-pattern>", ...], "ports": [<number> | "*", ...] },
+  "ipc": { "paths": ["<socket-glob>", ...] },   // unix sockets / Windows named pipes
   "child_process": false,     // boolean gate: may this package spawn subprocesses?
   "worker_threads": false,    // boolean gate: may this package start worker threads?
   "env": ["<KEY>", "<KEY>", ...],   // allowlist of process.env keys it may read
@@ -202,6 +203,49 @@ the address to `net`/`dns`), and therefore the form capwall observes and matches
   already been sent. If a granted host may redirect elsewhere, grant the redirect target too;
   `capwall observe` records it for you. See `docs/threat-model.md` § global egress residuals.
 - `data:` and `blob:` URLs are not gated at all — they resolve in-process and move no bytes.
+- A unix-domain-socket / named-pipe connect has no host:port pair and is **not** a `net` grant.
+  It is its own capability — see [`ipc`](#ipc--unix-sockets-and-named-pipes) below.
+
+### `ipc` — unix sockets and named pipes
+
+```jsonc
+"ipc": {
+  "paths": ["/var/run/myapp/api.sock", "./run/*.sock"]
+}
+```
+
+Every IPC destination — `net.connect({path})`, `http.request({socketPath})`, `tls.connect`,
+`http2` over a pipe — is gated against this list, by **socket path**. Omitted or empty means no
+IPC at all.
+
+- `paths` entries are globs, matched by the **same matcher `fs` grants use**: `*` within one
+  path segment, `**` across segments, `dir/**` covering `dir` itself. Relative patterns resolve
+  against the project root, exactly like `fs` globs, and Windows drive letters work the same way.
+- **Windows named pipes** are supported. Write them however you like — `"\\\\.\\pipe\\myapp-*"`,
+  `"//./pipe/myapp-*"` — both name the same pipe, and both match a pipe capwall observed under
+  either spelling. The pipe **name** is matched case-sensitively (the same call the `fs` matcher
+  makes for everything but the drive letter: a spurious deny is a smaller mistake than a
+  silently widened grant — widen with `*` if you need it).
+- `<tmp>` and `<home>` are **placeholders**, expanded against the machine that loads the policy
+  (`os.tmpdir()`, `os.homedir()`). `capwall observe` emits them so a socket in `/tmp` on Linux CI
+  and one in `/var/folders/…` on a maintainer's mac are the same grant. See § Generating a policy.
+- An IPC connect whose destination capwall could not read off the call is recorded as
+  `<unknown>`, which only an all-paths grant (`"*"` / `"**"`) covers. Fail-closed.
+
+#### Backward compatibility with `<ipc>`
+
+Before this capability existed, **every** socket and pipe was the single pseudo-target
+`<ipc>:0`, granted as `"net": {"hosts": ["<ipc>"], "ports": [0]}`. That shape **still works and
+still means every socket and pipe on the machine** — including the Docker socket, the systemd
+journal socket and an SSH agent socket. It is honored unchanged rather than reinterpreted,
+because a policy that silently becomes more restrictive on upgrade breaks a working deployment
+just as surely as one that silently becomes more permissive.
+
+It is nonetheless the coarse form, and `capwall observe` no longer emits it. **Prefer
+`ipc.paths`**; treat a remaining `<ipc>` host entry as "grants all local IPC" when you review a
+policy, and narrow it. A `net.hosts` wildcard (`"*.internal"`) never grants IPC — only the
+literal `"<ipc>"` or `"*"` host does, and only on port `0` or `"*"`, exactly as before.
+
 ### `child_process`, `worker_threads`, `vm` — boolean gates
 
 ```jsonc
@@ -337,7 +381,7 @@ Scope, precisely:
 
 Matching is **exact string equality**, or the single literal `"*"`. There are no prefix or
 glob forms — `"DEBUG_*"` matches a key literally named `DEBUG_*`, nothing else. (`fs.read`/
-`fs.write` and `net.hosts` *do* glob; `env` does not. An environment variable name
+`fs.write`, `net.hosts` and `ipc.paths` *do* glob; `env` does not. An environment variable name
 is not a hierarchy, so there is no separator for a wildcard to respect and no shape of grant a
 prefix would express safely.)
 
@@ -407,6 +451,7 @@ indistinguishable from a careless one.
   "default": {
     "fs": { "read": [], "write": [] },
     "net": { "hosts": [], "ports": [] },
+    "ipc": { "paths": [] },
     "child_process": false,
     "worker_threads": false,
     "env": [],
@@ -424,7 +469,8 @@ indistinguishable from a careless one.
       "env": ["NODE_ENV"]
     },
     "internal-client": {
-      "net": { "hosts": ["*.internal"], "ports": [443] }
+      "net": { "hosts": ["*.internal"], "ports": [443] },
+      "ipc": { "paths": ["/var/run/myapp/api.sock"] }
     }
   }
 }
@@ -449,6 +495,14 @@ The output of `observe` is a **starting point, not the answer.** It records what
   shell. Replace them with `"*"` (see `net.ports` above and `env` above) or delete them.
 - **Incidental code paths** — a capability used once during a code path you happened to
   exercise. Keep it only if it is a real requirement.
+
+Socket paths (`ipc.paths`) get a little help with this. `observe` writes one of three shapes,
+most portable first: a `./relative` path when the socket is inside the project root; `<tmp>/…`
+or `<home>/…` when it is under the temp or home directory (expanded per-machine at load time);
+otherwise the literal path. What it will **not** do is guess which segment of
+`/tmp/app-a91f3/api.sock` is random — capwall cannot know, and quietly emitting a wider grant
+than the run actually justified is precisely what you are reading this file to catch. Widen
+volatile segments yourself with `*` (a `/run/user/<uid>/…` socket is the other common case).
 
 Host names (`net.hosts`) are recorded concretely; if a dependency legitimately talks to a whole
 internal domain, replace the observed hosts with `"*.internal"` / `"**.internal"` by hand rather

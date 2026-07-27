@@ -1,7 +1,10 @@
 /**
- * End-to-end round-trip for `net.hosts` globs, against the BUILT cli + core (dist/) — run
- * `pnpm build` first, as CI does.
+ * End-to-end round-trips for the two policy-granularity features, against the BUILT cli + core
+ * (dist/) — run `pnpm build` first, as CI does.
  *
+ *  - #72 `ipc.paths`: observe → policy → enforce → diff for a unix-domain socket, including
+ *    that a grant for one socket is not a grant for another, and that the pre-#72
+ *    `net: { hosts: ["<ipc>"] }` shape still works.
  *  - #83 `net.hosts` globs: observe records the concrete host, an author tightens it to
  *    `"*.internal"`, and enforce/diff/explain all agree — the exact workflow the issue says
  *    silently failed before. Plus: a malformed pattern is a load-time error.
@@ -63,6 +66,105 @@ async function writePolicy(dir: string, packages: Record<string, unknown>): Prom
  * under test rather than about that documented escape hatch.
  */
 const LOADER_ENV = { "<unknown>": { env: ["WATCH_REPORT_DEPENDENCIES"] } };
+
+// The socket lives inside the project root, so this is the path an app under test uses and
+// `observe` stores as the portable `./api.sock`.
+const SOCK = "./api.sock";
+
+describe.skipIf(process.platform === "win32")("ipc.paths round-trip (#72)", () => {
+  it("observe records the CONCRETE socket path, project-relative so the policy is portable", async () => {
+    appDir = await freshAppDir();
+    const r = await runCli(["observe", "--", "node", "ipc.js"], appDir);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("ipc: connected"); // observe never blocks
+    expect(r.stderr).toMatch(/observe: recorded ipc .*api\.sock/);
+
+    const policy = JSON.parse(
+      await readFile(path.join(appDir, "capabilities.json"), "utf8"),
+    ) as Policy;
+    expect(policy.packages["trace-dep"]?.ipc?.paths).toEqual([SOCK]);
+    // The old shape is NOT emitted any more: no `<ipc>` pseudo-host, no port 0.
+    expect(policy.packages["trace-dep"]?.net?.hosts ?? []).not.toContain("<ipc>");
+  });
+
+  it("enforce under the generated policy runs clean", async () => {
+    appDir = await freshAppDir();
+    await runCli(["observe", "--", "node", "ipc.js"], appDir);
+    const r = await runCli(["enforce", "--", "node", "ipc.js"], appDir);
+    expect(r.stderr).not.toMatch(/DENY/);
+    expect(r.stdout).toContain("ipc: connected");
+    expect(r.code).toBe(0);
+  });
+
+  it("a grant for ONE socket is not a grant for another — the whole point of #72", async () => {
+    appDir = await freshAppDir();
+    await writePolicy(appDir, {
+      "trace-dep": { ipc: { paths: ["./other.sock"] } },
+      ...LOADER_ENV,
+    });
+    const r = await runCli(["enforce", "--", "node", "ipc.js"], appDir);
+    expect(r.stdout).toContain("ipc: CapabilityError");
+    expect(r.stderr).toMatch(/DENY 'trace-dep' ipc .*api\.sock/);
+  });
+
+  it("a glob over a socket directory grants it", async () => {
+    appDir = await freshAppDir();
+    await writePolicy(appDir, { "trace-dep": { ipc: { paths: ["./*.sock"] } }, ...LOADER_ENV });
+    const r = await runCli(["enforce", "--", "node", "ipc.js"], appDir);
+    expect(r.stdout).toContain("ipc: connected");
+    expect(r.code).toBe(0);
+  });
+
+  it("the pre-#72 `net: { hosts: [\"<ipc>\"], ports: [0] }` grant still works (all IPC)", async () => {
+    appDir = await freshAppDir();
+    await writePolicy(appDir, {
+      "trace-dep": { net: { hosts: ["<ipc>"], ports: [0] } },
+      ...LOADER_ENV,
+    });
+    const r = await runCli(["enforce", "--", "node", "ipc.js"], appDir);
+    expect(r.stdout).toContain("ipc: connected");
+    expect(r.code).toBe(0);
+  });
+
+  it("diff reports an ungranted socket as drift, naming the path", async () => {
+    appDir = await freshAppDir();
+    await writePolicy(appDir, {
+      "trace-dep": { ipc: { paths: ["./other.sock"] } },
+      ...LOADER_ENV,
+    });
+    const r = await runCli(["diff", "--json", "--", "node", "ipc.js"], appDir);
+    expect(r.code).toBe(1);
+    const lines = r.stdout.trim().split("\n");
+    const drift = JSON.parse(lines[lines.length - 1] ?? "") as Array<{
+      pkg: string;
+      kind: string;
+      detail: string;
+    }>;
+    expect(drift).toHaveLength(1);
+    expect(drift[0]).toMatchObject({ pkg: "trace-dep", kind: "ipc" });
+    expect(drift[0]?.detail).toMatch(/^ipc .*api\.sock$/);
+  });
+
+  it("diff reports no drift once the socket is granted", async () => {
+    appDir = await freshAppDir();
+    await writePolicy(appDir, { "trace-dep": { ipc: { paths: [SOCK] } }, ...LOADER_ENV });
+    const r = await runCli(["diff", "--", "node", "ipc.js"], appDir);
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain("no drift");
+  });
+
+  it("explain answers with the same evaluator enforce uses", async () => {
+    appDir = await freshAppDir();
+    await writePolicy(appDir, { "trace-dep": { ipc: { paths: ["./run/*.sock"] } } });
+    const allowed = await runCli(["explain", "trace-dep", "ipc", "./run/api.sock"], appDir);
+    expect(allowed.code).toBe(0);
+    expect(allowed.stdout).toMatch(/^ALLOW/);
+
+    const denied = await runCli(["explain", "trace-dep", "ipc", "/var/run/docker.sock"], appDir);
+    expect(denied.code).toBe(1);
+    expect(denied.stdout).toMatch(/^DENY: .*ipc \/var\/run\/docker\.sock/);
+  });
+});
 
 describe("net host globs round-trip (#83)", () => {
   it("observe records the concrete host, and enforce accepts an author-tightened `*.internal`", async () => {

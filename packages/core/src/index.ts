@@ -194,6 +194,18 @@ export { CapabilityError } from "./errors.js";
 export { evaluate, isGranted } from "./policy/evaluate.js";
 export type { CapabilityRequest, Decision } from "./policy/evaluate.js";
 export { loadPolicy, loadPolicyFromObject } from "./policy/load.js";
+// IPC destination handling (#72): the CLI needs `canonicalIpcPath` for `capwall explain` and
+// `placeholderizeIpcPath` to keep a generated policy portable across machines.
+export {
+  canonicalIpcPath,
+  expandIpcPlaceholders,
+  matchesIpcPath,
+  placeholderizeIpcPath,
+  IPC_HOME_PLACEHOLDER,
+  IPC_PSEUDO_HOST,
+  IPC_TMP_PLACEHOLDER,
+  UNKNOWN_IPC_PATH,
+} from "./policy/ipc.js";
 export type { LoadPolicyOptions } from "./policy/load.js";
 export {
   attributeCaller,

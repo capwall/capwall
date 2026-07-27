@@ -44,6 +44,10 @@ function describeRequest(req: CapabilityRequest): string {
       return `fs:${req.access} ${req.path}`;
     case "net":
       return `net ${req.host}:${req.port}`;
+    // The socket path, not the old `<ipc>:0` pseudo-target (#72): "a dep opened a unix socket"
+    // and "a dep opened /var/run/docker.sock" are very different drift reports.
+    case "ipc":
+      return `ipc ${req.path}`;
     case "env":
       return `env ${req.key}`;
     case "child_process":
