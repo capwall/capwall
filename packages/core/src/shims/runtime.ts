@@ -53,23 +53,85 @@ export function attributionOptionsFor(ctx: ShimContext): AttributionOptions {
 /** A shim contributes zero or more `specifier → module object` entries to the loader registry. */
 export type ShimRegistry = Map<string, unknown>;
 
-/**
- * Reentrancy guard for the env shim. When a shim performs a real operation that itself reads
- * `process.env` as an implementation detail — chiefly `child_process` spawning, where Node
- * enumerates `process.env` to build the child's environment block — those reads would
- * otherwise be attributed to the spawning dependency and soft-denied, stripping the child's
- * environment. The child_process shim brackets the real spawn with suspend/resume so the
- * env shim passes those internal reads through untouched. Depth-counted for nesting.
+/*
+ * ───────────────────────────────────────────────────────────────────────────────────────────
+ * KEY-SCOPED ENV AUTHORIZATION (issue #89)
+ * ───────────────────────────────────────────────────────────────────────────────────────────
+ *
+ * WHAT THIS REPLACES. Until #89 this was `suspendEnvGate()`/`resumeEnvGate()`: a process-wide
+ * boolean depth counter that the `child_process` shim raised around the ENTIRE real spawn call,
+ * and which made `shims/env.ts` `decide()` return `null` — no gate, no record — for EVERY key
+ * and EVERY package for the duration. Node reads the caller's own options object inside that
+ * window, so a getter on `options.cwd` ran with the env gate globally off and copied all 85
+ * values out of `process.env`, with nothing but the `child_process` decision in the trace. It
+ * was not even scoped to the spawning package: a second dependency with no grants at all read
+ * ungated too, purely because someone else happened to be inside a spawn.
+ *
+ * WHY AN AUTHORIZATION IS STILL NEEDED AT ALL. Node's own `lib/child_process.js` reads
+ * `process.env` while assembling the child's environment block. Those reads happen with the
+ * spawning dependency as the nearest stack frame and are indistinguishable — same trap, same
+ * `(target, key)`, byte-for-byte the same caller stack — from that dependency reading the key
+ * itself. Gating them would deny a granted package its own legitimate spawn (a child with no
+ * PATH/HOME), which is a functional break, not a security win.
+ *
+ * WHAT IS AUTHORIZED NOW. The bulk of those reads is gone rather than exempted: the
+ * child_process shim supplies an explicit `options.env` built from the un-proxied environment,
+ * so Node's `options.env || { ...process.env }` never enumerates the proxy (see
+ * `shims/child_process.ts`). What remains is a fixed, audited handful of NON-SECRET keys Node
+ * reads by NAME regardless of what the caller supplied. Those — and ONLY those, by exact string
+ * match — pass ungated, and only while a real spawn is on the stack. Every other key stays
+ * gated and recorded, for every package, including inside the spawn.
+ *
+ * So a caller accessor that still runs inside the real call (see the enumeration in
+ * `shims/child_process.ts`) reaches an authorization worth nothing: it can learn whether
+ * `NODE_V8_COVERAGE` is set, and nothing else.
+ *
+ * The set is supplied by the CALLER rather than defined here, so the knowledge of which keys
+ * Node reads lives next to the shim that knows why — this module holds only the mechanism.
  */
-let envGateSuspendDepth = 0;
-export function suspendEnvGate(): void {
-  envGateSuspendDepth++;
+let authorizedEnvKeys: ReadonlySet<string> | null = null;
+
+/**
+ * Run `fn` with `keys` — and nothing else — exempt from the env read gate. Save/restore rather
+ * than a counter, so nesting composes and an inner window can never widen an outer one beyond
+ * its own set.
+ */
+export function withAuthorizedEnvKeys<T>(keys: ReadonlySet<string>, fn: () => T): T {
+  const previous = authorizedEnvKeys;
+  authorizedEnvKeys = keys;
+  try {
+    return fn();
+  } finally {
+    authorizedEnvKeys = previous;
+  }
 }
-export function resumeEnvGate(): void {
-  if (envGateSuspendDepth > 0) envGateSuspendDepth--;
+
+/** True when `key` is one of the keys the currently-running real call is authorized to read. */
+export function isAuthorizedEnvKey(key: string): boolean {
+  return authorizedEnvKeys !== null && authorizedEnvKeys.has(key);
 }
-export function isEnvGateSuspended(): boolean {
-  return envGateSuspendDepth > 0;
+
+/**
+ * The environment object Node's own spawn would have enumerated, WITHOUT the read gate in front
+ * of it — registered by `installEnvGuard` (the only code that holds the un-proxied reference)
+ * and consumed by the child_process shim to build the child's environment block.
+ *
+ * This is a captured OBJECT REFERENCE, not a permission flag: reading it confers no authority
+ * that `installEnvGuard` did not already hold, and it is not time-windowed, so it has none of
+ * the properties that made the old `suspendEnvGate` seam dangerous.
+ *
+ * FAILS CLOSED when unset. With no env guard installed, `process.env` IS the real object, so the
+ * fallback is exact; if a guard were somehow installed without registering, the fallback reads
+ * through the proxy and every key is gated and recorded — noisy, never permissive.
+ */
+let unproxiedEnv: NodeJS.ProcessEnv | undefined;
+
+export function setUnproxiedEnv(env: NodeJS.ProcessEnv | undefined): void {
+  unproxiedEnv = env;
+}
+
+export function unproxiedProcessEnv(): NodeJS.ProcessEnv {
+  return unproxiedEnv ?? process.env;
 }
 
 /* eslint-disable @typescript-eslint/no-explicit-any */

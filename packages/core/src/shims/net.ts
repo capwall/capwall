@@ -127,6 +127,9 @@ import {
   type ShimRegistry,
 } from "./runtime.js";
 import { defineGuardedAccessor, harden, hardenClass } from "./harden.js";
+// The accessor-flattening clone helper moved to `shims/pin.ts` (#89) with NO behavior change, so
+// the child_process shim applies the identical rule rather than growing a second copy of it.
+import { copyOwnFieldsExcept, NO_SKIPPED_KEYS } from "./pin.js";
 import { guardedWebSocketClass } from "./global-egress.js";
 // The single-read URL pinning helpers live in their own module so the global egress guard
 // (#80) can share this exact implementation without an import cycle — see url-snapshot.ts.
@@ -196,9 +199,6 @@ const NET_TARGET_KEYS: readonly string[] = ["host", "hostname", "port", "path"];
  */
 const HTTP_TARGET_KEYS: readonly string[] = ["host", "hostname", "port", "socketPath", "defaultPort"];
 
-/** Nothing skipped — a lossless descriptor copy (still accessor-flattening). */
-const NO_SKIPPED_KEYS: readonly string[] = [];
-
 /** One egress call, fully resolved: the target to guard AND the exact args to forward. */
 interface ResolvedCall {
   host: string;
@@ -222,40 +222,6 @@ interface PinnedNetOptions {
   ipc: boolean | undefined;
   /** The clone to forward: same fields, every one a data property, no accessor anywhere. */
   pinned: Record<string, unknown>;
-}
-
-/**
- * Copy every OWN property of `src` onto `dst` except the keys in `skip` (which the caller pins
- * itself, from its own single read). `Reflect.ownKeys` + `defineProperty` so non-enumerable and
- * symbol-keyed fields survive — a plain enumerable-only, by-value copy silently drops those.
- *
- * SECURITY: every copied property lands on `dst` as a DATA property. An own ACCESSOR is invoked
- * EXACTLY ONCE, here, and its result frozen into a value; its descriptor is never copied. That
- * is the fail-closed half of the pinning invariant (module header): the object handed to Node
- * contains no getters at all, so Node cannot observe a value different from the one this pass
- * saw — even on a key capwall does not (yet) treat as capability-relevant. The previous version
- * copied descriptors verbatim, which is how a `path` accessor (#56) rode through live.
- *
- * A getter that THROWS propagates rather than being swallowed: capwall will not forward an
- * options object it could not pin, and Node would have thrown on the same read anyway.
- */
-function copyOwnFieldsExcept(dst: Record<string, unknown>, src: object, skip: readonly string[]): void {
-  for (const key of Reflect.ownKeys(src)) {
-    if (typeof key === "string" && skip.includes(key)) continue;
-    const desc = Object.getOwnPropertyDescriptor(src, key);
-    if (!desc) continue;
-    if (desc.get !== undefined || desc.set !== undefined) {
-      const value = desc.get !== undefined ? desc.get.call(src) : undefined; // the ONLY invocation
-      Object.defineProperty(dst, key, {
-        value,
-        writable: true,
-        enumerable: desc.enumerable === true,
-        configurable: true,
-      });
-    } else {
-      Object.defineProperty(dst, key, desc);
-    }
-  }
 }
 
 /**
