@@ -11,6 +11,7 @@
 import { attributeCallerDetailed, type AttributionOptions } from "../attribution/index.js";
 import { evaluate, type CapabilityRequest, type Decision } from "../policy/evaluate.js";
 import { CapabilityError } from "../errors.js";
+import { hardenClass } from "./harden.js";
 import type { Mode, Policy } from "@capwall/policy-schema";
 
 /** Callback capwall invokes on every decision (log sink in observe, collector for gen-policy). */
@@ -27,6 +28,13 @@ export interface ShimContext {
    * / the preload; absent means "use the attribution default".
    */
   maxFrames?: number;
+  /**
+   * Opt-in HARDENED MODE (#17): freeze the shim surfaces handed to dependencies so a
+   * dependency cannot monkey-patch away mediation. **Off by default** — it breaks
+   * `graceful-fs` and every other legitimate `fs` patcher. See `shims/harden.ts` for exactly
+   * what is (and is not) frozen, and docs/threat-model.md for what it does not protect.
+   */
+  hardened?: boolean;
 }
 
 /**
@@ -106,8 +114,8 @@ function ordinaryHasInstance(C: unknown, x: unknown): boolean {
  * A second, deliberate consequence: unlike a Proxy — where `Object.freeze` forwards
  * `[[PreventExtensions]]` to the TARGET and would freeze the real builtin class process-wide,
  * outliving `uninstall()` — a guarded subclass is an object capwall CREATED, so it is safe to
- * freeze. Every call site of this helper is therefore a valid `hardenClass()` target once
- * hardened mode (#17 / PR #63) lands; wire them up when it merges.
+ * freeze. Hardened mode (#17) therefore freezes what this helper builds, and it does so HERE
+ * rather than at each call site, so a future call site cannot forget to opt in.
  *
  * RESIDUAL (documented in docs/threat-model.md, same as the `net` sites): climbing PAST the
  * guarded subclass — `Object.getPrototypeOf(Guarded.prototype).constructor`, one hop up —
@@ -123,6 +131,7 @@ function ordinaryHasInstance(C: unknown, x: unknown): boolean {
 export function guardedConstructorSubclass<T extends AnyCtor>(
   RealClass: T,
   check: (args: unknown[]) => void,
+  ctx: ShimContext,
 ): T {
   const Guarded = class extends RealClass {
     constructor(...args: any[]) {
@@ -148,6 +157,8 @@ export function guardedConstructorSubclass<T extends AnyCtor>(
     value: (RealClass as { name: string }).name,
     configurable: true,
   });
+  // Hardened mode only (#17): freeze the subclass + its own prototype. No-op by default.
+  hardenClass(ctx, Guarded);
   return Guarded as unknown as T;
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */

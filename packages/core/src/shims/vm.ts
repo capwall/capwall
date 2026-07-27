@@ -32,6 +32,7 @@ import {
   type ShimContext,
   type ShimRegistry,
 } from "./runtime.js";
+import { harden } from "./harden.js";
 
 export type { DecisionSink, ShimContext, ShimRegistry } from "./runtime.js";
 
@@ -73,7 +74,7 @@ export function createVmShim(ctx: ShimContext): typeof import("node:vm") {
       return orig.apply(this, args);
     };
     Object.defineProperty(wrapped, "name", { value: orig.name, configurable: true });
-    return wrapped;
+    return harden(ctx, wrapped);
   }
 
   /**
@@ -87,9 +88,13 @@ export function createVmShim(ctx: ShimContext): typeof import("node:vm") {
    * {@link guardedConstructorSubclass}).
    */
   function wrapClass(RealClass: AnyCtor): AnyCtor {
-    return guardedConstructorSubclass(RealClass, () => {
-      check(); // throws on enforce-deny, before super() compiles anything
-    });
+    return guardedConstructorSubclass(
+      RealClass,
+      () => {
+        check(); // throws on enforce-deny, before super() compiles anything
+      },
+      ctx, // hardened mode (#17) freezes the guarded subclass; no-op by default
+    );
   }
 
   const realRecord = realVm as unknown as Record<string, unknown>;
@@ -112,7 +117,7 @@ export function createVmShim(ctx: ShimContext): typeof import("node:vm") {
     }
   }
 
-  return shim as typeof import("node:vm");
+  return harden(ctx, shim) as typeof import("node:vm");
 }
 
 /** Register the vm shim's specifiers (`vm`, `node:vm`) into the loader registry. */
