@@ -278,11 +278,16 @@ describe("#107 — every process-level write goes through lifecycle/process-patc
  *    and double-records every read, and the second `installEnvGuard` captured the FIRST guard's
  *    proxy as the "un-proxied" environment — which handed a GRANTED `spawn` an empty child
  *    environment (#103).
+ *  - `Module._findPath` (#127) is the one site that is not a gate at all: it OBSERVES resolutions
+ *    so a symlinked `node_modules` entry can be attributed to the package it was reached through
+ *    rather than to `<app>`. Shared, because two installs would record identical facts into the
+ *    same process-wide map and pay a second `lstat` per resolution to do it.
  *
  * Changing an entry here is changing an enforcement property. Adding one means a new
  * process-global mutation exists; say why in the PR.
  */
 const REVIEWED_SITES: ReadonlyArray<{ name: string; kind: PatchKind }> = [
+  { name: "Module._findPath", kind: "shared" },
   { name: "Module._load", kind: "relinked" },
   { name: "Module.prototype._compile", kind: "shared" },
   { name: "process.dlopen", kind: "relinked" },

@@ -69,6 +69,14 @@
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CHAIN_SEP } from "@capwall/policy-schema";
+import {
+  discoverPackageLink,
+  isUnder,
+  linkGeneration,
+  normalizeSeparators,
+  rewriteThroughLinks,
+} from "./link-map.js";
+import { realFs } from "../real-builtins.cjs"; // never `import … from "node:fs"` — see #78
 
 /**
  * Sentinel for the APPLICATION's own code — the trust root.
@@ -206,6 +214,17 @@ export function resolveMaxFrames(value: unknown, source = "attribution.maxFrames
  * `Map.get` on a hit and no extra allocation.
  */
 const pathToPackage = new Map<string, Map<string, string>>();
+
+/**
+ * The link-map generation the memo above was populated under (#127).
+ *
+ * A path's principal changes the moment a symlinked `node_modules` entry covering it is recorded,
+ * so the memo is dropped wholesale when that happens. Links are recorded a handful of times per
+ * process (once per linked package, during its resolution, before any of its code can run), so
+ * this is not a hot-path concern; it just removes the "was it recorded before or after the first
+ * frame?" ordering question entirely.
+ */
+let memoGeneration = linkGeneration();
 
 /** Capture the current stack as structured CallSites (no string formatting). */
 function captureCallSites(maxFrames: number): NodeJS.CallSite[] {
@@ -381,20 +400,6 @@ export function attributeCallerDetailed(options: AttributionOptions = {}): Attri
  */
 const VIRTUAL_STORE_DIRS: ReadonlySet<string> = new Set([".pnpm", ".store"]);
 
-/**
- * Normalize a path for segment scanning: back-slashes become forward slashes.
- *
- * Unconditionally, not just when `path.sep` is `\`. On POSIX a path such as
- * `/proj/node_modules\lodash/x.js` contains no `/node_modules/` segment, so the old scan
- * called it application code — i.e. a separator confusion resolved to the TRUST ROOT, the
- * wrong direction to be wrong in. A real POSIX file whose name genuinely contains a backslash
- * now attributes to a dependency instead of to `<app>`; that is both vanishingly rare and the
- * conservative side of the trade.
- */
-function normalizeSeparators(p: string): string {
-  return p.includes("\\") ? p.split("\\").join("/") : p;
-}
-
 /** Read the package name a `node_modules/` child directory denotes, or `null` if malformed. */
 function packageNameOf(segments: readonly string[]): string | null {
   const first = segments[0];
@@ -446,6 +451,10 @@ function packageNameOf(segments: readonly string[]): string | null {
  * because it re-opens exactly this hole for that one package.
  */
 export function packageForPath(filePath: string, projectRoot?: string): string {
+  if (memoGeneration !== linkGeneration()) {
+    pathToPackage.clear();
+    memoGeneration = linkGeneration();
+  }
   const rootKey = projectRoot ?? "";
   let byPath = pathToPackage.get(rootKey);
   if (byPath === undefined) {
@@ -459,9 +468,58 @@ export function packageForPath(filePath: string, projectRoot?: string): string {
   return pkg;
 }
 
+/**
+ * Every spelling of the project root a frame path might match (issue #127).
+ *
+ * The raw configured value first, then its realpath when that differs. Frames report realpath'd
+ * paths, so a project root that is itself reached through a symlink (`/var` on macOS, a checkout
+ * under a symlinked home, a container bind-mount) would match NOTHING under a raw comparison and
+ * every application file would fall out of the project — which, with the out-of-tree rule below,
+ * would deny the whole app. Cached because it costs a syscall and the root never changes.
+ */
+const rootSpellings = new Map<string, readonly string[]>();
+function spellingsOfRoot(projectRoot: string): readonly string[] {
+  const cached = rootSpellings.get(projectRoot);
+  if (cached !== undefined) return cached;
+  let raw = normalizeSeparators(projectRoot);
+  while (raw.endsWith("/") && raw.length > 1) raw = raw.slice(0, -1);
+  const out = [raw];
+  try {
+    let real = normalizeSeparators(realFs.realpathSync(projectRoot));
+    while (real.endsWith("/") && real.length > 1) real = real.slice(0, -1);
+    if (real !== raw) out.push(real);
+  } catch {
+    // A root that does not exist on disk (a test fixture, a stale config) is used as written.
+  }
+  rootSpellings.set(projectRoot, out);
+  return out;
+}
+
 /** The uncached derivation behind {@link packageForPath}. */
 function installChainFor(filePath: string, projectRoot?: string): string {
-  const normalized = normalizeSeparators(filePath);
+  const raw = normalizeSeparators(filePath);
+  const roots =
+    projectRoot === undefined || projectRoot === "" ? null : spellingsOfRoot(projectRoot);
+
+  // #127 — UNDO NODE'S REALPATH BEFORE READING POSITION. Node resolves module paths through
+  // `realpath`, so a dependency installed as a symlink into `node_modules` (every `npm i file:`,
+  // every `npm link`, every workspace package) reports a path with no `node_modules` segment and
+  // was therefore `<app>`, the trust root, exempt from four gates before the decision was even
+  // recorded. The link map rewrites the path back to the `node_modules` entry it was REACHED
+  // from, so the ordinary chain derivation below sees the position rather than the destination.
+  let normalized = rewriteThroughLinks(raw);
+
+  const marker = "/node_modules/";
+  const insideProject = roots !== null && roots.some((r) => isUnder(normalized, r));
+  if (roots !== null && !insideProject && !normalized.includes(marker)) {
+    // Out of the project, under no `node_modules`, and no link recorded for it — the shape a
+    // linked dependency has when capwall never observed its resolution (an ESM import; see
+    // `link-map.ts` on why the loader-thread hook cannot record). Try to recover the entry that
+    // links here. This can only turn `<unknown>` into a package NAME; it is never consulted for a
+    // path that would have been `<app>`, so the trust-root sentinel stays a positive
+    // identification (#60).
+    if (discoverPackageLink(normalized, roots[0] as string)) normalized = rewriteThroughLinks(raw);
+  }
 
   // Scan from the project root when the file is under it. Without this, a project that itself
   // lives inside a `node_modules` (capwall applied to a library under test, a monorepo package
@@ -469,16 +527,18 @@ function installChainFor(filePath: string, projectRoot?: string): string {
   // top-level `lodash` would be `thatlib>lodash` and no ordinary policy would match. The root
   // is trusted config, not attacker-controlled.
   let scanFrom = 0;
-  if (projectRoot !== undefined && projectRoot !== "") {
-    let root = normalizeSeparators(projectRoot);
-    while (root.endsWith("/") && root.length > 1) root = root.slice(0, -1);
-    if (normalized.startsWith(root + "/")) scanFrom = root.length;
+  if (roots !== null) {
+    for (const root of roots) {
+      if (normalized.startsWith(root + "/")) {
+        scanFrom = root.length;
+        break;
+      }
+    }
   }
 
-  const marker = "/node_modules/";
   const parts = normalized.slice(scanFrom).split(marker);
   // parts[0] is whatever precedes the first `node_modules`; one part means there is none.
-  if (parts.length < 2) return APP_ROOT;
+  if (parts.length < 2) return appOrUnattributed(normalized, roots);
 
   const chain: string[] = [];
   for (let i = 1; i < parts.length; i++) {
@@ -494,4 +554,33 @@ function installChainFor(filePath: string, projectRoot?: string): string {
   // A file directly inside a virtual store but not inside any package in it.
   if (chain.length === 0) return UNATTRIBUTED;
   return chain.join(CHAIN_SEP);
+}
+
+/**
+ * The verdict for a file under no `node_modules` and covered by no recorded link: the
+ * APPLICATION, or unattributable (issue #127).
+ *
+ * `<app>` REQUIRES BEING IN THE PROJECT. Before #127 "no `node_modules` segment" was sufficient,
+ * so any file anywhere on the disk was the trust root — which is how a `file:`/`link:` dependency
+ * whose realpath lives outside the tree became `<app>` and collected exemptions from the
+ * `process.env`, `dgram`, loader-hook and `_compile` gates without a single grant. Being outside
+ * the project is not evidence of being the project.
+ *
+ * `loader/native.ts`'s `ownerOfAddon` has made exactly this move since #49, for exactly this
+ * reason — an addon written to a temp dir and `dlopen`ed must not be charged to the app — and it
+ * was right there while the stack walk kept failing open. This is that rule, applied once, where
+ * every caller gets it.
+ *
+ * WITH NO PROJECT ROOT CONFIGURED there is nothing to judge "inside the project" against, so the
+ * pre-#127 answer stands. That path is reachable only through the public `packageForPath` export
+ * and in tests; `install()` always defaults `projectRoot` to `process.cwd()`.
+ *
+ * THE COST, STATED PLAINLY: an application whose own sources live outside its declared project
+ * root now attributes to `<unknown>` and is denied by default rather than trusted by default.
+ * That is loud (a `DENY '<unknown>'` line naming the capability), and the fixes are to point
+ * `CAPWALL_PROJECT_ROOT` at the tree that is actually the application, or to grant `<unknown>`.
+ */
+function appOrUnattributed(normalized: string, roots: readonly string[] | null): string {
+  if (roots === null) return APP_ROOT;
+  return roots.some((root) => isUnder(normalized, root)) ? APP_ROOT : UNATTRIBUTED;
 }
