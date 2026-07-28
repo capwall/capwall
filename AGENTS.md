@@ -31,7 +31,7 @@ milestone table is the single source of truth for that — this section describe
 not *how far along it is*, so it does not need editing every milestone.
 
 Working end-to-end on **both** the CJS `require` and the ESM `import` paths:
-`Module._load` patch / `module.register` hook → stack-walk attribution (nearest-package
+`Module._load` patch / `module.registerHooks()` hooks → stack-walk attribution (nearest-package
 policy) → shims → policy evaluate, in both modes. Shims: `fs`; the six egress modules
 `net`/`http`/`https`/`tls`/`http2`/`dgram` (registered **separately** — one shim never covers
 another, see `docs/threat-model.md` for why that is a security property and not a style
@@ -69,7 +69,12 @@ exception, `{...process.env}`, where a single JS call is one interception per en
 native-addon load gate
 (`native` capability, `core/src/loader/native.ts` — a `process.dlopen` patch; gating only,
 never confinement, see `docs/threat-model.md` § Native `.node` addons). The **ESM hook (M5)**
-is implemented (both static and dynamic `import` of mediated builtins are intercepted via a `module.register` hook; on by default under the CLI, `CAPWALL_ESM=0` to disable). Shims are handed out
+is implemented (both static and dynamic `import` of mediated builtins are intercepted via
+`module.registerHooks()` — synchronous, same-realm, same-thread hooks, which Node ≥22.15 has and
+which #173 migrated to off the DEP0205-deprecated `module.register()`; on by default under the
+CLI, `CAPWALL_ESM=0` to disable. Those hooks are consulted for `require()` as well as `import()`,
+so the ESM perimeter now overlaps the CJS one — see `loader/esm-hooks.ts` on why that is a second
+layer rather than a duplicate decision). Shims are handed out
 **mutable by default** (graceful-fs compatibility); opt-in **hardened mode**
 (`install(…, { hardened: true })` / `CAPWALL_HARDENED=1`, issue #17) freezes them instead —
 see `core/src/shims/harden.ts` and threat-model.md § Hardened mode for what it does and does
@@ -132,7 +137,7 @@ Where each concern lives:
 |---|---|
 | Public API — `install(policy, mode)` | `packages/core/src/index.ts` |
 | CJS `require` patch | `packages/core/src/loader/require.ts` |
-| ESM loader hook (`module.register`) | `packages/core/src/loader/{esm-hook,esm-hooks,esm-runtime}.ts` |
+| ESM loader hooks (`module.registerHooks()` — synchronous, this thread, also on the `require()` path) | `packages/core/src/loader/{esm-hook,esm-hooks,esm-runtime}.ts` |
 | Real-builtin capture (the ONLY place a mediated builtin is loaded — CJS on purpose, #78) | `packages/core/src/real-builtins.cts` |
 | Native `.node` load gate (`process.dlopen`) | `packages/core/src/loader/native.ts` |
 | Core-API capability shims | `packages/core/src/shims/{fs,net,child_process,worker_threads,env,vm}.ts` (`net.ts` registers all six egress modules) |
@@ -165,7 +170,7 @@ Mirror `docs/roadmap.md`. **Get observe→policy→enforce working end-to-end on
    capabilities and emits a starter policy. This is the headline feature — do it early.
 3. **`enforce` mode.** Deny-by-default; throw on violation; `malicious-dep-demo` is blocked.
 4. **Remaining shims.** `net`/`http(s)`, `child_process`, `worker_threads`, `env`, `vm`.
-5. **ESM.** Loader hooks via `module.register`; reach parity with the CJS path.
+5. **ESM.** Loader hooks via `module.registerHooks()`; reach parity with the CJS path.
 6. **SBOM import (stretch).** CycloneDX/CBOM → policy in `packages/sbom-import`.
 
 Do not start step *n+1* until step *n* has passing tests and a clean typecheck.
@@ -216,14 +221,38 @@ Do not start step *n+1* until step *n* has passing tests and a clean typecheck.
   preference, it is a 30 µs default nobody would notice.
   `evaluate()` is negligible (~125ns). Cache module→package resolution (the path→package cache
   gives ~50x cold-vs-warm).
-  **There is a second budget, on a different axis: STARTUP.** A mediated child costs ~250 ms at
-  p90 where a bare `node` costs ~48 ms, and that ~180 ms is paid once per process by every user
-  on every process they mediate. `bench.mjs` does not measure it; the breakdown is in
-  `scripts/bench/README.md` § Startup. The one thing to know before touching the install path:
-  **`module.register()` blocks the main thread while Node's loader thread resolves, compiles and
-  evaluates the hook module's entire import graph**, so an import added anywhere reachable from
-  `loader/esm-hooks.ts` is serial startup cost for every capwall user. `test/esm-hook-graph.test.ts`
-  fails on the two shapes that regress it (#150).
+  **There is a second budget, on a different axis: STARTUP.** A mediated child costs **141–179 ms**
+  (min estimator, idle 16-core: 178.8 on Node 22, 161.9 on 24, 141.0 on 26) where a bare `node`
+  costs **37–45 ms** — so ~100–135 ms is capwall, paid once per process by every user on every
+  process they mediate. Quote those, not the ~250 ms / ~180 ms p90 pair an earlier revision of this
+  bullet carried: that pair predates #152 and is high by ~80–95 ms. `bench.mjs` does not measure
+  this axis at all; `pnpm bench:startup` does, and the breakdown is in `scripts/bench/README.md`
+  § Startup and § After #152.
+  **What gates that budget, stated precisely, because the previous version of this paragraph named
+  a guard that no longer exists.** It said `module.register()` blocks the main thread while Node's
+  loader thread evaluates the hook module's whole import graph, and that
+  `test/esm-hook-graph.test.ts` fails on the two shapes that regress it (#150). Both halves went
+  with #173: the perimeter is `module.registerHooks()`, so there is no loader thread and no
+  blocking graph, and #150's two static scans were deleted in the same PR because the realm they
+  described was gone (that test file's own header is the record). What `test/esm-hook-graph.test.ts`
+  enforces **today** is three properties, each measured in a clean child:
+  - **capwall's ESM install starts no module-customization thread** (#152) — read off
+    `process.moduleLoadList`, with a bare `module.register()` in the same child as the positive
+    control, so "no thread" cannot be confused with "the probe stopped reporting". Mutant
+    `esm-no-loader-thread`.
+  - **a mediated process writes NOTHING to stderr while registering** (#153) — asserted as exact
+    emptiness, which is also how a loader crash or a new experimental warning surfaces.
+  - **the main thread's startup graph does not silently widen** (#167) — a CEILING ON A MODULE
+    COUNT: resolves under `zod/` once `policy/load.js` is in, budget 224 against an observed 180,
+    the headroom derived from 15 ms at the measured ~0.34 ms per resolve, plus a self-check that
+    pins the ceiling to that floor so raising one without re-deriving the other fails.
+  **Nothing scans `loader/esm-hooks.ts`'s import graph any more, so keeping it narrow is a
+  CONVENTION and not a gate — do not add an import there expecting a test to stop you.** #167's
+  counter only sees modules under `zod/`; a first-party module, or any third-party module that is
+  not zod, joins the startup graph with every gate green. It is still real money: #171 priced the
+  main-thread graph at **~450–500 µs per ES module** (35 modules cost 15–18 ms over the identical
+  source in one file), so roughly two modules is a millisecond. If you widen that graph, the way to
+  learn what it cost is `pnpm bench:startup` on 22/24/26, not `pnpm test`.
   **The same reasoning applies to `preload.ts`'s graph, and zod 4 is what it cost.** `zod`
   3 → 4 (#161) added **~58 ms** to that graph: ~+60 ms of zod's own module evaluation (79 ES
   modules where v3 had 10), ~+11 ms building the schema tree, and *zero* in `parsePolicy` — zod 4
@@ -233,12 +262,18 @@ Do not start step *n+1* until step *n* has passing tests and a clean typecheck.
   everything else may do. Do not re-litigate that from `pnpm outdated`; the measurement, the
   entry points that were tried (`zod/mini`, `zod/v4/core`, CJS) and the one lever left unpulled
   (Node's on-disk V8 compile cache, worth ~34 ms) are in `scripts/bench/README.md` § zod 4.
-  **`module.register()` is now DEPRECATED (DEP0205) as of Node 26**, which prints a
-  DeprecationWarning on stderr in every mediated process on that version. Together with the
-  ≥22.15 floor making `module.registerHooks()` unconditionally available, #152 is now unblocked
-  *and* on a clock — it is the deprecation path, not just a ~53 ms startup win. It is deliberately
-  NOT a drive-by change: the ESM perimeter is where #59, #61 and #62 lived, so it gets its own PR
-  with the full laundering-vector suite run against it.
+  **The ESM perimeter's migration is DONE — #152 and #153 are closed, landed by #173. Do not
+  re-do it.** `module.register()` is Stability 0 and runtime-deprecated as DEP0205 in Node 26,
+  where it printed a DeprecationWarning in every mediated process and, under `--throw-deprecation`,
+  stopped the application starting outright; capwall does not call it anywhere.
+  `packages/core/src/loader/esm-hook.ts` registers with `module.registerHooks()` and calls the
+  returned `deregister()` when the last install unwinds — the line `register()` could not offer,
+  and the reason the CJS and ESM paths now agree after teardown instead of ESM being fail-closed.
+  Two consequences are live constraints on new work rather than history: **these hooks are
+  consulted for `require()` as well as `import()`**, so a change to `resolve`/`load` is a change to
+  the CJS path too (see `loader/esm-hooks.ts` on why the module-read gate must not decide the same
+  load twice), and `registerHooks()` is Stability 1.2, so its status per major is tracked in
+  `docs/node-api-dependencies.md` and re-measured rather than assumed.
 - **License hygiene.** capwall is MIT, and the gate is **scoped by whether the dependency
   ships**. An earlier revision of this bullet said "permissive only" without saying *where*,
   which read as one blanket rule and blocked a devDep major over a licence that never reaches
@@ -314,8 +349,12 @@ the matrix as early warning: it becomes LTS on 2026-10-28, and it is already the
   delete).
 - **Start child processes through `packages/core/test/helpers/subprocess.ts`, and no more than
   two per test.** ~190 of the suite's children are a full `node` startup (122 in `core`, 69 in
-  `cli`), because hardened mode, ESM module caching and `module.register()` are
-  process-sticky. Each costs ~0.5s, and the per-test timeout is arithmetic on that count —
+  `cli`), because hardened mode and the ESM module registry are process-sticky: a synthetic
+  `capwall-esm:` module, once evaluated, stays in the realm's registry for the life of the process,
+  so a second install in the same process cannot re-decide an import the first one already served.
+  **Hook REGISTRATION is no longer on that list** — `module.registerHooks()` returns a
+  `deregister()` and `uninstall()` calls it (#152), where `module.register()` could not be undone
+  at all. Each child costs ~0.5s, and the per-test timeout is arithmetic on that count —
   which a setup file enforces, so a third child fails by name rather than by quietly
   invalidating a budget nobody re-derived. The helper owns the budget, the measurements behind
   it, and the failure message. A test over budget usually wants splitting; two `it`s asserting

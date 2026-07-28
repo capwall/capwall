@@ -21,9 +21,13 @@
  *   - `wall` — `performance.now()` read on the FIRST line of the target's entry point, i.e.
  *     milliseconds since the child's own timeOrigin, after the whole `--import` chain has run.
  *     This is the headline figure.
- *   - `cpu`  — the same instant's `process.cpuUsage()` (user+system), which counts the ESM
- *     loader thread's work as well as the main thread's. On a mediated child `cpu > wall`,
- *     and the gap IS the loader thread.
+ *   - `cpu`  — the same instant's `process.cpuUsage()` (user+system) for the WHOLE child, i.e.
+ *     every thread it has. `cpu > wall` on a mediated child, and since #152 that gap is
+ *     ordinary main-thread work plus Node's own pool (~40 ms, the same as the `CAPWALL_ESM=0`
+ *     control measured in `README.md` § After #152) — NOT a loader thread. This harness was
+ *     written while `module.register()` still started one, when the gap was 60–65 ms and the
+ *     extra 20–25 ms of it WAS that thread; that is what the column was for and it is why it
+ *     is still printed. Do not attribute today's gap to a thread that is not there.
  *   - `spawn` — the parent's wall clock around `spawnSync`, printed only under `--verbose`.
  *     It folds in fork/exec, parent scheduling and teardown, which on a loaded machine are
  *     hundreds of milliseconds of variance on top of a ~200 ms signal. Recorded so the
@@ -39,8 +43,10 @@
  *     what the pre-floor measurements in the README quote — is reported under `--verbose`; it is
  *     the honest figure on an IDLE box and pure contention on a busy one.
  *  3. CONTROL ROWS ARE NOT OPTIONAL. `bare node` and `CAPWALL_ESM=0` are printed on every run.
- *     A change that claims the ESM loader thread and moves `bare node` did not measure what it
- *     says it measured.
+ *     A change that claims the ESM perimeter and moves `bare node` did not measure what it says
+ *     it measured. `CAPWALL_ESM=0` is the sharper of the two: it is the same preload with the
+ *     hooks not registered, so the difference between it and the mediated arm is the whole of
+ *     what the perimeter costs.
  *  4. THE HARNESS CHECKS ITS OWN PREMISE, before it times anything. Every arm is probed once:
  *     the target requires a granted-NOTHING fixture dependency and attempts an `fs` read, and
  *     the harness asserts that the mediated arms DENIED it and charged `bench-dep-denied` —
@@ -280,6 +286,7 @@ if (JSON_OUT) {
   }
   process.stdout.write(
     "\nms, lower is better. `wall` is measured INSIDE the child on the first line of the entry\n" +
-      "point; `cpu` is that child's own user+system CPU and includes the ESM loader thread.\n",
+      "point; `cpu` is that child's own user+system CPU across every thread it has. Since #152\n" +
+      "capwall starts none of its own, so `cpu - wall` is main-thread work plus Node's pool.\n",
   );
 }

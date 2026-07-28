@@ -157,8 +157,18 @@ type ResolveFilename = (this: unknown, ...args: unknown[]) => string;
  * exactly what Node 22 forwards. Given how this parameter has moved (see {@link ModuleLoad}), a
  * Node that hands `_load` the resolve options directly again is a live possibility, and dropping
  * a `paths` on the floor would put the gate back to deciding about a file Node is not opening.
+ *
+ * EXPORTED FOR TESTS, and that is a coverage decision rather than an API one (#176). The
+ * end-to-end rows for this fix have to drive a real `Module._load` with the four-argument form,
+ * which only Node ≥24.18 honours — so on **22.15, the declared `engines` floor**, they
+ * `it.skipIf` out and `pnpm test` gave the fix zero coverage on the version the repo tells
+ * adopters to run. The classification above is a pure function of `args` and is deliberately NOT
+ * version-keyed, so it can be asserted on every runtime by calling it directly; that is what
+ * `test/module-read.test.ts` § "the classification rule itself" does, and what lets the
+ * `module-read-resolve-options-unwrapped` mutant be evidence of something on 22 instead of a
+ * false `SURVIVED`. Not re-exported from `src/index.ts` and not on any `exports` path.
  */
-function resolveOptionsFrom(args: unknown[]): unknown {
+export function resolveOptionsFrom(args: unknown[]): unknown {
   const internal = args[3];
   if (typeof internal !== "object" || internal === null) return undefined;
   const bag = internal as { requireResolveOptions?: unknown; paths?: unknown; conditions?: unknown };

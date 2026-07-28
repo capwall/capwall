@@ -60,7 +60,7 @@ has roughly doubled since the harness was written.
 | hardened mode (#17) | yes | a second, stacked hardened install; both arms mediated |
 | `Module.prototype._compile` gate (#93) | yes (#134) | `[G]` — N generated CJS modules `require`d fresh, with the real and the patched `_compile` swapped into the prototype slot per arm |
 | `process.dlopen` native gate (S2) | yes (#134) | `[G]` — a placeholder `.node` inside the fixture package, so the gate's two subjects (#49) are one principal |
-| ESM cold resolution (loader-thread hooks) | yes (#134) | `[G]` — a fresh `?n=` URL per iteration; paired against the same import with a NON-mediated specifier |
+| ESM cold resolution (`registerHooks` `resolve`/`load`) | yes (#134) | `[G]` — a fresh `?n=` URL per iteration; paired against the same import with a NON-mediated specifier |
 | `node:module` loader-hook registration gate (#61) | **no** | once per process. |
 | `vm` / `worker_threads` gates | **no** | one `guard()` each, identical in shape to the `child_process` deny row, and the allowed form is dominated by thread/context creation. |
 | observe mode | **no** | the sink here is a no-op; a real `observe` run writes a trace line per decision, and that cost is the embedder's, not capwall's. |
@@ -821,8 +821,10 @@ printing a confident number:
   the before and after #143 figures print `≲`. The **`fetch`, denied** row is the resolvable one.
 - **hardened mode** — measured at or below resolution, i.e. hardening costs nothing per call,
   which is what you would expect from an `Object.freeze` that happens at shim-build time.
-- **`[G]` ESM cold resolve** — a loader-thread round trip is milliseconds with millisecond spread,
-  and capwall's synthetic-module half is far under it, so the paired delta prints `≲` and is
+- **`[G]` ESM cold resolve** — a cold module resolution is milliseconds with millisecond spread
+  (it was a loader-thread round trip when this row was written; since #152 it is Node's own
+  resolver on this thread, and the spread is the same order), and capwall's synthetic-module half
+  is far under it, so the paired delta prints `≲` and is
   frequently negative. Read it as "the mediated half of a cold resolution is below the noise floor
   of the resolution itself", which is a genuine answer to #134's question and not a measurement.
 

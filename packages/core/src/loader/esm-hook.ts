@@ -25,7 +25,9 @@
  *     holds no capwall state, so the policy was COPIED to it over a `MessagePort` and re-copied
  *     on every change. The hooks now run in this realm and read `liveCtx` directly. The
  *     `MessageChannel`, the `onLiveContextChange` subscription, the `EsmGateSnapshot` posts and
- *     the decision-return path are all deleted, not ported.
+ *     the decision-return path are all deleted, not ported. (`onLiveContextChange` ITSELF is
+ *     still there and this was its only caller — `live-context.ts`'s header says why it was kept
+ *     and where it is now tested.)
  *  2. **No `data` payload.** `bridgeUrl` and the export-name map used to cross a thread boundary
  *     as `register()`'s `data`; they are now an ordinary function call into the hook module.
  *  3. **A real teardown.** `module.registerHooks()` returns a handle with `deregister()`, where

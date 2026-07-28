@@ -142,9 +142,10 @@ corepack enable   # provides the pnpm version this repo pins
 
 `pnpm install` runs **no dependency install scripts** on a fresh clone. That is deliberate, and
 since the vite 8 bump it is also literal: no package anywhere in the tree declares one. pnpm
-blocks install scripts by default, and `pnpm-workspace.yaml` § `allowBuilds` — where a
-reviewed-and-declined script would be recorded, as `name: false` — is currently empty. Nothing
-needs approving.
+blocks install scripts by default, and `pnpm-workspace.yaml`'s `allowBuilds` map — where a
+reviewed script *would* be recorded, as `name: true` or `name: false` — is a key that deliberately
+does not exist today; the file's own header says why an empty `allowBuilds: {}` is worse than no
+key at all. Nothing needs approving.
 
 If a fresh install ever *fails* with `ERR_PNPM_IGNORED_BUILDS`, a new dependency brought a new
 install script in and pnpm wants a decision on it. Note that word: pnpm 11 **fails the install**

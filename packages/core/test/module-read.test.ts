@@ -33,6 +33,7 @@ import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { moduleLoadNeedsDecision, decideEsmModuleRead } from "../src/loader/module-read.js";
+import { resolveOptionsFrom } from "../src/loader/require.js";
 import { parsePolicy } from "@capwall/policy-schema";
 import {
   assertPreloadBuilt,
@@ -437,6 +438,77 @@ describe("#123 CJS — require() is not a way around fs.read", () => {
 // `Module._load` reaches it.** They deliberately do not assert an argument count.
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 describe("#123 — every spelling of Module._load reaches the same decision", () => {
+  /**
+   * THE CLASSIFICATION RULE ITSELF — the half of #157 that runs on the FLOOR (issue #176).
+   *
+   * The two end-to-end rows below need a `Module._load` that honours `requireResolveOptions`,
+   * which arrived in a 24 MINOR. `HONOURS_REQUIRE_RESOLVE_OPTIONS` feature-detects that correctly
+   * and both rows therefore skip on Node 22 — which is right, and was also the whole of the
+   * problem: `engines` is `>=22.15.0`, so on the version this repo tells adopters to run,
+   * `pnpm test` exercised none of the fix for a live deny-all-policy bypass. Only `pnpm ci:local`
+   * (a Docker matrix nobody runs per commit) touched it.
+   *
+   * `resolveOptionsFrom` is a pure function of `Module._load`'s argument list and — per
+   * `require.ts`'s own comment — is deliberately classified by the fields an object HAS rather
+   * than by a Node version. So the durable part of the fix can be asserted on every runtime by
+   * calling it, without a `_load` that honours anything. These rows are what the
+   * `module-read-resolve-options-unwrapped` mutant fails against on 22; without them the catalog
+   * would report a false `SURVIVED` there, since a mutant whose claimed tests all SKIPPED is not
+   * evidence of anything (`scripts/mutation-guard.mjs` reads "the tests did not fail" as
+   * survived).
+   *
+   * These do NOT replace the end-to-end rows. They pin the rule; the rows below pin that the rule
+   * is wired into the gate on a runtime that can reach it.
+   */
+  describe("the classification rule itself — runtime-independent, so it runs on the floor", () => {
+    /** Positional filler for `(request, parent, isMain)`; only `args[3]` is under test. */
+    const load = (fourth: unknown): unknown[] => ["./secrets.json", null, false, fourth];
+
+    it("unwraps Node ≥24.18's internal bag to the field _resolveFilename actually takes", () => {
+      // THE BUG, stated as an assertion: pre-#157 this returned the BAG. `_resolveFilename` found
+      // no `paths` on it, threw, `resolveQuietly` returned null, and the #123 gate read that as
+      // "nothing to decide" — bytes delivered, zero decisions recorded, under a deny-all policy.
+      const options = { paths: ["/proj/vault"] };
+      expect(
+        resolveOptionsFrom(load({ requireResolveOptions: options, shouldSkipModuleHooks: false })),
+      ).toBe(options);
+    });
+
+    it("passes a bare ResolveFilenameOptions through, so a future Node cannot lose its `paths`", () => {
+      // Not hypothetical symmetry: this parameter has already appeared, vanished and returned
+      // across 20/22/23/24/26. A Node that hands `_load` the resolve options directly again must
+      // not have its `paths` dropped on the floor — that puts the gate back to deciding about a
+      // file Node is not opening, which is the same defect from the other side.
+      const direct = { paths: ["/proj/vault"] };
+      expect(resolveOptionsFrom(load(direct))).toBe(direct);
+      const conditions = { conditions: ["node", "import"] };
+      expect(resolveOptionsFrom(load(conditions))).toBe(conditions);
+    });
+
+    it("contributes nothing for Node 22's bag and for the three-argument majors", () => {
+      // Node 22's `_load` gets `{ shouldSkipModuleHooks }` and forwards NO options argument at
+      // all, so `undefined` is what matches Node rather than what is left over. Asserted as an
+      // exact `undefined` — returning the bag here is the ≥24.18 defect one major earlier.
+      expect(resolveOptionsFrom(load({ shouldSkipModuleHooks: true }))).toBeUndefined();
+      expect(resolveOptionsFrom(load(undefined))).toBeUndefined();
+      expect(resolveOptionsFrom(load(null))).toBeUndefined();
+      expect(resolveOptionsFrom(["./secrets.json", null, false])).toBeUndefined();
+      // A non-object fourth argument is not an options bag whatever a future Node calls it.
+      expect(resolveOptionsFrom(load("paths"))).toBeUndefined();
+    });
+
+    it("prefers the bag's own field when both spellings are present", () => {
+      // An object carrying BOTH is only reachable from a Node that changed shape mid-release or
+      // from something forging an argument list. `requireResolveOptions` wins because that is the
+      // field Node itself destructures and forwards; the outer `paths` is the bag's, not the
+      // resolver's, and honouring it would resolve against paths Node is not using.
+      const inner = { paths: ["/inner"] };
+      expect(resolveOptionsFrom(load({ requireResolveOptions: inner, paths: ["/outer"] }))).toBe(
+        inner,
+      );
+    });
+  });
+
   it.skipIf(!HONOURS_REQUIRE_RESOLVE_OPTIONS)(
     "denies the `requireResolveOptions` form exactly as it denies the plain one",
     async () => {

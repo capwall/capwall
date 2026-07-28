@@ -45,7 +45,7 @@ Get the full **observe → policy → enforce** loop working end-to-end on **one
 - Extend policy generation and `explain` to cover them.
 
 ### M5 — ESM
-- Loader hooks via `module.register` (`core/src/loader/esm-hook.ts`); reach parity with the
+- Loader hooks via `module.registerHooks()` (`core/src/loader/esm-hook.ts`); reach parity with the
   CJS path. Expect this to be genuinely hard (static imports resolve before hooks; immutable
   bindings) — see architecture.md Risks.
 

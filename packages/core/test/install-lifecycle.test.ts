@@ -37,7 +37,12 @@ import {
   type InstallHandle,
   type Policy,
 } from "../src/index.js";
-import { liveCtx, popInstall, pushInstall } from "../src/loader/live-context.js";
+import {
+  liveCtx,
+  onLiveContextChange,
+  popInstall,
+  pushInstall,
+} from "../src/loader/live-context.js";
 import type { ShimContext } from "../src/shims/runtime.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -351,6 +356,99 @@ describe("#87 — the live context mirrors the whole install", () => {
     expect(liveCtx.projectRoot).toBeUndefined();
     expect(liveCtx.maxFrames).toBeUndefined();
     expect(liveCtx.hardened).toBeUndefined();
+  });
+});
+
+/**
+ * THE SUBSCRIPTION KEPT FOR A CONSUMER THAT NO LONGER EXISTS — issue #175.
+ *
+ * `onLiveContextChange` had exactly one consumer: the ESM hooks, while `module.register()` ran
+ * them on Node's loader thread holding a COPY of the policy that had to be re-sent whenever the
+ * original moved. #152 put the hooks in this realm reading `liveCtx` directly, so the copy — and
+ * the only subscriber — went away. The audit that filed #175 confirmed zero callers anywhere in
+ * `src`, `test`, `scripts` or `examples`, and that it is not on the published `exports` surface.
+ *
+ * It is KEPT, deliberately: an out-of-realm or out-of-process mediator is a shape capwall may
+ * plausibly need again, and this is the only place that knows when the live context was
+ * re-pointed. See `loader/live-context.ts`'s header for that argument and for the rule that comes
+ * with it — nothing IN-realm may use this to cache policy state.
+ *
+ * WHAT THIS FILE ADDS is the other half of "kept". Zero callers also means zero coverage, in the
+ * module that owns the #62/#87 fix, and `oxlint`'s `no-unused-vars` cannot see an exported
+ * symbol — so without these rows the first re-user finds out at runtime whether the machinery
+ * still works, having read a comment that promised it does. These assert the four things a
+ * re-user would rely on, plus the failure isolation.
+ */
+describe("#175 — the live-context subscription still works with no subscribers in `src`", () => {
+  const ctxFor = (mode: "observe" | "enforce"): ShimContext => ({
+    policy: tight(),
+    mode,
+    onDecision: () => {},
+  });
+
+  it("delivers the current state on subscribe, then every re-point, until unsubscribed", () => {
+    const seen: Array<[string, boolean]> = [];
+    // Subscribing mid-lifecycle must not require the subscriber to reconstruct what it missed —
+    // that immediate first call is why a re-user can attach after an install rather than before.
+    const outer = ctxFor("observe");
+    pushInstall(outer);
+    let unsubscribe: (() => void) | undefined;
+    try {
+      unsubscribe = onLiveContextChange((ctx, installed) => {
+        seen.push([ctx.mode, installed]);
+      });
+      expect(seen, "a subscriber must be handed the CURRENT state on subscribe").toEqual([
+        ["observe", true],
+      ]);
+
+      // A push re-points the box, so the subscriber hears the NEW top of stack, not the old one.
+      const inner = ctxFor("enforce");
+      pushInstall(inner);
+      expect(seen[seen.length - 1]).toEqual(["enforce", true]);
+      popInstall(inner);
+      expect(seen[seen.length - 1]).toEqual(["observe", true]);
+    } finally {
+      popInstall(outer);
+    }
+
+    // The pop that empties the stack is the notification an out-of-realm mediator most needs:
+    // `installed` goes false and the policy it is holding must be discarded, not merely aged.
+    expect(seen[seen.length - 1]?.[1], "teardown must be delivered as installed=false").toBe(false);
+
+    const beforeUnsubscribe = seen.length;
+    unsubscribe?.();
+    const after = ctxFor("enforce");
+    pushInstall(after);
+    popInstall(after);
+    expect(seen.length, "unsubscribe must actually detach the listener").toBe(beforeUnsubscribe);
+  });
+
+  it("isolates a listener that throws, so one bad subscriber cannot strand an install", () => {
+    // #107's bug 3 in a new place: a half-applied lifecycle transition is strictly worse than a
+    // noisy one, so `notifyOne` swallows and reports. Asserted through a SECOND listener rather
+    // than by "it did not throw" — that alone would pass with the try/catch deleted only if the
+    // thrower ran last, which is an ordering accident, not a property.
+    const reached: string[] = [];
+    const stopThrower = onLiveContextChange(() => {
+      reached.push("thrower");
+      throw new Error("capwall test: a live-context listener threw on purpose");
+    });
+    const stopWitness = onLiveContextChange(() => {
+      reached.push("witness");
+    });
+    reached.length = 0;
+
+    const ctx = ctxFor("enforce");
+    try {
+      pushInstall(ctx);
+      expect(reached).toEqual(["thrower", "witness"]);
+      // …and the install really did take effect, rather than unwinding at the throw.
+      expect(liveCtx.mode).toBe("enforce");
+    } finally {
+      popInstall(ctx);
+      stopThrower();
+      stopWitness();
+    }
   });
 });
 
