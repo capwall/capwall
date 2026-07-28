@@ -32,4 +32,12 @@ ARG CACHEBUST=0
 RUN echo "run ${CACHEBUST}" && pnpm test
 RUN pnpm lint
 
+# ci.yml step: "Perf gate" — the reduced-iteration benchmark run (scripts/bench/bench.mjs
+# --quick, ~10s). It gates on a CO-SAMPLED RATIO rather than an absolute microsecond figure, so
+# it is portable across machines and does not go red because the host is busy; see
+# scripts/bench/README.md § The regression gate for how the threshold was derived and what it
+# will and will not catch. Set BENCH=0 to skip it (scripts/ci-local.sh passes CI_BENCH through).
+ARG BENCH=1
+RUN if [ "${BENCH}" = "1" ]; then pnpm bench:gate; else echo "perf gate skipped (BENCH=0)"; fi
+
 # A green build of this image == a green CI run for this Node version.

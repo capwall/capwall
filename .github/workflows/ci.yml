@@ -43,3 +43,10 @@ jobs:
       # not a second `tsc` pass. See docs/ci-local.md § the fast path.
       - name: Lint
         run: pnpm lint
+
+      # The roadmap S4 perf claim, checked rather than assumed. Reduced-iteration run (~10s)
+      # gating on a CO-SAMPLED RATIO, not on absolute microseconds — a shared runner's speed
+      # cancels out, so this is not a flaky gate. scripts/bench/README.md § The regression gate
+      # documents how the threshold was derived and what it will and will not catch.
+      - name: Perf gate
+        run: pnpm bench:gate
