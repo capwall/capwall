@@ -1,12 +1,12 @@
-# Publish the four @capwall packages to npm.
+# Publish the @capwall packages to npm.
 #
-# READ docs/releasing.md BEFORE TOUCHING THIS FILE. Two things about it are load-bearing in
+# READ docs/releasing.md BEFORE TOUCHING THIS FILE. Three things about it are load-bearing in
 # ways that are not obvious from the YAML:
 #
 #  1. THE FILENAME IS PART OF THE TRUST CONFIGURATION. npm trusted publishing binds a package
 #     to a specific repository AND a specific workflow *filename*. Renaming this file, or
-#     moving the publish step into a different workflow, breaks publishing for all four
-#     packages until someone reconfigures each one by hand on npmjs.com.
+#     moving the publish step into a different workflow, breaks publishing for every package
+#     until someone reconfigures each one by hand on npmjs.com.
 #
 #  2. THE TARBALLS ARE BUILT BY pnpm AND UPLOADED BY npm, ON PURPOSE. The packages depend on
 #     each other with pnpm's `workspace:*` protocol. Only pnpm rewrites that to a concrete
@@ -17,6 +17,11 @@
 #     concrete versions inside, and npm attaches the provenance attestation. Do not
 #     "simplify" this into one command; each half is there for a reason the other cannot
 #     cover.
+#
+#  3. NOT EVERY WORKSPACE PACKAGE IS PUBLISHED. Everything under packages/ is packed, but the
+#     publish set is declared in scripts/check-release-versions.mjs and read back here with
+#     `--publish-list` — one list, not two that can drift. @capwall/sbom-import is held back
+#     today; see docs/releasing.md § What is published for why.
 #
 # npm publishes are effectively permanent (the unpublish window is 72 hours and narrow even
 # inside it). Rehearse with the `dry_run` input before tagging anything.
@@ -100,18 +105,26 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
 
-      # Fail before touching the registry if the tag and the manifests disagree, or if the
-      # four packages are not in lockstep. Publishing three of four and then discovering the
-      # fourth is at a different version is not a recoverable state.
-      - name: Check versions are in lockstep and match the tag
+      # Fail before touching the registry if the tag and the manifests disagree, if the
+      # packages are not in lockstep, if an internal dependency is a range rather than an
+      # exact pin, or if CHANGELOG.md has no dated entry for this version. Publishing two of
+      # three and then discovering the third is at a different version is not a recoverable
+      # state. See scripts/check-release-versions.mjs for the reasoning behind each check.
+      - name: Check versions, pins and changelog
         run: node scripts/check-release-versions.mjs "${{ github.ref_type == 'tag' && github.ref_name || '' }}"
 
       # pnpm rewrites `workspace:*` to a concrete version here. This is the step npm cannot do.
+      #
+      # EVERY workspace package is packed, including any held back from the registry: packing
+      # is how the packaging assertions below get something to inspect, and a held-back package
+      # that has quietly stopped packing correctly is a nasty surprise on the release that
+      # finally publishes it. What gets *published* is a smaller list, read from
+      # check-release-versions.mjs so it is declared in exactly one place.
       - name: "Pack with pnpm (rewrites the workspace: protocol)"
         run: |
           mkdir -p dist-tarballs
-          for p in policy-schema core sbom-import cli; do
-            (cd "packages/$p" && pnpm pack --pack-destination ../../dist-tarballs)
+          for d in packages/*/; do
+            (cd "$d" && pnpm pack --pack-destination ../../dist-tarballs)
           done
           ls -l dist-tarballs
 
@@ -139,9 +152,15 @@ jobs:
           name: capwall-tarballs
           path: dist-tarballs/*.tgz
 
-      # Dependency order: policy-schema -> core -> sbom-import -> cli. npm does not require
-      # it (a version that does not exist yet is not checked at publish time), but it keeps
-      # the registry consistent at every intermediate moment if a later publish fails.
+      # WHICH PACKAGES, AND IN WHAT ORDER, COMES FROM ONE PLACE. `--publish-list` prints the
+      # publish set in dependency order (policy-schema -> core -> cli today; @capwall/sbom-import
+      # is held back — see docs/releasing.md § What is published). Hardcoding the list here as
+      # well would be a second copy that can silently disagree with the one the guard checks
+      # against, which is exactly the class of mistake this workflow exists to prevent.
+      #
+      # npm does not require the order (a version that does not exist yet is not checked at
+      # publish time), but it keeps the registry consistent at every intermediate moment if a
+      # later publish fails.
       #
       # THE LEADING `./` IS REQUIRED. `npm publish dist-tarballs/x.tgz` is parsed as the
       # GitHub shorthand `<user>/<repo>` and fails with "Repository not found"; only a path
@@ -151,7 +170,7 @@ jobs:
       - name: Publish to npm (trusted publishing + provenance)
         if: github.event_name == 'push' || inputs.dry_run == false
         run: |
-          for p in policy-schema core sbom-import cli; do
+          for p in $(node scripts/check-release-versions.mjs --publish-list); do
             echo "::group::publish @capwall/$p"
             npm publish ./dist-tarballs/capwall-$p-*.tgz --provenance --access public
             echo "::endgroup::"
@@ -160,7 +179,7 @@ jobs:
       - name: Dry run (no publish)
         if: github.event_name == 'workflow_dispatch' && inputs.dry_run == true
         run: |
-          for p in policy-schema core sbom-import cli; do
+          for p in $(node scripts/check-release-versions.mjs --publish-list); do
             npm publish ./dist-tarballs/capwall-$p-*.tgz --provenance --access public --dry-run
           done
           echo "Dry run complete — nothing was published."

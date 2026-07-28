@@ -25,6 +25,11 @@ types are exported from `@capwall/policy-schema`.
 
 - **Deny-by-default.** In `enforce` mode, a package with no entry falls back to `default`;
   the recommended `default` grants nothing (see `capabilities.example.json`).
+- **`"version": 1` is the *policy format* version, and it has nothing to do with the version
+  of capwall you are running.** It moves only when the shape of this file changes
+  incompatibly, which has not happened yet. Upgrading from capwall `0.1.x` to `0.2.x` does not
+  mean bumping it — leave it at `1` until a release note tells you otherwise.
+  (See [`releasing.md`](./releasing.md) § Versioning.)
 
 ## Enforcement mode
 

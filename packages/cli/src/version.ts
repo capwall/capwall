@@ -17,9 +17,9 @@
  * `scripts/check-release-versions.mjs` keeps the four packages in version lockstep, so the two
  * lines agreeing is the normal case and them disagreeing is the thing worth seeing.
  *
- * NOTHING IS HARDCODED. Every package is at `0.0.0` today and the release process bumps four
- * manifests at once; a literal here would be wrong the moment that happens. Both numbers are
- * read from a `package.json` on disk at call time.
+ * NOTHING IS HARDCODED. The release process bumps all four manifests at once (lockstep, see
+ * `scripts/check-release-versions.mjs`); a literal here would be wrong the moment that
+ * happens. Both numbers are read from a `package.json` on disk at call time.
  */
 import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";

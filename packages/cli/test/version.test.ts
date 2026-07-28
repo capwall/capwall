@@ -35,8 +35,8 @@ function runCli(args: string[], cwd: string): Promise<RunResult> {
 }
 
 describe("#124 — capwall --version", () => {
-  // The whole point is that it is NOT hardcoded: every package is 0.0.0 today and the release
-  // bumps four manifests at once, so the test reads the manifest the same way the CLI must.
+  // The whole point is that it is NOT hardcoded: the release bumps all four manifests at once
+  // (lockstep), so the test reads the manifest the same way the CLI must.
   const declared = (JSON.parse(
     readFileSync(path.join(PKG_ROOT, "package.json"), "utf8"),
   ) as { version: string }).version;

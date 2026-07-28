@@ -1,6 +1,6 @@
 {
   "name": "@capwall/policy-schema",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "capabilities.json schema (Zod + inferred TS types) and JSON Schema for capwall policies.",
   "license": "MIT",
   "author": "William Zujkowski",

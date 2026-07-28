@@ -3,11 +3,17 @@
 How the four packages get to npm, and — kept deliberately separate below — the steps only a
 person with account access can do.
 
-Nothing has been published yet. Every package is at `0.0.0` and neither `@capwall/cli` nor
-`@capwall/core` exists on the registry. The first release is therefore the one that sets all
-the precedents, and it is the one that cannot be undone: **npm's unpublish window is 72 hours
-and narrow even inside it.** A broken first version sits in the `@capwall` namespace forever,
-which is a poor opening argument for a supply-chain security tool.
+Nothing has been published yet. The manifests are staged at `0.1.0` and `CHANGELOG.md` carries
+its entry, but neither `@capwall/cli` nor `@capwall/core` exists on the registry. The first
+release is therefore the one that sets all the precedents, and it is the one that cannot be
+undone: **npm's unpublish window is 72 hours and narrow even inside it.** A broken first
+version sits in the `@capwall` namespace forever, which is a poor opening argument for a
+supply-chain security tool.
+
+Everything a machine can check about a release is checked by
+`scripts/check-release-versions.mjs` (versions, pins, publish set, changelog) and
+`scripts/check-tarball-sources.mjs` (what is actually inside the tarballs). Both run in the
+release workflow before anything is uploaded. Read them; they carry the reasoning inline.
 
 ---
 
@@ -62,23 +68,91 @@ all four packages until each one is reconfigured by hand on npmjs.com.
 
 ## Versioning
 
-**Lockstep, semver, starting at `0.1.0`.** `scripts/check-release-versions.mjs` enforces
-lockstep and refuses to publish `0.0.0`; the release workflow runs it before packing.
+**Lockstep, semver, starting at `0.1.0`.** `scripts/check-release-versions.mjs` enforces all
+of it and the release workflow runs it before packing.
 
-- **Lockstep** because the four packages are one product on one cadence. `@capwall/cli` does
-  not merely call `@capwall/core`, it injects it into a *different process* via
-  `NODE_OPTIONS=--import` — a mismatched core is a silently differently-behaving firewall.
-  Same argument for `@capwall/policy-schema`: `core`'s evaluator and `cli`'s generator must
-  agree byte-for-byte on what a policy key means, and a range would let a resolver seat two
-  different copies in one tree.
-- **Exact pins between the four**, which is what pnpm's `workspace:*` rewrite produces
-  (`"@capwall/core": "0.1.0"`, not `^0.1.0`). Caret ranges for third-party deps — `zod` is
-  the only one.
-- **`0.x`, not `1.0.0`.** `1.0.0` is a compatibility promise, and the policy format is still
-  moving: `packages` key semantics changed in #92, `ipc.paths` arrived in #72, `net.hosts`
-  globs in #83. Stay on `0.x` until the format has been through outside hands.
-- The `capabilities.json` `"version": 1` field is **independent** of the package version and
-  does not move with it.
+### Why `0.1.0` and not a number that looks more finished
+
+The roadmap is complete (M1–M5, S1–S4) and the tool works end-to-end, which is an argument for
+a bigger opening number. It loses to three others:
+
+- **The policy format broke recently.** A bare `"lodash"` key now grants the top-level install
+  only, where it used to match every copy in the tree (#92/#100). `ipc.paths` arrived in #72,
+  `net.hosts` globs in #83. The format has never been through outside hands.
+- **`1.0.0` is a promise you would immediately break.** The next policy-format change would
+  force `2.0.0` on a tool with no installed base, which reads as churn rather than stability.
+  Pre-1.0 semver exists precisely for this: `0.y.z` says the surface may still move, and a
+  **minor** bump is allowed to carry a breaking change. Given how much has moved recently,
+  that is the property worth having.
+- **`0.9.0` is a claim about the near future, not the present.** It says "1.0 is next", which
+  nothing supports. Padding a version number is an unearned maturity signal, which is a
+  strange thing for a security tool to emit; the README and the threat model are where
+  maturity gets argued, honestly and in detail.
+
+`0.1.0` also leaves room. Breaking policy-format changes become `0.2.0`, `0.3.0` — cheap and
+semver-legal. Starting at `0.9.0` leaves one such change before the number corners you.
+
+### Lockstep, and the cost of it
+
+All packages carry the same version and are released together — including any held back from
+the registry, which stay in lockstep in-repo so the release that finally publishes them does
+not have to reason about a gap.
+
+- `@capwall/cli` does not merely call `@capwall/core`, it injects it into a *different
+  process* via `NODE_OPTIONS=--import`. A mismatched core is a silently differently-behaving
+  firewall.
+- Same argument for `@capwall/policy-schema`: `core`'s evaluator and `cli`'s generator must
+  agree byte-for-byte on what a policy key means. A range would let a resolver seat one copy
+  under `core` and another under `cli` in the same tree, and the failure mode is a policy that
+  generates one way and evaluates another.
+
+**The trade, stated plainly.** Lockstep plus exact pinning means every release touches every
+package, so `@capwall/policy-schema@0.1.1` can be byte-identical to `0.1.0` and still get
+published. Version numbers stop being a claim that something changed, and a one-line fix in
+`core` costs three registry publishes instead of one. Independent versions would avoid that,
+at the price of making "which core does this CLI want?" a real question with a range for an
+answer — and for a firewall injected into another process, a resolver being free to pick is
+exactly the freedom being bought off. Redundant publishes are cheap; an ambiguous enforcement
+version is not.
+
+**Exact pins between the packages** is the same decision at dependency level, and it is what
+pnpm's `workspace:*` rewrite produces (`"@capwall/core": "0.1.0"`, not `^0.1.0`). A patch to
+`@capwall/core` must not be able to change what an already-installed `@capwall/cli` enforces.
+Caret ranges are right for third-party deps — `zod` is the only one. Writing a caret on an
+internal dep by hand is the mistake `check-release-versions.mjs` catches.
+
+The `capabilities.json` `"version": 1` field is **independent** of the package version and does
+not move with it — a capwall `0.2.0` still reads `"version": 1` policies. This is stated at the
+top of `CHANGELOG.md` too, because otherwise the first `0.2.0` makes someone bump their policy.
+
+## What is published
+
+| package | published | why |
+|---|---|---|
+| `@capwall/policy-schema` | yes | the schema every consumer validates against |
+| `@capwall/core` | yes | the enforcement engine |
+| `@capwall/cli` | yes | the entry point everyone actually installs |
+| `@capwall/sbom-import` | **held back** | see below |
+
+`@capwall/sbom-import` (roadmap S1) is built, tested, versioned in lockstep and released
+in-repo, but does **not** go to the registry in `0.1.0`. No CLI subcommand exposes it; it is
+reachable only as a library that nothing in the product imports. Publishing it would put a
+package on npm with no entry point and — because of lockstep — republish it on every release
+forever, adding permanent registry surface and a provenance attestation for something with no
+consumer. The one argument that would justify shipping it anyway, reserving the name against
+squatters, does not apply: owning the `@capwall` org on npm already reserves every
+`@capwall/*` name.
+
+Holding it back costs nothing — it stays in the repo, in CI, in the tests — and it turns into a
+real release note when a `capwall`-side consumer lands, which is a better announcement than a
+library nobody can reach. Its first published version will be whatever release adds that
+consumer, not `0.1.0`; that is normal and needs no apology in the changelog.
+
+The publish set lives in `scripts/check-release-versions.mjs` (`--publish-list`) and the
+workflow reads it from there, so there is one list rather than two that can disagree. The
+guard also refuses to let a published package depend on a held-back one — pnpm would rewrite
+the specifier to a version that is not on the registry and the tarball would be uninstallable
+for everyone.
 
 ## Source maps — the tarballs ship `src/` (#126)
 
@@ -118,10 +192,22 @@ node scripts/check-tarball-sources.mjs dist-tarballs/*.tgz
 
 ## Changelog
 
-One `CHANGELOG.md` at the repo root, Keep-a-Changelog format, with an `## [Unreleased]`
-section that PRs add to. A `Security` heading is not optional here — "capwall stopped
-mediating X" is a security-relevant regression and has to be findable. Cut a release by
-renaming `[Unreleased]` to `[0.1.0] - YYYY-MM-DD`.
+One `CHANGELOG.md` at the repo root, [Keep a Changelog](https://keepachangelog.com/) format,
+hand-written. **No generator**, deliberately: the entries worth reading say what a change means
+for someone running capwall, and nothing that reads commit subjects can write those. A scheme
+that needs tooling nobody runs produces a changelog nobody trusts.
+
+- PRs that change behaviour add a line under `## [Unreleased]`, using
+  `Added` / `Changed` / `Deprecated` / `Removed` / `Fixed` / `Security`.
+- A `Security` heading is not optional here — "capwall stopped mediating X" is a
+  security-relevant regression for every user and has to be findable without reading the diff.
+- Cut a release by renaming `[Unreleased]` to `[X.Y.Z] - unreleased`, then replacing
+  `unreleased` with the ISO date on the day you tag.
+
+`check-release-versions.mjs` fails if there is no `## [<version>]` section, and — once a tag is
+being released — fails if that heading still says `unreleased` instead of a `YYYY-MM-DD` date.
+Forgetting the changelog at the moment it matters is the characteristic failure of a
+hand-written one, so it is the one part not left to discipline.
 
 ---
 
@@ -133,7 +219,7 @@ Blocking — a broken or dangerous first artifact:
 |---|---|
 | #116 | `npm pack` ships `workspace:*`. **Fixed**: `prepack` guard + the pack-with-pnpm workflow. |
 | #113 | Repo is private. Trusted publishing requires a public repo; the README's only install path is a clone. |
-| #115 | Versions are `0.0.0`, no CHANGELOG. Enforced by `check-release-versions.mjs`. |
+| #115 | No versions, no CHANGELOG, no publish set. **Fixed**: all packages staged at `0.1.0`, `CHANGELOG.md` written, publish set declared once; all enforced by `check-release-versions.mjs`. |
 | #126 | Maps shipped without sources. **Fixed**: `"files": ["dist", "src"]`, enforced by `check-tarball-sources.mjs`. Done before the first publish on purpose — `files` decides what a reader can audit, and changing it later silently changes that answer. |
 | #3 | Actions is billing-blocked. OIDC publishing *runs in Actions*, so this gates the whole path. |
 | LICENSE | Now shipped in all four tarballs. |
@@ -165,11 +251,14 @@ release after that run through Actions.
 
 ```bash
 pnpm install --frozen-lockfile && pnpm build
-node scripts/check-release-versions.mjs
-for p in policy-schema core sbom-import cli; do
-  (cd "packages/$p" && pnpm pack --pack-destination ../../dist-tarballs)
-done
-for p in policy-schema core sbom-import cli; do
+node scripts/check-release-versions.mjs v0.1.0
+
+# Pack everything (the assertions below need something to inspect)...
+for d in packages/*/; do (cd "$d" && pnpm pack --pack-destination ../../dist-tarballs); done
+node scripts/check-tarball-sources.mjs dist-tarballs/*.tgz
+
+# ...but publish only the declared set, in the declared order.
+for p in $(node scripts/check-release-versions.mjs --publish-list); do
   npm publish ./dist-tarballs/capwall-$p-*.tgz --access public   # no --provenance outside CI
 done
 ```
@@ -214,8 +303,14 @@ Everything below needs account access. Nothing above this line does. Work top to
 
 ### C. npm — configure trusted publishing, per package
 
-Do this **four times**, once for each of `@capwall/policy-schema`, `@capwall/core`,
-`@capwall/sbom-import`, `@capwall/cli`.
+Do this **three times**, once for each of `@capwall/policy-schema`, `@capwall/core`,
+`@capwall/cli` — the packages that are actually published. `@capwall/sbom-import` is held back
+from `0.1.0` (see § What is published), so it has no registry entry to configure yet; do this
+for it on the release that first publishes it.
+
+```bash
+node scripts/check-release-versions.mjs --publish-list   # the authoritative list
+```
 
 7. Package page → **Settings** → **Trusted Publisher** → *GitHub Actions*, and enter:
 
@@ -240,15 +335,20 @@ Do this **four times**, once for each of `@capwall/policy-schema`, `@capwall/cor
 
 ### D. Cutting a release
 
-9. Set the version in all four `packages/*/package.json` to the same value, and update
-   `CHANGELOG.md`. Verify locally:
+9. **Date the changelog entry.** For `0.1.0` the manifests are already staged and
+   `CHANGELOG.md` already has its entry, so the only edit left is replacing `unreleased` with
+   today's date on the `## [0.1.0] -` heading. (For later releases: bump every
+   `packages/*/package.json` to the same value and rename `[Unreleased]` first.) Then verify —
+   the check refuses an undated heading when a tag is supplied, which is the whole point:
    ```bash
    node scripts/check-release-versions.mjs v0.1.0
    ```
 10. **Rehearse.** Actions → *Release* → *Run workflow*, leaving **Dry run = true**. This runs
-    the full matrix, packs with pnpm, asserts no `workspace:` string survived, and calls
-    `npm publish --dry-run`. Nothing is uploaded. Download the `capwall-tarballs` artifact and
-    look inside if you want to be sure.
+    the full matrix, packs with pnpm, asserts no `workspace:` string survived, asserts every
+    source map resolves inside its own tarball, and calls `npm publish --dry-run` for the
+    published set only. Nothing is uploaded. Download the `capwall-tarballs` artifact and look
+    inside if you want to be sure — note it contains a `@capwall/sbom-import` tarball that is
+    packed for verification and deliberately **not** published.
 11. Merge the version bump, then tag and push:
     ```bash
     git tag v0.1.0 && git push origin v0.1.0
@@ -271,10 +371,19 @@ Do this **four times**, once for each of `@capwall/policy-schema`, `@capwall/cor
     ```
     If `npm i` fails with `Unsupported URL Type "workflow:"` the guard was bypassed somehow —
     that is the #116 failure, and it means the version is unusable.
+
+    Then confirm the sources really shipped, because it is the claim `docs/` now makes to
+    anyone deciding whether to trust this:
+    ```bash
+    ls node_modules/@capwall/core/src/shims/fs.ts
+    ```
 14. Create the GitHub release from the tag, body pointing at the `CHANGELOG.md` entry.
 
 ### E. Afterwards
 
 15. Delete any granular access token used for a manual first publish.
 16. Update the README: replace the "nothing is published" note and the from-clone quickstart
-    with `npm i -D @capwall/cli`, keeping the clone path as the contributor route.
+    with `npm i -D @capwall/cli`, keeping the clone path as the contributor route. Also update
+    `packages/policy-schema/README.md` and `packages/cli/README.md`, which each carry their own
+    "not published yet" note.
+17. Open the `[Unreleased]` section in `CHANGELOG.md` for the next cycle.

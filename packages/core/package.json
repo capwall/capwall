@@ -1,6 +1,6 @@
 {
   "name": "@capwall/core",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "capwall interception engine + policy evaluator: per-package runtime capability enforcement for Node.js.",
   "license": "MIT",
   "author": "William Zujkowski",

@@ -12,8 +12,8 @@ subprocesses, env, …), then enforce it at runtime.
 > `process.env`, `vm`, `.node` addon loads, `Module.prototype._compile`, and the **global**
 > egress APIs `fetch`/`WebSocket`/`EventSource`.
 >
-> **Nothing is published to npm yet** and every package is at version `0.0.0` — run it from a
-> clone (see [Quickstart](#quickstart-the-observe--enforce-loop)). And read
+> **Nothing is published to npm yet** — the manifests are staged at `0.1.0` but nothing has
+> been uploaded, so run it from a clone (see [Quickstart](#quickstart-the-observe--enforce-loop)). And read
 > [`docs/threat-model.md`](./docs/threat-model.md) before relying on it: "implemented" is a
 > statement about coverage, not about strength, and capwall is deliberately not a sandbox.
 
@@ -116,7 +116,8 @@ tracked, and this list is a description of scope, not of progress.
 ## Quickstart (the observe → enforce loop)
 
 > **capwall is not published to npm yet.** `@capwall/cli` and `@capwall/core` are not on the
-> registry (all four packages are at version `0.0.0`), so `pnpm add -D @capwall/cli` will
+> registry — the manifests are staged at `0.1.0` but nothing has been uploaded — so
+> `pnpm add -D @capwall/cli` will
 > 404 today. Step 1 below builds it from a clone instead; every later step is exactly what
 > you would run against a published build. The whole loop — all capabilities, CJS and ESM —
 > works from a clone right now.

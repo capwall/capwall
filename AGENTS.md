@@ -76,8 +76,9 @@ see `core/src/shims/harden.ts` and threat-model.md § Hardened mode for what it 
 not close. Build order is
 authoritative in `docs/roadmap.md` and mirrored in § 4 below.
 
-**Nothing is published to npm.** All four packages are `version: 0.0.0` and neither
-`@capwall/cli` nor `@capwall/core` exists on the registry, so every user-facing doc must show
+**Nothing is published to npm.** The manifests are staged at `0.1.0` but nothing has been
+uploaded — neither `@capwall/cli` nor `@capwall/core` exists on the registry, so every
+user-facing doc must show
 the run-from-a-clone path (`pnpm install && pnpm build`, then
 `node packages/cli/dist/index.js …`) rather than an install command that 404s. Revisit every
 such spot at first publish.
@@ -103,10 +104,22 @@ publishing's trust configuration — do not rename it). Two guards enforce the o
 matters: `scripts/assert-pnpm-pack.mjs` (`prepack`) refuses an `npm pack`, because only pnpm
 rewrites `workspace:*` into a real version (#116); `scripts/assert-pnpm-install.mjs` (root
 `preinstall`) refuses an `npm install` at the clone root, which otherwise exits 0 having linked
-nothing (#122). `scripts/check-release-versions.mjs` is the
-pre-publish guard that keeps the four packages in **version lockstep** and matching the tag
-(#115) — so a version bump is all four manifests or none. All four are `0.0.0` today; read
-version numbers from `package.json`, never hardcode one.
+nothing (#122). `scripts/check-release-versions.mjs` is the pre-publish guard for everything a
+machine can check about a release (#115): **version lockstep** across all four packages, the
+tag matching, internal deps declared `workspace:*` so they publish as exact pins, a dated
+`CHANGELOG.md` entry, and the declared publish set — a version bump is all four manifests or
+none. `scripts/check-tarball-sources.mjs` opens the packed tarballs and asserts every source
+map resolves inside its own tarball (#126), the packaging defect no other gate can see. All
+four are staged at `0.1.0`; **read version numbers from `package.json`, never hardcode one.**
+
+**`@capwall/sbom-import` is deliberately not published** in the first release — nothing
+consumes it, so it would land on npm as an unreachable library. It stays in lockstep in-repo.
+The publish set is declared once, in `check-release-versions.mjs` (`--publish-list`); the
+workflow reads it from there. See `docs/releasing.md` § What is published.
+
+**Behaviour changes add a line to `CHANGELOG.md` under `## [Unreleased]`** in the same PR —
+`Added` / `Changed` / `Deprecated` / `Removed` / `Fixed` / `Security`. It is hand-written on
+purpose; there is no generator and there should not be one.
 
 ## 3. Architecture orientation
 
