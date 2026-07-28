@@ -1,6 +1,6 @@
 {
   "name": "@capwall/sbom-import",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Import a CycloneDX SBOM / CBOM into a starter capwall capabilities.json policy.",
   "license": "MIT",
   "author": "William Zujkowski",
@@ -15,7 +15,7 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": ["dist", "src"],
   "engines": { "node": ">=20" },
   "scripts": {
     "prepack": "node ../../scripts/assert-pnpm-pack.mjs",

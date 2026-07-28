@@ -9,7 +9,9 @@ user-supplied policy file against `PolicySchema`. The authoritative field-by-fie
 documentation is [`docs/policy-format.md`](https://github.com/williamzujkowski/capwall/blob/main/docs/policy-format.md)
 — this README is the orientation, not the reference.
 
-> **Not published to npm yet** (version `0.0.0`, like the other three packages). See the root
+> **Not published to npm yet** (staged at `0.1.0`, in lockstep with the other three
+> packages — see [`docs/releasing.md`](https://github.com/williamzujkowski/capwall/blob/main/docs/releasing.md)).
+> See the root
 > [README](https://github.com/williamzujkowski/capwall#readme) § Quickstart for the
 > run-from-a-clone path.
 

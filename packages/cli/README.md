@@ -7,7 +7,7 @@ The `capwall` command-line interface — the primary way users drive the observe
 > with `@capwall/core/preload` injected via `NODE_OPTIONS --import`. Milestone status is
 > tracked in one place, [`../../docs/roadmap.md`](../../docs/roadmap.md).
 >
-> Not published to npm yet (version `0.0.0`) — run it as
+> Not published to npm yet (staged at `0.1.0`) — run it as
 > `node <clone>/packages/cli/dist/index.js` after `pnpm install && pnpm build`. See the root
 > [`README.md`](../../README.md) § Quickstart.
 
