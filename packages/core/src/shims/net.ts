@@ -170,8 +170,6 @@ import {
   type UrlSnapshot,
 } from "./url-snapshot.js";
 
-export type { DecisionSink, ShimContext } from "./runtime.js";
-
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type AnyCtor = new (...args: any[]) => any;
 

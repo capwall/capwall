@@ -96,8 +96,6 @@ import {
 import { harden, hardenClass } from "./harden.js";
 import { pinAllOwnFields } from "./pin.js";
 
-export type { DecisionSink, ShimContext } from "./runtime.js";
-
 /**
  * The ONLY `process.env` keys exempt from the read gate while a real spawn runs, and only then.
  *

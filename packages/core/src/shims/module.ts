@@ -68,8 +68,6 @@ import {
   type ShimRegistry,
 } from "./runtime.js";
 
-export type { DecisionSink, ShimContext, ShimRegistry } from "./runtime.js";
-
 type AnyFn = (...args: unknown[]) => unknown;
 
 /**

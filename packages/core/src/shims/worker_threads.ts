@@ -30,8 +30,6 @@ import {
 } from "./runtime.js";
 import { harden } from "./harden.js";
 
-export type { DecisionSink, ShimContext } from "./runtime.js";
-
 /**
  * Build a shimmed `worker_threads` module: the `Worker` constructor is guarded; everything
  * else (`isMainThread`, `parentPort`, `threadId`, `MessageChannel`, `SHARE_ENV`, …) is the

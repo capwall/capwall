@@ -14,7 +14,8 @@
 import * as realVm from "node:vm";
 import { describe, expect, it } from "vitest";
 import { loadPolicyFromObject, type Decision, type Policy } from "../src/index.js";
-import { createVmShim, type ShimContext } from "../src/shims/vm.js";
+import { createVmShim } from "../src/shims/vm.js";
+import type { ShimContext } from "../src/shims/runtime.js";
 
 type Recorded = { pkg: string; decision: Decision };
 

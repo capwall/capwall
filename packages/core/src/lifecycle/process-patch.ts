@@ -289,7 +289,7 @@ export function globalPropertySlot(name: string): GlobalPropertySlot {
 export type PatchKind = "relinked" | "shared";
 
 /**
- * One registered process-level patch, as `test/process-patch-lifecycle.test.ts` sees it.
+ * One registered process-level patch, as `test/process-patch-sites.test.ts` sees it.
  *
  * The registry is the second half of the enforcement mechanism. The source scan proves a new
  * patch site had to come through this file; the registry proves the resulting site is EXERCISED
