@@ -13,8 +13,11 @@
  *  3. `cwd` — a caller-controlled option that decides the base, so it obeys the same single-read
  *     pinning rule as every other capability-relevant option (#26/#56/#89).
  *
- * NODE 20 has none of this family. That is asserted (`describe("Node version matrix")`), not
- * skipped past: the shim must expose exactly what the runtime does and invent nothing.
+ * The family is present on every supported runtime now that the floor is Node ≥22.15 — this file
+ * used to open with a Node-20 caveat and carry a `HAS_GLOB` predicate through seven `describe`
+ * blocks. What survives that removal is the claim that was never about the version: the shim must
+ * expose exactly what the runtime does and invent nothing, asserted against the real `fs` rather
+ * than against a hardcoded expectation.
  */
 import { createRequire } from "node:module";
 import * as nodeFs from "node:fs";
@@ -34,13 +37,15 @@ const SUB = path.join(DATA, "sub");
 const SECRETS = path.join(SCRATCH, "secrets");
 
 /**
- * The REAL, un-shimmed `globSync` — Node ≥22 only, and typed by hand because `@types/node` is
- * pinned to v20 and does not declare the family at all. Reading it off the real `fs` is what lets
- * the matrix below compare what the RUNTIME has against what the SHIM exposes.
+ * The REAL, un-shimmed `globSync`. The `fs.glob` family is Node ≥22 and the supported floor is
+ * ≥22.15, so it is now present on every runtime this suite runs on — it used to be read through
+ * a hand-written type because `@types/node` was pinned to v20 and did not declare the family at
+ * all, and both that cast and the `HAS_GLOB` skip guard went away with the Node 20 leg.
+ *
+ * Still read off the real `fs` rather than assumed, because the matrix row below compares what
+ * the RUNTIME has against what the SHIM exposes; that comparison is the point.
  */
-const realGlobSync = (nodeFs as unknown as { globSync?: (p: string, o?: unknown) => unknown[] })
-  .globSync;
-const HAS_GLOB = typeof realGlobSync === "function";
+const realGlobSync = nodeFs.globSync;
 
 interface FixtureDep {
   globSurface(): { glob: string; globSync: string; promisesGlob: string };
@@ -139,32 +144,36 @@ afterEach(() => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════
-// The Node version matrix. Runs on BOTH supported majors and asserts the right thing on each,
-// which is the point: a `skip` on Node 20 would prove nothing about the no-op.
+// The shim mirrors the runtime. This block used to be the Node version matrix, asserting
+// "present on ≥22, absent on 20" from a `HAS_GLOB` predicate; with the floor at ≥22.15 the
+// absent arm is unreachable, so it now states the claim directly rather than deriving it from
+// a condition that can only be true. The claim is still worth an assertion: `wrapSurface`
+// builds the shim from a table of NAMES, and a name the runtime does not define is skipped —
+// so "the shim exposes the family" is a fact about the wrapping, not about the Node version.
 // ═══════════════════════════════════════════════════════════════════════════════════════════
-describe("fs.glob — Node version matrix (#106)", () => {
-  it("the shim exposes exactly what the runtime does: present on ≥22, absent on 20", () => {
-    const expected = HAS_GLOB ? "function" : "undefined";
+describe("fs.glob — the shim exposes exactly what the runtime does (#106)", () => {
+  it("exposes the whole glob family, because this runtime has it", () => {
+    // Cross-checked against the REAL fs rather than hardcoded to "function": if a future Node
+    // ever drops or renames one of these, this fails as a mismatch instead of quietly passing
+    // against a constant nobody re-derived.
+    expect(typeof realGlobSync).toBe("function");
     const { result } = withCapwall(emptyEnforcePolicy(), "enforce", (dep) => dep.globSurface());
     expect(result).toEqual({
-      glob: expected,
-      globSync: expected,
-      promisesGlob: expected,
+      glob: "function",
+      globSync: "function",
+      promisesGlob: "function",
     });
   });
 
-  it("wrapping the family never breaks the rest of the surface on a runtime without it", () => {
-    // The Node-20 no-op in one assertion: an unrelated, always-present method still works, so a
-    // table entry for a name the runtime does not define costs nothing.
+  it("wrapping the family leaves the rest of the surface alone", () => {
     const { decisions } = withCapwall(readGrant(["./fixtures/**"]), "enforce", (dep) => {
       // The exact surface, not `toBeTruthy()` — which accepts any non-empty object and would
       // hold with the glob table emptied entirely (#112). Same expectation as the row above,
       // asserted here under a GRANTING policy so the two differ only in the policy.
-      const expected = HAS_GLOB ? "function" : "undefined";
       expect(dep.globSurface()).toEqual({
-        glob: expected,
-        globSync: expected,
-        promisesGlob: expected,
+        glob: "function",
+        globSync: "function",
+        promisesGlob: "function",
       });
       expect(nodeFs.existsSync(path.join(DATA, "a.txt"))).toBe(true);
     });
@@ -172,9 +181,7 @@ describe("fs.glob — Node version matrix (#106)", () => {
   });
 });
 
-// From here on the API has to exist. `skipIf` rather than a silent no-op assertion, because the
-// version matrix above already carries the Node-20 claim.
-describe.skipIf(!HAS_GLOB)("fs.glob — deny by default, allow when granted (#106)", () => {
+describe("fs.glob — deny by default, allow when granted (#106)", () => {
   it("does not charge Node's own lazy minimatch env read to the calling package", () => {
     // Node `require`s its vendored minimatch from inside the FIRST glob in the process, and that
     // module reads `__MINIMATCH_TESTING_PLATFORM__` at module scope — on the stack of whoever
@@ -278,7 +285,7 @@ const FS_ROOT = asPolicyPath(path.parse(SCRATCH).root);
 // alternatives rather than the filesystem root — tighter, and still outside the grant, because
 // the expansion is now performed instead of being pattern-matched for a `/` or a `..`.
 // ═══════════════════════════════════════════════════════════════════════════════════════════
-describe.skipIf(!HAS_GLOB)("fs.glob — patterns really do escape their literal prefix", () => {
+describe("fs.glob — patterns really do escape their literal prefix", () => {
   const escaping: Array<[name: string, pattern: string, base: string]> = [
     ["`**` then `..` (** matches zero segments)", "**/../secrets/*.txt", FS_ROOT],
     ["a brace group containing `..`", "{.,..}/secrets/*.txt", asPolicyPath(SCRATCH)],
@@ -290,7 +297,7 @@ describe.skipIf(!HAS_GLOB)("fs.glob — patterns really do escape their literal 
   ];
   for (const [name, pattern, base] of escaping) {
     it(`un-shimmed, ${name} reaches SECRETS from a cwd of DATA`, () => {
-      const reached = realGlobSync!(pattern, { cwd: DATA }).map((m) =>
+      const reached = realGlobSync(pattern, { cwd: DATA }).map((m) =>
         path.resolve(DATA, m as string),
       );
       expect(reached).toContain(path.join(SECRETS, "key.txt"));
@@ -320,7 +327,7 @@ describe.skipIf(!HAS_GLOB)("fs.glob — patterns really do escape their literal 
 // its own directory and nothing else. It is EVIDENCE, not the mechanism — the property test below
 // is what checks capwall against real `fs.globSync` over patterns nobody wrote down.
 // ═══════════════════════════════════════════════════════════════════════════════════════════
-describe.skipIf(!HAS_GLOB)("fs.glob — a `..` written as an expansion cannot escape (#120)", () => {
+describe("fs.glob — a `..` written as an expansion cannot escape (#120)", () => {
   /** #120's table, plus the two spellings its "same shape from the other side" note describes. */
   const spellings = [
     "[.][.]",
@@ -335,7 +342,7 @@ describe.skipIf(!HAS_GLOB)("fs.glob — a `..` written as an expansion cannot es
 
   for (const token of spellings) {
     it(`un-shimmed, '${token}' really does reach the parent of the cwd`, () => {
-      const reached = realGlobSync!(`${token}/*.txt`, { cwd: SUB }).map((m) =>
+      const reached = realGlobSync(`${token}/*.txt`, { cwd: SUB }).map((m) =>
         path.resolve(SUB, m as string),
       );
       expect(reached).toContain(path.join(DATA, "a.txt"));
@@ -400,7 +407,7 @@ describe.skipIf(!HAS_GLOB)("fs.glob — a `..` written as an expansion cannot es
 // If minimatch grows a new way to spell `..` — or capwall's expansion ever disagrees with the
 // real one — this fails, whether or not anybody thought to write that spelling down.
 // ═══════════════════════════════════════════════════════════════════════════════════════════
-describe.skipIf(!HAS_GLOB)("fs.glob — capwall's base bounds where Node really walks (#120)", () => {
+describe("fs.glob — capwall's base bounds where Node really walks (#120)", () => {
   /**
    * A DEEP, TINY sandbox, and both adjectives are load-bearing.
    *
@@ -496,7 +503,7 @@ describe.skipIf(!HAS_GLOB)("fs.glob — capwall's base bounds where Node really 
       if (base === fsRoot) continue;
       let matches: unknown[];
       try {
-        matches = realGlobSync!(pattern, { cwd: WALK_CWD });
+        matches = realGlobSync(pattern, { cwd: WALK_CWD });
       } catch {
         // Node itself rejected the pattern — no walk, so nothing was disclosed.
         continue;
@@ -536,7 +543,7 @@ describe.skipIf(!HAS_GLOB)("fs.glob — capwall's base bounds where Node really 
 // BASE DERIVATION. One policy (`./fixtures/scratch-glob/data/**`), many patterns; what changes is
 // only which directory the walk is rooted at.
 // ═══════════════════════════════════════════════════════════════════════════════════════════
-describe.skipIf(!HAS_GLOB)("fs.glob — which directory each pattern is gated on (#106)", () => {
+describe("fs.glob — which directory each pattern is gated on (#106)", () => {
   const cases: Array<{ name: string; pattern: string; cwd?: string; base: string }> = [
     { name: "`**` is rooted at the cwd", pattern: "**", cwd: DATA, base: DATA },
     { name: "a literal prefix descends", pattern: "sub/*.txt", cwd: DATA, base: SUB },
@@ -599,7 +606,7 @@ describe.skipIf(!HAS_GLOB)("fs.glob — which directory each pattern is gated on
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 // PATTERN ARRAYS — one enumeration per pattern, so one decision per pattern.
 // ═══════════════════════════════════════════════════════════════════════════════════════════
-describe.skipIf(!HAS_GLOB)("fs.glob — an array of patterns (#106)", () => {
+describe("fs.glob — an array of patterns (#106)", () => {
   it("records one decision per pattern", () => {
     const { result, decisions } = withCapwall(DATA_GRANT(), "enforce", (dep) =>
       dep.globSyncMany(["*.txt", "sub/*.txt"], { cwd: DATA }),
@@ -641,7 +648,7 @@ describe.skipIf(!HAS_GLOB)("fs.glob — an array of patterns (#106)", () => {
 // `options.cwd` PINNING (#26/#56/#89, glob flavor). `cwd` decides the base, so it is
 // capability-relevant, so it is read exactly once and the single answer is what Node receives.
 // ═══════════════════════════════════════════════════════════════════════════════════════════
-describe.skipIf(!HAS_GLOB)("fs.glob — options.cwd is pinned (#106)", () => {
+describe("fs.glob — options.cwd is pinned (#106)", () => {
   it("a cwd accessor runs ONCE, and Node walks the directory capwall guarded", () => {
     const { result, decisions } = withCapwall(DATA_GRANT(), "enforce", (dep) =>
       dep.globSyncFlipFloppingCwd("*.txt", DATA, SECRETS),

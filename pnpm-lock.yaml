@@ -13,8 +13,8 @@ importers:
   .:
     devDependencies:
       '@types/node':
-        specifier: ^20.14.0
-        version: 20.19.43
+        specifier: ^22.15.0
+        version: 22.20.1
       oxlint:
         specifier: 1.75.0
         version: 1.75.0
@@ -23,7 +23,7 @@ importers:
         version: 5.9.3
       vitest:
         specifier: ^3.2.6
-        version: 3.2.7(@types/node@20.19.43)
+        version: 3.2.7(@types/node@22.20.1)
 
   examples/express-app:
     dependencies:
@@ -43,14 +43,14 @@ importers:
         version: link:../policy-schema
     devDependencies:
       '@types/node':
-        specifier: ^20.14.0
-        version: 20.19.43
+        specifier: ^22.15.0
+        version: 22.20.1
       typescript:
         specifier: ^5.6.0
         version: 5.9.3
       vitest:
         specifier: ^3.2.6
-        version: 3.2.7(@types/node@20.19.43)
+        version: 3.2.7(@types/node@22.20.1)
 
   packages/core:
     dependencies:
@@ -59,14 +59,14 @@ importers:
         version: link:../policy-schema
     devDependencies:
       '@types/node':
-        specifier: ^20.14.0
-        version: 20.19.43
+        specifier: ^22.15.0
+        version: 22.20.1
       typescript:
         specifier: ^5.6.0
         version: 5.9.3
       vitest:
         specifier: ^3.2.6
-        version: 3.2.7(@types/node@20.19.43)
+        version: 3.2.7(@types/node@22.20.1)
 
   packages/policy-schema:
     dependencies:
@@ -79,7 +79,7 @@ importers:
         version: 5.9.3
       vitest:
         specifier: ^3.2.6
-        version: 3.2.7(@types/node@20.19.43)
+        version: 3.2.7(@types/node@22.20.1)
 
   packages/sbom-import:
     dependencies:
@@ -88,14 +88,14 @@ importers:
         version: link:../policy-schema
     devDependencies:
       '@types/node':
-        specifier: ^20.14.0
-        version: 20.19.43
+        specifier: ^22.15.0
+        version: 22.20.1
       typescript:
         specifier: ^5.6.0
         version: 5.9.3
       vitest:
         specifier: ^3.2.6
-        version: 3.2.7(@types/node@20.19.43)
+        version: 3.2.7(@types/node@22.20.1)
 
 packages:
 
@@ -527,8 +527,8 @@ packages:
   '@types/estree@1.0.9':
     resolution: {integrity: sha512-GhdPgy1el4/ImP05X05Uw4cw2/M93BCUmnEvWZNStlCzEKME4Fkk+YpoA5OiHNQmoS7Cafb8Xa3Pya8m1Qrzeg==}
 
-  '@types/node@20.19.43':
-    resolution: {integrity: sha512-6oYBAi5ikg4Pl+kGsoYtawUMBT2zZMCvPNF7pVLnHZfd1zf38DRiWn/gT01RYCdUqkv7Fhr+C9ot4/tb+2sVvA==}
+  '@types/node@22.20.1':
+    resolution: {integrity: sha512-EANqOCF9QFyra+4pfxUcX9STKJpCLjMbObVzljIJomAWSnuSIEAvyzEU53GaajbXJEgdh0iEcPL+DGvpUd4k1Q==}
 
   '@vitest/expect@3.2.7':
     resolution: {integrity: sha512-E8eBXaKibuvH2pSZErOjdVb5vF4PbKYcrnluBTYxEk1l/VhhwZg1kZQsdtjq+CsF5CFydf2Rdkz7jDHKSisi3w==}
@@ -1281,7 +1281,7 @@ snapshots:
 
   '@types/estree@1.0.9': {}
 
-  '@types/node@20.19.43':
+  '@types/node@22.20.1':
     dependencies:
       undici-types: 6.21.0
 
@@ -1293,13 +1293,13 @@ snapshots:
       chai: 5.3.3
       tinyrainbow: 2.0.0
 
-  '@vitest/mocker@3.2.7(vite@6.4.3(@types/node@20.19.43))':
+  '@vitest/mocker@3.2.7(vite@6.4.3(@types/node@22.20.1))':
     dependencies:
       '@vitest/spy': 3.2.7
       estree-walker: 3.0.3
       magic-string: 0.30.21
     optionalDependencies:
-      vite: 6.4.3(@types/node@20.19.43)
+      vite: 6.4.3(@types/node@22.20.1)
 
   '@vitest/pretty-format@3.2.7':
     dependencies:
@@ -1798,13 +1798,13 @@ snapshots:
 
   vary@1.1.2: {}
 
-  vite-node@3.2.4(@types/node@20.19.43):
+  vite-node@3.2.4(@types/node@22.20.1):
     dependencies:
       cac: 6.7.14
       debug: 4.4.3
       es-module-lexer: 1.7.0
       pathe: 2.0.3
-      vite: 6.4.3(@types/node@20.19.43)
+      vite: 6.4.3(@types/node@22.20.1)
     transitivePeerDependencies:
       - '@types/node'
       - jiti
@@ -1819,7 +1819,7 @@ snapshots:
       - tsx
       - yaml
 
-  vite@6.4.3(@types/node@20.19.43):
+  vite@6.4.3(@types/node@22.20.1):
     dependencies:
       esbuild: 0.28.1
       fdir: 6.5.0(picomatch@4.0.5)
@@ -1828,14 +1828,14 @@ snapshots:
       rollup: 4.62.2
       tinyglobby: 0.2.17
     optionalDependencies:
-      '@types/node': 20.19.43
+      '@types/node': 22.20.1
       fsevents: 2.3.3
 
-  vitest@3.2.7(@types/node@20.19.43):
+  vitest@3.2.7(@types/node@22.20.1):
     dependencies:
       '@types/chai': 5.2.3
       '@vitest/expect': 3.2.7
-      '@vitest/mocker': 3.2.7(vite@6.4.3(@types/node@20.19.43))
+      '@vitest/mocker': 3.2.7(vite@6.4.3(@types/node@22.20.1))
       '@vitest/pretty-format': 3.2.7
       '@vitest/runner': 3.2.7
       '@vitest/snapshot': 3.2.7
@@ -1853,11 +1853,11 @@ snapshots:
       tinyglobby: 0.2.17
       tinypool: 1.1.1
       tinyrainbow: 2.0.0
-      vite: 6.4.3(@types/node@20.19.43)
-      vite-node: 3.2.4(@types/node@20.19.43)
+      vite: 6.4.3(@types/node@22.20.1)
+      vite-node: 3.2.4(@types/node@22.20.1)
       why-is-node-running: 2.3.0
     optionalDependencies:
-      '@types/node': 20.19.43
+      '@types/node': 22.20.1
     transitivePeerDependencies:
       - jiti
       - less

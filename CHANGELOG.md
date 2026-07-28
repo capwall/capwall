@@ -21,6 +21,49 @@ has to be findable without reading the diff.
 
 ## [Unreleased]
 
+### Removed
+
+- **Node 20 support.** It went end-of-life on 2026-04-30. `engines` is now `>=22.15.0` in all
+  four manifests, and the CI matrix is **22, 24 and 26**.
+
+  The floor is `22.15`, not `22.0`, on purpose: `module.registerHooks()` landed in 22.15, and
+  capwall wants it available **without a version gate** (issue #152 — Node 26 has since
+  deprecated `module.register()` in its favour, DEP0205). If you are on Node 20, upgrade to 24
+  (the active LTS, supported to 2028-04-30).
+
+### Added
+
+- **Node 24 and Node 26 are tested.** 24 is the active LTS; 26 becomes LTS on 2026-10-28 and is
+  carried early so breakage surfaces before it is everyone's runtime.
+- **Web Storage is classified.** Node 26 introduced `Storage`/`localStorage`/`sessionStorage`,
+  `Temporal`, `ErrorEvent` and `QuotaExceededError` as globals. All six were reviewed and are
+  **inert for egress** — none can originate a network request. `localStorage` is separately
+  documented as a **known, un-mediated, flag-gated file channel**: with `--localstorage-file`,
+  Node's internal read/write of that one file happens below the `fs` shim. See
+  `docs/threat-model.md` § Web Storage.
+
+### Changed
+
+- **Tests that used to skip on Node 20 now run everywhere**: the `fs.glob` family (seven
+  `describe` blocks, previously behind a `HAS_GLOB` predicate), `globalThis.WebSocket` and the
+  `node:http` `WebSocket` re-export, `WebSocket` under hardened mode, and — the security-relevant
+  one — the `module.registerHooks()` laundering cases in `esm.test.ts` (#61's synchronous-chain
+  gate and #78's backstop), which now assert the *guarded* outcome on every leg instead of
+  accepting `UNSUPPORTED` on one.
+- `@types/node` moved from v20 to v22, removing several hand-written declarations for APIs the
+  v20 types did not know about.
+- `.devcontainer/ci.Dockerfile` installs corepack from npm when the base image lacks it — Node
+  unbundled corepack in 25, so `node:26` images have none.
+
+### Known gaps (unchanged by this release)
+
+- `EventSource` is still behind `--experimental-eventsource` on **22, 24 and 26**, so the
+  in-process suites skip it; it is covered by `test/global-egress-flagged.test.ts`, which spawns
+  a child with the flag.
+- `vm.SourceTextModule`/`SyntheticModule` are still behind `--experimental-vm-modules` on all
+  three, and vitest is never handed that flag. The gate is asserted only where the classes are
+  absent. This is a real hole, not a version artifact.
+
 ### Security
 
 - **Closed an unrecorded route around the module-read gate (#123) on Node ≥24.18.** capwall

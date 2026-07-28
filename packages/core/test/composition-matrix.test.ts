@@ -412,28 +412,26 @@ describe("S12 × the net shims — one grant, one authority, however it is spell
    *
    * This used to be one test that (a) `return`ed silently after installing capwall when
    * `globalThis.WebSocket` was absent — reporting green with zero assertions on the Node 20 leg
-   * of the CI matrix, invisible in the report, against the convention `fs-glob.test.ts:165`
-   * argues for in prose — and (b) accepted `TypeError` as proof of guarding. `TypeError` is the
-   * UN-guarded outcome: `new undefined(...)` when `http.WebSocket` does not exist. "The property
-   * is missing" satisfied "the property is guarded".
+   * of the CI matrix, invisible in the report — and (b) accepted `TypeError` as proof of
+   * guarding. `TypeError` is the UN-guarded outcome: `new undefined(...)` when `http.WebSocket`
+   * does not exist. "The property is missing" satisfied "the property is guarded".
    *
-   * Availability differs per surface, so the skip conditions do too:
-   *   `globalThis.WebSocket` — on from Node 22; `--experimental-websocket` on Node 20.
-   *   `http.WebSocket`       — the same class object, re-exported from Node 22 only.
+   * BOTH SKIP CONDITIONS ARE GONE WITH NODE 20. `globalThis.WebSocket` is unflagged from 22.4 and
+   * `http.WebSocket` re-exports the same class object from 22, both below the ≥22.15 floor, so
+   * these two rows now run on every leg of the matrix — verified present on 22, 24 and 26 rather
+   * than inferred from the changelog. They are still cross-checked against the real modules by
+   * the third row, which is what would catch a future Node dropping either.
    */
-  const HAS_GLOBAL_WEBSOCKET = typeof (globalThis as { WebSocket?: unknown }).WebSocket === "function";
-  const HAS_HTTP_WEBSOCKET =
-    typeof (nodeHttp as unknown as { WebSocket?: unknown }).WebSocket === "function";
   const DENIED_WS = "ws://10.0.0.1:9999/";
 
-  it.skipIf(!HAS_GLOBAL_WEBSOCKET)("guards the global WebSocket (S12/S13)", async () => {
+  it("guards the global WebSocket (S12/S13)", async () => {
     const dep = capwall(policyGranting(ALLOWED_PORT)) as FixtureDep & {
       openWebSocket(url: string): Promise<string>;
     };
     await expect(dep.openWebSocket(DENIED_WS)).rejects.toMatchObject({ name: "CapabilityError" });
   });
 
-  it.skipIf(!HAS_HTTP_WEBSOCKET)(
+  it(
     "guards the SAME class through the http namespace re-export (S13)",
     () => {
       const dep = capwall(policyGranting(ALLOWED_PORT)) as FixtureDep & {
@@ -454,13 +452,19 @@ describe("S12 × the net shims — one grant, one authority, however it is spell
   );
 
   it("the http shim neither invents nor drops `WebSocket` relative to the real module", () => {
-    // The always-running half, and the honest Node-20 statement: on a runtime where real
-    // `node:http` has no `WebSocket`, the dependency must not see one either — that, and not a
-    // bare `TypeError`, is why the previous assertion could not fail there.
+    // The shim must mirror the real module exactly: expose `WebSocket` where `node:http` has it,
+    // and expose nothing where it does not. Still derived from the REAL module rather than
+    // hardcoded to "function" — that is what makes this the row that catches a future Node
+    // dropping the re-export, which would otherwise turn the two guarded rows above into tests
+    // of a property that is simply absent.
     const dep = capwall(policyGranting(ALLOWED_PORT)) as FixtureDep & {
       httpNamespaceWebSocketType(): string;
     };
-    expect(dep.httpNamespaceWebSocketType()).toBe(HAS_HTTP_WEBSOCKET ? "function" : "undefined");
+    const real = typeof (nodeHttp as unknown as { WebSocket?: unknown }).WebSocket;
+    expect(real, "node:http must re-export WebSocket on the supported floor (>=22.15)").toBe(
+      "function",
+    );
+    expect(dep.httpNamespaceWebSocketType()).toBe(real);
   });
 });
 

@@ -32,16 +32,20 @@ const POLICY_SWAP_APP = path.join(APP_DIR, "policy-swap-app.mjs");
 const BACKSTOP_APP = path.join(APP_DIR, "backstop-app.mjs");
 
 /**
- * `module.registerHooks()` is Node ≥22.15 — absent on the Node 20 leg of the CI matrix.
+ * `module.registerHooks()` is Node ≥22.15, and the supported floor is now exactly that — so this
+ * is TRUE ON EVERY RUNTIME IN THE MATRIX and the two tests it gated run unconditionally. It was
+ * a `skipIf` predicate for the Node 20 leg; #112 had previously found two worse shapes here (an
+ * `expect(...).toMatch(/…|UNSUPPORTED/)` that Node 20 satisfied without testing the gate, and an
+ * `if (…UNSUPPORTED) return;` that made a whole test a no-op there).
  *
- * Evaluated ONCE here, at module scope, so the two tests that depend on it can `skipIf` (which
- * the reporter shows) instead of accepting an `UNSUPPORTED` alternative in an assertion or
- * returning silently mid-body (which it does not). #112 found both shapes here: an
- * `expect(...).toMatch(/…|UNSUPPORTED/)` that the Node-20 leg satisfied without ever testing
- * the gate, and a `if (…UNSUPPORTED) return;` that made a whole test a no-op there.
+ * It is kept as an ASSERTED PRECONDITION rather than deleted outright. The API's presence is a
+ * load-bearing premise of the synchronous-chain backstop test below — that test is only
+ * meaningful if the sync chain actually exists — so it is asserted once, loudly, instead of
+ * being assumed by a test whose failure would read as a backstop regression.
+ *
+ * Read off the namespace rather than imported by name so this stays a RUNTIME check: the point
+ * is what the running Node has, not what the types promise.
  */
-// Read off the namespace rather than imported by name: `@types/node` is pinned at v20 here, so
-// `registerHooks` is not in the declarations even on a runtime that has it.
 const HAS_REGISTER_HOOKS =
   typeof (nodeModule as { registerHooks?: unknown }).registerHooks === "function";
 
@@ -166,18 +170,17 @@ describe("#61 — a dependency cannot register a loader hook ahead of capwall's"
       { CAPWALL_MODE: "enforce", CAPWALL_POLICY_FILE: denyPolicy },
       HOOKJACK_APP,
     );
-    // `registerHooks` is Node >=22.15; on an older runtime the API is simply absent, which is
-    // not a bypass. `register` (Node >=20.6) is always present, so it always asserts.
+    // BOTH registration APIs are gated, and both assertions are now unconditional. This used to
+    // derive the expected string from the runtime, because `registerHooks` (Node ≥22.15) did not
+    // exist on the Node 20 leg — one step better than the `/…(BLOCKED:…|UNSUPPORTED)/` alternation
+    // #112 deleted, which accepted the UN-guarded outcome on every version, but still a branch
+    // that only ever asserted the gate on part of the matrix.
     //
-    // The expected string is DERIVED from the runtime rather than offered as an alternation:
-    // `/…(BLOCKED:esm-hookjack-dep|UNSUPPORTED)/` let the Node-20 leg pass on the un-guarded
-    // outcome, so the `registerHooks` gate had no coverage there and would not have had any if
-    // it were deleted on 22 either — the alternation accepted both (#112).
-    expect(r.stdout).toContain(
-      HAS_REGISTER_HOOKS
-        ? "HOOKJACK:registerHooks:BLOCKED:esm-hookjack-dep"
-        : "HOOKJACK:registerHooks:UNSUPPORTED",
-    );
+    // With the floor at ≥22.15 there is no arm to choose: `UNSUPPORTED` coming back from the
+    // fixture is now a FAILURE, not a runtime fact, which is exactly the state you want the
+    // #61 gate's regression test in.
+    expect(r.stdout).toContain("HOOKJACK:registerHooks:BLOCKED:esm-hookjack-dep");
+    expect(r.stdout).not.toContain("HOOKJACK:registerHooks:UNSUPPORTED");
     expect(r.stdout).toContain("HOOKJACK:register:BLOCKED:esm-hookjack-dep");
     expect(r.stderr).toMatch(/DENY 'esm-hookjack-dep' module\.register/);
   });
@@ -283,12 +286,21 @@ describe("#78 — the load()-level re-mediation backstop actually fires", () => 
     }
   });
 
-  it.skipIf(!HAS_REGISTER_HOOKS)("holds against the SYNCHRONOUS registerHooks chain too, which runs ahead of capwall's", async () => {
-    // `module.registerHooks()` (Node ≥22.15) is the strictly stronger position: its resolve chain
-    // runs entirely ahead of the asynchronous `register` chain capwall lives in. The asynchronous
-    // LOAD chain still descends to capwall, which is what makes the backstop reach this case —
+  it("holds against the SYNCHRONOUS registerHooks chain too, which runs ahead of capwall's", async () => {
+    // `module.registerHooks()` is the strictly stronger attacker position: its resolve chain runs
+    // entirely ahead of the asynchronous `register` chain capwall lives in. The asynchronous LOAD
+    // chain still descends to capwall, which is what makes the backstop reach this case —
     // asserted rather than assumed, since it is the case the backstop most needs to cover.
-    // Absent on Node 20, where the API simply does not exist; that is not a bypass.
+    //
+    // This used to `skipIf(!HAS_REGISTER_HOOKS)` for the Node 20 leg. With the floor at ≥22.15
+    // the API is present everywhere, so the strongest laundering case in this file now runs on
+    // EVERY leg of the matrix instead of all-but-one. The premise is asserted rather than
+    // dropped: if a runtime ever lacks the API, this fails as a missing precondition rather than
+    // as a phantom backstop regression.
+    expect(
+      HAS_REGISTER_HOOKS,
+      "module.registerHooks() is required by the supported floor (Node >=22.15) — see engines",
+    ).toBe(true);
     const r = await runApp(
       {
         CAPWALL_MODE: "enforce",
@@ -297,9 +309,10 @@ describe("#78 — the load()-level re-mediation backstop actually fires", () => 
       },
       BACKSTOP_APP,
     );
-    // The runtime-level skip is `skipIf(!HAS_REGISTER_HOOKS)` above, which the reporter shows.
-    // This pins that the CHILD agrees with the parent's view — a silent `return` here used to
-    // turn the whole test into a green no-op on Node 20 (#112).
+    // The CHILD must agree with the parent's view of the API. A silent `return` here used to
+    // turn the whole test into a green no-op on Node 20 (#112); now that the floor guarantees
+    // the API, `UNSUPPORTED` coming back from the child would mean the fixture failed to install
+    // the sync hook, which is a real failure rather than a runtime that lacks it.
     expect(r.stdout).not.toContain("BACKSTOP:UNSUPPORTED");
     for (const spec of MEDIATED) {
       expect(r.stdout, `${spec} reached the raw builtin via the sync chain`).toContain(

@@ -12,7 +12,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: [20, 22]
+        # THE MATRIX IS THE SUPPORTED RANGE, AND `engines` MUST AGREE WITH IT (>=22.15.0 in all
+        # four manifests). Node 20 went end-of-life on 2026-04-30 and was dropped here; 22 is the
+        # floor because `module.registerHooks()` is 22.15 and capwall wants that API ungated
+        # (issue #152). 24 is the active LTS. 26 is `current` and becomes LTS on 2026-10-28 — it
+        # is carried now so a break lands as a CI failure while it is still cheap to fix, not on
+        # the day it becomes the version everyone upgrades to.
+        #
+        # The floor leg is not the boring one: 22 is where a newer API used unconditionally
+        # breaks, and 26 is where a removed one does. Do not narrow this to a single version.
+        node-version: [22, 24, 26]
     steps:
       - uses: actions/checkout@v4
 

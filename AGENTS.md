@@ -218,6 +218,12 @@ Do not start step *n+1* until step *n* has passing tests and a clean typecheck.
   evaluates the hook module's entire import graph**, so an import added anywhere reachable from
   `loader/esm-hooks.ts` is serial startup cost for every capwall user. `test/esm-hook-graph.test.ts`
   fails on the two shapes that regress it (#150).
+  **`module.register()` is now DEPRECATED (DEP0205) as of Node 26**, which prints a
+  DeprecationWarning on stderr in every mediated process on that version. Together with the
+  ≥22.15 floor making `module.registerHooks()` unconditionally available, #152 is now unblocked
+  *and* on a clock — it is the deprecation path, not just a ~53 ms startup win. It is deliberately
+  NOT a drive-by change: the ESM perimeter is where #59, #61 and #62 lived, so it gets its own PR
+  with the full laundering-vector suite run against it.
 - **License hygiene.** capwall is MIT. **Do NOT** pull in non-compete / source-available
   code (e.g. PolyForm-licensed Socket code). Prefer permissive (MIT/BSD/Apache-2.0) deps
   only.
@@ -235,10 +241,18 @@ A feature is done only when **all** of:
   and **allowed (only logged) in `observe` mode**.
 
 **GitHub Actions is billing-blocked (issue #3), so there is no automated CI.** Reproduce the
-full `ci.yml` matrix (Node 20 **and** 22, clean install → build → typecheck → test → lint) in
+full `ci.yml` matrix (Node **22, 24 and 26**, clean install → build → typecheck → test → lint) in
 Docker with `pnpm ci:local` — a green run there is a green CI run. See
 [`docs/ci-local.md`](docs/ci-local.md). Until Actions billing is restored, treat `pnpm ci:local`
 as the gate.
+
+**The supported range is `>=22.15.0`, declared in all four manifests' `engines`.** Node 20 went
+EOL on 2026-04-30 and was dropped. The floor is 22.15 rather than 22.0 for one reason:
+`module.registerHooks()` landed in 22.15, and capwall wants it **without a version gate** (#152).
+Three copies of that fact have to move together — `engines` in the four manifests, the
+`node-version` matrix in both workflows, and the default in `scripts/ci-local.sh`. Node 26 is in
+the matrix as early warning: it becomes LTS on 2026-10-28, and it is already the leg that caught
+`module.register()`'s DEP0205 deprecation and six new globals.
 
 ## 7. Testing
 

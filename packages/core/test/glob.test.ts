@@ -295,10 +295,10 @@ describe("policy glob normalization against projectRoot", () => {
 // nodeGlobPrefixes / nodeGlobBase (#106, hardened by #120) — reach analysis for NODE's glob
 // dialect, not capwall's.
 //
-// The analysis is pure syntax (no filesystem), so this runs identically on Node 20 (where
-// `fs.glob` does not exist) and on Node 22. The corresponding "…and Node really does escape
-// like that" evidence — including the generated-pattern property test — lives in
-// fs-glob.test.ts, which can only run where the API exists.
+// The analysis is pure syntax (no filesystem), so it never needed `fs.glob` to exist at all —
+// which is why this file ran on Node 20 when fs-glob.test.ts could not. The corresponding
+// "…and Node really does escape like that" evidence — including the generated-pattern property
+// test — lives in fs-glob.test.ts, against the real API.
 // ---------------------------------------------------------------------------------------
 
 /** `nodeGlobBase` against a POSIX-style cwd, so the expectations read as absolute paths. */

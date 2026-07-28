@@ -42,15 +42,30 @@ catalog.
 
 ## The CI-faithful path (Docker matrix)
 
-`.github/workflows/ci.yml` runs on **Node 20 and 22**. To reproduce that matrix — clean install, both Node versions, all gates — in Docker:
+`.github/workflows/ci.yml` runs on **Node 22, 24 and 26**. To reproduce that matrix — clean install, every Node version, all gates — in Docker:
 
 ```bash
-pnpm ci:local          # Node 20 AND 22 (the ci.yml matrix)
-pnpm ci:local:22       # just Node 22 (faster)
-scripts/ci-local.sh 20 # any single version
-CI_NODE_VERSIONS="18 20 22" scripts/ci-local.sh   # custom set
+pnpm ci:local          # Node 22, 24 AND 26 (the ci.yml matrix)
+pnpm ci:local:24       # just Node 24, the active LTS (faster)
+pnpm ci:local:22       # just the floor
+scripts/ci-local.sh 26 # any single version
+CI_NODE_VERSIONS="22 24" scripts/ci-local.sh      # custom set
 CI_CPUSET=0,1 pnpm ci:local                       # pin to 2 cores — a GitHub hosted runner
 ```
+
+### Why those three
+
+| version | why it is in the matrix |
+|---|---|
+| **22** | The **floor**, and `engines` says `>=22.15.0`. 22.15 is where `module.registerHooks()` landed; capwall wants that API without a version gate (issue #152). The floor leg is where code that reaches for a newer API breaks. |
+| **24** | The **active LTS** (until 2028-04-30) — what most users upgrading off 20 land on. It is also the version the release workflow packs on. |
+| **26** | `current`, and **LTS from 2026-10-28**. Carried now so breakage lands as a CI failure months before it becomes the version everyone runs. It has already paid for itself twice — see below. |
+
+Node 20 went **EOL on 2026-04-30** and is no longer tested or supported.
+
+**Node 26 needs one thing the others do not.** Corepack was unbundled from Node in 25, so the
+`node:25`/`node:26` images have no `corepack` on `PATH` and `ci.Dockerfile` installs it from npm
+when it is missing. `ci.yml` is unaffected — `pnpm/action-setup@v4` installs pnpm directly.
 
 Each version builds `.devcontainer/ci.Dockerfile` and runs, in order: `pnpm install --frozen-lockfile=false` → `build` → `typecheck` → `test` → `lint` → `bench:gate`. **A green build == a green CI run for that Node version.** The script exits non-zero if any gate fails on any version, so it can gate a merge.
 
@@ -98,4 +113,4 @@ environment. That test exists because the claim silently became false once befor
 
 ## Dev container
 
-`.devcontainer/devcontainer.json` gives a reproducible Node 22 dev environment (VS Code Dev Containers / GitHub Codespaces). On create it enables the pinned pnpm, installs, and builds. It includes the `docker-outside-of-docker` feature so you can run `pnpm ci:local` from inside the container too.
+`.devcontainer/devcontainer.json` gives a reproducible Node 24 dev environment — the active LTS, matching the primary CI target (VS Code Dev Containers / GitHub Codespaces). On create it enables the pinned pnpm, installs, and builds. It includes the `docker-outside-of-docker` feature so you can run `pnpm ci:local` from inside the container too.

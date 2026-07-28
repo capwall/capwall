@@ -39,7 +39,7 @@ has roughly doubled since the harness was written.
 |---|---|---|
 | `fs` read/write, sync | yes | `fs.readFileSync`, paired, at two stack depths |
 | `fs` path pinning (file-URL args) | no | same `coercePath` as the sync read; not separately priced |
-| `fs.glob`/`globSync`/`promises.glob` (#106) | yes (Node ≥22) | `fs.globSync`; skipped on Node 20, which has no `globSync` |
+| `fs.glob`/`globSync`/`promises.glob` (#106) | yes (Node ≥22) | `fs.globSync`; present on every supported Node since the floor moved to ≥22.15 |
 | `fs` stream/class constructors | no | same `guard()` call as `createReadStream`; priced by the fs row |
 | `net.connect`, allowed | yes | with a **6-key options bag**, so the accessor-flattening clone (#26/#56) is in the number |
 | `net`/`tls`/`http2`/`dgram`/`https` | partly | one guard implementation in `net.ts`; the `net.connect` row prices the shape |
@@ -310,7 +310,7 @@ and fails nothing.
 
 | cost | ms | why it stays |
 |---|---|---|
-| Node's loader-thread bootstrap | ~53 | Node's, and `register()` blocks until it is done. `module.registerHooks()` (synchronous, no thread) would remove it, but it is Node ≥22.15 — absent on the Node 20 leg of the CI matrix — and it would mean a second implementation of the security-critical hook, version-gated, with each leg exercising only one arm. A follow-up with a real design question in it, not a tweak. |
+| Node's loader-thread bootstrap | ~53 | Node's, and `register()` blocks until it is done. `module.registerHooks()` (synchronous, no thread) would remove it. **The version objection is gone**: it is Node ≥22.15, which is exactly the supported floor, so it needs no gate and no second version-conditional implementation of a security-critical hook. Node 26 additionally DEPRECATED `module.register()` (DEP0205) in its favour. Tracked as #152 — still a follow-up with a real design question in it (the ESM perimeter is where #59/#61/#62 lived), not a tweak. |
 | `real-builtins.cts`'s twelve `require`s on the MAIN thread | 13 | #78. They must be eager and inside `index.js`'s static graph: that is the whole proof that they run against a pristine `Module._load` rather than capturing capwall's own shims. Narrowing helps a realm that needs two of them; it cannot help the realm that needs all twelve. |
 | `globalThis.Request` → undici | 21 | `global-egress.ts` captures the real `Request.prototype.url` getter at module scope, and V8 materializes undici on the first *observation* of that global (even `getOwnPropertyDescriptor` triggers it — verified). The capture is load-bearing: it is what stops a `Request` with a shadowed own `url` accessor reporting a granted destination while undici dials another (#26/#56). Deferring it to first `fetch()` would put that capture *after* dependencies have run, which is the window it exists to close. Note the guard itself is nearly free once undici is resident — `installGlobalEgressGuard` is ~1 ms — so this is the price of the TOCTOU capture, not of the guard. |
 | zod on the MAIN thread | 4 | `parsePolicy` is real validation of a real document, and the preload always parses one. |
@@ -331,7 +331,7 @@ the two builds differed in something other than the change.
 | | bare node (control) | 48 ms | 54 ms | +6 ms — the noise floor |
 | `docker --cpus=2`, Node 22 | mediated, esm ON | 280 ms | **259 ms** | −21 ms |
 | | `CAPWALL_ESM=0` (control) | 156 ms | 158 ms | +2 ms |
-| `docker --cpus=2`, Node 20 | mediated, esm ON | 289 ms | **249 ms** | −40 ms |
+| `docker --cpus=2`, Node 20 (EOL; historical) | mediated, esm ON | 289 ms | **249 ms** | −40 ms |
 | | `CAPWALL_ESM=0` (control) | 166 ms | 160 ms | −5 ms |
 | 16-core, 24 spinners (load 21) | mediated, esm ON | 1102 ms | **950 ms** | −152 ms |
 | | `CAPWALL_ESM=0` (control) | 576 ms | 602 ms | +26 ms |
@@ -426,7 +426,7 @@ How the limit was derived, so it can be re-derived rather than nudged (all figur
 | condition | observed ratio |
 |---|---|
 | idle 16-core Linux box, 6 sequential runs | 2.57 – 2.63 |
-| Node 20 in the CI container | 2.29 |
+| Node 22 in the CI container | 2.29 |
 | 8 concurrent benchmark processes on 16 cores | 2.6 – 4.2 |
 | 16 concurrent processes (it plateaus) | 4.4 – 4.6 |
 
@@ -448,7 +448,7 @@ reversion.
 
 `pnpm bench:gate` (`--quick`: 4 blocks, quarter iterations, ~10 s) runs in CI — as a step in
 `.github/workflows/ci.yml` and as a layer in `.devcontainer/ci.Dockerfile`, so `pnpm ci:local`
-covers it on Node 20 and 22. `CI_BENCH=0 pnpm ci:local` skips it.
+covers it on Node 22, 24 and 26. `CI_BENCH=0 pnpm ci:local` skips it.
 
 ## Layout
 

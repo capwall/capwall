@@ -6,9 +6,10 @@
 # version in the CI matrix, in a clean container, so a merge can be gated on a real green run.
 #
 # Usage:
-#   scripts/ci-local.sh                 # Node 20 and 22 (the ci.yml matrix)
-#   scripts/ci-local.sh 22              # just Node 22 (fast iteration)
-#   CI_NODE_VERSIONS="18 20 22" scripts/ci-local.sh
+#   scripts/ci-local.sh                 # Node 22, 24 and 26 (the ci.yml matrix)
+#   scripts/ci-local.sh 24              # just Node 24, the active LTS (fast iteration)
+#   scripts/ci-local.sh 22              # just the floor
+#   CI_NODE_VERSIONS="22 24" scripts/ci-local.sh
 #   CI_BENCH=0 scripts/ci-local.sh      # skip the perf gate (scripts/bench/README.md)
 #   CI_CPUSET=0,1 scripts/ci-local.sh   # pin the build to 2 cores — a GitHub hosted runner
 #
@@ -35,12 +36,17 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
-# Node versions: CLI args > $CI_NODE_VERSIONS > the ci.yml matrix (20, 22).
+# Node versions: CLI args > $CI_NODE_VERSIONS > the ci.yml matrix (22, 24, 26).
+#
+# KEEP THIS DEFAULT AND ci.yml's `node-version:` IN SYNC — the whole claim of this script is
+# "a green run here is a green CI run", and a local matrix narrower than the real one quietly
+# stops being true. `engines` in all four manifests (>=22.15.0) is the third copy of the same
+# fact; all three move together or none of them does.
 if [ "$#" -gt 0 ]; then
   NODE_VERSIONS=("$@")
 else
   # shellcheck disable=SC2206
-  NODE_VERSIONS=(${CI_NODE_VERSIONS:-20 22})
+  NODE_VERSIONS=(${CI_NODE_VERSIONS:-22 24 26})
 fi
 
 DOCKERFILE=".devcontainer/ci.Dockerfile"

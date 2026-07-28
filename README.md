@@ -126,7 +126,7 @@ tracked, and this list is a description of scope, not of progress.
 
 | | |
 |---|---|
-| **Node** | ≥ 20 (tested on 20 and 22) |
+| **Node** | ≥ 22.15 (tested on 22, 24 and 26) |
 | **pnpm** | ≥ 10 — **required, not a preference** |
 
 capwall is a pnpm workspace, and the root manifest has no npm `workspaces` field. `npm install`

@@ -16,10 +16,10 @@
  *    `new (fs.ReadStream.prototype.constructor)(deniedPath)` reached the real class and read
  *    the file unguarded (#64). Purely fd-based operations (`read`, `write`, `ftruncate`,
  *    `fchmod`, …) are NOT mediated — fd escapes are out-of-scope.
- *  - The Node ≥22 ENUMERATION family `glob`/`globSync`/`promises.glob` is mediated as one
- *    `fs.read` decision per pattern, on the directory that pattern's walk is rooted at — see the
- *    block comment above {@link GlobCwd} for the semantics and why they are not per-result
- *    (#106). Absent on Node 20, where `wrapSurface` skips them and the shim is unchanged.
+ *  - The ENUMERATION family `glob`/`globSync`/`promises.glob` is mediated as one `fs.read`
+ *    decision per pattern, on the directory that pattern's walk is rooted at — see the block
+ *    comment above {@link GlobCwd} for the semantics and why they are not per-result (#106).
+ *    Node ≥22, i.e. present on every supported runtime since the floor moved to ≥22.15.
  *  - Denials are delivered via the SAME channel the real API would use, so idiomatic
  *    (try/catch-free) callback code is not crashed by an uncaught synchronous throw:
  *      - `*Sync` methods throw `CapabilityError` synchronously (matches real sync `fs`).
@@ -119,10 +119,11 @@ const FS_METHODS: Record<string, MethodSpec> = {
   accessSync: "access",
   // exists / existsSync are handled bespoke (they must never throw — see createFsShim).
   // `openAsBlob` reads the file's CONTENTS (through the Blob it returns), so it is an ordinary
-  // read — it was simply missing from this table until the #99 sweep. Present on Node 20 and 22.
+  // read — it was simply missing from this table until the #99 sweep.
   openAsBlob: R0,
-  // Node ≥22 only; `wrapSurface` skips a name the runtime does not define, so these two are a
-  // clean no-op on Node 20 (issue #106).
+  // The Node ≥22 enumeration family (issue #106). `wrapSurface` skips a name the runtime does
+  // not define, which is what made these safe to list before the floor moved; on every supported
+  // runtime now they are really wrapped.
   glob: "glob",
   globSync: "glob",
   opendir: R0,
@@ -430,10 +431,11 @@ let globInternalsWarmed = false;
 function warmGlobInternals(): void {
   if (globInternalsWarmed) return;
   globInternalsWarmed = true;
-  const realGlobSync = (realFs as { globSync?: (p: string) => unknown }).globSync;
-  if (typeof realGlobSync !== "function") return; // Node 20 — nothing to warm
+  // `globSync` is Node ≥22 and the supported floor is ≥22.15, so it is simply present — the
+  // hand-written optional type and the `if (typeof … !== "function") return` that guarded the
+  // Node 20 leg are both gone. `@types/node` declares the family now that it tracks 22.
   try {
-    withAuthorizedEnvKeys(GLOB_INTERNAL_ENV_KEYS, () => realGlobSync(""));
+    withAuthorizedEnvKeys(GLOB_INTERNAL_ENV_KEYS, () => realFs.globSync(""));
   } catch {
     // Best-effort. The worst case is the cosmetic recording defect described above, not a gap.
   }

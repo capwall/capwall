@@ -387,12 +387,17 @@ describe("#80 — redirects", () => {
   });
 });
 
-// `WebSocket` is unflagged only on Node >=22; on Node 20 it needs --experimental-websocket.
-// The flagged-runtime coverage for BOTH classes lives in global-egress-flagged.test.ts, which
-// spawns a child process with the flags, so Node 20 is covered there rather than skipped.
+// `WebSocket` is unflagged from Node 22.4, below the ≥22.15 floor, so it is present in-process
+// on every leg of the matrix and this block NO LONGER SKIPS — it used to, on the Node 20 leg,
+// where the class needed `--experimental-websocket`. `EventSource` is still flag-only on 22, 24
+// and 26; the flagged-runtime coverage for BOTH classes lives in global-egress-flagged.test.ts,
+// which spawns a child process with the flags.
+//
+// Kept as a read off the real global rather than a constant: this is what the shape assertion
+// below compares the SHIM against, and inventing an expectation would defeat that.
 const hasWebSocket = typeof (globalThis as { WebSocket?: unknown }).WebSocket === "function";
 
-describe.skipIf(!hasWebSocket)("#80 — globalThis.WebSocket is mediated", () => {
+describe("#80 — globalThis.WebSocket is mediated", () => {
   it("denies an ungranted dependency's WebSocket in enforce", async () => {
     await withCapwall(denyAll(), "enforce", async ({ dep, decisions }) => {
       await expect(dep.openWebSocket(`ws://127.0.0.1:${mainPort}/`)).rejects.toThrowError(
@@ -534,10 +539,11 @@ describe("#80 — the guarded globals keep their observable shape", () => {
       const shape = dep.globalEgressShape();
       expect(shape["fetchName"]).toBe("fetch");
       expect(shape["fetchLength"]).toBe(globalThis.fetch.length);
-      // Both legs of the CI matrix assert something. On a runtime without `WebSocket` the claim
-      // is that capwall did not INVENT one — an `if (hasWebSocket)` with no `else` silently
-      // dropped half this test on Node 20 (#112). The guarded-shape claim for `WebSocket` on
-      // Node 20 is covered by `global-egress-flagged.test.ts`, which runs under the flag.
+      // Derived from the runtime, not hardcoded: on a runtime WITHOUT `WebSocket` the claim is
+      // that capwall did not INVENT one, and on one with it that the class is really guarded.
+      // An `if (hasWebSocket)` with no `else` silently dropped half this test on Node 20 (#112).
+      // Every supported Node now takes the present arm; the absent arm is what would catch a
+      // future Node dropping the class rather than capwall dropping the guard.
       expect({
         name: shape["webSocketName"],
         guarded: shape["webSocketPrototypeConstructorIsGuarded"],

@@ -18,9 +18,9 @@
  *
  * `Module._extensions[".node"]` is a two-line function whose body is
  * `return process.dlopen(module, path.toNamespacedPath(filename))` — verified by reading the
- * live function on Node 20.20, 22.22, 22.23, 24.18 and 26.5. `process.dlopen` is therefore the
+ * live function on Node 22.22, 22.23, 24.18 and 26.5. `process.dlopen` is therefore the
  * single JS-reachable chokepoint through which EVERY addon load passes, and it is a plain
- * writable+configurable own property of `process` on all five (`dlopen.length` is 0 on all of
+ * writable+configurable own property of `process` on all four (`dlopen.length` is 0 on all of
  * them — it is a C++ binding, so its real arity is not readable from JS, which is a further
  * reason this wrapper forwards `args` rather than a written-out parameter list). Hooking it
  * (rather than `Module._extensions`, or the literal `require("*.node")` specifier) is what makes
@@ -64,7 +64,7 @@
  * `process.dlopen` BEFORE capwall installed keeps an un-gated reference (the same pre-install
  * capture residual as every shim — install via the `--import` preload); and Node's experimental
  * `require.addon()` is a C++-side loader that may not route through `process.dlopen` — absent
- * on Node 20.20/22.22/22.23/24.18 and on 26.5 as shipped, with and without
+ * on Node 22.22/22.23/24.18 and on 26.5 as shipped, with and without
  * `--experimental-addon-modules`, but `node-gyp-build` PREFERS it when it exists, so recheck this
  * hook when it stabilizes.
  */

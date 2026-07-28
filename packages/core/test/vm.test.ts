@@ -134,7 +134,8 @@ describe("vm shim — class escape surfaces (#64)", () => {
    * `vm.SourceTextModule` / `vm.SyntheticModule` live behind `--experimental-vm-modules`, and
    * vitest is never handed that flag (`packages/core/vitest.config.ts` sets only
    * `esbuild.include`; `.github/workflows/ci.yml` runs plain `pnpm test`). So they are
-   * `undefined` on Node 20, 22 AND 24 as this suite runs.
+   * `undefined` on Node 22, 24 AND 26 as this suite runs — this is a REAL, still-open coverage
+   * gap that dropping Node 20 did not close, not a version artifact.
    *
    * This used to be ONE test whose title claimed both halves — "gated when present, and absent
    * ones don't throw" — with the present-half behind a `continue` that has never executed on any
