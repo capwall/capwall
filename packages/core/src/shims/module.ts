@@ -172,8 +172,32 @@ export interface CompileGateHandle {
   uninstall(): void;
 }
 
-/** `Module.prototype._compile`'s shape. Node passes exactly `(content, filename)`. */
-type CompileFn = (this: unknown, content: string, filename: string) => unknown;
+/**
+ * `Module.prototype._compile`'s shape — deliberately VARIADIC (issue #128).
+ *
+ * It used to be written `(content: string, filename: string)`, with a comment asserting that
+ * "Node passes exactly `(content, filename)`". That was true when it was written and stopped
+ * being true in Node 22.18, which added a third parameter, `format`:
+ *
+ *   Module.prototype._compile = function(content, filename, format) {
+ *     if (format === "commonjs-typescript" || format === "module-typescript" || …)
+ *
+ * `Module._extensions` passes `format: "commonjs-typescript"` for a `.ts`/`.cts` file, and it is
+ * what drives Node's built-in type stripping. A wrapper that forwarded a FIXED arity dropped it,
+ * so `require("./x.ts")` handed raw TypeScript to `wrapSafe` and threw `SyntaxError` — under any
+ * policy, in both modes, with capwall's own frame in the stack. (`require(esm)` self-healed only
+ * because `wrapSafe` re-detects ESM via `canParseAsESM`; type stripping has no second chance.)
+ *
+ * THE RULE THIS ENCODES, which is the durable half: a capwall wrapper over a Node primitive
+ * forwards with `Reflect.apply(real, this, args)` and never re-states the primitive's parameter
+ * list. Re-stating an arity is a correctness claim about a Node internal that a Node MINOR can
+ * falsify silently, and it fails in both directions — dropping an argument can as easily change
+ * what V8 compiles as it can break a load, so the gate would be reasoning about source Node did
+ * not compile. `test/primitive-arity.test.ts` asserts the property (arguments forwarded
+ * unchanged, whatever the count) rather than any particular number, so a future Node adding a
+ * fourth parameter needs no code change here and cannot regress silently.
+ */
+type CompileFn = (this: unknown, ...args: unknown[]) => unknown;
 
 /**
  * Frames belonging to Node's own CJS module machinery. `_compile` is called once per module
@@ -240,7 +264,7 @@ function calledByNodeLoader(hideAbove: CompileFn): boolean {
  * trust root, which would turn "compile under a bare label" into a free `<app>` impersonation.
  * `path.isAbsolute` is checked explicitly rather than relied on implicitly.
  */
-function guardCompile(ctx: ShimContext, filename: string): void {
+function guardCompile(ctx: ShimContext, filename: unknown): void {
   const attribution = attributeCallerDetailed(attributionOptionsFor(ctx));
   if (attribution.pkg === APP_ROOT) return;
   if (
@@ -332,9 +356,14 @@ const compileGatePatch = definePropertyPatch<CompileFn>("Module.prototype._compi
     "_compile",
   ),
   build(ctx, realCompile) {
-    const patched: CompileFn = function (this: unknown, content: string, filename: string): unknown {
-      if (!calledByNodeLoader(patched)) guardCompile(ctx, filename);
-      return realCompile.call(this, content, filename);
+    const patched: CompileFn = function (this: unknown, ...args: unknown[]): unknown {
+      // `args[1]` is `filename` on every Node that has ever had this method; the gate reads it
+      // POSITIONALLY and forwards the list VERBATIM, so a Node that adds a parameter changes
+      // what is forwarded without changing what is gated. `guardCompile` already treats a
+      // non-string / non-absolute filename as "never self-compilation", so a runtime that ever
+      // reordered the parameters fails closed here rather than waving the compile through.
+      if (!calledByNodeLoader(patched)) guardCompile(ctx, args[1]);
+      return Reflect.apply(realCompile, this, args);
     };
     // Keep `.name`/`.length` faithful: `require.extensions` tooling feature-detects on this
     // prototype, and a wrapper that renamed the method would be a gratuitous behavior change.

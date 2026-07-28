@@ -671,12 +671,14 @@ stop it. A guarded subclass raises the cost of the accidental and the opportunis
 not a boundary.
 
 **Attribution outcomes: `<pkg>`, `<app>`, `<unknown>`.** Every mediated call is charged to one
-of three principals. A frame under `node_modules/<pkg>` charges that package. A real source
-file **not** under `node_modules` charges `<app>`, the trust root, which the `process.env` and
-`dgram` gates exempt. Everything else — no qualifying frame on the stack at all, or app code
-reached only *through* code with no filesystem identity (a `data:`/`blob:` module, any
-`eval`/`new Function` frame, a bundler `//# sourceURL=`, `node -e`/stdin) — charges
-`<unknown>`.
+of three principals. A frame under `node_modules/<pkg>` charges that package — **including one
+that got there through a symlink**, which since #127 is resolved back to the `node_modules` entry
+it was reached through rather than to the realpath (see § Package identity). A real source file
+under **no** `node_modules` and **inside the project root** charges `<app>`, the trust root, which
+the `process.env` and `dgram` gates exempt. Everything else — no qualifying frame on the stack at
+all, app code reached only *through* code with no filesystem identity (a `data:`/`blob:` module,
+any `eval`/`new Function` frame, a bundler `//# sourceURL=`, `node -e`/stdin), or a real source
+file outside the project root that no `node_modules` entry points at — charges `<unknown>`.
 
 Only a frame's `getFileName()` is used to name a package, because that is the one thing V8
 reports from how the code was **loaded** rather than from what the code **says about itself**.
@@ -869,10 +871,12 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
   still **deliberately deepen or launder its own stack** — push its frame past the frame budget,
   or arrange for another package's frame to be the nearest one — and a `vm` grant lets it name
   any file it likes (`vm.runInThisContext(code, { filename: "…/node_modules/lodash/x.js" })`
-  produces frames that attribute to `lodash`). A file that is not under any `node_modules` is
-  `<app>` regardless of where it lives, so a dependency that can write a file **and** load it
-  (`require("/tmp/x.js")`) is charged to the app; the fs write is itself gated, but a dependency
-  with any write grant plus load is an escalation path. And granting `<unknown>` broadly in a
+  produces frames that attribute to `lodash`). A file under no `node_modules` **and inside the
+  project root** is `<app>`, so a dependency that can write a file **and** load it
+  (`require("<projectRoot>/tmp/x.js")`) is charged to the app; the fs write is itself gated, but a
+  dependency with any write grant plus load is an escalation path. A file under no `node_modules`
+  and **outside** the project root is `<unknown>`, not `<app>` — see the linked-dependency bullet
+  under § Package identity for why that changed in #127. And granting `<unknown>` broadly in a
   policy restores an exemption for every unattributable call by hand. These are the
   determined-in-process-attacker class, same as un-patching the shims — real, and not papered
   over.
@@ -999,11 +1003,65 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
   `child_process` is a bypass with extra steps. Trees installed with yarn 1, which nests far more
   aggressively than npm 3+, will see the most churn.
 
+  **Linked and workspace dependencies — the consequence of "identity is position" that arrives
+  for free (#127).** Node resolves module paths through `realpath`, so a dependency installed as a
+  **symlink** into `node_modules` reports a file path with no `node_modules` segment in it. Until
+  #127 that made it `<app>`, the trust root — which needed no attacker action and no grant,
+  because it is the default on-disk shape of `npm i file:../x`, of `npm link`, and of every
+  workspace tool. Every first-party package in a monorepo was the application, could not be given
+  a policy at all, and picked up `<app>`'s exemptions from the `process.env`, `dgram` and
+  loader-hook gates *before* the decision was recorded, plus the identity-granting `_compile`
+  exemption. The `<app>` bullet above described the rule; it drew the consequence only for a
+  dependency that could write a file and then load it, and this is the same consequence with no
+  write and no attacker.
+
+  **What capwall does now.** The identity of a linked package is **the link source** — the
+  `node_modules/<name>` entry that pointed at it — run through the ordinary install-chain
+  derivation. `proj/node_modules/linked -> ../vendor/linked` makes every file under
+  `vendor/linked` answer to the principal `linked`: a name a policy author can write, a name
+  `observe` / `gen-policy` emit, and a principal distinct from `<app>`. A workspace member is
+  therefore neither the application nor an unnameable blob; it is `@scope/lib`, exactly as if it
+  had been installed from a registry. Rewriting is iterative, so it composes with the chain —
+  `@w/util` reached through `@w/lib` is `@w/lib>@w/util`, not the top-level `@w/util`.
+
+  The link is recorded when Node resolves through it (a `Module._findPath` observer, which is
+  passive and gates nothing), because there is no directory capwall could scan instead: **npm
+  hoists the workspace link to the repo root, pnpm puts it in the importing package's own
+  `node_modules`.** A resolution capwall did not observe is recovered afterwards by looking for a
+  `node_modules/<name>` entry that *verifiably* resolves to the package directory; the `name` in
+  a `package.json` is used only as a lookup key, never believed, so a package claiming
+  `"name": "lodash"` gains nothing unless a `node_modules/lodash` really does point at it — in
+  which case that is what `require("lodash")` resolves to in that tree.
+
+  **What this does not reach, stated plainly.**
+  - **ESM imports are recovered, not observed.** `module.register()` hooks run on Node's separate
+    loader thread, so capwall's ESM `resolve` hook cannot write the map. Recovery covers a link
+    sitting in a `node_modules` directory above the package itself or above the project root,
+    which is every layout measured (`npm i file:`, `npm link`, npm/yarn workspaces, and pnpm
+    workspaces when the project root is the consuming package — what `npm run -w` and
+    `pnpm --filter` both produce). The gap is an **ESM-only** import of a workspace package whose
+    realpath is **inside** the declared project root, when nothing ever resolved it through CJS:
+    that one is still `<app>`. Pointing `CAPWALL_PROJECT_ROOT` at the consuming package closes it.
+  - **The entry-point package stays `<app>`.** Code reached by path rather than through a
+    `node_modules` entry is the application, which is what makes `<app>` a *positive*
+    identification (#60) rather than a fallback.
+  - **A file outside the project root, under no `node_modules`, with no link found, is now
+    `<unknown>`** — deny-by-default, recorded, grantable — rather than `<app>`. Being outside the
+    project is not evidence of being the project; `loader/native.ts` has made the same move for
+    `.node` files since #49. The cost is that an application whose own sources live outside its
+    declared project root is denied by default. That is loud (a `DENY '<unknown>'` line naming the
+    capability), and the fix is to point `CAPWALL_PROJECT_ROOT` at the tree that is actually the
+    application.
+
   **What remains forgeable.**
   - **Identity is still position, not publisher.** `node_modules/lodash` is whatever is on disk
     at that path. A typosquat, a compromised publish, or a hand-edited working copy all answer to
     `lodash`. capwall verifies nothing about the artifact; that is a job for a lockfile-integrity
     or provenance-attestation check at install time, and capwall does not do one.
+  - **Anything that can create a symlink can choose a name**, exactly as anything that can write
+    into `node_modules` can. A dependency with an `fs` write grant that covers a `node_modules`
+    directory can link a granted name at its own tree. This is the bullet below, not a new hole:
+    the link is a `node_modules` entry like any other.
   - **Anything that can write into the tree can choose its name.** An `fs` write grant covering
     `node_modules`, a postinstall script, or any lifecycle hook can install code at a granted
     package's path. Grants that let a dependency write into `node_modules` should be read as
@@ -1123,11 +1181,34 @@ realistic way to trip it is code outside capwall pinning an egress global non-co
 a hardened install, after which nobody can harden or restore it; capwall refuses rather than
 running with the option quietly absent.
 
-One consequence of `hardened` is worth stating plainly, because `Object.freeze` is irreversible
-and everything else about an install IS live: a shim reference a module already captured keeps
-the hardening of the install that first built it. A later install with a different `hardened`
-gets correctly-hardened shims for anything freshly handed out — the registry is memoized per
-hardened-ness — but it cannot un-freeze, or retroactively freeze, what is already held.
+**`hardened` is a RATCHET for the process, not a per-install setting (#129).** Installs nest, and
+this is the one option that does **not** follow the newest one the way `policy` and `mode` do.
+Once any install has asked for hardening, every freshly handed-out shim is frozen and the egress
+globals stay pinned **until the last install is released**; `hardened: false` means "I am not
+asking for it", never "turn it off". So a later `install({ hardened: false })` cannot downgrade a
+hardened install that is still active, and passing `hardened: false` guarantees nothing about the
+surfaces you get if something else in the process asked for hardening.
+
+Before #129 only *half* the option behaved this way. The egress globals ratcheted
+(`GlobalPropertySlot.pin` is re-applied on every install and nothing un-pins until the last one
+restores), while the shim registries were last-writer-wins: with a `hardened: true` install still
+active, a later `install({ hardened: false })` made every subsequent `require("node:fs")` return
+an **unfrozen** shim, which a dependency can then monkey-patch — process-wide, unlogged, the exact
+one-liner hardened mode exists to close. The `hardened: true` install had verified its
+post-condition (above) and returned a handle; nothing revoked or re-checked that promise, and
+nothing warned. One `install()` therefore left the process half-hardened, and which half you saw
+depended on which surface you looked at, so neither behaviour was documented as intended. The
+ratchet is the safer of the two and the one already in force on the egress side, so it is now the
+rule on both. It is not a dependency-reachable bypass — reaching it means calling `install()`,
+which is the "reach capwall's own machinery" class this document already declines to defend — but
+it is a real hazard for embedders, who are told installs nest and teardown is order-independent.
+
+One further consequence is worth stating plainly, because `Object.freeze` is irreversible and
+everything else about an install IS live: a shim reference a module already captured keeps the
+hardening of the install that first built it. A later hardened install gets frozen shims for
+anything freshly handed out — the registry is memoized per hardened-ness — but it cannot
+retroactively freeze what is already held. Install capwall early; that is what the `--import`
+preload is for.
 
 Note the dependency on issue #64: while `fs.ReadStream`, `vm.Script` and
 `worker_threads.Worker` were construct-trap Proxies, hardened mode could not freeze them at

@@ -19,6 +19,7 @@
 import { patchRequire, type RequirePatchHandle } from "./loader/require.js";
 import { registerEsmHook, type EsmHookHandle } from "./loader/esm-hook.js";
 import { liveCtx, liveRegistry } from "./loader/live-context.js";
+import { installLinkObserver, type LinkObserverHandle } from "./loader/linked-packages.js";
 import { installNativeGate, type NativeGateHandle } from "./loader/native.js";
 import { installEnvGuard, type EnvGuardHandle } from "./shims/env.js";
 import { installCompileGate, type CompileGateHandle } from "./shims/module.js";
@@ -129,6 +130,19 @@ export interface InstallOptions {
    * accepted and silently inert on the ESM path; a security option that is accepted and not
    * applied is worse than one that is refused. See `hardeningGaps` for why the check cannot
    * produce a false positive.
+   *
+   * A RATCHET FOR THE PROCESS, NOT A PER-INSTALL SETTING (#129). Installs nest, and `hardened`
+   * does NOT follow the newest one the way `policy` and `mode` do. Once ANY install has asked for
+   * it, every freshly handed-out shim is frozen and the egress globals stay pinned until the LAST
+   * install is released — so a later `install({ hardened: false })` cannot silently downgrade a
+   * hardened install that is still active, and `hardened: false` is "I am not asking for it",
+   * never "turn it off". Both halves of the option behave this way; before #129 the egress globals
+   * ratcheted and the shim registries were last-writer-wins, which left the process half-hardened.
+   * The corollary is that passing `hardened: false` guarantees nothing about the surfaces you get
+   * if something else in the process asked for hardening.
+   *
+   * What it still cannot do is reach BACKWARDS: a reference captured before the hardened install
+   * arrived stays unfrozen, because a frozen object is made frozen when it is built. Install early.
    */
   hardened?: boolean;
 }
@@ -269,6 +283,7 @@ export function install(
     | RequirePatchHandle
     | EsmHookHandle
     | EnvGuardHandle
+    | LinkObserverHandle
     | NativeGateHandle
     | GlobalEgressGuardHandle
     | CompileGateHandle
@@ -276,6 +291,12 @@ export function install(
   // First: this pushes `ctx` onto the install stack, so `liveCtx` below already describes THIS
   // install by the time the guards that read it are built.
   handles.push(patchRequire(ctx));
+  // LINKED-PACKAGE OBSERVATION (#127). Installed FIRST among the guards, and before anything the
+  // application requires, because it can only record a link it sees resolved: a package resolved
+  // before the observer exists keeps the identity capwall can recover for it after the fact
+  // (`link-map.ts` § discovery) rather than the one it would have observed. Passive — it gates
+  // nothing and returns Node's own resolution untouched. See loader/linked-packages.ts.
+  handles.push(installLinkObserver(liveCtx));
   // The four guards below are handed `liveCtx`, NOT `ctx`. They are not import-routed, so each
   // one hands a dependency a long-lived object (the `process.env` proxy, the wrapped `fetch`, the
   // patched `process.dlopen`, the patched `Module.prototype._compile`) that outlives its install
