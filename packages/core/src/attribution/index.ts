@@ -257,14 +257,31 @@ const pathToPackage = new Map<string, Map<string, string>>();
  */
 let memoGeneration = linkGeneration();
 
-/** Capture the current stack as structured CallSites (no string formatting). */
-function captureCallSites(maxFrames: number): NodeJS.CallSite[] {
+/**
+ * A function that is on the current stack and marks where a capture should START — everything
+ * up to and including its topmost frame is skipped. See {@link attributeCallerVia}.
+ */
+export type StackBoundary = (...args: never[]) => unknown;
+
+/**
+ * Capture the current stack as structured CallSites (no string formatting).
+ *
+ * `maxFrames` is the number of frames V8 MATERIALIZES, and that count is the dominant cost of
+ * attribution — measured on Node 22, a capture costs a ~4 µs fixed floor plus ~1.4 µs per frame,
+ * so a 25-frame capture from a 24-deep stack is ~38 µs against ~6 µs for a 1-frame one (#133).
+ * The limit applies AFTER the `hideAbove` skip, which is what makes {@link attributeCallerVia}'s
+ * fast path cheap: skipped frames are not materialized and do not count against the limit.
+ */
+function captureCallSites(
+  maxFrames: number,
+  hideAbove: StackBoundary = captureCallSites,
+): NodeJS.CallSite[] {
   const origPrepare = Error.prepareStackTrace;
   const origLimit = Error.stackTraceLimit;
   Error.prepareStackTrace = (_err, sites) => sites;
   Error.stackTraceLimit = maxFrames;
   const holder: { stack?: NodeJS.CallSite[] } = {};
-  Error.captureStackTrace(holder as object, captureCallSites);
+  Error.captureStackTrace(holder as object, hideAbove);
   const sites = holder.stack ?? [];
   Error.prepareStackTrace = origPrepare;
   Error.stackTraceLimit = origLimit;
@@ -371,6 +388,165 @@ function isNodeScriptFrame(site: NodeJS.CallSite): boolean {
 }
 
 /**
+ * THE walk — the single definition of nearest-package attribution, shared by the full capture
+ * and by {@link attributeCallerDetailedVia}'s short one (#133).
+ *
+ * `found: null` is "this capture did not reach an answer", NOT "unattributable". The two callers
+ * give it different meanings on purpose: the full capture has spent the whole budget, so `null`
+ * there is {@link UNATTRIBUTED}; the short capture has only looked at a prefix, so `null` there
+ * means "look further" and it re-runs the full walk. Collapsing those would either fail open (a
+ * short capture answering `<app>`) or fail loud (a deep stack denied on a budget it never spent).
+ *
+ * `initiatedByNode` is reported separately because it is meaningful even when nothing qualified:
+ * a stack of nothing but `node:` internals has no principal but is still Node's own doing (#119).
+ *
+ * `budgetExhausted` is always `false` on `found` — only the caller knows whether the frames it
+ * handed over were a whole budget or a prefix of one, and guessing from inside would let a
+ * 3-frame capture claim a 25-frame budget had been spent.
+ */
+interface WalkResult {
+  found: Attribution | null;
+  initiatedByNode: boolean;
+}
+
+function walkFrames(sites: readonly NodeJS.CallSite[], projectRoot?: string): WalkResult {
+  let sawOpaque = false;
+  // Was the FIRST non-capwall frame Node's own JS? Set once, by whichever frame gets there
+  // first, and never revised — see `Attribution.initiatedByNode`. `undefined` means the walk
+  // has seen nothing but capwall's own frames so far; it resolves to `false` if it stays that
+  // way, so "capwall is the only thing on the stack" is not mistaken for "Node initiated it".
+  let initiatedByNode: boolean | undefined;
+  for (const site of sites) {
+    const source = frameSource(site);
+    if (source === null) {
+      // Neutral machinery: a `node:` internal (Node initiated this) or a native frame (no
+      // identity at all — fail closed and call it not-Node).
+      initiatedByNode ??= isNodeScriptFrame(site);
+      continue; // node:* internals, native frames
+    }
+    if (source === OPAQUE) {
+      initiatedByNode ??= false;
+      sawOpaque = true;
+      continue;
+    }
+    if (source.startsWith(CAPWALL_ROOT + path.sep)) continue; // capwall's own machinery
+    initiatedByNode ??= false;
+    const pkg = packageForPath(source, projectRoot);
+    // A dependency frame is a positive identification of untrusted code, so it stands even
+    // below opaque code (and is stricter than `<unknown>` would be). `<app>` is the opposite:
+    // it is the TRUST ROOT and carries exemptions, so it may only be claimed when nothing
+    // opaque ran above it. Otherwise a `data:` module invoked from app code would inherit the
+    // app's authority — the same fail-open, one frame up.
+    if (pkg === APP_ROOT && sawOpaque) {
+      // Opaque code laundering the trust root. Report `initiatedByNode: false` even if a
+      // `node:` frame sat on top: the interesting fact about this stack is the laundering, and
+      // a consumer that suppresses recording for Node-initiated calls must not be talked out
+      // of recording this one.
+      return {
+        found: { pkg: UNATTRIBUTED, budgetExhausted: false, initiatedByNode: false },
+        initiatedByNode: false,
+      };
+    }
+    return {
+      found: { pkg, budgetExhausted: false, initiatedByNode: initiatedByNode ?? false },
+      initiatedByNode: initiatedByNode ?? false,
+    };
+  }
+  return { found: null, initiatedByNode: initiatedByNode ?? false };
+}
+
+/**
+ * Frames the {@link attributeCallerVia} fast path materializes before it gives up and falls
+ * back to the full walk.
+ *
+ * Three, and the third one is not padding. Measured frame shapes at a Proxy trap (Node 20/22):
+ * an inline `{...env}` / `for..in` / `env.K` puts the reading package at frame 0, but every
+ * enumeration that goes through a builtin — `Object.assign({}, env)` (dotenv's shape),
+ * `JSON.stringify(env)`, `Object.entries(env)`, `Object.keys(env)` — inserts ONE native frame
+ * (no file name, skipped as neutral machinery) above it, and a read reached through a `node:`
+ * internal inserts another. Two would cover today's observed shapes; three leaves a frame of
+ * margin so a Node release that adds an internal hop degrades to "slightly slower" rather than
+ * "fast path never hits".
+ */
+const FAST_PATH_FRAMES = 3;
+
+/**
+ * Smallest `maxFrames` at which the fast path is allowed to answer at all.
+ *
+ * The fast path is only sound because it is a PREFIX of what the full walk would examine, and
+ * that argument needs the full walk to be able to reach the same frame: its budget is spent on
+ * capwall's own frames first (≤8 between any shim entry point and `captureCallSites`) and only
+ * then on caller frames. `8 + FAST_PATH_FRAMES` is the point past which "the short capture found
+ * it" implies "the full capture would have found it too". Below that — only reachable by
+ * deliberately setting `CAPWALL_MAX_FRAMES` very low — the fast path stands down and behavior is
+ * bit-for-bit what it was before #133, rather than the two paths disagreeing about a principal.
+ */
+const FAST_PATH_MIN_BUDGET = 8 + FAST_PATH_FRAMES;
+
+/**
+ * Attribute the caller of `hideAbove` — same answer as {@link attributeCallerDetailed}, reached
+ * without materializing a full stack's worth of CallSites when the answer is near the top (#133).
+ *
+ * WHY THIS EXISTS. Attribution's cost is dominated by the NUMBER OF FRAMES V8 materializes, not
+ * by the package lookup (which is memoized at ~20 ns). A 25-frame capture from a realistic stack
+ * is ~38 µs; a 3-frame one is ~9 µs. That is invisible on a single `fs.readFileSync`, and it is
+ * the whole story for `{...process.env}`, where ONE JS call is two attributions per environment
+ * variable — ~160 stack walks, milliseconds, for a single line of `dotenv`.
+ *
+ * WHAT `hideAbove` IS AND WHY IT IS NOT A TRUST DECISION. It is a function object the CALLER
+ * passes and V8 matches against its own frame records; it names where to start materializing,
+ * and nothing else. It is not read, not compared against a policy, and never contributes to the
+ * principal. Pass the shim's own trap/guard function so the capture starts at the frame below
+ * it — capwall's own frames are skipped by the walk anyway, so skipping them earlier costs
+ * nothing and saves materializing them. If `hideAbove` is not on the stack V8 returns NO frames
+ * (verified on Node 20 and 22), the walk finds nothing, and this falls back to the full capture:
+ * a wrong boundary is slow, never permissive.
+ *
+ * WHY THE RESULT IS THE SAME PRINCIPAL, NOT A CACHED GUESS. Nothing is remembered between
+ * calls. This does not reuse a previous read's answer, does not key anything on an identity the
+ * running code could shape, and does not treat a run of reads as one event — the whole class of
+ * bug that #84 and #92 were. Every invocation walks a real stack with {@link walkFrames}, the
+ * one nearest-package definition, applying the same `node:`/native skip, the same
+ * {@link OPAQUE} handling, the same `<app>`-below-opaque rule and the same `initiatedByNode`
+ * derivation (#119). The only difference is how many frames were materialized, and the frames it
+ * looks at are the same frames, in the same order, that the full walk looks at once capwall's
+ * own are skipped — V8 skipping them via `hideAbove` and the loop skipping them via
+ * `CAPWALL_ROOT` are the same set. So:
+ *
+ *   - a hit is exactly what the full walk returns (it is a prefix of the same sequence, and the
+ *     walk terminates at the FIRST qualifying frame — see {@link FAST_PATH_MIN_BUDGET} for the
+ *     one configuration where the prefix argument needs a guard);
+ *   - a miss falls through to the full walk verbatim, including `budgetExhausted` accounting.
+ *
+ * A dependency therefore cannot become a different principal by controlling how deep it calls
+ * from, how many native frames it interposes, or whether it enumerates: the deeper it hides its
+ * real frame, the more often the fast path DECLINES, which costs it time and changes nothing.
+ * See `test/attribution-fast-path.test.ts` for the adversarial cases run against this.
+ */
+export function attributeCallerDetailedVia(
+  hideAbove: StackBoundary,
+  options: AttributionOptions = {},
+): Attribution {
+  const maxFrames = coerceMaxFrames(options.maxFrames) ?? DEFAULT_MAX_FRAMES;
+  if (maxFrames >= FAST_PATH_MIN_BUDGET) {
+    const near = walkFrames(captureCallSites(FAST_PATH_FRAMES, hideAbove), options.projectRoot);
+    if (near.found !== null) return near.found;
+  }
+  return attributeCallerDetailed(options);
+}
+
+/**
+ * {@link attributeCallerDetailedVia} for callers that only want the principal — the same
+ * relationship {@link attributeCaller} has to {@link attributeCallerDetailed}.
+ */
+export function attributeCallerVia(
+  hideAbove: StackBoundary,
+  options: AttributionOptions = {},
+): string {
+  return attributeCallerDetailedVia(hideAbove, options).pkg;
+}
+
+/**
  * Return the name of the package that owns the current call site (nearest-package policy),
  * {@link APP_ROOT} when the nearest qualifying frame is application code, or
  * {@link UNATTRIBUTED} when the call cannot be tied to either (issue #60).
@@ -396,42 +572,8 @@ export function attributeCallerDetailed(options: AttributionOptions = {}): Attri
   // everything to <unknown>. Coercion here is pure and cheap.
   const maxFrames = coerceMaxFrames(options.maxFrames) ?? DEFAULT_MAX_FRAMES;
   const sites = captureCallSites(maxFrames);
-  let sawOpaque = false;
-  // Was the FIRST non-capwall frame Node's own JS? Set once, by whichever frame gets there
-  // first, and never revised — see `Attribution.initiatedByNode`. `undefined` means the walk
-  // has seen nothing but capwall's own frames so far; it resolves to `false` if it stays that
-  // way, so "capwall is the only thing on the stack" is not mistaken for "Node initiated it".
-  let initiatedByNode: boolean | undefined;
-  for (const site of sites) {
-    const source = frameSource(site);
-    if (source === null) {
-      // Neutral machinery: a `node:` internal (Node initiated this) or a native frame (no
-      // identity at all — fail closed and call it not-Node).
-      initiatedByNode ??= isNodeScriptFrame(site);
-      continue; // node:* internals, native frames
-    }
-    if (source === OPAQUE) {
-      initiatedByNode ??= false;
-      sawOpaque = true;
-      continue;
-    }
-    if (source.startsWith(CAPWALL_ROOT + path.sep)) continue; // capwall's own machinery
-    initiatedByNode ??= false;
-    const pkg = packageForPath(source, options.projectRoot);
-    // A dependency frame is a positive identification of untrusted code, so it stands even
-    // below opaque code (and is stricter than `<unknown>` would be). `<app>` is the opposite:
-    // it is the TRUST ROOT and carries exemptions, so it may only be claimed when nothing
-    // opaque ran above it. Otherwise a `data:` module invoked from app code would inherit the
-    // app's authority — the same fail-open, one frame up.
-    if (pkg === APP_ROOT && sawOpaque) {
-      // Opaque code laundering the trust root. Report `initiatedByNode: false` even if a
-      // `node:` frame sat on top: the interesting fact about this stack is the laundering, and
-      // a consumer that suppresses recording for Node-initiated calls must not be talked out
-      // of recording this one.
-      return { pkg: UNATTRIBUTED, budgetExhausted: false, initiatedByNode: false };
-    }
-    return { pkg, budgetExhausted: false, initiatedByNode: initiatedByNode ?? false };
-  }
+  const walked = walkFrames(sites, options.projectRoot);
+  if (walked.found !== null) return walked.found;
   // Fell off the end of the walk: no dependency frame, no app frame, nothing to charge.
   //
   // This USED to return APP_ROOT, silently handing the trust root's exemptions to whatever
@@ -448,7 +590,7 @@ export function attributeCallerDetailed(options: AttributionOptions = {}): Attri
   return {
     pkg: UNATTRIBUTED,
     budgetExhausted: sites.length >= maxFrames,
-    initiatedByNode: initiatedByNode ?? false,
+    initiatedByNode: walked.initiatedByNode,
   };
 }
 

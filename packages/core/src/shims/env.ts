@@ -125,6 +125,37 @@
  * capwall, and a spoofable heuristic inside the anti-exfiltration control is worse than a
  * documented gap. See docs/threat-model.md § residuals.
  *
+ * ENUMERATION COST — WHY THE TRAPS ARE NAMED FUNCTIONS (#133). Everything above means that one
+ * `{...process.env}` is TWO gated traps per environment variable: `getOwnPropertyDescriptor`
+ * (hide, do not record) and then `get` (hide and record). On an 81-key environment that is 162
+ * attributions for a single JS call, and it measured **~4.5 ms of added latency** — four times
+ * capwall's entire per-intercepted-call budget, paid at startup by `dotenv`, by every config
+ * loader, and by anything doing `Object.assign({}, process.env)`.
+ *
+ * The pair is NOT redundant and neither half was removed. The spread reads `[[Enumerable]]` from
+ * the descriptor and the value from `[[Get]]`, and the descriptor trap cannot tell that spread
+ * apart from a real `Object.getOwnPropertyDescriptor(env, k).value` — the #67 problem, unchanged.
+ * Dropping the descriptor-trap decision would re-open the exfiltration hole; deciding once and
+ * REUSING it for the `get` that follows would make the anti-exfiltration control depend on a
+ * cache whose invalidation an attacker helps schedule, which is the #84 shape and is exactly what
+ * this file must not contain. So both traps still decide, independently, every time.
+ *
+ * What changed is the price of ONE decision. Attribution's cost is dominated by how many V8
+ * CallSites the capture materializes, and the reading package is almost always the frame directly
+ * below the trap — so each trap hands ITSELF to `attributeCallerDetailedVia` as the point where
+ * the capture starts, and a 3-frame capture answers instead of a 25-frame one. Same walk, same
+ * rules, same principal; when the short capture does not reach a qualifying frame it falls back
+ * to the full one. Nothing is remembered between reads. See `attribution/index.ts` for why that
+ * is a cheaper computation of the same function rather than a cache, and
+ * `test/attribution-fast-path.test.ts` for the attacks run against it.
+ *
+ * IT IS ONLY A HALVING, AND THE ROW STILL BLOWS THE BUDGET: ~2 ms on that same 81-key
+ * environment. Two captures per key is the floor while both traps must decide, and
+ * `Error.captureStackTrace` costs ~4 µs however few frames it materializes, so ~80 keys cannot
+ * fit in 1 ms by this route. `install(..., { env: false })` remains the only way to delete the
+ * cost, at the price of this control. Stated in `scripts/bench/README.md` § Where the budget
+ * does not hold rather than left for the next person to rediscover.
+ *
  * WRITES ARE NOT MEDIATED (#66). The `set` trap exists only to restore ordinary object
  * semantics, not to gate anything — see the comment on the trap itself. `has` / `deleteProperty`
  * / `defineProperty` / `ownKeys` need no trap at all: they forward to the target and already
@@ -145,7 +176,11 @@
  * are not recorded — they are Node's plumbing, not a package's read of a secret, and recording
  * them would widen every generated policy with a key no dependency asked for.
  */
-import { APP_ROOT, attributeCallerDetailed } from "../attribution/index.js";
+import {
+  APP_ROOT,
+  attributeCallerDetailedVia,
+  type StackBoundary,
+} from "../attribution/index.js";
 import { definePropertyPatch, valueSlot } from "../lifecycle/process-patch.js";
 import { evaluate, type Decision } from "../policy/evaluate.js";
 import {
@@ -182,9 +217,15 @@ export function createEnvProxy(
    * ITSELF rather than written by the attributed package (see the header). The decision is
    * still made, and the caller still hides the value on a denial — only the audit record is
    * dropped.
+   *
+   * `trap` is the trap function whose frame the capture should start below — see
+   * {@link attributeCallerDetailedVia} and the ENUMERATION COST note in the header. It selects
+   * where V8 begins materializing CallSites; it is not an identity, and it contributes nothing
+   * to either the principal or the `record` flag.
    */
   function decide(
     key: string | symbol,
+    trap: StackBoundary,
   ): { pkg: string; decision: Decision; record: boolean } | null {
     if (typeof key !== "string") return null;
     // #89: exempt by KEY, not by wall-clock window. Only the fixed non-secret keys Node's own
@@ -193,8 +234,10 @@ export function createEnvProxy(
     if (key.startsWith("CAPWALL_")) return null;
     // Shared frame budget with every other attribution site (#15/#58) — a shim that quietly
     // kept the default while the rest honored a raised cap would attribute the same call to a
-    // different package depending on which capability it touched.
-    const attribution = attributeCallerDetailed(attributionOptionsFor(ctx));
+    // different package depending on which capability it touched. `attributeCallerDetailedVia`
+    // spends that budget lazily (#133); it does not change it, and it falls back to the identical
+    // full walk whenever the short capture does not reach a qualifying frame.
+    const attribution = attributeCallerDetailedVia(trap, attributionOptionsFor(ctx));
     const pkg = attribution.pkg;
     // App code is not gated — see header. Since #60 this is a POSITIVE identification (a real
     // application source file on the stack); an unattributable read is `<unknown>`, which
@@ -214,8 +257,8 @@ export function createEnvProxy(
    * The report is skipped for a read Node itself initiated (#119) — the decision, and the
    * hiding, are unchanged.
    */
-  function deniedValueRead(key: string | symbol): boolean {
-    const outcome = decide(key);
+  function deniedValueRead(key: string | symbol, trap: StackBoundary): boolean {
+    const outcome = decide(key, trap);
     if (outcome === null) return false;
     if (outcome.record) ctx.onDecision(outcome.pkg, outcome.decision);
     return !outcome.decision.allowed;
@@ -226,16 +269,39 @@ export function createEnvProxy(
    * fires once per key for every `Object.keys` / `for..in` as well as for a genuine descriptor
    * read and cannot distinguish them. Hiding still happens; only the recording is dropped.
    */
-  function deniedUnrecorded(key: string | symbol): boolean {
-    const outcome = decide(key);
+  function deniedUnrecorded(key: string | symbol, trap: StackBoundary): boolean {
+    const outcome = decide(key, trap);
     return outcome !== null && !outcome.decision.allowed;
   }
 
+  /*
+   * The two gated traps are NAMED FUNCTION DECLARATIONS, not method shorthands, for one reason:
+   * each hands ITSELF to `attributeCallerDetailedVia` as the frame below which the capture starts
+   * (#133). A method shorthand has no binding to pass. Nothing else about them changed.
+   *
+   * Passing the trap rather than an inner helper matters: V8 skips up to and including the
+   * TOPMOST frame matching the function object, so if a decision sink re-enters `process.env`
+   * the nested trap's own frame is the boundary and the sink is attributed, not the outer
+   * reader. Handing it something further up would have made the outer reader the answer.
+   */
+  function envGet(target: NodeJS.ProcessEnv, key: string | symbol, receiver: unknown): unknown {
+    if (deniedValueRead(key, envGet)) return undefined;
+    return Reflect.get(target, key, receiver);
+  }
+
+  function envGetOwnPropertyDescriptor(
+    target: NodeJS.ProcessEnv,
+    key: string | symbol,
+  ): PropertyDescriptor | undefined {
+    const desc = Reflect.getOwnPropertyDescriptor(target, key);
+    if (desc && deniedUnrecorded(key, envGetOwnPropertyDescriptor)) {
+      return { ...desc, value: undefined };
+    }
+    return desc;
+  }
+
   return new Proxy(realEnv, {
-    get(target, key, receiver) {
-      if (deniedValueRead(key)) return undefined;
-      return Reflect.get(target, key, receiver);
-    },
+    get: envGet,
     /**
      * Restores ordinary assignment semantics; it mediates nothing (#66).
      *
@@ -277,13 +343,7 @@ export function createEnvProxy(
      * `Object.keys` / `for..in`, which read only `[[Enumerable]]`, and recording there logged
      * mere enumeration as a value read of every secret in the environment.
      */
-    getOwnPropertyDescriptor(target, key) {
-      const desc = Reflect.getOwnPropertyDescriptor(target, key);
-      if (desc && deniedUnrecorded(key)) {
-        return { ...desc, value: undefined };
-      }
-      return desc;
-    },
+    getOwnPropertyDescriptor: envGetOwnPropertyDescriptor,
   });
 }
 

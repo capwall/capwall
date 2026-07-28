@@ -143,13 +143,39 @@ attribution is **~70%** of it at a realistic depth rather than the ~50% issue #3
 shallow stack. Express, promise chains and `async_hooks`-heavy frameworks all put you at the cap.
 If you are looking for headroom, the stack walk is where it is.
 
+That depth-dependence is *materialization*, not walking, and #133 turned it into a lever. Timed
+in isolation on Node 22, a capture costs a ~4 µs floor plus ~1.4 µs per frame it materializes:
+a 25-frame capture from a 24-deep stack is ~38 µs, a 3-frame one ~9 µs. `Error.stackTraceLimit`
+applies *after* the `Error.captureStackTrace` boundary skip, so a shim that hands its own trap
+function in as the boundary pays for the frames below it and nothing else. The env shim does
+this; **no other shim opts in yet**, so every non-env row above is still a 25-frame capture and
+still has that ~4x sitting in it.
+
 ## Where the budget does not hold
 
 `{...process.env}` — the shape `dotenv`, config loaders and Node's own spawn use — runs the env
 Proxy's `getOwnPropertyDescriptor` **and** `get` traps once per key, and each of those attributes
-the caller from scratch. On an 81-key environment that measured **~4.4 ms of added latency for a
-single JS call**, against ~54 µs per interception. Nothing is wrong with the per-interception
-number; the operation is simply 81 interceptions wearing one call's clothing.
+the caller from scratch. It is 81 interceptions wearing one call's clothing, and no amount of
+per-interception optimization changes the multiplier.
+
+**#133 halved the per-interception cost, and the row still blows the budget.** Attribution's
+price is dominated by how many V8 CallSites the capture materializes (~4 µs fixed plus ~1.4 µs
+per frame), and the reading package is nearly always the frame directly below the trap — so the
+env traps now start the capture below their own frame and materialize 3 frames instead of 25.
+Measured on an 81-key environment, twelve alternating runs of the two builds:
+
+| | before #133 | after #133 |
+|---|---|---|
+| `{...process.env}`, added latency for one JS call | 4.0 – 4.9 ms | **1.9 – 2.2 ms** |
+| per attribution (162 of them) | ~25 – 30 µs | **~12 – 13 µs** |
+| single `process.env.K` read by a dependency | ~26 – 29 µs | **~10 – 14 µs** |
+
+That is the honest ceiling for this shape. Both traps must still decide independently on every
+key — the descriptor trap cannot tell a spread from a real
+`Object.getOwnPropertyDescriptor(env, k).value`, and sharing one decision between them would put
+a cache with attacker-schedulable invalidation inside the anti-exfiltration control — so the
+floor is two stack captures per key, and `Error.captureStackTrace` itself costs ~4 µs no matter
+how few frames it materializes. **80 keys × 2 captures cannot fit in 1 ms.**
 
 Consequences worth stating plainly:
 
@@ -164,8 +190,7 @@ Consequences worth stating plainly:
   Proxy is an order of magnitude slower than the **shimmed** one. That is why both spawn arms in
   this harness pass an explicit env; see `SPAWN_OPTS` in `bench.mjs`.
 - `install(..., { env: false })` removes the whole class of cost, at the price of the
-  anti-exfiltration control. Whether it can be made cheaper without weakening the gate is
-  issue #133.
+  anti-exfiltration control. It remains the only way to get this shape under 1 ms.
 
 ## Resolution limits
 

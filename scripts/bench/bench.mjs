@@ -898,7 +898,7 @@ printRow(
     mediated: () => dep.envSpread(),
     iters: 40,
     warmup: 20,
-    note: "ONE call, ~2 attributions per key — the most expensive mediated operation measured",
+    note: "ONE call, ~2 attributions per key (each now a 3-frame capture, #133) — still the most expensive mediated operation measured",
   }),
 );
 

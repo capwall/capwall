@@ -315,9 +315,16 @@ The implementing agent should treat these as the real work, not incidentals:
   three-frame stack. Attribution materializes up to `maxFrames` (25) V8 CallSites per call, so
   the cost scales with the caller's depth: ~16 µs at depth 0, ~30 µs at the cap, which is ~70%
   of the added latency for a call made from a realistic stack. The walk is where the headroom
-  is. **(2) the per-call budget does not hold where one JS call is many interceptions** —
-  `{...process.env}` costs ~2 attributions per environment variable and measured ~4.4 ms on an
-  81-key environment (issue #133). Cache module→package resolution aggressively (the path→package cache is
+  is — and issue #133 took the first slice of it: the depth-dependence is V8 *materializing*
+  CallSites (~4 µs floor, ~1.4 µs each), and `Error.stackTraceLimit` applies after the
+  `captureStackTrace` boundary skip, so a shim that passes its own trap function as the boundary
+  can materialize 3 frames instead of 25 and get the same principal from the same walk. Only the
+  env shim opts in so far. **(2) the per-call budget does not hold where one JS call is many
+  interceptions** — `{...process.env}` costs ~2 attributions per environment variable and
+  measures ~2 ms on an 81-key environment (~4.4 ms before #133, and it will not go below ~1 ms:
+  both env traps must decide per key, and neither the decision nor the capture can be shared
+  without putting an attacker-schedulable cache inside the anti-exfiltration control).
+  Cache module→package resolution aggressively (the path→package cache is
   worth ~50x cold-vs-warm); avoid allocations on the hot path; and read
   `scripts/bench/README.md` before quoting a headline figure.
 - **Monkey-patch robustness.** capwall's shims are JS-level patches. Malicious code may try

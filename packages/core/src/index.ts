@@ -369,6 +369,8 @@ export type { LoadPolicyOptions } from "./policy/load.js";
 export {
   attributeCaller,
   attributeCallerDetailed,
+  attributeCallerDetailedVia,
+  attributeCallerVia,
   packageForPath,
   resolveMaxFrames,
   APP_ROOT,
@@ -376,7 +378,7 @@ export {
   CHAIN_SEP,
   DEFAULT_MAX_FRAMES,
 } from "./attribution/index.js";
-export type { Attribution, AttributionOptions } from "./attribution/index.js";
+export type { Attribution, AttributionOptions, StackBoundary } from "./attribution/index.js";
 export type { DecisionSink } from "./shims/fs.js";
 export type {
   Policy,
