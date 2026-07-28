@@ -178,9 +178,10 @@ Do not start step *n+1* until step *n* has passing tests and a clean typecheck.
   microseconds of added latency, comfortably inside the budget — but **one JS call is not
   always one interception**, and where it is not, the per-call budget does not hold:
   `{...process.env}` is ~2 interceptions per environment variable and costs **milliseconds**
-  (measured ~4.4ms on an 81-key environment; issue #133). The harness prints those cases under
-  `AMPLIFICATION` on every run; do not quote the headline without them. See
-  `scripts/bench/README.md` § Where the budget does not hold.
+  (issue #133 halved the per-interception cost and it is still ~2 ms on an 81-key environment,
+  down from ~4.4 ms). The harness prints those cases under `AMPLIFICATION` on every run; do not
+  quote the headline without them. See `scripts/bench/README.md` § Where the budget does not
+  hold — including why two captures per key is the floor rather than a to-do.
   Two more things the benchmark now says that older notes here did not:
   **cost scales with stack depth** (attribution materializes up to `maxFrames` CallSites per
   call, so a 3-frame stack — what the old harness measured — under-reports a realistic one by

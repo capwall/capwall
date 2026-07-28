@@ -128,7 +128,7 @@
  * ENUMERATION COST — WHY THE TRAPS ARE NAMED FUNCTIONS (#133). Everything above means that one
  * `{...process.env}` is TWO gated traps per environment variable: `getOwnPropertyDescriptor`
  * (hide, do not record) and then `get` (hide and record). On an 81-key environment that is 162
- * attributions for a single JS call, and it measured **5 ms of added latency** — five times
+ * attributions for a single JS call, and it measured **~4.5 ms of added latency** — four times
  * capwall's entire per-intercepted-call budget, paid at startup by `dotenv`, by every config
  * loader, and by anything doing `Object.assign({}, process.env)`.
  *
@@ -148,6 +148,13 @@
  * to the full one. Nothing is remembered between reads. See `attribution/index.ts` for why that
  * is a cheaper computation of the same function rather than a cache, and
  * `test/attribution-fast-path.test.ts` for the attacks run against it.
+ *
+ * IT IS ONLY A HALVING, AND THE ROW STILL BLOWS THE BUDGET: ~2 ms on that same 81-key
+ * environment. Two captures per key is the floor while both traps must decide, and
+ * `Error.captureStackTrace` costs ~4 µs however few frames it materializes, so ~80 keys cannot
+ * fit in 1 ms by this route. `install(..., { env: false })` remains the only way to delete the
+ * cost, at the price of this control. Stated in `scripts/bench/README.md` § Where the budget
+ * does not hold rather than left for the next person to rediscover.
  *
  * WRITES ARE NOT MEDIATED (#66). The `set` trap exists only to restore ordinary object
  * semantics, not to gate anything — see the comment on the trap itself. `has` / `deleteProperty`
