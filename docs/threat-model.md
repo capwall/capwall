@@ -1668,17 +1668,59 @@ names a real file, the policy already has a glob vocabulary for exactly that, an
 package `require` `<project>/config.json`" and "may it `readFileSync` it" are the same question.
 `observe` emits the grant automatically, so the observe→enforce round trip needs no hand editing.
 
+**Where the decision is taken: the filename Node opens (#177/#178).** The gate sits on
+`Module.prototype.load(filename)` for CJS and on the `resolve` hook for `import`. That is not a
+detail of plumbing, it is the security property. `Module.prototype.load` is the point at which
+Node has finished resolving and commits to a path, so `filename` is **Node's own resolution
+result**; the gate does not reconstruct it, and therefore has no input an attacker can steer.
+
+It used to. The gate lived inside the `Module._load` wrapper and re-ran `Module._resolveFilename`
+from `Module._load`'s own argument list to work out what the load would open, which meant its
+correctness rested on caller-supplied arguments in three places at once, and each one turned out
+to be reachable: `isMain` (`Module._load(secret, undefined, true)` skipped the gate outright —
+#177), the fourth-argument options bag (whose fields steered the re-resolution to a decoy inside
+`node_modules`, graph-exempt, while Node opened the real file — #178), and a "this load was
+already decided" mark scoped to the *dynamic extent* of a `Module._load` rather than to the load
+being decided, which disarmed the ESM half for the whole of every module body (#179). All three
+are the same sentence: a second opinion the attacker parameterises is not a second opinion.
+Moving the gate to the chokepoint removes the second resolution rather than hardening it, and it
+also covers a route the old site could not see at all — `new Module(f).load(f)`, which never
+enters `Module._load`.
+
 **Subjects, and why they differ by module system.** On the CJS path the subject is the
 **attributed caller** (capwall's ordinary stack walk), deliberately not the `parent` module the
 loader supplies: `createRequire()` builds a module record whose filename is whatever string it was
 given, so trusting `parent.filename` would let any dependency present itself as a granted package.
-On the ESM path the subject is `context.parentURL`, which the host sets from the module record
-containing the `import` and which in-process code cannot choose. An importer with no filesystem
-identity (a `data:` URL module) is charged to `<unknown>`, never inferred to be the trust root.
-Until #152 that was forced — the hook ran on Node's loader thread and there was no JavaScript
-stack belonging to the importer to walk. Since #152 it is a **choice**, and the right one:
-`parentURL` is the host's own answer to the question a stack walk would be inferring, and at ESM
-resolution time the stack is Node's loader machinery with the importer somewhere below it.
+On the **`import`** path the subject is `context.parentURL`, which the host sets from the module
+record containing the `import` and which in-process code cannot choose. An importer with no
+filesystem identity (a `data:` URL module) is charged to `<unknown>`, never inferred to be the
+trust root. Until #152 the stack walk was also impossible there — the hook ran on Node's loader
+thread and there was no JavaScript stack belonging to the importer to walk. Since #152 not taking
+it is a **choice**, and on the `import` path the right one: `parentURL` is the host's own answer
+to the question a stack walk would be inferring, and at ESM resolution time the stack is Node's
+loader machinery with the importer somewhere below it.
+
+> **The qualifier matters, and this document used to omit it (#180).** `registerHooks()` is
+> consulted for `require()` as well, and on *that* path `context.parentURL` is derived from the
+> `parent` module record handed to `Module._load` — an ordinary argument, the very object the CJS
+> half already refuses to trust. So "in-process code cannot choose it" was true of `import` and
+> false of `require`: a dependency naming `node_modules/impostor/index.js` (a directory that need
+> not exist) wore that principal and inherited its grants, and naming the application's own file
+> bought the `<app>` exemption, which short-circuits before the decision is even recorded. The fix
+> is not a better test on `parentURL`; the `resolve` hook now declines **every**
+> `require`-conditioned resolution, so those loads are decided by the CJS half, whose subject is
+> the stack walk.
+
+**The process entry point is a host fact, not a claim (#177).** The gate runs for the entry point
+too, and the entry point has no requiring package — the stack above its load is nothing but Node's
+module machinery, so attribution answers `<unknown>`, which is deny-by-default. It therefore needs
+an exemption, and #177 is exactly what happens when that exemption is something a caller can
+assert: `isMain` is `Module._load`'s third argument and "no `parent` was passed" is its second.
+The exemption is now keyed to a **recorded** process root, written only from facts Node produces
+before any dependency runs: `process.argv[1]` as `install()` sees it, and a `resolve` with no
+importer that does *not* carry the `require` condition — Node resolving something for itself. A
+dependency can produce neither; every parentless resolution it can drive comes through
+`Module._load` and carries `require`.
 
 **How the ESM half reaches a policy (#152 deleted the interesting half of this).** It reads
 `liveCtx` — the same single live-context box every CJS shim reads — so there is one policy and no
@@ -1690,16 +1732,25 @@ evaluated against a superseded policy. The window that discipline existed to kee
 exists. Decisions go straight into `onDecision` on the same call, and enforcement is a throw from
 `resolve`, before Node opens the file.
 
-**One load, one decision (#152).** `module.registerHooks()` is consulted for `require()` as well
-as `import()`, so the CJS half and the ESM half can now both see the same load. `loader/require.ts`
-decides it — it has the better subject — and marks the dynamic extent of what it decided; the
-`resolve` hook stands down only when it is inside such a load **and** the resolution carries the
-`require` export condition. Both halves are needed: `require(esm)` pulls a whole ES subgraph in
-synchronously inside one `Module._load`, so the extent test alone would disarm the gate for every
-`import` below it, and the condition test alone would let a load `Module._load` failed to resolve
-go undecided by either. Deciding twice would be an *audit* defect — two `DENY` lines, two grants
+**One load, one decision (#152, simplified by #179).** `module.registerHooks()` is consulted for
+`require()` as well as `import()`, so both halves can see the same load. The line between them is
+`conditions.includes("require")` — Node's own statement about which resolver is running — and
+nothing else: the `resolve` hook declines every `require`-conditioned resolution, and the CJS half
+decides it at `Module.prototype.load`. `require(esm)` is the case that tests the rule, because it
+pulls a whole ES subgraph in synchronously: the direct resolution carries `["require", …]` and is
+declined here (the `.mjs` file reaches `Module.prototype.load` and is decided there), while every
+nested `import` inside that subgraph carries `["node", "import", …]` and is decided by the hook.
+Measured on 22/24/26.
+
+This used to be a conjunction with a **depth counter** over the dynamic extent of a `Module._load`
+that had taken a decision, which was #179: a module body runs inside its own `Module._load`, so the
+counter was non-zero for the whole of every module evaluation and the hook stood down for every
+nested load made from a module body — which is where a supply-chain payload runs. The identical
+call was allowed during module evaluation and denied after it. There is no counter now, because the
+CJS half can no longer *fail* to decide a load it is handed, so there is nothing for a second layer
+to be a second layer of. Deciding twice would be an *audit* defect — two `DENY` lines, two grants
 out of `observe`, phantom drift in `capwall diff` — and both directions are asserted in
-`test/module-read.test.ts` § #152.
+`test/module-read.test.ts` (§ #152 and § #179).
 
 **Carve-out: `.node`.** An addon load is already gated as `native` at `process.dlopen`, which is
 *stricter* than this gate — it charges both the caller and the addon file's owner, and an addon
@@ -1719,7 +1770,9 @@ grant from `observe` and change no outcome, so `.node` skips this gate and keeps
 - **Reaching past the loader entirely** — calling `Module._extensions[".json"](m, file)` directly,
   or `process.binding` — is the same class of escape as un-patching any shim, which capwall does
   not claim to stop. So is a hostile module-customization hook registered ahead of capwall's (see
-  § ESM known limits).
+  § ESM known limits). Note that `new Module(f).load(f)` is **no longer** in this class: since
+  #177 the gate is on `Module.prototype.load` itself, so that route is decided like any other.
+  `Module._extensions[…]` is one level below it and remains outside.
 - **Network imports** (`import("https://…")`) read no local file and are not mediated by this gate
   or any other.
 - **A compatibility change worth knowing about:** a test runner, bundler or framework that loads

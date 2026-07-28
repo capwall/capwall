@@ -60,8 +60,11 @@ package's slice of the policy.
     a `MessagePort`-shipped snapshot, so there is no copy to keep in step. ~100 ms off a mediated
     process's startup, measured — `scripts/bench/README.md` § Startup.
   - **The hooks see `require()` too.** So `loader/require.ts` and the `resolve` hook can both see
-    one load, and the arbitration between them is explicit: `Module._load` wins, and marks the
-    extent of what it decided. See `loader/module-read.ts` § WHICH OF THE GATES DECIDES A GIVEN LOAD.
+    one load, and the arbitration between them is one test with no state behind it: the hook
+    declines every `require`-conditioned resolution, and the CJS half decides it at
+    `Module.prototype.load`. Until #177/#179 the arbitration was a depth counter over the dynamic
+    extent of a `Module._load`, which disarmed the hook for the whole of every module body. See
+    `loader/module-read.ts` § WHICH OF THE GATES DECIDES A GIVEN LOAD.
   - **Teardown is real.** `registerHooks()` returns a `deregister()`, so the last `uninstall()`
     removes the hooks and the ESM path matches CJS instead of carrying its own known limit.
 

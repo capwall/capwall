@@ -44,8 +44,9 @@ changelog summary. See § Reproducing the measurement.
 
 | API | What capwall uses it for | Status (22 / 24 / 26) | Supported replacement | What breaks if it goes |
 |---|---|---|---|---|
-| `Module._load` | The CJS interception point. Patched so a mediated builtin specifier returns a shim, and so a path specifier takes the #123 module-read decision. `loader/require.ts` | **Undocumented**, no DEP code, present and writable on all four | `module.registerHooks()` — see § The one migration that matters | **The entire CJS path.** Every capability on `require` |
-| `Module._resolveFilename` | Called (not patched) to learn which file a load will open, for the #123 gate. `loader/require.ts` | **Undocumented**, no DEP code, `(request, parent, isMain, options)` on all four | a `registerHooks` `resolve` hook | The module-read gate (#123) declines; `fs.read` via `require` is un-gated again |
+| `Module._load` | The CJS interception point. Patched so a mediated builtin SPECIFIER returns a shim. Since #177 it no longer takes the #123 module-read decision — that moved to `Module.prototype.load`, because everything `_load` could say about the file a load opens it had to reconstruct from arguments the caller supplies. `loader/require.ts` | **Undocumented**, no DEP code, present and writable on all four | `module.registerHooks()` — see § The one migration that matters | **The entire CJS path.** Every capability on `require` |
+| `Module.prototype.load` | The #123 module-read gate (#177), at the point Node commits to a filename: `Module._load` has finished resolving and calls this with the result, which then picks the extension handler that opens the file. Every CJS route passes through it, including `new Module(f).load(f)`, which never enters `Module._load`. `loader/require.ts` | **Undocumented**, no DEP code. `(filename)` on 20/22/23/24/26 — the most stable signature of any internal in this table | a `registerHooks` `resolve` hook, which sees the resolution but not the commitment | **The module-read gate (#123).** `fs.read` via `require` is un-gated again |
+| `Module._resolveFilename` | **No longer used** (#178). It was called (not patched) to re-derive which file a load would open; that re-resolution was driven by `Module._load`'s caller-supplied argument list and was steerable. `Module._findPath` below is a separate, passive use | **Undocumented**, no DEP code, `(request, parent, isMain, options)` on all four | n/a | Nothing — capwall no longer depends on it |
 | `Module._findPath` | Passive observer: records symlinked `node_modules` entries at resolution time so a linked workspace package gets an identity (#127). `loader/linked-packages.ts` | **Undocumented**, no DEP code. Signature **changed**: gained `conditions` after 20 | Partial — a `resolve` hook sees the specifier and parent but not Node's ordered search-path list | Linked/workspace dependencies lose their identity and fall back to the out-of-project rule. Not a gate; degrades attribution, denies nothing |
 | `Module.prototype._compile` | The `compile` capability gate (#93) — the primitive that lets a caller choose what V8 reports as `getFileName()`, i.e. execute as an arbitrary principal. `shims/module.ts` | **Undocumented**, no DEP code. Signature **changed** in 22.18 (gained `format`) — this is #128 | **None** | **The `compile` capability dies.** Identity forgery via a chosen filename becomes ungated again |
 | `Module._extensions[".node"]` | Not patched — it is the *reason* `process.dlopen` is the right hook. Body confirmed as `process.dlopen(module, path.toNamespacedPath(filename))` on 20.20 / 22.22 / 22.23 / 24.18 / 26.5 | **Docs-only deprecated** as `require.extensions` (**DEP0039**, since v0.10.6 — `require.extensions === Module._extensions`, verified on all four); `Module._extensions` itself undocumented | none | Nothing directly — capwall does not depend on it, by design |
@@ -347,11 +348,12 @@ spelling of the identical read was denied and logged correctly, which is exactly
 invisible. Node 22 and earlier reject the four-argument form outright, so it never showed on the
 CI matrix.
 
-Fixed by mirroring Node's own unwrapping (`resolveOptionsFrom` in `loader/require.ts`). Covered by
-`test/module-read.test.ts` § "every spelling of `Module._load` reaches the same decision", which
-**feature-detects** the four-argument form at runtime rather than version-gating it — because the
-history above shows any `major >= N` test would have been wrong for two of the five majors. Both
-new rows fail against the pre-fix tree on 24.18 and 26.5 and skip on 20/22.
+Fixed at the time by mirroring Node's own unwrapping (`resolveOptionsFrom` in `loader/require.ts`).
+Covered by `test/module-read.test.ts` § "every spelling of `Module._load` reaches the same
+decision", which **feature-detects** the four-argument form at runtime rather than version-gating
+it — because the history above shows any `major >= N` test would have been wrong for two of the
+five majors. Both new rows fail against the pre-fix tree on 24.18 and 26.5 and skip on 20/22.
+**That fix has since been superseded — see the subsection at the end of this section.**
 
 Note what this says about the CI matrix, because it is the uncomfortable part: **the defect could
 not be observed on either Node in `ci.yml`.** It was introduced by a Node minor on a major the
@@ -388,12 +390,47 @@ fixed-arity wrapper gets written:
   `ERR_UNKNOWN_FILE_EXTENSION`** rather than skipping — a row that reports green by doing nothing
   is the #112 failure mode.
 
-The fix itself is also written to survive the next move. `resolveOptionsFrom` classifies
-`Module._load`'s fourth argument by the fields it **has** — unwrap `requireResolveOptions`, pass
-through an object carrying `paths`/`conditions`, contribute nothing otherwise — rather than by a
-Node version. Given how this parameter has behaved, a Node that hands `_load` the resolve options
-directly again is a live possibility, and dropping a `paths` on the floor would put the gate back
-to deciding about a file Node is not opening.
+### Superseded by #178 — and the reason is the most useful thing in this document
+
+Everything above stands as a record of what was measured. The **fix** did not survive review.
+
+`resolveOptionsFrom` classified `Module._load`'s fourth argument by the fields it **has** — unwrap
+`requireResolveOptions`, pass through an object carrying `paths`/`conditions`, contribute nothing
+otherwise — rather than by a Node version, on the reasoning that a Node which hands `_load` the
+resolve options directly again is a live possibility and dropping a `paths` on the floor would put
+the gate back to deciding about a file Node is not opening.
+
+**The fields are the attacker's.** #178 turned that classifier into a steering wheel: a
+dependency passing `{ paths: [<some node_modules dir>] }` sent capwall's re-resolution to a
+graph-exempt decoy — no decision — while Node, which reads `paths` off `_load`'s fourth argument
+on no released version, opened the real file. That construction worked on **22, 24 and 26**. A
+getter showed the bag was read twice by capwall and a third time by Node, so it could answer the
+two differently. The forward-compatibility branch, written to prevent the gate deciding about a
+file Node is not opening, is what made it do exactly that on every Node that exists.
+
+The durable fix was not a better classifier and not a snapshot of the bag. It was to **stop taking
+the decision from a second resolution at all**: the gate moved to `Module.prototype.load`, which
+Node calls with the filename it resolved. `resolveOptionsFrom`, `resolveQuietly` and the double
+resolve this section measured are all deleted — see `docs/threat-model.md` § The module system as
+a read channel, and issues #177/#178/#179/#180.
+
+Three things in this document are worth re-reading with that outcome in mind:
+
+- The mutant paragraph above says no mutant was added for `resolveOptionsFrom` because on 20/22
+  the mutation is behaviourally identical. That was true, and it also meant the repo's strongest
+  gate had nothing to say about a function whose behaviour on the floor was a live bypass. The
+  four mutants that replaced it (`module-read-gate-at-proto-load`,
+  `module-read-ignores-node-main-marking`, `esm-gate-declines-every-require-resolution`,
+  `module-read-host-root-only-from-parentless-resolution`) all pin properties that are observable
+  on **every** supported Node, because the design no longer has a behaviour that varies by one.
+- **#154's coverage argument was right and insufficient.** The matrix now covers 24 and 26, which
+  is what #154 asked for — and #178's construction A was reachable on 22 the whole time. A wider
+  matrix finds defects that a Node version exposes; it does nothing for a defect that is exposed
+  by an argument the caller controls.
+- The rule this section was written to establish — *a DERIVED argument is not a forwarded one*
+  (#128 one level up) — is still right. It just has a sharper form: **a re-resolution is a second
+  opinion, and a second opinion the attacker parameterises is worthless.** Where a gate needs to
+  know what a primitive is about to do, take it from the point the primitive has already decided.
 
 ## Reproducing the measurement
 

@@ -399,8 +399,13 @@ the matrix as early warning: it becomes LTS on 2026-10-28, and it is already the
   changelogs. Two rules follow. (1) A wrapper over a Node primitive forwards
   `Reflect.apply(real, this, args)` and states no arity (#128, #135); a *derived* argument handed
   to a DIFFERENT primitive needs the same treatment, which is where the #123 gate sprang a leak on
-  Node 24.18. (2) If you change one of those call sites, or claim a version fact in a comment,
-  re-measure it — § Reproducing the measurement is written to be repeatable.
+  Node 24.18. **#178 then showed the sharper form of that rule, and it is the one to remember: a
+  re-resolution is a second opinion, and a second opinion the attacker parameterises is worthless.
+  Where a gate needs to know what a primitive is about to do, take it from the point the primitive
+  has already decided** — which is why the module-read gate now lives on `Module.prototype.load`
+  and not inside the `Module._load` wrapper. (2) If you change one of those call sites, or claim a
+  version fact in a comment, re-measure it — § Reproducing the measurement is written to be
+  repeatable.
 - **Malicious fixtures must stay obviously inert.** `examples/malicious-dep-demo` may only
   `console.log("would exfiltrate …")`. Never write real exfiltration, real network egress,
   or anything that touches a real secret. The demo proves the **block**, not the attack.

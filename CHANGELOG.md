@@ -21,6 +21,50 @@ has to be findable without reading the diff.
 
 ## [Unreleased]
 
+### Security
+
+- **The module-read gate (#123) is now decided on the filename Node opens, closing four bypasses**
+  (issues **#177**, **#178**, **#179**, **#180**). Under a **deny-all `enforce` policy with zero
+  grants**, a dependency could read any file on the machine — `.json` hands the contents back as a
+  value, `.js` executes it — with **no decision recorded at all**: nothing thrown, nothing on
+  stderr, nothing in the `observe` trace, nothing for `capwall diff`. Reproduced on **22.22.3,
+  24.18.0 and 26.5.0**; unaffected by `CAPWALL_HARDENED=1`.
+
+  All four were the same defect. The gate lived inside the `Module._load` wrapper and re-ran
+  `Module._resolveFilename` to work out which file a load would open, so its correctness rested on
+  arguments **the caller supplies**:
+
+  - **#177 (CRITICAL)** — `module.constructor._load(secret, undefined, true)`. `isMain` is just
+    the third argument, and it skipped the CJS half; the missing `parent` made the ESM half see no
+    importer and skip too. One line, both halves waived.
+  - **#178 (CRITICAL)** — `Module._load`'s fourth argument was classified by the fields it
+    carried, and the fields are the attacker's. Three constructions steered capwall's
+    re-resolution to a decoy inside `node_modules` (graph-exempt, no decision) while Node opened
+    the real file; a getter answered capwall and Node differently. capwall's own audit trail then
+    named the decoy.
+  - **#179 (HIGH)** — the "already decided" mark was a depth counter over a whole `Module._load`,
+    and a module body runs inside one. The ESM half stood down for every nested load made while
+    any module was evaluating — which is exactly when a supply-chain payload runs.
+  - **#180 (HIGH)** — on the `require()` side of the `resolve` hook, `parentURL` comes from the
+    `parent` record the caller passed, so the caller chose the principal: `<app>` (exempt, and
+    exempt *before* the decision is recorded) or any name in the policy, via a
+    `node_modules/<name>/` directory that does not have to exist.
+
+  **What changed.** The CJS half moved to **`Module.prototype.load(filename)`** — the point Node
+  commits to a path — so it is handed Node's own resolution result and there is no second
+  resolution to steer, no options bag to classify, no `isMain` to believe and no extent to disarm.
+  The `resolve` hook now declines **every** `require`-conditioned resolution, leaving those loads
+  to the half whose subject is an unspoofable stack walk. The process entry point, which the gate
+  must still exempt, is identified from **host** facts (`process.argv[1]`, and Node's own
+  parentless non-`require` resolution) instead of from `isMain`.
+
+  **No policy changes, and no new grants.** The rule is unchanged — a load is free when the
+  resolved file belongs to an installed package or the loader is the application —
+  so `require("mime-db")` and every other dependency-graph load stays free.
+  `examples/express-app` still runs under its committed policy with zero denials and no
+  `capwall diff` drift. **One route is newly gated:** `new Module(f).load(f)`, which never enters
+  `Module._load` and so could not be seen from the old site at all.
+
 ### Changed
 
 - **`CAPWALL_GLOBAL_EGRESS=0` now refunds the startup cost it was supposed to avoid** (#170).
