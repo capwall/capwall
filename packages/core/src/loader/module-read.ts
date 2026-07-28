@@ -97,7 +97,9 @@
  *    decision is taken once, for whoever loaded it first.
  *  - Reaching past the loader entirely — a direct `Module._extensions[".json"](m, file)` call, or
  *    `process.binding` — is the same class of escape as un-patching any shim, which capwall does
- *    not claim to stop.
+ *    not claim to stop. Since #177 the chokepoint is `Module.prototype.load`, so this residual is
+ *    one level narrower than it was: `new Module(f).load(f)` IS decided now, and only the
+ *    extension handler below it is out of reach.
  */
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -217,41 +219,116 @@ export function moduleLoadNeedsDecision(
 
 /*
  * ═════════════════════════════════════════════════════════════════════════════════════════════
- * WHICH OF THE GATES DECIDES A GIVEN LOAD (#152)
+ * WHICH OF THE GATES DECIDES A GIVEN LOAD (#152, rewritten by #177/#178/#179)
  * ═════════════════════════════════════════════════════════════════════════════════════════════
- * Until the ESM path moved to `module.registerHooks()`, the two halves of this gate could not
- * see the same load: `Module._load` saw `require`, and a `module.register()` hook saw `import`,
- * and nothing was both. `registerHooks` is broader — its `resolve` is consulted for `require()`
- * as well — so without a discriminator every `require` of an out-of-graph file would now take
- * TWO decisions: two `DENY` lines, two trace entries, two grants out of `observe`.
+ * The CJS half decides EVERY CJS load and the ESM half decides every `import`. The line between
+ * them is `conditions.includes("require")`, which is Node's own statement about which loader is
+ * running, and it needs no state of any kind.
  *
- * The rule is that `loader/require.ts` wins, because it has the better subject: a STACK WALK,
- * which a `createRequire()` filename cannot spoof, where the hook has only `parentURL`. So the
- * hook stands down for the dynamic extent of a `Module._load` that actually reached
- * {@link guardCjsModuleRead} with a resolved path.
+ * WHAT THIS REPLACED, AND WHY. The CJS half used to sit in the `Module._load` wrapper and
+ * RE-RESOLVE the load from `Module._load`'s own argument list, then mark the load "decided" for
+ * the dynamic extent of that call so the `registerHooks` `resolve` hook — which since #152 sees
+ * `require()` too — would not decide it twice. Three CRITICAL bypasses came out of that one
+ * design, and they are the same defect stated three ways: **the decision was taken from
+ * arguments the caller supplies, not from the file Node opens.**
  *
- * IT IS A DEPTH COUNTER AND NOT A FLAG because module loads nest: a required module's body runs
- * inside its own `Module._load`, and every `require` it makes opens another. It is entered only
- * on the path that DID take a decision, so a `Module._load` whose resolution failed — the shape
- * of the ≥24.18 bypass the 2026-07 Node audit found — leaves the hook armed and the hook becomes
- * a real second layer for it rather than a duplicate. See `loader/esm-hooks.ts`
- * § `alreadyDecidedByCjsGate` for the other half of the test and why one alone is not enough.
+ *  - #177 — `Module._load(secret, undefined, true)`. `args[2]` is `isMain`, the caller's third
+ *    argument, and the CJS half skipped itself for it; `parent` was `undefined`, so the ESM half
+ *    saw no importer and skipped itself too. One line, both halves waived, zero decisions.
+ *  - #178 — `Module._load(spec, parent, false, bag)`. The fourth argument was classified by the
+ *    fields it carried in order to reconstruct what Node would pass `_resolveFilename`. The
+ *    fields are the attacker's, so the re-resolution could be steered to a decoy inside
+ *    `node_modules` (graph-exempt, no decision) while Node loaded the real file — and the decoy
+ *    resolution ALSO disarmed the ESM hook. A getter answered capwall and Node differently.
+ *  - #179 — `insideGatedCjsLoad()` was a depth counter over a whole `Module._load`, and a module
+ *    body runs inside one, so the hook stood down for every nested load while any module was
+ *    evaluating. The identical call was allowed during module evaluation and denied after it.
+ *
+ * THE CHOKEPOINT. Node resolves a CJS load once, in `Module._load`, and then commits: it
+ * constructs the module and calls **`Module.prototype.load(filename)`**, which picks the
+ * extension handler and reads the file. `filename` there is Node's own resolution result — not a
+ * specifier, not an argument capwall reconstructed — and every CJS route reaches it. Measured on
+ * 22.22.3 / 24.18.0 / 26.5.0: `require(abs)`, `require.resolve()`-then-`require`, a direct
+ * `Module._load` (with any `isMain`, any `parent`, any options bag), `require(esm)`, the process
+ * entry point, and even `new Module(f).load(f)` — which never goes through `Module._load` at all,
+ * so the old gate could not see it. `import()` is the one route that does NOT pass here; it is
+ * the ESM half's, and there `parentURL` really is the host's record.
+ *
+ * So there is nothing left to coordinate. The CJS gate cannot "fail to resolve" (it is handed the
+ * resolution), cannot be steered (there is no second resolution), and cannot be disarmed (there
+ * is no flag). The ESM hook declines `require`-conditioned resolutions unconditionally because
+ * the load it is being asked about is on its way to {@link guardCjsModuleRead} — see
+ * `loader/esm-hooks.ts` § `gateModuleRead`.
  */
-let gatedCjsLoadDepth = 0;
 
-/** Enter the dynamic extent of a `Module._load` whose module-read decision has been taken. */
-export function beginGatedCjsLoad(): void {
-  gatedCjsLoadDepth += 1;
+/**
+ * Absolute paths Node ITSELF resolved as a process ROOT — the entry point, and any `--import` /
+ * `--require` preload.
+ *
+ * WHY THIS EXISTS AT ALL. The process entry point is a file with no requiring package: the stack
+ * above its load is nothing but Node's own module machinery, so {@link attributeCallerDetailed}
+ * answers `<unknown>`, which since #60 is deny-by-default. Waving it through is therefore
+ * necessary — and #177 is precisely what happens when the thing waved through is a CLAIM. The old
+ * code believed `isMain`, the caller's own third argument to `Module._load`; the ESM half believed
+ * "no `parent` was passed". Both are selectable by any caller in one line.
+ *
+ * WHAT IS RECORDED HERE IS NOT A CLAIM. Two independent HOST facts, neither of which any
+ * in-process caller can produce, and both established before a single line of dependency code has
+ * run (capwall installs from a preload):
+ *
+ *  1. `process.argv[1]`, snapshotted by `install()`. Node writes it from the command line during
+ *     bootstrap. It is the cheap one and it is exact whenever the operator spelled the entry with
+ *     its extension (`node app.js`), which is the common case.
+ *  2. A ROOT RESOLUTION seen by the `resolve` hook: `parentURL === undefined` on a resolution
+ *     that does NOT carry the `require` condition. That is Node resolving something for itself
+ *     rather than for a module — and it is the authoritative one, because it is the fully
+ *     resolved, realpath'd filename Node is about to load, so it covers `node app`, `node .`,
+ *     a symlinked checkout and a `main` field. Verified on 22/24/26 that a CJS entry point is
+ *     root-resolved through the hook before `Module._load` ever sees it.
+ *
+ * A dependency cannot reach (2): the only way it can drive a resolution with no parent is through
+ * `Module._load`, and every resolution that comes from there carries the `require` condition —
+ * measured on 22/24/26, and it is Node's own definition of the CJS resolver, not an accident of a
+ * release. `import()` always carries the importer.
+ *
+ * BOUNDED so a pathological host (or a future Node that root-resolves more than it does today)
+ * cannot grow it without limit; a real process records two or three entries.
+ */
+const hostRootTargets = new Set<string>();
+const MAX_HOST_ROOT_TARGETS = 32;
+
+/** Record one host-resolved process root. Absolute native paths only. */
+export function recordHostRootTarget(nativePath: string): void {
+  if (!path.isAbsolute(nativePath)) return;
+  if (hostRootTargets.size >= MAX_HOST_ROOT_TARGETS) return;
+  hostRootTargets.add(nativePath);
 }
 
-/** Leave it. Clamped at zero so an unbalanced call can never leave the gate permanently off. */
-export function endGatedCjsLoad(): void {
-  if (gatedCjsLoadDepth > 0) gatedCjsLoadDepth -= 1;
+/** Is `nativePath` one of them? Read by {@link guardCjsModuleRead}. */
+export function isHostRootTarget(nativePath: string): boolean {
+  return hostRootTargets.has(nativePath);
 }
 
-/** True while at least one such load is in progress. Read by the `resolve` hook. */
-export function insideGatedCjsLoad(): boolean {
-  return gatedCjsLoadDepth > 0;
+/**
+ * Record source (1): `process.argv[1]`, read at `install()`.
+ *
+ * Node writes `argv` from the command line during bootstrap and capwall installs from a preload,
+ * so this is read before any dependency exists — which is the whole difference between it and
+ * `isMain`. It is UNRESOLVED on purpose: `path.resolve` is a string operation, not a module
+ * resolution, so nothing here consults the filesystem or Node's resolver. That makes it exact for
+ * `node app.js` and silent for `node app` / `node .`, where it simply never matches and source (2)
+ * answers instead. Deliberately not "fixed" by running the entry through `Module._findPath`: a
+ * second resolution is what #178 was about, and this one would buy only the cases already covered.
+ */
+export function recordProcessEntryFromArgv(argv: readonly string[]): void {
+  const entry = argv[1];
+  if (typeof entry !== "string" || entry === "") return;
+  recordHostRootTarget(path.resolve(entry));
+}
+
+/** Drop every recorded root. For tests only — a process has exactly one set of roots. */
+export function forgetHostRootTargets(): void {
+  hostRootTargets.clear();
 }
 
 /** The capability request a module read raises. Identical in shape to a `readFileSync`. */
@@ -267,18 +344,29 @@ function moduleReadRequest(resolvedPath: string): {
  * CJS half: decide whether the calling package may load `resolvedPath`. Returns normally when
  * the load may proceed; throws {@link CapabilityError} on an enforce-mode denial.
  *
+ * `resolvedPath` MUST BE THE FILENAME NODE IS ABOUT TO OPEN, and the one caller — the
+ * `Module.prototype.load` patch in `loader/require.ts` — is the only place that has it without
+ * having reconstructed it. Handing this function a path derived from `Module._load`'s argument
+ * list is what #178 was, and the note above the chokepoint discussion says why no amount of care
+ * with that argument list is enough.
+ *
  * The subject is the ATTRIBUTED CALLER — capwall's ordinary stack walk — and deliberately not the
  * `parent` module the loader hands us. `parent.filename` is caller-controlled: `createRequire()`
  * builds a module record whose filename is whatever string it was given, so
  * `createRequire("/proj/node_modules/granted/index.js")("./x.json")` would present itself as
  * `granted` and inherit its grants. The stack walk cannot be spoofed that way (and where it CAN
  * be defeated — an `eval` frame, a `data:` module — it answers `<unknown>`, which holds nothing).
+ * Since #180 that is the subject on the `require()` side of the ESM hook as well, by the simple
+ * route of that hook not deciding those loads at all.
  *
  * The walk only runs for loads that survived {@link moduleLoadNeedsDecision}, so in a normal
  * process it runs for the application's own requires and nothing else.
  */
 export function guardCjsModuleRead(ctx: ShimContext, resolvedPath: string): void {
   if (!moduleLoadNeedsDecision(resolvedPath, ctx.projectRoot)) return;
+  // Node loading a process ROOT — the entry point, a preload. Nobody to charge, and the entry IS
+  // the application. See {@link hostRootTargets} for why this is a host fact and `isMain` was not.
+  if (isHostRootTarget(resolvedPath)) return;
   const attribution = attributeCallerDetailed(attributionOptionsFor(ctx));
   if (attribution.pkg === APP_ROOT) return; // the trust root, as everywhere else
   guardAttributed(ctx, attribution, moduleReadRequest(resolvedPath));
@@ -324,21 +412,33 @@ export interface EsmGateOutcome {
 /**
  * ESM half: decide whether the module at `importerUrl` may load `resolvedUrl`.
  *
- * WHY THE IMPORTER'S URL IS THE SUBJECT HERE, when the CJS half insists on a stack walk.
- * `context.parentURL` is set by the HOST from the module record that actually contains the
- * `import`, and no in-process code can choose it the way it can choose a `createRequire`
- * filename. The two spellings a dependency CAN reach — a `data:` URL module and a synthetic/`vm`
- * module — are not `file:` URLs, and this function charges those to `<unknown>` rather than
- * inferring the trust root from them, which is #60's rule applied on this path.
+ * **THIS IS THE `import` PATH ONLY.** `loader/esm-hooks.ts` declines every `require`-conditioned
+ * resolution before calling here, and that restriction is what makes the paragraph below true —
+ * see #180 for what happened while it was not.
  *
- * UNTIL #152 THAT WAS ALSO A CONSTRAINT: `module.register()` ran the hook on Node's loader
- * thread, which has no JavaScript stack belonging to the importing package, so there was nothing
- * to walk even in principle. `module.registerHooks()` runs it in this realm and a walk is now
- * possible. It is deliberately NOT taken. `parentURL` is the stronger answer here — it is the
- * host's own record of which module contains the `import`, where a stack at ESM resolution time
- * is Node's loader machinery with the importer somewhere below it — and swapping a working,
- * unspoofable subject for a stack walk would be re-litigating #60 on the one path where the host
- * hands us the answer.
+ * WHY THE IMPORTER'S URL IS THE SUBJECT HERE, when the CJS half insists on a stack walk. On the
+ * `import` path `context.parentURL` is set by the HOST from the module record that actually
+ * contains the `import`, and no in-process code can choose it the way it can choose a
+ * `createRequire` filename. The two spellings a dependency CAN reach — a `data:` URL module and a
+ * synthetic/`vm` module — are not `file:` URLs, and this function charges those to `<unknown>`
+ * rather than inferring the trust root from them, which is #60's rule applied on this path.
+ *
+ * THAT WAS NOT TRUE OF THE `require()` PATH `registerHooks` ADDED (#180), and the claim used to be
+ * stated without the qualifier — here and in `docs/threat-model.md`. There `parentURL` is derived
+ * from the `parent` module record handed to `Module._load`, i.e. from an ordinary argument: a
+ * dependency naming `node_modules/impostor/index.js` — a directory that need not exist — wore
+ * that principal, and naming the app's own file bought the `<app>` exemption outright. The fix is
+ * not a better test on `parentURL`; it is that those loads are decided by
+ * {@link guardCjsModuleRead}, whose subject is a stack walk, and are not decided here at all.
+ *
+ * UNTIL #152 THE STACK WALK WAS ALSO IMPOSSIBLE HERE: `module.register()` ran the hook on Node's
+ * loader thread, which has no JavaScript stack belonging to the importing package, so there was
+ * nothing to walk even in principle. `module.registerHooks()` runs it in this realm and a walk is
+ * now possible. On the `import` path it is deliberately NOT taken: `parentURL` is the stronger
+ * answer there — it is the host's own record of which module contains the `import`, where a stack
+ * at ESM resolution time is Node's loader machinery with the importer somewhere below it — and
+ * swapping a working, unspoofable subject for a stack walk would be re-litigating #60 on the one
+ * path where the host hands us the answer.
  *
  * `installed: false` makes this inert, and that is deliberate rather than an oversight. It used
  * to be load-bearing — the hook could not be unregistered, so this code outlived `uninstall()`
@@ -365,9 +465,20 @@ export function decideEsmModuleRead(
   }
   if (!moduleLoadNeedsDecision(resolvedPath, snapshot.projectRoot)) return null;
 
-  // No importer at all: Node loading the process entry point. There is nobody to charge, and the
-  // entry IS the application — the ESM counterpart of `isMain` on the CJS side.
-  if (importerUrl === undefined) return null;
+  // NO IMPORTER AT ALL. On this path — `import` conditions, the caller having been declined
+  // upstream — that is Node resolving a ROOT for itself: the process entry point, or a preload.
+  // There is nobody to charge and the entry IS the application, so it is free; and because this
+  // is the resolved, realpath'd filename Node is about to open, it is also the authoritative
+  // record of which file that is, which the CJS half needs for the same reason. See
+  // {@link hostRootTargets}.
+  //
+  // #177 IS WHAT THIS BRANCH USED TO BE. It ran for `require`-conditioned resolutions too, where
+  // `parentURL` is `undefined` because the CALLER passed `Module._load` no `parent` — a choice,
+  // not a statement by the host. Those never reach here now.
+  if (importerUrl === undefined) {
+    recordHostRootTarget(resolvedPath);
+    return null;
+  }
   let pkg: string;
   if (importerUrl.startsWith("file:")) {
     try {

@@ -32,8 +32,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { moduleLoadNeedsDecision, decideEsmModuleRead } from "../src/loader/module-read.js";
-import { resolveOptionsFrom } from "../src/loader/require.js";
+import {
+  decideEsmModuleRead,
+  forgetHostRootTargets,
+  isHostRootTarget,
+  moduleLoadNeedsDecision,
+  recordHostRootTarget,
+} from "../src/loader/module-read.js";
 import { parsePolicy } from "@capwall/policy-schema";
 import {
   assertPreloadBuilt,
@@ -322,7 +327,176 @@ module.exports = function run() {
 `,
   );
   await writeFile(path.join(proj, "app-internal-options.js"), `require("evil/internal-options.js")();\n`);
+
+  await buildGroundTruthFixture();
 }
+
+/**
+ * THE #177/#178/#179/#180 FIXTURE — every load capwall decides is decided on the filename NODE
+ * resolved, never on an argument the caller supplied.
+ *
+ * Each probe gets its OWN vault file, because the preload deduplicates identical decisions per
+ * process (`preload.ts`): a shared target would let one `DENY` line satisfy an assertion about a
+ * different route. `decoy` is a real installed package holding a file with the same relative
+ * name as each target, so #178's steered re-resolution had somewhere graph-exempt to land.
+ */
+async function buildGroundTruthFixture(): Promise<void> {
+  const evil = path.join(proj, "node_modules", "evil");
+  const decoy = path.join(proj, "node_modules", "decoy");
+  await mkdir(decoy, { recursive: true });
+  await writeFile(
+    path.join(decoy, "package.json"),
+    JSON.stringify({ name: "decoy", version: "1.0.0" }),
+  );
+
+  for (const name of GROUND_TRUTH_TARGETS) {
+    await writeFile(path.join(vault, `${name}.json`), JSON.stringify({ key: SECRET }));
+    // The decoy copy is HARMLESS and inside the dependency graph — resolving to it is exactly
+    // what "no decision was taken" looked like in #178.
+    await writeFile(path.join(decoy, `${name}.json`), JSON.stringify({ harmless: true }));
+  }
+
+  // Shared preamble: a forged `parent` record (the object `guardCjsModuleRead` refuses to trust),
+  // a bag whose getters throw (which used to make capwall's own re-resolution fail while Node's
+  // succeeded), and the reporter every probe prints through.
+  const preamble = `const Module = require("node:module");
+const VAULT = ${JSON.stringify(vault)};
+const DECOY = ${JSON.stringify(decoy)};
+const abs = (n) => require("node:path").join(VAULT, n + ".json");
+// A module record whose \`filename\` is any string the caller likes — createRequire builds one of
+// these for free. #180 is what happens when a gate believes it.
+function rec(filename) {
+  const m = new Module("forged", null);
+  m.filename = filename;
+  m.paths = [];
+  return m;
+}
+const honest = () => rec(__filename);
+// Getters that throw: capwall's deleted re-resolution died on these, and read "nothing to decide".
+const hostileBag = () => ({ get paths() { throw new Error("x"); } });
+function report(name, fn) {
+  try {
+    const v = fn();
+    console.log("GT:" + name + ":OK:" + JSON.stringify(v));
+  } catch (err) {
+    console.log("GT:" + name + ":ERR:" + err.name + ":" + err.pkg);
+  }
+}
+`;
+
+  // ── #177 ────────────────────────────────────────────────────────────────────────────────
+  // `isMain` is the caller's third argument, and `parent: undefined` is the caller's second.
+  // Passing both waived the CJS half and the ESM half at once. `proto-load-direct` is the route
+  // that never reaches `Module._load` AT ALL — the old gate could not see it even in principle.
+  await writeFile(
+    path.join(evil, "gt-177.js"),
+    `${preamble}module.exports = function run() {
+  report("177-baseline", () => require(abs("gt-177-baseline")));
+  report("177-ismain", () => Module._load(abs("gt-177-ismain"), undefined, true));
+  report("177-ismain-honest-parent", () => Module._load(abs("gt-177-ismain2"), honest(), true));
+  report("177-proto-load-direct", () => {
+    const f = abs("gt-177-proto");
+    const m = new Module(f, module);
+    m.load(f);
+    return m.exports;
+  });
+};
+`,
+  );
+  await writeFile(path.join(proj, "app-gt-177.js"), `require("evil/gt-177.js")();\n`);
+
+  // ── #178 ────────────────────────────────────────────────────────────────────────────────
+  // Three constructions of `Module._load`'s fourth argument, all of which steered capwall's
+  // re-resolution to `decoy` (graph-exempt, no decision) while Node opened the vault file.
+  // A works on 22/24/26; B is the getter read three times; C is the 22-specific unwrap.
+  await writeFile(
+    path.join(evil, "gt-178.js"),
+    `${preamble}// A parent whose directory is the VAULT, so a relative specifier resolves there — and a
+// \`paths\`/\`requireResolveOptions\` that points at the decoy package instead.
+const vaultParent = () => rec(require("node:path").join(VAULT, "parent.js"));
+module.exports = function run() {
+  report("178-a-static-paths", () =>
+    Module._load("./gt-178-a.json", vaultParent(), false, { paths: [DECOY] }));
+  let reads = 0;
+  const getterBag = {
+    get requireResolveOptions() {
+      reads += 1;
+      return reads <= 2 ? { paths: [DECOY] } : undefined;
+    },
+  };
+  report("178-b-getter", () => Module._load("./gt-178-b.json", vaultParent(), false, getterBag));
+  console.log("GT:178-b-reads:" + reads);
+  report("178-c-unwrap", () =>
+    Module._load("./gt-178-c.json", vaultParent(), false, { requireResolveOptions: { paths: [DECOY] } }));
+};
+`,
+  );
+  await writeFile(path.join(proj, "app-gt-178.js"), `require("evil/gt-178.js")();\n`);
+
+  // ── #179 ────────────────────────────────────────────────────────────────────────────────
+  // The SAME call, twice: once from a module body (which runs inside its own `Module._load`, so
+  // the deleted depth counter was non-zero) and once from a `setImmediate` (counter at zero).
+  // The whole point is that the two answers must be identical.
+  await writeFile(
+    path.join(evil, "gt-179.js"),
+    `${preamble}// TOP LEVEL — this file's body is being evaluated inside its own Module._load right now.
+report("179-during-eval", () => Module._load(abs("gt-179-during"), module, false, hostileBag()));
+setImmediate(() => {
+  report("179-after-eval", () => Module._load(abs("gt-179-after"), module, false, hostileBag()));
+});
+`,
+  );
+  await writeFile(path.join(proj, "app-gt-179.js"), `require("evil/gt-179.js");\n`);
+
+  // ── #180 ────────────────────────────────────────────────────────────────────────────────
+  // Principal selection. `setImmediate` so the deleted depth counter was at zero and the ESM hook
+  // was genuinely armed — which is the configuration in which it charged whoever the caller named.
+  // `node_modules/impostor/` DOES NOT EXIST; that it was accepted as a principal is the finding.
+  await writeFile(
+    path.join(evil, "gt-180.js"),
+    `${preamble}const path = require("node:path");
+const APP = ${JSON.stringify(proj)};
+module.exports = function run() {
+  setImmediate(() => {
+    report("180-honest", () => Module._load(abs("gt-180-honest"), module, false, hostileBag()));
+    report("180-forged-app", () =>
+      Module._load(abs("gt-180-app"), rec(path.join(APP, "app.js")), false, hostileBag()));
+    report("180-forged-impostor", () =>
+      Module._load(abs("gt-180-impostor"), rec(path.join(APP, "node_modules", "impostor", "index.js")), false, hostileBag()));
+  });
+};
+`,
+  );
+  await writeFile(path.join(proj, "app-gt-180.js"), `require("evil/gt-180.js")();\n`);
+
+  // ── THE ENTRY POINT, spelled the three ways an operator spells it ───────────────────────
+  // The gate now runs for the entry point too, so "which file is the process root" has to be a
+  // HOST fact. `process.argv[1]` answers the first spelling exactly and neither of the other two;
+  // the `resolve` hook's root resolution answers all three. Every one of these must start.
+  await mkdir(path.join(proj, "entrydir"), { recursive: true });
+  await writeFile(
+    path.join(proj, "entrydir", "package.json"),
+    JSON.stringify({ name: "entrydir", version: "1.0.0", main: "index.js" }),
+  );
+  await writeFile(path.join(proj, "entrydir", "index.js"), `console.log("ENTRY:dir-main:OK");\n`);
+  await writeFile(path.join(proj, "entry-plain.js"), `console.log("ENTRY:plain:OK");\n`);
+}
+
+/** One vault file per probe — see {@link buildGroundTruthFixture} on why they cannot be shared. */
+const GROUND_TRUTH_TARGETS = [
+  "gt-177-baseline",
+  "gt-177-ismain",
+  "gt-177-ismain2",
+  "gt-177-proto",
+  "gt-178-a",
+  "gt-178-b",
+  "gt-178-c",
+  "gt-179-during",
+  "gt-179-after",
+  "gt-180-honest",
+  "gt-180-app",
+  "gt-180-impostor",
+] as const;
 
 beforeAll(async () => {
   assertPreloadBuilt();
@@ -418,97 +592,30 @@ describe("#123 CJS — require() is not a way around fs.read", () => {
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 // The four-argument `Module._load` form — a live bypass a Node MINOR opened under the gate.
 //
-// The gate has to know which file a load will open, so `loader/require.ts` re-runs
-// `Module._resolveFilename` before delegating. It used to do that by forwarding `_load`'s OWN
-// argument list verbatim, on the stated reasoning that the two take the same arguments. They do
-// not, and Node 24.18 made that observable: `_load`'s fourth argument became an INTERNAL bag
-// (`CJSModuleLoadInternalOptions`), and Node unwraps its `requireResolveOptions` field before
-// handing it to `_resolveFilename`. capwall passed the bag itself, `_resolveFilename` found no
-// `paths` in it, resolution FAILED, and `resolveQuietly` returned `null` — which the gate reads
-// as "nothing to decide".
+// #157's HISTORY, because the shape of the fix changed twice. The gate used to need to know which
+// file a load would open, so it RE-RAN `Module._resolveFilename` before delegating — first by
+// forwarding `_load`'s own argument list verbatim (wrong: `_load`'s fourth argument is an internal
+// bag, `_resolveFilename`'s is `ResolveFilenameOptions`, and on 24.18/26 resolution therefore
+// THREW and the gate read that as "nothing to decide"), then by CLASSIFYING that bag by the fields
+// it carried. #178 is what the second attempt cost: the fields are the attacker's, so the
+// classifier could be steered, and capwall re-resolved to a decoy inside `node_modules` while Node
+// opened the real file. There is no classifier any more and no second resolution — see the
+// `#178` block below, and `loader/module-read.ts` § WHICH OF THE GATES DECIDES A GIVEN LOAD.
 //
-// Measured, not reasoned about: on Node 24.18.0 and 26.5.0, before the fix, a dependency reading
-// a file outside the project through this form under a DENY-ALL enforce policy got the bytes and
-// produced ZERO decisions — no throw, no stderr line, nothing for `observe` or `capwall diff` to
-// see. The three-argument spelling of the identical read was denied correctly, which is what kept
-// it invisible. Node 22 and earlier reject the form outright, so it never showed there.
+// #176's CONCERN, ANSWERED PROPERLY. The two rows here need a `Module._load` that honours
+// `requireResolveOptions`, which arrived in a 24 MINOR, so they skip on the FLOOR — and `engines`
+// is `>=22.15.0`, which meant `pnpm test` on the version this repo tells adopters to run exercised
+// none of the fix. #176 answered that by unit-testing the classifier on every runtime. Deleting
+// the classifier deletes those rows with it; what replaces them is better, because it is
+// end-to-end rather than a unit test of an internal: the `#178` block reaches the identical
+// four-argument bypass on 22, 24 and 26 with NO feature probe and NO skip, by giving the forged
+// `parent` a directory the relative specifier actually resolves in.
 //
-// These rows assert the PROPERTY that makes that class of defect impossible to reintroduce
-// quietly: **the same read by the same package is decided the same way whichever spelling of
+// These two rows stay because they assert the property on a runtime that reaches this spelling of
+// it: **the same read by the same package is decided the same way whichever spelling of
 // `Module._load` reaches it.** They deliberately do not assert an argument count.
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 describe("#123 — every spelling of Module._load reaches the same decision", () => {
-  /**
-   * THE CLASSIFICATION RULE ITSELF — the half of #157 that runs on the FLOOR (issue #176).
-   *
-   * The two end-to-end rows below need a `Module._load` that honours `requireResolveOptions`,
-   * which arrived in a 24 MINOR. `HONOURS_REQUIRE_RESOLVE_OPTIONS` feature-detects that correctly
-   * and both rows therefore skip on Node 22 — which is right, and was also the whole of the
-   * problem: `engines` is `>=22.15.0`, so on the version this repo tells adopters to run,
-   * `pnpm test` exercised none of the fix for a live deny-all-policy bypass. Only `pnpm ci:local`
-   * (a Docker matrix nobody runs per commit) touched it.
-   *
-   * `resolveOptionsFrom` is a pure function of `Module._load`'s argument list and — per
-   * `require.ts`'s own comment — is deliberately classified by the fields an object HAS rather
-   * than by a Node version. So the durable part of the fix can be asserted on every runtime by
-   * calling it, without a `_load` that honours anything. These rows are what the
-   * `module-read-resolve-options-unwrapped` mutant fails against on 22; without them the catalog
-   * would report a false `SURVIVED` there, since a mutant whose claimed tests all SKIPPED is not
-   * evidence of anything (`scripts/mutation-guard.mjs` reads "the tests did not fail" as
-   * survived).
-   *
-   * These do NOT replace the end-to-end rows. They pin the rule; the rows below pin that the rule
-   * is wired into the gate on a runtime that can reach it.
-   */
-  describe("the classification rule itself — runtime-independent, so it runs on the floor", () => {
-    /** Positional filler for `(request, parent, isMain)`; only `args[3]` is under test. */
-    const load = (fourth: unknown): unknown[] => ["./secrets.json", null, false, fourth];
-
-    it("unwraps Node ≥24.18's internal bag to the field _resolveFilename actually takes", () => {
-      // THE BUG, stated as an assertion: pre-#157 this returned the BAG. `_resolveFilename` found
-      // no `paths` on it, threw, `resolveQuietly` returned null, and the #123 gate read that as
-      // "nothing to decide" — bytes delivered, zero decisions recorded, under a deny-all policy.
-      const options = { paths: ["/proj/vault"] };
-      expect(
-        resolveOptionsFrom(load({ requireResolveOptions: options, shouldSkipModuleHooks: false })),
-      ).toBe(options);
-    });
-
-    it("passes a bare ResolveFilenameOptions through, so a future Node cannot lose its `paths`", () => {
-      // Not hypothetical symmetry: this parameter has already appeared, vanished and returned
-      // across 20/22/23/24/26. A Node that hands `_load` the resolve options directly again must
-      // not have its `paths` dropped on the floor — that puts the gate back to deciding about a
-      // file Node is not opening, which is the same defect from the other side.
-      const direct = { paths: ["/proj/vault"] };
-      expect(resolveOptionsFrom(load(direct))).toBe(direct);
-      const conditions = { conditions: ["node", "import"] };
-      expect(resolveOptionsFrom(load(conditions))).toBe(conditions);
-    });
-
-    it("contributes nothing for Node 22's bag and for the three-argument majors", () => {
-      // Node 22's `_load` gets `{ shouldSkipModuleHooks }` and forwards NO options argument at
-      // all, so `undefined` is what matches Node rather than what is left over. Asserted as an
-      // exact `undefined` — returning the bag here is the ≥24.18 defect one major earlier.
-      expect(resolveOptionsFrom(load({ shouldSkipModuleHooks: true }))).toBeUndefined();
-      expect(resolveOptionsFrom(load(undefined))).toBeUndefined();
-      expect(resolveOptionsFrom(load(null))).toBeUndefined();
-      expect(resolveOptionsFrom(["./secrets.json", null, false])).toBeUndefined();
-      // A non-object fourth argument is not an options bag whatever a future Node calls it.
-      expect(resolveOptionsFrom(load("paths"))).toBeUndefined();
-    });
-
-    it("prefers the bag's own field when both spellings are present", () => {
-      // An object carrying BOTH is only reachable from a Node that changed shape mid-release or
-      // from something forging an argument list. `requireResolveOptions` wins because that is the
-      // field Node itself destructures and forwards; the outer `paths` is the bag's, not the
-      // resolver's, and honouring it would resolve against paths Node is not using.
-      const inner = { paths: ["/inner"] };
-      expect(resolveOptionsFrom(load({ requireResolveOptions: inner, paths: ["/outer"] }))).toBe(
-        inner,
-      );
-    });
-  });
-
   it.skipIf(!HONOURS_REQUIRE_RESOLVE_OPTIONS)(
     "denies the `requireResolveOptions` form exactly as it denies the plain one",
     async () => {
@@ -633,6 +740,192 @@ describe("#152 — the CJS gate and the ESM hook decide each load exactly once, 
     expect(r.stdout).toContain("BUILTIN:same-object:true");
     expect(r.stdout).toContain("BUILTIN:has-readFileSync:true");
     expect(r.stdout).toContain("BUILTIN:is-namespace:false");
+  }, 30_000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// GROUND TRUTH (#177, #178, #179, #180) — the gate decides on the filename NODE resolved.
+//
+// Four CRITICAL/HIGH findings, one root cause. The CJS half used to live inside the
+// `Module._load` wrapper and RE-RESOLVE the load from `Module._load`'s own argument list, then
+// mark the load "decided" for the dynamic extent of that call. Every input to that was the
+// caller's:
+//
+//   #177  `Module._load(secret, undefined, true)` — `isMain` waived the CJS half and the missing
+//         `parent` waived the ESM half. One line, deny-all enforce policy, ZERO decisions.
+//   #178  the fourth argument steered capwall's re-resolution to a decoy inside `node_modules`
+//         (graph-exempt) while Node opened the real file — three constructions, 22/24/26.
+//   #179  the "already decided" mark was a DEPTH COUNTER over a whole `Module._load`, and a
+//         module body runs inside one, so the identical call was allowed during module
+//         evaluation and denied after it.
+//   #180  on the `require()` side of the `resolve` hook, `parentURL` comes from the `parent`
+//         record the caller passed — so the caller chose the principal, including `<app>` and
+//         including `node_modules/impostor/`, a directory that does not exist.
+//
+// The gate is now at `Module.prototype.load`, which is handed the filename Node resolved, so
+// none of these has an input to steer. These rows run on EVERY supported Node — no feature
+// probe, no skip (#176): all four reproduce on 22.22.3 as well as on 24.18.0 and 26.5.0.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+describe("#177 — `isMain` and a missing `parent` are claims, not identities", () => {
+  it("denies `Module._load(secret, undefined, true)` and charges the calling package", async () => {
+    const r = await deny(path.join(proj, "app-gt-177.js"));
+    // The control: the ordinary spelling was always denied. That it and the bypass now agree is
+    // the property — it is what made the bypass invisible that they did not.
+    expect(r.stdout).toContain("GT:177-baseline:ERR:CapabilityError:evil");
+    expect(r.stdout).toContain("GT:177-ismain:ERR:CapabilityError:evil");
+    expect(r.stdout).toContain("GT:177-ismain-honest-parent:ERR:CapabilityError:evil");
+    expect(r.stdout).not.toContain(SECRET);
+  }, 30_000);
+
+  it("gates `new Module(f).load(f)`, which never reaches `Module._load` at all", async () => {
+    // Not in the original report, and the reason the chokepoint moved rather than being patched:
+    // a gate on `Module._load` cannot see this load even in principle.
+    const r = await deny(path.join(proj, "app-gt-177.js"));
+    expect(r.stdout).toContain("GT:177-proto-load-direct:ERR:CapabilityError:evil");
+  }, 30_000);
+
+  it("records every one of them, so `observe` and `capwall diff` see the reach", async () => {
+    // The compounding cost #123 was filed about: a policy generated from a poisoned `observe`
+    // run under-reports the package's real reach. Four distinct files, four `DENY` lines.
+    const r = await deny(path.join(proj, "app-gt-177.js"));
+    for (const target of ["gt-177-baseline", "gt-177-ismain", "gt-177-ismain2", "gt-177-proto"]) {
+      expect(r.stderr, `no decision recorded for ${target}`).toContain(`${target}.json`);
+    }
+  }, 30_000);
+});
+
+describe("#178 — Module._load's fourth argument cannot steer the decision", () => {
+  /*
+   * WHAT IS AND IS NOT VERSION-UNIFORM HERE, because getting this wrong is #176 in the other
+   * direction — an assertion that is merely TRUE ON MY MACHINE is as bad as one that skips.
+   *
+   * The DEFECT is uniform: on 22, 24 and 26, all three constructions handed the vault file's
+   * bytes to the caller with zero decisions recorded. So `not.toContain(SECRET)` is the
+   * regression signal and it is the same on every supported Node.
+   *
+   * The OUTCOME is not, and cannot be made so, because Node itself differs: `requireResolveOptions`
+   * is honoured from 24.18, so on 24/26 NODE resolves B and C to `node_modules/decoy` and opens a
+   * harmless file there, while on 22 Node ignores the field and opens the vault file. Both are
+   * correct results for the same rule — *capwall decides about the file Node opened* — and
+   * asserting `CapabilityError` for all three would be asserting a Node version, not a property.
+   * Construction A is the one that is uniform in outcome as well, and #178 calls it the important
+   * one for exactly that reason: no released Node reads `paths` off `_load`'s fourth argument, so
+   * A always resolves to the vault and must always be denied.
+   */
+  it("never hands the caller the vault file, by any of the three constructions", async () => {
+    const r = await deny(path.join(proj, "app-gt-178.js"));
+    expect(r.stdout).not.toContain(SECRET);
+    // Each construction ends in one of exactly two legitimate states: capwall denied the vault
+    // read, or Node itself resolved to the graph-exempt decoy and the caller got its harmless
+    // contents. What is excluded is the third state, which is what #178 was: the decoy decided
+    // and the vault opened.
+    for (const t of ["178-a-static-paths", "178-b-getter", "178-c-unwrap"]) {
+      expect(r.stdout, `${t} reached neither a denial nor the decoy`).toMatch(
+        new RegExp(`GT:${t}:(ERR:CapabilityError:evil|OK:\\{"harmless":true\\})`),
+      );
+    }
+  }, 30_000);
+
+  it("denies the static `paths` construction on EVERY supported Node", async () => {
+    // A needs no getter and no version knowledge, and it worked because the fallback branch #157
+    // added was forward-compatibility for a Node that does not exist — while on every Node that
+    // does, it made the gate decide about a file Node was not opening.
+    const r = await deny(path.join(proj, "app-gt-178.js"));
+    expect(r.stdout).toContain("GT:178-a-static-paths:ERR:CapabilityError:evil");
+    expect(r.stderr).toMatch(/DENY 'evil' fs:read [^\n]*[/\\]vault[/\\]gt-178-a\.json/);
+  }, 30_000);
+
+  it("never reads the caller's options bag — there is no second opinion to answer differently", async () => {
+    // #178-B was a TOCTOU: capwall read `requireResolveOptions` twice and Node read it a third
+    // time, so a getter could hand capwall a decoy and Node the real thing. The durable fix is
+    // not to snapshot the bag, it is to have no opinion about it. At most ONE read remains and it
+    // is Node's own (24.18+; on 22 Node does not look either, so the count is 0). Pre-fix this was
+    // 2 on the floor and 3 on 24/26 — so the bound catches the regression on every version
+    // without asserting which one is running.
+    const r = await deny(path.join(proj, "app-gt-178.js"));
+    const reads = Number(/GT:178-b-reads:(\d+)/.exec(r.stdout)?.[1] ?? NaN);
+    expect(
+      reads,
+      `capwall must not read the caller's options bag (${reads} total reads; >1 means capwall looked)`,
+    ).toBeLessThanOrEqual(1);
+  }, 30_000);
+
+  it("never records a decision about a file Node did not open", async () => {
+    // The half of #178 that is an AUDIT defect rather than a read: capwall's trace named the
+    // decoy, so `observe` and `capwall diff` reported a reach that had not happened and missed
+    // the one that had. A decoy load is graph-exempt, so a decision naming it is proof the gate
+    // decided about a resolution of its own.
+    //
+    // HONEST ABOUT WHAT THIS ROW IS: unlike the other ten in this section it also passes against
+    // the PRE-FIX build, because there the decoy resolution was graph-exempt and therefore
+    // recorded nothing at all — the audit defect was the silence, which the row above pins. This
+    // is a forward guard: a future gate that reintroduces a second resolution would most likely
+    // reintroduce it against a path that IS out of graph, and this is what would fail then.
+    const r = await deny(path.join(proj, "app-gt-178.js"));
+    expect(r.stderr).not.toMatch(/fs:read [^\n]*decoy/);
+  }, 30_000);
+});
+
+describe("#179 — the same call decides the same way inside and outside a module body", () => {
+  it("denies during module evaluation exactly as it denies after it", async () => {
+    // The disarm used to belong to the ENCLOSING load, not the load being decided: `require`ing
+    // any module opened a dynamic extent that covered its whole body, which is where a
+    // supply-chain payload runs. The two rows below differ ONLY in that.
+    const r = await deny(path.join(proj, "app-gt-179.js"));
+    expect(r.stdout).toContain("GT:179-during-eval:ERR:CapabilityError:evil");
+    expect(r.stdout).toContain("GT:179-after-eval:ERR:CapabilityError:evil");
+    expect(r.stdout).not.toContain(SECRET);
+  }, 30_000);
+
+  it("records both, not just the one that happened to be outside the extent", async () => {
+    const r = await deny(path.join(proj, "app-gt-179.js"));
+    expect(r.stderr).toMatch(/DENY 'evil' fs:read [^\n]*gt-179-during\.json/);
+    expect(r.stderr).toMatch(/DENY 'evil' fs:read [^\n]*gt-179-after\.json/);
+  }, 30_000);
+});
+
+describe("#180 — the principal is the stack walk's answer, never the caller's `parent`", () => {
+  it("charges the real package for a forged `<app>` and a forged package name alike", async () => {
+    const r = await deny(path.join(proj, "app-gt-180.js"));
+    // The honest control, and the two forgeries, must be indistinguishable in the OUTCOME and in
+    // the SUBJECT. `<app>` is the trust root and short-circuits before `evaluate`, so naming it
+    // was an unlogged read; `impostor` names a directory that does not exist, so any name in the
+    // policy could be worn instead.
+    expect(r.stdout).toContain("GT:180-honest:ERR:CapabilityError:evil");
+    expect(r.stdout).toContain("GT:180-forged-app:ERR:CapabilityError:evil");
+    expect(r.stdout).toContain("GT:180-forged-impostor:ERR:CapabilityError:evil");
+    expect(r.stdout).not.toContain(SECRET);
+  }, 30_000);
+
+  it("never records a decision against a principal the caller named", async () => {
+    const r = await deny(path.join(proj, "app-gt-180.js"));
+    expect(r.stderr).not.toMatch(/DENY 'impostor'/);
+    expect(r.stderr).not.toMatch(/DENY '<app>'/);
+    expect(r.stderr).toMatch(/DENY 'evil' fs:read [^\n]*gt-180-impostor\.json/);
+  }, 30_000);
+});
+
+describe("#177 — the process entry point is a HOST fact, and every spelling of it still starts", () => {
+  // The gate now runs for the entry point too (it used to be skipped on the caller's word), so
+  // "which file is the process root" has to come from somewhere no caller can reach. Two
+  // independent sources answer it — `process.argv[1]`, and the `resolve` hook's root resolution
+  // — and these are the spellings that separate them: only the second answers the last two.
+  it("starts when the entry is spelled with its extension", async () => {
+    const r = await deny(path.join(proj, "entry-plain.js"));
+    expect(r.stdout).toContain("ENTRY:plain:OK");
+    expect(r.stderr).not.toMatch(/DENY/);
+  }, 30_000);
+
+  it("starts when the entry is spelled WITHOUT its extension — argv[1] is not the filename", async () => {
+    const r = await deny(path.join(proj, "entry-plain"));
+    expect(r.stdout).toContain("ENTRY:plain:OK");
+    expect(r.stderr).not.toMatch(/DENY/);
+  }, 30_000);
+
+  it("starts when the entry is a DIRECTORY resolved through its package.json main", async () => {
+    const r = await deny(path.join(proj, "entrydir"));
+    expect(r.stdout).toContain("ENTRY:dir-main:OK");
+    expect(r.stderr).not.toMatch(/DENY/);
   }, 30_000);
 });
 
@@ -762,6 +1055,41 @@ describe("#123 the rule itself", () => {
     expect(
       decideEsmModuleRead(snapshot({}), undefined, pathToFileURL(p("app.mjs")).href),
     ).toBeNull();
+  });
+
+  it("RECORDS that entry point as a host root, which is the CJS half's only way to know", () => {
+    // #177's two halves were symmetric claims: `isMain` on one side, "no importer" on the other,
+    // both selectable by the caller. The ESM half's version is the one that survives, because on
+    // the `import` path `parentURL === undefined` really is the host speaking — so it is not a
+    // free pass any more, it is the RECORD the CJS half consults. Nothing else can write it:
+    // every resolution a caller can drive through `Module._load` carries the `require` condition
+    // and `loader/esm-hooks.ts` declines those before this function is reached.
+    forgetHostRootTargets();
+    const entry = p("some-entry.mjs");
+    expect(isHostRootTarget(entry)).toBe(false);
+    decideEsmModuleRead(snapshot({}), undefined, pathToFileURL(entry).href);
+    expect(isHostRootTarget(entry)).toBe(true);
+    // …and a load WITH an importer records nothing, however out-of-graph it is.
+    const notARoot = p("config", "secrets.json");
+    decideEsmModuleRead(
+      snapshot({}),
+      pathToFileURL(p("node_modules", "evil", "index.mjs")).href,
+      pathToFileURL(notARoot).href,
+    );
+    expect(isHostRootTarget(notARoot)).toBe(false);
+    forgetHostRootTargets();
+  });
+
+  it("only records absolute paths, and stops recording long before the set can grow", () => {
+    // A bound, not a policy: a real process records two or three roots. Without one, anything
+    // that ever drove a parentless resolution could grow a process-lifetime Set.
+    forgetHostRootTargets();
+    recordHostRootTarget("relative/not/absolute.js");
+    expect(isHostRootTarget("relative/not/absolute.js")).toBe(false);
+    for (let i = 0; i < 100; i++) recordHostRootTarget(p(`root-${i}.js`));
+    expect(isHostRootTarget(p("root-0.js"))).toBe(true);
+    expect(isHostRootTarget(p("root-99.js"))).toBe(false);
+    forgetHostRootTargets();
   });
 
   it("takes no decision for a non-file: target — there are no bytes to read", () => {

@@ -1,7 +1,19 @@
 /**
  * CJS loader interception (the PRIMARY, first-implemented interception path).
  *
- * Approach: patch `Module._load` so that when any module requires a capability-sensitive
+ * TWO PATCHES, TWO QUESTIONS, TWO DIFFERENT LIFECYCLES — do not merge them.
+ *
+ *  1. **`Module._load`** ({@link loadPatch}) — *which SPECIFIER is this?* Routes a mediated
+ *     builtin name to its shim. Its subject genuinely is the argument list, and it STACKS,
+ *     because two installs may route to different registries.
+ *  2. **`Module.prototype.load`** ({@link moduleReadGatePatch}) — *which FILE is this?* The
+ *     module-read gate (#123). Its subject is the filename NODE resolved, which is why it cannot
+ *     live in (1): everything (1) could say about the file a load will open it would have to
+ *     reconstruct from arguments the caller supplies, and #177/#178 are what that cost. It is a
+ *     SINGLE reference-counted patch, because it evaluates a policy and two links would decide
+ *     one load twice.
+ *
+ * Approach for (1): patch `Module._load` so that when any module requires a capability-sensitive
  * core builtin, it receives capwall's SHIMMED version instead of the raw builtin.
  * Non-sensitive requires pass through untouched to keep overhead near zero.
  *
@@ -34,8 +46,8 @@
  */
 import { realModule } from "../real-builtins.cjs"; // never `import … from "node:module"` — see #78
 import { liveRegistry, popInstall, pushInstall } from "./live-context.js";
-import { defineRelinkedPatch, valueSlot } from "../lifecycle/process-patch.js";
-import { beginGatedCjsLoad, endGatedCjsLoad, guardCjsModuleRead } from "./module-read.js";
+import { defineRelinkedPatch, definePropertyPatch, valueSlot } from "../lifecycle/process-patch.js";
+import { guardCjsModuleRead } from "./module-read.js";
 import type { ShimContext } from "../shims/runtime.js";
 
 /** Core modules capwall mediates; requiring any of these returns a shim once installed. */
@@ -103,130 +115,15 @@ export interface RequirePatchHandle {
 type ModuleLoad = (this: unknown, ...args: unknown[]) => unknown;
 
 /**
- * `Module._resolveFilename`, read LIVE off the real module object — see {@link resolveQuietly}.
+ * `Module.prototype.load(filename)` — VARIADIC for the reason {@link ModuleLoad} is (#128).
  *
- * VARIADIC for the same reason {@link ModuleLoad} is (#128). Its signature has been stable at
- * `(request, parent, isMain, options)` on 20/22/23/24/26 — but the OPTIONS OBJECT IS NOT
- * `Module._load`'s fourth argument, and conflating the two is what {@link resolveOptionsFrom}
- * exists to prevent.
+ * Node's declared signature has been `(filename)` on 20/22/23/24/26 and the gate reads `args[0]`
+ * POSITIONALLY, forwarding the list verbatim, so a Node that adds a parameter changes what is
+ * forwarded without changing what is gated. A non-string first argument is treated as "nothing to
+ * decide" by {@link guardCjsModuleRead}'s `path.isAbsolute` test, which is fail-closed only in the
+ * sense that it matches what Node itself would then fail on.
  */
-type ResolveFilename = (this: unknown, ...args: unknown[]) => string;
-
-/**
- * The `options` argument Node itself hands `Module._resolveFilename`, derived from
- * `Module._load`'s own argument list.
- *
- * WHY THIS IS NOT JUST `args[3]`. `Module._load`'s fourth argument is an INTERNAL options bag
- * that Node unwraps before resolving; it is not `_resolveFilename`'s `ResolveFilenameOptions`.
- * Read from the live `lib/internal/modules/cjs/loader.js` on each binary:
- *
- *  - **Node 22** — `_load(request, parent, isMain, options)` calls
- *    `resolveForCJSWithHooks(request, parent, isMain, options.shouldSkipModuleHooks)`, whose
- *    default impl calls `Module._resolveFilename(specifier, parent, isMain)` — with NO options
- *    argument at all.
- *  - **Node ≥24.18 / 26** — the fourth argument is `CJSModuleLoadInternalOptions`, and
- *    `resolveForCJSWithHooks` destructures `{ requireResolveOptions, shouldSkipModuleHooks }`
- *    and passes `requireResolveOptions` — that field, not the bag — down to
- *    `Module._resolveFilename`.
- *
- * capwall used to forward `_load`'s whole argument list into `_resolveFilename`, which put the
- * internal bag where `{ paths, conditions }` belongs — and that was NOT merely untidy. Measured on
- * Node 24.18.0 and 26.5.0: `_resolveFilename` found no `paths` in the bag, resolution THREW,
- * {@link resolveQuietly} returned `null`, and the module-read gate (#123) read that as "nothing to
- * decide". A dependency calling
- *
- *   Module._load("./secrets.json", parent, false, { requireResolveOptions: { paths: [dir] } })
- *
- * under a DENY-ALL enforce policy got the file contents and produced ZERO decisions — nothing
- * thrown, nothing on stderr, nothing for `observe` or `capwall diff`. The ordinary three-argument
- * spelling of the identical read was denied and logged, which is precisely what kept it invisible.
- * Node 22 and earlier reject the form outright, so it never appeared on the CI matrix (#154).
- *
- * The durable rule, which is #128's one level up: a DERIVED argument is not a forwarded one.
- * Forwarding `args` verbatim to the primitive you wrapped is always right; forwarding it to a
- * DIFFERENT primitive is a claim that the two take the same arguments, and that claim needs the
- * same treatment as an arity — read it off Node, do not assert it.
- *
- * Anything that is not an object (`undefined` on the 3-argument majors) yields `undefined`,
- * which is what Node passes there too.
- *
- * THE FALLBACK IS NOT A GUESS EITHER. The object is classified by the fields it ACTUALLY has,
- * not by a Node version: a bag carrying `requireResolveOptions` is unwrapped; an object carrying
- * `ResolveFilenameOptions`' own fields (`paths` / `conditions`) IS the options and is passed
- * through; anything else — Node 22's `{ shouldSkipModuleHooks }` — contributes nothing, which is
- * exactly what Node 22 forwards. Given how this parameter has moved (see {@link ModuleLoad}), a
- * Node that hands `_load` the resolve options directly again is a live possibility, and dropping
- * a `paths` on the floor would put the gate back to deciding about a file Node is not opening.
- *
- * EXPORTED FOR TESTS, and that is a coverage decision rather than an API one (#176). The
- * end-to-end rows for this fix have to drive a real `Module._load` with the four-argument form,
- * which only Node ≥24.18 honours — so on **22.15, the declared `engines` floor**, they
- * `it.skipIf` out and `pnpm test` gave the fix zero coverage on the version the repo tells
- * adopters to run. The classification above is a pure function of `args` and is deliberately NOT
- * version-keyed, so it can be asserted on every runtime by calling it directly; that is what
- * `test/module-read.test.ts` § "the classification rule itself" does, and what lets the
- * `module-read-resolve-options-unwrapped` mutant be evidence of something on 22 instead of a
- * false `SURVIVED`. Not re-exported from `src/index.ts` and not on any `exports` path.
- */
-export function resolveOptionsFrom(args: unknown[]): unknown {
-  const internal = args[3];
-  if (typeof internal !== "object" || internal === null) return undefined;
-  const bag = internal as { requireResolveOptions?: unknown; paths?: unknown; conditions?: unknown };
-  if (bag.requireResolveOptions !== undefined) return bag.requireResolveOptions;
-  return bag.paths !== undefined || bag.conditions !== undefined ? internal : undefined;
-}
-
-/**
- * What the load described by `args` (`Module._load`'s own argument list) will resolve to, or
- * `null` when it cannot be resolved.
- *
- * WHY RESOLVE AT ALL, rather than classifying the SPECIFIER. Because the specifier is the
- * attacker's grammar and the resolved path is the ground truth — the #120/#84/#95 lesson applied
- * here before it becomes a fourth instance. A bare specifier looks like dependency-graph
- * traversal, but Node's legacy (non-`exports`) subpath resolution accepts `..` inside it; a
- * relative specifier looks like a package's own file, but `../../..` is relative too. Resolving
- * once and asking the resulting PATH which package owns it needs no model of the specifier
- * grammar at all.
- *
- * `Module._resolveFilename` is read live rather than captured, so a resolver hook (`tsx`,
- * `tsconfig-paths`, `ts-node`) that replaced it answers this question the same way it will answer
- * Node's own, one line later.
- *
- * ONE ROUTE THIS DOES NOT SEE, stated rather than implied. Since Node 22.15/23.5,
- * `Module._load` resolves through `resolveForCJSWithHooks`, so a SYNCHRONOUS
- * `module.registerHooks()` `resolve` hook that short-circuits (returns without calling
- * `nextResolve`) produces a filename `Module._resolveFilename` never computes — and the gate
- * would then decide about the default resolution rather than the one Node loads. Registering
- * such a hook is itself gated as an application-only operation (#61, `shims/module.ts`), so
- * this is a residual for the APPLICATION's own tooling, not a dependency-reachable bypass.
- *
- * COST, measured rather than asserted. Node resolves twice per load, but the second one hits
- * `Module._pathCache` (keyed by request + search paths, populated by the first). Instrumenting
- * `Module._resolveFilename` while `require`ing the whole `examples/express-app` tree: the CALL
- * count goes from 255 to 485, and the total time spent inside it does not change (~42 ms either
- * way) — the duplicate is a cache hit. An A/B of the whole `require("express")` against a build
- * without this gate is inside run-to-run variance on the same machine. Module loading is startup
- * work in any case; the per-request budget (AGENTS.md § 5) is untouched, because nothing here
- * runs per request.
- *
- * A throw means Node will throw the identical `MODULE_NOT_FOUND` a moment later. Swallowing it
- * here and delegating is what keeps the error the caller sees unchanged.
- */
-function resolveQuietly(args: unknown[]): string | null {
-  const resolve = (realModule as unknown as { _resolveFilename?: ResolveFilename })
-    ._resolveFilename;
-  if (typeof resolve !== "function") return null; // a Node without the internal — nothing to gate
-  try {
-    return Reflect.apply(resolve, realModule, [
-      args[0],
-      args[1],
-      args[2],
-      resolveOptionsFrom(args),
-    ]);
-  } catch {
-    return null;
-  }
-}
+type ModuleProtoLoad = (this: unknown, ...args: unknown[]) => unknown;
 
 /**
  * The CJS loader patch, as a shared relink chain (`lifecycle/process-patch.ts`).
@@ -248,36 +145,75 @@ const loadPatch = defineRelinkedPatch<ModuleLoad>("Module._load", {
         const reg = liveRegistry("cjs");
         if (reg.has(request)) return reg.get(request);
       }
-      // A PATH specifier is a second, previously un-gated read channel to the same bytes `fs`
-      // guards (#123): `require("/abs/secrets.json")` reads through `Module._extensions['.json']`
-      // and hands the contents back as a value. See loader/module-read.ts for which loads this
-      // takes a decision for and, more importantly, which it deliberately does not. Throws on an
-      // enforce-mode denial, BEFORE the real loader opens the file.
-      //
-      // `args[2]` is `isMain`: Node loading the process ENTRY POINT, which has no requiring
-      // package to charge and is the application by definition.
-      let decided = false;
-      if (args[2] !== true && typeof request === "string" && !realModule.isBuiltin(request)) {
-        const resolved = resolveQuietly(args);
-        if (resolved !== null) {
-          guardCjsModuleRead(ctx, resolved);
-          decided = true;
-        }
-      }
-      // Since #152 the ESM `resolve` hook is consulted for `require()` too, so it would take a
-      // SECOND decision about this same load unless it is told not to. Marked only when the
-      // decision above actually happened, so a load this gate could not resolve leaves the hook
-      // armed — see loader/module-read.ts § WHICH OF THE GATES DECIDES A GIVEN LOAD. The
-      // `guardCjsModuleRead` throw path deliberately marks nothing: nothing is delegated.
-      if (!decided) return Reflect.apply(link.next, this, args);
-      beginGatedCjsLoad();
-      try {
-        return Reflect.apply(link.next, this, args);
-      } finally {
-        endGatedCjsLoad();
-      }
+      // THE MODULE-READ GATE (#123) IS NOT HERE ANY MORE — it is on {@link moduleReadGatePatch}
+      // below, at `Module.prototype.load`. Everything this wrapper could say about the file a
+      // load will open it had to RECONSTRUCT from `args`, and `args` is the caller's, which is
+      // #177 (`isMain`) and #178 (the options bag) in one sentence. `Module._load` keeps the one
+      // job whose subject really is the argument list: routing a mediated builtin SPECIFIER to
+      // its shim.
+      return Reflect.apply(link.next, this, args);
     },
 });
+
+/**
+ * THE MODULE-READ GATE (#123), at the point Node commits to a filename.
+ *
+ * `Module.prototype.load(filename)` is called by `Module._load` once resolution has produced a
+ * concrete path, and it is what picks the extension handler that opens the file. So `filename` is
+ * NODE'S OWN resolution result. That is the whole of the fix for #177 and #178: there is no second
+ * resolution to steer, no options bag to classify, and no `isMain` to believe. See
+ * `loader/module-read.ts` § WHICH OF THE GATES DECIDES A GIVEN LOAD for the routes this was
+ * measured against on 22.22.3 / 24.18.0 / 26.5.0, including `new Module(f).load(f)`, which never
+ * reaches `Module._load` and was therefore un-gated before this.
+ *
+ * A SINGLE PATCH, REFERENCE-COUNTED (`definePropertyPatch`), where `Module._load` above STACKS.
+ * The difference is the subject. `Module._load`'s patch routes to a per-install shim REGISTRY, so
+ * two installs must both run; this gate evaluates a policy, and every guard has read the policy
+ * out of {@link liveCtx} since #87 — one box whose fields the install stack re-points. Stacking it
+ * would take two decisions for one load under a nested install: two `DENY` lines, two trace
+ * entries, two grants out of `observe`, which is exactly the duplication #152 had to design
+ * against on the ESM side.
+ *
+ * A Node with no `Module.prototype.load` is treated as "nothing to gate" rather than crashing the
+ * host process on install — the slot reads `undefined` and `definePropertyPatch` declines. That is
+ * the same contract the `_compile` gate keeps, and it is load-bearing for a preload: a capability
+ * firewall that will not let the application start has failed worse than one that under-gates.
+ */
+const moduleReadGatePatch = definePropertyPatch<ModuleProtoLoad>("Module.prototype.load", {
+  slot: valueSlot<ModuleProtoLoad>(
+    "Module.prototype.load",
+    () => (realModule as unknown as { prototype?: object }).prototype,
+    "load",
+  ),
+  build(ctx, realLoad) {
+    const patched: ModuleProtoLoad = function (this: unknown, ...args: unknown[]): unknown {
+      // Throws on an enforce-mode denial, BEFORE the extension handler opens the file. Node
+      // deletes the half-built module from `Module._cache` and re-throws to the requiring code,
+      // which is the same shape a `MODULE_NOT_FOUND` already has.
+      const filename = args[0];
+      if (typeof filename === "string") guardCjsModuleRead(ctx, filename);
+      return Reflect.apply(realLoad, this, args);
+    };
+    // Keep `.name`/`.length` faithful: `require.extensions` tooling and bundlers feature-detect on
+    // this prototype, and a wrapper that renamed the method would be a gratuitous change.
+    Object.defineProperty(patched, "name", { value: "load", configurable: true });
+    Object.defineProperty(patched, "length", { value: realLoad.length, configurable: true });
+    return patched;
+  },
+});
+
+export interface ModuleReadGateHandle {
+  uninstall(): void;
+}
+
+/**
+ * Install the module-read gate. Hand it {@link liveCtx}, never a per-install context — see the
+ * note on {@link moduleReadGatePatch} and `shims/module.ts` § `installCompileGate`, which has the
+ * identical contract for the identical reason.
+ */
+export function installModuleReadGate(ctx: ShimContext): ModuleReadGateHandle {
+  return moduleReadGatePatch.install(ctx);
+}
 
 /**
  * Patch the CJS loader to return shimmed builtins for mediated modules.
