@@ -73,10 +73,14 @@ it "will be removed in a future version of Node.js". Node's stated reason is not
 
 Measured on the real binary, not inferred. On **Node 26.5.0**, a capwall-mediated process:
 
-- prints `(node:…) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use
-  `module.registerHooks()` instead.` on **stderr, on every run**; and
-- under `--throw-deprecation`, **fails to start at all** — `install()` throws from
-  `registerEsmHook` with `code: 'DEP0205'` and the mediated app never runs.
+- prints, on **stderr, on every run**:
+
+  ```
+  (node:…) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+  ```
+
+- and, under `--throw-deprecation`, **fails to start at all** — `install()` throws from
+  `registerEsmHook` with `code: 'DEP0205'`, exit 1, and the mediated app never runs.
 
 Both matter more for capwall than they would for a library. capwall's stderr is where `DENY`
 lines live; a tool that unconditionally prints a Node deprecation warning there is training its
