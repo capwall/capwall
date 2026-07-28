@@ -141,11 +141,13 @@ corepack enable   # provides the pnpm version this repo pins
 ```
 
 `pnpm install` runs **no dependency install scripts** on a fresh clone, and says nothing about
-it. That is deliberate: pnpm 10 blocks them by default, and the one script capwall looked at
-and declined (`esbuild`'s postinstall) is recorded in `pnpm-workspace.yaml` §
-`ignoredBuiltDependencies`, which suppresses the `Ignored build scripts:` warning. Nothing
-needs approving. If you ever *do* see that warning, a new package brought a new install script
-in — read `pnpm-workspace.yaml`'s header before adding it to the list.
+it. That is deliberate, and since the vite 8 bump it is also literal: no package anywhere in
+the tree declares one. pnpm 10 blocks install scripts by default, and
+`pnpm-workspace.yaml` § `ignoredBuiltDependencies` — where a reviewed-and-declined script would
+be recorded — is currently empty. Nothing needs approving. If you ever *do* see
+`Ignored build scripts:`, a new dependency brought a new install script in; read
+`pnpm-workspace.yaml`'s header before adding it to the list, because doing so is a security
+decision rather than a build fix.
 
 ```bash
 # 1. Build capwall from a clone (there is no published package yet — see the note above).
