@@ -383,6 +383,10 @@ Two measurement choices worth knowing before quoting a number out of it:
 - **`cpu` is the child's own `process.cpuUsage()`** at the same instant, which counts the ESM
   loader thread's work as well as the main thread's. On a mediated child `cpu > wall`, and the gap
   is that thread.
+- **`--compare <other/dist/preload.js>` puts a SECOND BUILD in the same rounds** (#171). Both
+  builds are premise-checked, and their arms alternate per sample rather than occupying separate
+  blocks of wall-clock time — which is how #150 and #152 were measured, and which on a contended
+  box lets the block structure outweigh the change. See § Bundling `dist` for what that cost.
 
 It deliberately does **not** gate. Startup is a machine-dependent wall-clock number and gating on
 one is the flake generator AGENTS.md § 7 forbids; #167 is where the gate question lives, and a
@@ -591,10 +595,10 @@ a cold process, min of 7:
 capwall ships 35 on the main thread and ~10 more on the loader thread. That is the largest
 remaining capwall-side term in § Startup after #78's capture and the undici materialization, and
 unlike those two it is not bought by a guarantee — it is bought by the source layout. Bundling
-`dist` would collect it, and is emphatically not a drive-by: `real-builtins.cts` has to stay a
-separate CJS module for #78's proof to mean anything, and `test/esm-hook-graph.test.ts` holds the
-loader thread's graph in place with a *static scan of the import graph* that a bundle would
-invalidate. Filed as **#171** with these numbers rather than attempted.
+`dist` would collect it. Filed as **#171** with these numbers rather than attempted; § Bundling
+`dist` below is the answer, which is that it collects about what this predicts and is declined
+anyway, for reasons that only showed up once a bundle actually ran.
+
 ## After #152 — `module.registerHooks()`, and the loader thread is gone
 
 #150 shaved capwall's own graph off the loader thread. **#152 removed the thread.** The ESM path
@@ -764,6 +768,161 @@ recovers **~34 ms of zod 4's ~80 ms** on a warm cache (45.4 ms vs 79.7 ms p50, s
 ~6 ms of zod 3's, so it narrows the gap rather than closing it. It also makes a security tool's
 preload write bytecode into a cache directory in the target's environment, which is a decision
 with a threat-model paragraph attached and not a line in a dependency bump. Filed separately.
+
+## Bundling `dist` — the ~15 ms is real, and it is declined (#171)
+
+§ What none of this touches prices capwall's 35-module main-thread graph at ~15–18 ms of pure
+resolution, and says a bundle would collect it. **It does: measured at ~9–24 ms.** It is declined
+anyway, and the reasons are not the two the issue predicted — they only appeared once a bundle was
+actually built and run.
+
+### The prototype, and what it recovered
+
+`rollup` 4.62.3 (MIT, dev-only) over the built `packages/core/dist`, `real-builtins.cjs` and
+`@capwall/policy-schema` external, two entry points. **capwall's 35 ES modules collapse to two
+chunks**: `index.js` (33 modules, 499 KiB) and `preload.js` (2 modules, 13 KiB).
+
+Measured with `pnpm bench:startup --compare <other>/dist/preload.js`, which this PR added for
+exactly this and which is the reproducible half of the result:
+
+```
+node scripts/bench/startup.mjs --rounds 25 \
+  --node ~/.nvm/versions/node/v24.18.0/bin/node \
+  --compare packages/core/dist-bundled/preload.js
+```
+
+`--compare` puts both builds' mediated arms in the **same round**, so they alternate per sample
+under the existing ABBA order and share the machine's mood. That matters more than it sounds:
+#150 and #152 were measured by swapping the two builds' `dist` trees on disk between whole
+harness runs, which leaves each build's samples contiguous in wall-clock time. Done that way here,
+on a box at loadavg ~3.5, the `CAPWALL_ESM=0` arm moved by −6 ms on Node 22 and −18 ms on Node 24
+for a change that is identical on both — i.e. the block structure was worth more than the signal.
+Per-sample interleaving collapsed that spread. Min of 25 rounds, 5 arms, both builds premise-
+checked independently.
+
+| Node | arm | unbundled | bundled | Δ |
+|---|---|---|---|---|
+| 22.22.3 | mediated, esm ON — capwall's own cost | 149.8 ms | **125.5 ms** | **−24.3** |
+| | `CAPWALL_ESM=0` | 148.3 | 133.1 | −15.1 |
+| | bare node (control) | 35.7 ms absolute, both arms | | |
+| 24.18.0 | mediated, esm ON — capwall's own cost | 156.4 ms | **139.8 ms** | **−16.6** |
+| | `CAPWALL_ESM=0` | 152.7 | 142.1 | −10.6 |
+| | bare node (control) | 38.2 ms absolute, both arms | | |
+| 26.5.0 | mediated, esm ON — capwall's own cost | 147.6 ms | **138.7 ms** | **−8.9** |
+| | `CAPWALL_ESM=0` | 140.0 | 128.0 | −12.0 |
+| | bare node (control) | 36.5 ms absolute, both arms | | |
+
+Read the two treatment rows together, per § zod 4's rule: this is a MAIN-thread change, so
+`CAPWALL_ESM=0` is a second treatment arm and not a control — it must move by about the same
+amount, and it does. `bare node` is the only control, and it is the same binary in both arms.
+The six deltas average **−14.6 ms**, on a capwall cost of 140–156 ms: **~9%**, and squarely
+inside the 15–18 ms § What none of this touches predicted from the synthetic barrel.
+
+So the ceiling is confirmed. What follows is why it is not taken.
+
+### Three things a bundle changes that no bundler flag controls
+
+**1. Two path-derived security constants silently change meaning.** `CAPWALL_ROOT` is computed
+twice — in `attribution/index.ts` and in `loader/module-read.ts` — as
+`path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")`. Emitted at
+`dist/attribution/index.js` that is `<package>/dist`. Emitted from a bundle at `dist/index.js` it
+is `<package>` — one level up. Attribution then treats **every frame under the package root** as
+capwall's own machinery and skips it; the #123 module-read trust root widens the same way. In this
+repository that charges real dependencies to `<unknown>`, and **84 tests fail** with
+`attribution hit the 25-frame budget and fell back to '<unknown>'`.
+
+The fix is one character (`".."` → `"."` plus a bundler that knows it). The finding is not the fix:
+**in the published layout the same change is silent**, because `node_modules/@capwall/core/..` has
+nothing in it but capwall's own files, so the widened predicate never matches anything it should
+not. It was caught here only because this repo happens to keep `test/fixtures/` one level above
+`dist`. Nothing in the repo asserts either constant's value. A security predicate whose value is a
+function of which directory the build tool put a file in is the "breaks nothing and fails nothing"
+shape that #150's and #152's mutants exist for — and there is no mutant for this one because
+until a bundler existed there was nothing that could move it.
+
+**2. capwall generates source code containing a resolvable path, and that file therefore cannot be
+bundled.** `loader/esm-hook.ts` computes
+
+```js
+const here = path.dirname(fileURLToPath(import.meta.url));
+bridgeUrl: pathToFileURL(path.join(here, "esm-runtime.js")).href,
+```
+
+and writes `bridgeUrl` into the source of **every synthetic mediated-builtin module** the `load`
+hook returns. Bundled, `here` is `dist` instead of `dist/loader`, so the first `import("node:dgram")`
+dies with `ERR_MODULE_NOT_FOUND: .../dist/esm-runtime.js imported from capwall-esm:node:dgram`.
+Measured, not reasoned about.
+
+`esm-runtime.js` must therefore stay a separately emitted file at a stable path — **and must not
+ALSO be inlined into the bundle**, because `pushEsmContext`/`popEsmContext` maintain a context
+stack that the hook pushes onto and the synthetic module pops from. Two copies is not a slow ESM
+perimeter, it is a split-brain one, and the missing-context direction is the permissive one. A
+correct bundle needs `esm-runtime.js` as a third entry point and needs to get that right; nothing
+would fail if it did not, which is the same objection as (1).
+
+**3. `@capwall/policy-schema` cannot be inlined either.** The first prototype did inline it, and
+`bench:startup`'s premise check killed the run:
+`Cannot find package 'zod' imported from @capwall/core/dist/index.js`. Bundling a workspace
+dependency hoists **its** dependencies into the bundling package's resolution scope, and under
+pnpm's strict layout `@capwall/core` cannot see `zod` — it is `@capwall/policy-schema`'s
+dependency. Making it work means declaring `zod` a direct runtime dependency of `@capwall/core`,
+which changes the published dependency graph and the one-command licence audit
+(`pnpm --filter '@capwall/*' licenses list --prod`). So the bundle can only ever collect capwall's
+own 33 modules; policy-schema's 3 and zod's 79 stay where they are. The ~62 ms zod costs — **four
+times what bundling recovers** — is untouched by any of this.
+
+### And the ordinary work, for completeness
+
+- **Source maps do not chain for free.** rollup does not read the input `.js.map` files, so the
+  emitted map's `sources` are `../dist/*.js` — the `tsc` intermediate. Under `files: ["dist","src"]`
+  with the per-module `.js` removed, that is **30 dangling references** and
+  `scripts/check-tarball-sources.mjs` (#126) fails by construction. Fixable with a hand-written
+  `load()` plugin that returns the sibling map, which is one more piece of custom machinery between
+  `src/` and what ships.
+- **#78's boundary changes from language-enforced to config-enforced.** Today `real-builtins.cts`
+  cannot be inlined into ESM `tsc` output — the module systems are different and `tsc` emits two
+  files. With a bundler it stays separate because one predicate in a build script says
+  `external: id.endsWith(".cjs")`. (In the prototype it held: `import { realFs, … } from
+  './real-builtins.cjs'` is the FIRST statement of both emitted chunks, hoisted above every other
+  import, which is if anything a stronger ordering than today's. That is not the point — the point
+  is that the guarantee now depends on a line nothing tests.) A landable PR needs a new gate over
+  the *emitted* output, asserting the capture import is first and that no chunk statically imports
+  a mediated builtin.
+- **Two tests resolve deep `dist` paths** and would need re-pointing at `dist/index.js`:
+  `test/esm-hook-graph.test.ts`'s fixture imports `dist/policy/load.js`, and
+  `test/linked-packages.test.ts` resolves `dist/attribution/index.js`. Both are one-liners.
+- **The `.d.ts` tree stays unbundled** (TS 7 ships no programmatic API, so there is no `.d.ts`
+  bundler here), leaving `dist` with a per-module declaration tree whose sibling `.js` files no
+  longer exist.
+
+### The issue's own two collisions, corrected
+
+#171 was filed against `test/esm-hook-graph.test.ts`'s **static scan of the loader thread's import
+graph**. That scan no longer exists: #152/#173 moved the hooks to `module.registerHooks()`, which
+runs them in this realm, and both scans — the zod ban and the narrow per-builtin captures — were
+deleted with the thread they guarded. What is left in that file is #167's **zod-resolve budget**,
+and a bundle does not move it: zod stays external, the count stays 180, and only the fixture's
+`import` needs re-pointing. So one of the two stated blockers is stale, and the other (#78) turned
+out to be the easy one.
+
+### The decision
+
+**DECLINED.** ~14 ms, ~9% of capwall's startup cost, in exchange for making three run-time
+behaviours depend on which directory a build tool decided to put a file in — two of them security
+predicates, and one of them silent in the published layout, where it matters and where no test
+runs. Against that, the artifact itself: `dist` today is `tsc` output, near enough a 1:1
+transliteration of the `src/` that ships beside it (#126), so an auditor can diff them by eye. A
+bundle makes the executing artifact a machine-rewritten concatenation whose correspondence to
+`src` can only be checked by trusting rollup or re-running it — in a tool whose entire argument is
+that a build-time dependency is attack surface.
+
+The largest remaining term is still zod, at ~62 ms, and none of this reaches it.
+
+**If this is revisited**, the checklist is the six items above, and the first thing to do is not to
+write a bundler config: it is to make `CAPWALL_ROOT` and `bridgeUrl` independent of the emitting
+file's directory, and add a test that asserts each one's value. Both are worth doing on their own
+merits — they are load-bearing constants with no coverage — and until they are, a bundle cannot be
+proven safe rather than merely observed to pass.
 
 ## Where the budget does not hold
 

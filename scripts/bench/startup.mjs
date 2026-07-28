@@ -61,7 +61,16 @@
  *   node scripts/bench/startup.mjs --quick          # 8 rounds
  *   node scripts/bench/startup.mjs --compile-cache  # + the NODE_COMPILE_CACHE arms
  *   node scripts/bench/startup.mjs --node /path/to/node   # measure a different Node
+ *   node scripts/bench/startup.mjs --compare /path/to/other/dist/preload.js
  *   node scripts/bench/startup.mjs --json
+ *
+ * `--compare` is how two BUILDS are put against each other, and it exists because the obvious
+ * alternative is worse. #150 and #152 were measured by swapping the two builds' `dist` trees on
+ * disk between whole harness runs, which leaves each build's samples contiguous in wall-clock
+ * time — fine on an idle box, and on a contended one it measures the machine's mood. Pointing
+ * this flag at a second `preload.js` adds that build's two mediated arms to the SAME round, so
+ * the two builds alternate per sample under the existing ABBA order. Both builds are premise-
+ * checked independently. Used for #171 (bundling `dist`); see README.md § Bundling `dist`.
  *
  * Exits non-zero if a premise check fails. It does NOT gate on a threshold: startup is a
  * machine-dependent number and a CI gate on it would be a flake generator. Dependency-free, on
@@ -91,6 +100,7 @@ const ROUNDS = Number(opt("rounds", has("quick") ? "8" : "20"));
 const WITH_CACHE = has("compile-cache");
 const JSON_OUT = has("json");
 const VERBOSE = has("verbose");
+const COMPARE = opt("compare", undefined);
 
 function fail(msg) {
   process.stderr.write(`\n[startup] FAIL: ${msg}\n`);
@@ -99,6 +109,9 @@ function fail(msg) {
 
 if (!fs.existsSync(PRELOAD)) {
   fail(`${PRELOAD} not found — run "pnpm build" first (see scripts/bench/README.md).`);
+}
+if (COMPARE !== undefined && !fs.existsSync(COMPARE)) {
+  fail(`--compare ${COMPARE} not found. It must be a built preload.js of the OTHER build.`);
 }
 
 /**
@@ -143,6 +156,17 @@ const arms = [
   },
   { name: "mediated, esm ON", mediated: true, opts: [preloadOpt], env: {} },
 ];
+
+// `--compare` adds the OTHER build's two mediated arms to the same round. No second bare-node
+// arm: `node -v` is the same binary in both, so one control covers both builds — and a second
+// one would only invite reading a delta between two identical things as signal.
+if (COMPARE !== undefined) {
+  const compareOpt = `--import ${pathToFileURL(path.resolve(COMPARE)).href}`;
+  arms.push(
+    { name: "B: CAPWALL_ESM=0", mediated: true, opts: [compareOpt], env: { CAPWALL_ESM: "0" } },
+    { name: "B: mediated, esm ON", mediated: true, opts: [compareOpt], env: {} },
+  );
+}
 
 if (WITH_CACHE) {
   // NODE_COMPILE_CACHE is Node's own env channel (>=22.1) and needs nothing from capwall — see
