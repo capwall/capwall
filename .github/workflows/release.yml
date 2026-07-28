@@ -23,6 +23,13 @@
 #     `--publish-list` — one list, not two that can drift. @capwall/sbom-import is held back
 #     today; see docs/releasing.md § What is published for why.
 #
+#  4. EVERY `uses:` IS PINNED TO A COMMIT SHA (issue #168). ci.yml's header has the reasoning
+#     and the two `gh api` commands that resolve and round-trip a pin. It matters more here
+#     than there: this is the workflow that holds `id-token: write` and publishes to npm, so a
+#     moved tag on any of these four actions is code with an OIDC token in reach. The versions
+#     themselves are UNVERIFIED — Actions is billing-blocked (#3) and `pnpm ci:local` does not
+#     run actions, only steps. Rehearse with `dry_run` before trusting any of it.
+#
 # npm publishes are effectively permanent (the unpublish window is 72 hours and narrow even
 # inside it). Rehearse with the `dry_run` input before tagging anything.
 
@@ -53,11 +60,11 @@ jobs:
         # than CI is a release nobody checked on the versions `engines` claims to support.
         node-version: [22, 24, 26]
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
           version: 11
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: pnpm
@@ -81,9 +88,9 @@ jobs:
       contents: read
       id-token: write # required for npm trusted publishing (OIDC) and provenance
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
           version: 11
 
@@ -91,7 +98,7 @@ jobs:
       # depend on which Node packs them, but "whatever the active LTS is" is the least
       # surprising thing for a released artifact to have been built on. `verify` above is what
       # covers the whole supported range.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: pnpm
@@ -154,8 +161,18 @@ jobs:
       - name: "Assert every source map resolves inside its own tarball"
         run: node scripts/check-tarball-sources.mjs dist-tarballs/*.tgz
 
+      # A BUILD RECORD, NOT A HANDOFF. Nothing downloads this — there is no `download-artifact`
+      # anywhere in this repository, and `publish` packs, checks and publishes in this same job.
+      # That is worth stating because it is the assumption behind bumping this action across
+      # three majors without being able to run it: the v4 artifact-semantics change that broke
+      # so many workflows broke *upload/download pairs*, and there is no pair here. If a future
+      # revision splits packing and publishing into two jobs, this line stops being low-risk.
+      #
+      # v7 adds an `archive:` input (single-file, unzipped uploads). It is NOT set: `path` is a
+      # glob that resolves to four tarballs, and `archive: false` fails on multi-file globs. The
+      # default (true) is the v4 behaviour this step has always had.
       - name: Upload tarballs as a build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: capwall-tarballs
           path: dist-tarballs/*.tgz

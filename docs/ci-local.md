@@ -65,7 +65,16 @@ Node 20 went **EOL on 2026-04-30** and is no longer tested or supported.
 
 **Node 26 needs one thing the others do not.** Corepack was unbundled from Node in 25, so the
 `node:25`/`node:26` images have no `corepack` on `PATH` and `ci.Dockerfile` installs it from npm
-when it is missing. `ci.yml` is unaffected — `pnpm/action-setup@v4` installs pnpm directly.
+when it is missing. `ci.yml` is unaffected — `pnpm/action-setup` installs pnpm directly.
+
+**What this script does NOT reproduce, and it is the whole of `.github/workflows/`'s dependency
+surface.** `ci:local` runs the *steps* in a container: install, build, typecheck, test, lint,
+bench:gate. It never runs `actions/checkout`, `actions/setup-node`, `pnpm/action-setup` or
+`actions/upload-artifact` — it checks out nothing, installs no toolchain through an action, and
+uploads no artifact. So a green matrix here says exactly nothing about the four `uses:` lines in
+each workflow, which since #168 are SHA-pinned and, while Actions billing is blocked (#3),
+entirely unexercised. "A green run here is a green CI run" is a claim about capwall's code, not
+about the workflow files.
 
 Each version builds `.devcontainer/ci.Dockerfile` and runs, in order: `pnpm install --frozen-lockfile=false` → `build` → `typecheck` → `test` → `lint` → `bench:gate`. **A green build == a green CI run for that Node version.** The script exits non-zero if any gate fails on any version, so it can gate a merge.
 

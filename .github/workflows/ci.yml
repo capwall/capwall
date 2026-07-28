@@ -1,3 +1,29 @@
+# EVERY `uses:` IN THIS REPO IS PINNED TO A COMMIT SHA, NOT A TAG (issue #168).
+#
+# A tag is mutable — the owner of the action repository can move it, and anyone who compromises
+# that repository can move it for them. capwall's whole argument is that a dependency is attack
+# surface; a floating `@v7` in the workflow that builds and publishes it would be that argument
+# not applied to itself. The trailing `# vX.Y.Z` comment is what makes the pin readable and is
+# the form Dependabot writes and updates, if it is ever turned on here.
+#
+# TO CHANGE ONE, RESOLVE THE SHA — do not hand-copy it from a README:
+#
+#   gh api repos/actions/checkout/git/ref/tags/v7.0.1 --jq '.object.sha'
+#   # if `.object.type` is "tag" (annotated, e.g. pnpm/action-setup), dereference it:
+#   gh api repos/pnpm/action-setup/git/tags/<sha> --jq '.object.sha'
+#
+# and confirm it round-trips before committing:
+#
+#   gh api repos/<owner>/<repo>/git/matching-refs/tags/<vX.Y.Z> --jq '.[].ref'
+#
+# NONE OF THE ACTION VERSIONS BELOW HAVE BEEN EXERCISED. GitHub Actions is billing-blocked
+# (issue #3), so no workflow in this repository has run since long before these were bumped.
+# `pnpm ci:local` reproduces the STEPS in a container; it never touches `checkout`,
+# `setup-node`, `pnpm/action-setup` or `upload-artifact`. A green local matrix says nothing
+# about the four lines below. They were chosen by reading each project's release notes for the
+# majors crossed — see the PR for #168 — which is exactly the "read, not measured" standard
+# #153 and #157 exist to reject, and is the best available until #3 is unblocked.
+
 name: CI
 
 on:
@@ -23,15 +49,31 @@ jobs:
         # breaks, and 26 is where a removed one does. Do not narrow this to a single version.
         node-version: [22, 24, 26]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # pnpm/action-setup v6 IS THE FIRST RELEASE THAT DECLARES pnpm 11 SUPPORT, and this repo
+      # is `packageManager: pnpm@11.17.0`. The v4 pin here predates pnpm 11 entirely, so this
+      # is the one bump in this file with a concrete reason beyond currency.
+      #
+      # `version: 11` is kept rather than dropped. The action can read `packageManager` from
+      # the root package.json when `version` is omitted, but that makes the installed pnpm an
+      # implicit consequence of a field two files away; stating it keeps the workflow readable
+      # on its own. Both are the same 11.x today.
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
           version: 11
 
+      # ORDER IS LOAD-BEARING: pnpm must be on PATH before setup-node runs, or `cache: pnpm`
+      # cannot find a store to key against. It already is, and stays that way here.
+      #
+      # `cache: pnpm` is stated EXPLICITLY and that matters across this bump. setup-node v5
+      # started auto-enabling the cache whenever `packageManager` is present in package.json;
+      # v6 narrowed that auto-detection to npm only. An explicit `cache:` is unaffected by
+      # either change, which is why this line is not being replaced by the newer implicit
+      # behaviour — implicit caching that silently changed scope once can change it again.
       - name: Setup Node ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: pnpm

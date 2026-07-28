@@ -18,8 +18,8 @@
         "DEBUG",
         "DEBUG_COLORS",
         "DEBUG_DEPTH",
-        "DEBUG_FD",
-        "DEBUG_SHOWHIDDEN"
+        "DEBUG_HIDE_DATE",
+        "DEBUG_SHOW_HIDDEN"
       ]
     },
     "depd": {
@@ -31,11 +31,6 @@
     "express": {
       "env": [
         "NODE_ENV"
-      ]
-    },
-    "mime": {
-      "env": [
-        "DEBUG_MIME"
       ]
     }
   }
