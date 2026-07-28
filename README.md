@@ -140,10 +140,12 @@ easy path is to let Corepack hand you the pnpm version the repo already pins
 corepack enable   # provides the pnpm version this repo pins
 ```
 
-`pnpm install` prints `Ignored build scripts: esbuild@0.28.1` on a fresh clone. That is
-expected and deliberate — capwall runs no dependency install scripts, and the ones it has
-reviewed and declined are recorded in `pnpm-workspace.yaml` § `ignoredBuiltDependencies`.
-Nothing needs approving.
+`pnpm install` runs **no dependency install scripts** on a fresh clone, and says nothing about
+it. That is deliberate: pnpm 10 blocks them by default, and the one script capwall looked at
+and declined (`esbuild`'s postinstall) is recorded in `pnpm-workspace.yaml` §
+`ignoredBuiltDependencies`, which suppresses the `Ignored build scripts:` warning. Nothing
+needs approving. If you ever *do* see that warning, a new package brought a new install script
+in — read `pnpm-workspace.yaml`'s header before adding it to the list.
 
 ```bash
 # 1. Build capwall from a clone (there is no published package yet — see the note above).

@@ -8,9 +8,12 @@ packages:
 # an open question. esbuild is a vitest transitive whose postinstall only fetches/links its
 # platform binary; nothing in this workspace needs it, and every suite passes without it.
 #
-# pnpm 10.33 prints its "Ignored build scripts" warning regardless of this list — it suppresses
-# only for scripts you APPROVE, not for ones you record as declined. So README.md § Prerequisites
-# also says the line is expected. Re-check whether the note is still needed when pnpm is bumped.
+# Recording a script here DOES suppress pnpm 10.33's "Ignored build scripts" warning — an
+# earlier revision of this comment claimed the opposite, and a fresh `node:22` container
+# disproves it: delete the entry below and the warning comes back. So a clean clone is silent,
+# and README.md § Prerequisites says so. That silence is the reason this list has to be read
+# rather than trusted: nothing on screen distinguishes "no install scripts in the tree" from
+# "one install script, declined here". Re-verify when pnpm is bumped.
 #
 # ADDING TO THIS LIST IS A SECURITY DECISION, not a build fix: an install script runs arbitrary
 # code from a dependency, before any of capwall's own mediation exists, at exactly the phase
