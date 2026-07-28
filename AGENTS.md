@@ -197,6 +197,14 @@ Do not start step *n+1* until step *n* has passing tests and a clean typecheck.
   preference, it is a 30 µs default nobody would notice.
   `evaluate()` is negligible (~125ns). Cache module→package resolution (the path→package cache
   gives ~50x cold-vs-warm).
+  **There is a second budget, on a different axis: STARTUP.** A mediated child costs ~250 ms at
+  p90 where a bare `node` costs ~48 ms, and that ~180 ms is paid once per process by every user
+  on every process they mediate. `bench.mjs` does not measure it; the breakdown is in
+  `scripts/bench/README.md` § Startup. The one thing to know before touching the install path:
+  **`module.register()` blocks the main thread while Node's loader thread resolves, compiles and
+  evaluates the hook module's entire import graph**, so an import added anywhere reachable from
+  `loader/esm-hooks.ts` is serial startup cost for every capwall user. `test/esm-hook-graph.test.ts`
+  fails on the two shapes that regress it (#150).
 - **License hygiene.** capwall is MIT. **Do NOT** pull in non-compete / source-available
   code (e.g. PolyForm-licensed Socket code). Prefer permissive (MIT/BSD/Apache-2.0) deps
   only.
