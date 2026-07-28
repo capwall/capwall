@@ -54,6 +54,68 @@ has to be findable without reading the diff.
   v20 types did not know about.
 - `.devcontainer/ci.Dockerfile` installs corepack from npm when the base image lacks it — Node
   unbundled corepack in 25, so `node:26` images have none.
+- **`zod` 3.25.76 → 4.4.3** (#161). capwall's only runtime dependency, still MIT, still with no
+  runtime dependencies of its own. No source changes and no behaviour change to policy
+  validation: every API `@capwall/policy-schema` uses survives, and #138's structural error
+  formatting is unaffected.
+
+  **It costs ~58 ms of startup, per mediated process, and that was accepted rather than
+  engineered around.** The cost is entirely zod's module graph — ~79 ES modules where zod 3
+  evaluated ~10 — plus ~11 ms building the schema tree. *Parsing is exactly as fast as before*
+  (5.87 ms vs 5.77 ms on the real policy file). Every cheaper route was measured: `zod/mini` is
+  4 ms better, `zod/v4/core` 14 ms better at the cost of the inferred types, and the CJS entry is
+  *slower*. The remaining routes all buy the milliseconds by not validating the policy at
+  startup, which is a fail-open in the component that decides what everything else may do. The
+  full breakdown, the harness and the one lever left unpulled are in
+  `scripts/bench/README.md` § zod 4. zod is still **absent from the ESM loader thread's** graph;
+  #150's guard passes unchanged.
+
+  One thing to know if you write a test against it: zod's own default message text changed
+  (`"Required"` → `"Invalid input: expected string, received undefined"`). Nothing asserts on it
+  today.
+- **TypeScript 5.9.3 → 7.0.2** (#160), the Go rewrite. One config line: `types: ["node"]` in
+  `tsconfig.base.json`, because TS 7 defaults `types` to `[]` where 5.x auto-included every
+  `@types/*` in scope. No source changes. Emit was diffed against 5.9.3 across all four packages:
+  **16 differing files out of ~200 — 15 source maps and one `.d.ts` whose only change is the key
+  order of an emitted enum object type.** `scripts/check-tarball-sources.mjs` is green on all four
+  packed tarballs (98 maps, 0 dangling), and the new maps were spot-checked against source lines
+  rather than only for existence. Note TS 7.0 ships **no programmatic API** (`import ts from
+  "typescript"` yields `{version, versionMajorMinor}`); nothing here uses it, but it forecloses a
+  `.d.ts` validation gate until 7.1.
+- **pnpm 10.33.0 → 11.17.0** (#162), now that the `>=22.15.0` floor satisfies pnpm 11's
+  `engines.node: >=22.13`. `packageManager`, both workflows' `pnpm/action-setup` pin,
+  `.devcontainer/devcontainer.json` and README § Prerequisites all move together. The lockfile
+  format is **unchanged** (`lockfileVersion: '9.0'`), verified by a from-scratch resolve with
+  both `node_modules` and `pnpm-lock.yaml` deleted.
+
+  **The install-script setting changed spelling and behaviour**, which is the thing #162 said to
+  re-check by running it. pnpm 11 removed `ignoredBuiltDependencies` (with
+  `onlyBuiltDependencies`, `onlyBuiltDependenciesFile`, `neverBuiltDependencies` and
+  `ignoreDepScripts`) in favour of one `allowBuilds` map of name → boolean — and unlike pnpm 10
+  it does **not** go quiet on a `false`: it **fails** the install with `ERR_PNPM_IGNORED_BUILDS`,
+  exit 1, until every package carrying a build script has an explicit decision. pnpm 10 printed a
+  warning above the summary; pnpm 11 will not let you scroll past it.
+
+  This composes with #165, which had just emptied the list because vite 8 removed `esbuild` — the
+  last install script in the tree — entirely. So the end state is that **neither setting appears
+  in `pnpm-workspace.yaml` at all**: there is nothing to declare, and the first dependency that
+  brings a script in fails the install rather than logging. An empty `allowBuilds: {}` was
+  considered and rejected as the same "refers to nothing" defect #165 removed. Verified in a
+  clean `node:22` container against a cold store: silent, exit 0, and pnpm does not rewrite the
+  file. README § Prerequisites describes the new failure instead of the old silence.
+
+  Both pnpm guards were re-verified under 11: `npm install` at the clone root still fails loudly
+  (#122) and `npm pack` is still refused (#116).
+- **`@types/node` stays at `^22.15.0`** (#163), matching the Node floor rather than tracking
+  `latest`. Evaluated and deliberately declined: `@types/node`'s major tracks a Node major, so
+  `^24` or `^26` would let `tsc` accept APIs the minimum supported runtime does not have,
+  silently, in a codebase whose entire job is calling Node internals that move between majors.
+  The rule is "types major == floor major", and the floor is 22.15. Demonstrated rather than
+  asserted: `new URLPattern({pathname:"/x"})` compiles clean under `@types/node` `^24` and `^26`
+  and is correctly rejected under `^22`, while `globalThis.URLPattern` is `undefined` on Node
+  22.22. (The rule is directional, not airtight — DefinitelyTyped backports some globals across
+  lines, so `^22` already types `localStorage`, which Node 22 also does not have. It moves the
+  hazard, it does not remove it.)
 
 ### Known gaps (unchanged by this release)
 

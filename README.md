@@ -127,28 +127,30 @@ tracked, and this list is a description of scope, not of progress.
 | | |
 |---|---|
 | **Node** | ≥ 22.15 (tested on 22, 24 and 26) |
-| **pnpm** | ≥ 10 — **required, not a preference** |
+| **pnpm** | ≥ 11 — **required, not a preference** |
 
 capwall is a pnpm workspace, and the root manifest has no npm `workspaces` field. `npm install`
 at the clone root therefore *succeeds* while linking none of the four packages, and the build
 then fails with `Cannot find module 'zod'` — which reads as "this project is broken" rather than
 "wrong package manager". A root `preinstall` guard now stops that with an explanation, but the
 easy path is to let Corepack hand you the pnpm version the repo already pins
-(`packageManager: "pnpm@10.33.0"`):
+(`packageManager: "pnpm@11.17.0"`):
 
 ```bash
 corepack enable   # provides the pnpm version this repo pins
 ```
 
-`pnpm install` runs **no dependency install scripts** on a fresh clone, and says nothing about
-it. That is deliberate, and since the vite 8 bump it is also literal: no package anywhere in
-the tree declares one. pnpm 10 blocks install scripts by default, and
-`pnpm-workspace.yaml` § `ignoredBuiltDependencies` — where a reviewed-and-declined script would
-be recorded — is currently empty. Nothing needs approving. If you ever *do* see
-`Ignored build scripts:`, a new dependency brought a new install script in; read
-`pnpm-workspace.yaml`'s header before adding it to the list, because doing so is a security
-decision rather than a build fix.
+`pnpm install` runs **no dependency install scripts** on a fresh clone. That is deliberate, and
+since the vite 8 bump it is also literal: no package anywhere in the tree declares one. pnpm
+blocks install scripts by default, and `pnpm-workspace.yaml` § `allowBuilds` — where a
+reviewed-and-declined script would be recorded, as `name: false` — is currently empty. Nothing
+needs approving.
 
+If a fresh install ever *fails* with `ERR_PNPM_IGNORED_BUILDS`, a new dependency brought a new
+install script in and pnpm wants a decision on it. Note that word: pnpm 11 **fails the install**
+where pnpm 10 printed a warning, so it cannot be scrolled past. Read `pnpm-workspace.yaml`'s
+header before writing an entry, because `true` there is a security decision rather than a build
+fix.
 ```bash
 # 1. Build capwall from a clone (there is no published package yet — see the note above).
 git clone https://github.com/williamzujkowski/capwall.git ~/src/capwall
