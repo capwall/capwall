@@ -24,6 +24,7 @@
     "lint": "oxlint",
     "bench": "node scripts/bench/bench.mjs",
     "bench:gate": "node scripts/bench/bench.mjs --quick",
+    "bench:startup": "node scripts/bench/startup.mjs",
     "mutation:gate": "node scripts/mutation-guard.mjs",
     "ci:local": "bash scripts/ci-local.sh",
     "ci:local:22": "bash scripts/ci-local.sh 22",

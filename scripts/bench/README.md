@@ -65,7 +65,7 @@ has roughly doubled since the harness was written.
 | `vm` / `worker_threads` gates | **no** | one `guard()` each, identical in shape to the `child_process` deny row, and the allowed form is dominated by thread/context creation. |
 | observe mode | **no** | the sink here is a no-op; a real `observe` run writes a trace line per decision, and that cost is the embedder's, not capwall's. |
 | end-to-end request latency (express-app) | **no** | still the follow-up it always was: this harness measures the shim hot path in isolation. |
-| **process startup** (loading the preload + `install()`) | **no** | a different unit — milliseconds once per process, not microseconds per call — so folding it in would put two incomparable numbers in one table. Measured separately and written down in § Startup below (#150). |
+| **process startup** (loading the preload + `install()`) | **no** — by `bench.mjs`; **yes** by `startup.mjs` | a different unit — milliseconds once per process, not microseconds per call — so folding it in would put two incomparable numbers in one table. It has its own harness, `pnpm bench:startup`; the breakdown is in § Startup below (#150) and the per-major numbers in § The ≥22.15 floor. |
 
 ## Methodology
 
@@ -346,6 +346,256 @@ dominant term is still Node starting a loader thread, and the two largest capwal
 (#78's capture and the undici materialization) are each bought by a guarantee that is worth more
 than the milliseconds.
 
+## The ≥22.15 floor — five leads, measured (#159)
+
+Dropping EOL Node 20 (#155) made a set of APIs unconditionally available that capwall was written
+without. This section is what each of them turned out to be worth. **One was taken — as a
+documented operator switch rather than as capwall behaviour — and four were rejected.** The
+rejections are the useful half: each one is a thing the next person does not have to re-derive.
+
+**Read the deltas, not the totals.** Everything below was measured on a *contended* 16-core box
+(loadavg 10–18 throughout, other suites running), so absolute figures run ~1.4x the idle numbers
+in § Startup above. The arms are ABBA-interleaved and the estimator is min-over-samples, so the
+differences survive the contention; the totals do not. Where the contention swallowed a result
+this section says so rather than rounding it into a claim.
+
+### The startup harness is committed now
+
+`scripts/bench/startup.mjs`, wired as **`pnpm bench:startup`**. The ~180 ms breakdown in § Startup
+came from a harness that was never checked in, so every claim about startup since has had to be
+taken on trust or rebuilt from scratch — twice now (#150, and again for #161's zod measurement).
+It applies the same discipline `bench.mjs` applies one level down: ABBA-interleaved arms with the
+round order reversed on odd rounds, a min estimator, `bare node` and `CAPWALL_ESM=0` as mandatory
+control rows, and — the part that matters — **a premise check before it times anything**. Every
+arm's target `require`s the granted-nothing `bench-dep-denied` fixture and attempts an `fs` read;
+the mediated arms must DENY it, with a `CapabilityError`, charged to `bench-dep-denied`; the bare
+arm must allow it and capwall must not speak. Without that, a preload that silently failed to
+install (a bad path, a policy that parsed to inert, a `--import` Node quietly ignored) is timed as
+"bare node twice" and reported as a spectacular win.
+
+Two measurement choices worth knowing before quoting a number out of it:
+
+- **The clock is read inside the child**, on the first line of the target's entry point, not
+  around `spawnSync` in the parent. Fork/exec, parent scheduling and teardown are hundreds of
+  milliseconds of variance on a loaded box sitting on top of a ~200 ms signal. The parent-side
+  figure is still recorded, and printed under `--verbose`, so the difference is visible rather
+  than argued about.
+- **`cpu` is the child's own `process.cpuUsage()`** at the same instant, which counts the ESM
+  loader thread's work as well as the main thread's. On a mediated child `cpu > wall`, and the gap
+  is that thread.
+
+It deliberately does **not** gate. Startup is a machine-dependent wall-clock number and gating on
+one is the flake generator AGENTS.md § 7 forbids; #167 is where the gate question lives, and a
+module-COUNT gate is the candidate there, not this.
+
+### 1. `module.enableCompileCache()` — real, and an operator's switch rather than capwall's
+
+**TAKEN, as documentation.** Node's on-disk V8 compile cache (`NODE_COMPILE_CACHE` since 22.1,
+`module.enableCompileCache()` since 22.8) does work on a `--import` preload: a mediated child
+populates **49 blobs / 268 KiB**, and on the next run `NODE_DEBUG_NATIVE=COMPILE_CACHE` reports
+every one of capwall's ESM modules `accepted`, on 22, 24 and 26 alike. Two entries per module,
+because the main thread and the loader thread each compile them.
+
+`pnpm bench:startup --compile-cache`, 25 rounds, two reps per major, min estimator, quoting
+**capwall's own cost** (the arm minus its matching bare-node control):
+
+| Node | arm | no cache | warm cache | |
+|---|---|---|---|---|
+| 22.22.3 | `CAPWALL_ESM=0` | 121.3 / 136.4 ms | **105.2 / 120.2 ms** | −16.1 / −16.2 |
+| | mediated, esm ON | 242.2 / 248.5 ms | 209.2 / 238.0 ms | −33.0 / −10.5 |
+| 24.18.0 | `CAPWALL_ESM=0` | 125.1 / 129.7 ms | **100.7 / 110.4 ms** | −24.4 / −19.3 |
+| | mediated, esm ON | 206.2 / 231.5 ms | 198.6 / 217.2 ms | −7.6 / −14.3 |
+| 26.5.0 | `CAPWALL_ESM=0` | 127.7 / 134.5 ms | **114.2 / 103.1 ms** | −13.5 / −31.4 |
+| | mediated, esm ON | 222.3 / 211.2 ms | 224.3 / 223.3 ms | +2.0 / +12.1 |
+
+Read that table honestly, because half of it is noise:
+
+- **The `CAPWALL_ESM=0` arm is the trustworthy row.** It moved the same direction in all six
+  runs, on all three majors, by **13.5–31.4 ms**. That arm has no loader thread, so the only
+  thing between the two columns is V8 compiling capwall's module graph.
+- **The full mediated arm did not resolve on this box.** Same change, same runs: −33.0 to +12.1.
+  The loader thread's own scheduling under loadavg 15 is larger than the effect being measured.
+  The mechanism is not in doubt — the cache demonstrably hits on that thread too — but the
+  whole-child figure is not something this machine can put a number on, and inventing one from
+  the favourable half of the runs is exactly the estimator artifact § Methodology exists to stop.
+- **The V8 component, measured directly** (a `vm.SourceTextModule` / `vm.Script` compile of every
+  file in `core/dist` + `policy-schema/dist`, 38 files / 557 KiB, min of 15 ABBA blocks):
+
+  | Node | compile, no cache | with `cachedData` | saved, per pass |
+  |---|---|---|---|
+  | 22.22.3 | 7.31 ms | 1.77 ms | 5.55 ms |
+  | 24.18.0 | 7.72 ms | 1.69 ms | 6.03 ms |
+  | 26.5.0 | 6.45 ms | 1.23 ms | 5.22 ms |
+
+  That is the *floor*, not the ceiling: it caches only what a fresh compile eagerly produces
+  (96 KiB of blobs), where a real `NODE_COMPILE_CACHE` run writes what the process actually
+  compiled (268 KiB), lazily-compiled function bodies included, and pays it twice — main thread
+  and loader thread.
+
+**Why it is documentation and not a default.** Three properties of the API, none of them about
+the measurement, and they answer #166's five bullets:
+
+1. **Process-wide, with no way off.** There is no `disableCompileCache()`. To cover capwall's own
+   graph it has to be on before capwall's first module compiles, and from that instant every
+   module the *host application* compiles is serialized to disk too. capwall is injected into
+   someone else's process through `NODE_OPTIONS`; writing that process's compiled code into a
+   directory of capwall's choosing is not a call an injected security tool makes for the host.
+2. **The cache I/O is invisible to capwall's own `fs` gate.** Verified: with `NODE_COMPILE_CACHE`
+   set and a trace file attached, a mediated run records the fixture's `fs:read` and records
+   **nothing at all** for the cache directory — the reads and writes happen natively, below the
+   JS `fs` surface capwall mediates. capwall would be causing disk activity its own control
+   cannot see or record.
+3. **Integrity is against corruption, not against an adversary.** Node stores a hash of the
+   payload in each blob's header and rejects a mismatch — verified by flipping bytes in a
+   populated cache on 22, which yields `cache hash mismatch` and a clean recompile. That is
+   Node's own non-cryptographic checksum over a file Node wrote: it stops bit rot, not someone
+   with write access to the directory. The default location is 0700 and uid-suffixed on all three
+   majors, which keeps that to the same-uid case — but it is a deserialize-and-execute path on
+   the boot line of a supply-chain firewall, and it wants an operator's yes.
+
+So the answer to "opt-in or default" is **neither: it is Node's switch, and it already works.**
+`NODE_COMPILE_CACHE=<dir> capwall enforce -- node app.js` needs no capwall code, since the CLI
+passes the environment through to the child. It is documented in `packages/core/README.md`
+§ Environment variables and in `docs/node-api-dependencies.md` § The V8 compile cache, and it
+closes #166. capwall's gates are unaffected by it: the whole suite and `bench.mjs`'s 21
+self-checks are green with the cache enabled, writing 774 blobs.
+
+### 2. `module.registerHooks()` — deliberately not here
+
+Worth ~53 ms, tracked as **#152**, and out of scope on purpose. It is the ESM perimeter where
+#59, #61 and #62 lived, and it needs its own PR with the full laundering-vector suite run against
+both paths. Nothing in this section touches `loader/`. What it *does* leave behind is a measuring
+device: `pnpm bench:startup` prices exactly the arm #152 changes, with the mediated-vs-`ESM=0`
+gap already broken out, so that work does not have to build one first.
+
+### 3. V8 across 22 → 24 → 26 — stack capture did not get cheaper, it got slightly dearer
+
+**REJECTED, and in the opposite direction from the hypothesis.** capwall's hot path is
+`Error.captureStackTrace` plus structured CallSite access, and the guess was that three majors of
+V8 might have made it cheap enough that some constant tuned in 2024 (`FAST_PATH_FRAMES`,
+`DEFAULT_MAX_FRAMES`) is now wrong in a recoverable direction. Measured with the three node
+binaries themselves ABBA-interleaved round-robin — the same discipline, one level further up,
+because otherwise this is a measurement of which version happened to run while the box was quiet:
+
+| node / stack depth below the boundary | 1f | 3f | 5f | 6f | 8f | 25f |
+|---|---|---|---|---|---|---|
+| 22.22.3, 3 below | 4.91 | 7.57 | 9.82 | 9.83 | 12.10 | 13.31 |
+| 22.22.3, 27 below | 5.18 | 7.84 | 10.93 | 11.41 | 13.85 | **34.02** |
+| 24.18.0, 3 below | 4.93 | 8.04 | 10.11 | 10.50 | 12.97 | 13.67 |
+| 24.18.0, 27 below | 5.50 | 8.48 | 11.14 | 12.50 | 15.08 | **38.09** |
+| 26.5.0, 3 below | 4.88 | 7.67 | 10.93 | 10.96 | 12.63 | 13.97 |
+| 26.5.0, 27 below | 5.64 | 8.76 | 10.79 | 11.93 | 16.40 | **39.51** |
+
+µs per capture, min over 6 interleaved rounds. The Node 22 row reproduces § Stack depth's own
+figures (~6.1 µs at 1 frame, ~7.6 at 3, ~12.2 at 6, ~37.8 at 25) closely enough to trust the
+method.
+
+Three readings, and none of them moves a constant:
+
+- **The floor rose 9%** across three majors (5.18 → 5.64 µs at one frame from a deep stack), and
+  **the deep 25-frame capture rose 16%** (34.0 → 39.5 µs). Newer V8 is not cheaper here.
+- **The marginal frame got dearer too**: (25f − 3f) ÷ 22 frames is 1.19 µs on 22, 1.35 on 24,
+  1.40 on 26. `FAST_PATH_FRAMES = 3` is therefore *better* justified than when it was chosen, not
+  worse — and raising it to 5 would cost +3.1 / +2.7 / +2.0 µs on **every** mediated call for no
+  coverage gain, since every surface but `dlopen` already sits 0 frames below its boundary and
+  `dlopen` needs 7.
+- **`DEFAULT_MAX_FRAMES = 25` stays.** Lowering it is a security change, not a perf one (a deeper
+  owner falls to `<unknown>`), and raising it only costs on the slow path. Nothing in this table
+  argues for either.
+
+The one thing that *did* change is the case for #143 itself: the boundary-frame optimization is
+worth more on 26 than it was on 22, because the frames it declines to materialize now cost more.
+
+### 4. Newer built-ins that would replace hand-rolled work — three candidates, three rejections
+
+Min over 12 blocks of 20 000 calls, per Node:
+
+| candidate | capwall today | the built-in | verdict |
+|---|---|---|---|
+| `path.matchesGlob` vs `policy/glob.ts` | **99 / 153 / 153 ns** (22/24/26) | 13 650 / 11 575 / 11 368 ns | **REJECTED — 75–110x slower**, before the semantics even come up |
+| `structuredClone` vs `shims/pin.ts` | 3 591 / 3 497 / 4 077 ns | 3 580 / 3 680 / 3 471 ns | **REJECTED — no speed to gain, and it is not the same operation** |
+| `URL.parse` vs `new URL` in `try/catch` | valid 955 / 850 / 738 ns; **invalid 9 710 / 11 006 / 11 364 ns** | valid 1 044 / 849 / 792 ns; **invalid 288 / 260 / 254 ns** | **NOT TAKEN — see below** |
+
+- **`path.matchesGlob` is the surprise.** It is two orders of magnitude slower than capwall's
+  compiled-and-cached `RegExp`, which is enough on its own for a function on the `fs` guard's hot
+  path. The semantic objection is the larger one and was the expected answer: it is a
+  minimatch-flavoured dialect, considerably richer than the one `policy/glob.ts` documents, so
+  swapping it in would silently *widen* every `fs` grant a policy author has written. Two
+  independent reasons, and the fast one is not the one that matters.
+- **`structuredClone` is not the same operation.** `pin.ts` exists to flatten own accessors to
+  data properties *losslessly* — `Reflect.ownKeys` + `defineProperty`, so non-enumerable and
+  symbol-keyed fields survive (#26/#56/#89). Measured: `structuredClone` **drops** both, and
+  throws `DataCloneError` on a bag carrying a function — which `net` and `child_process` options
+  routinely do (`lookup`, `createConnection`, `stdio`). It is also no faster. There is nothing
+  here to trade.
+- **`URL.parse` is 34–43x faster on the INVALID path only** (it returns `null` instead of
+  constructing and throwing), and identical on the valid one. The invalid path exists in
+  `shims/global-egress.ts` `targetFromHref` and two places in `shims/net.ts` — all of which reach
+  it for input Node itself is about to reject, so the caller is already broken. Left alone: the
+  `net.ts` sites have `catch` blocks covering more than the `new URL` call, and narrowing them is
+  a behaviour change on the #26/#56/#99 pin path in exchange for ~10 µs on a path a working
+  program does not take. Recorded so it is a decision rather than an oversight.
+
+Nothing else came up. `Object.groupBy`, `Set.prototype.union`/`intersection`, `Array.prototype`
+`findLast`/`toSorted`/`at` and the rest of the ES2024/2025 additions have no hand-rolled
+equivalent in `packages/*/src` — the enforcement path does very little collection work by design.
+
+### 5. undici / `globalThis.Request` materialization — re-checked, and the obvious fix is dead too
+
+**REJECTED, and now with a proof rather than a reason.** § Startup records 21 ms for undici being
+materialized by `global-egress.ts`'s capture of the real `Request.prototype.url` getter, and
+concluded it cannot be deferred without reopening the #26/#56 TOCTOU window. Two things were
+re-checked at the new floor:
+
+- **No major makes it cheaper.** Touching `globalThis.Request` in an otherwise-empty process costs
+  53 / 53 / 53 ms on 22 / 24 / 26 on this box (~21 ms idle, per § Startup). `Response`, `Headers`,
+  `WebSocket` and `FormData` are the same slot; `globalThis.fetch` is **not** — reading it costs
+  0.01 ms on every major, because Node's `fetch` global is a real function that pulls undici in
+  when it is *called*. So the cost is specifically the `Request.prototype` capture, and it is
+  unchanged from 22 to 26.
+- **The lazy-interposition idea does not work, and this is the new part.** The obvious escape is
+  to install capwall's *own* accessor on `globalThis.Request` at install time — early enough that
+  nothing can tamper before it — and let it materialize undici and capture the pristine getter on
+  the first read by anyone. That would close the TOCTOU window without paying 21 ms in a process
+  that never touches `fetch`. It does not work: **`Object.defineProperty(globalThis, "Request", …)`
+  itself materializes undici**, measured at 67 / 66 / 48 ms on 22 / 24 / 26. Every way of touching
+  that slot — a read, a `getOwnPropertyDescriptor`, or a `defineProperty` over it — triggers the
+  lazy initializer. There is no interposition that is cheaper than the capture it would defer.
+
+One thing did fall out of re-checking it, and it is a defect rather than a lead:
+**`CAPWALL_GLOBAL_EGRESS=0` does not avoid this cost.** The capture is an IIFE at module scope of
+`global-egress.ts`, which is on capwall's static graph, so the 21 ms is paid whether or not the
+guard is installed — measured at 188.98 vs 187.78 ms on 22 and 148.76 vs 159.36 ms on 26, i.e. no
+difference at all. The switch removes the control and keeps its dominant startup cost. Filed as
+**#170** rather than fixed here: moving the capture into `installGlobalEgressGuard()` is provably
+window-free for the preload path (`install()` runs before the target's entry point) and widens the
+window for an embedder who imports `@capwall/core` early and calls `install()` late, which is the
+#26/#56/#80/#97 perimeter and deserves its own PR for the same reason #152 does.
+
+### What none of this touches: the compile cache's ceiling is compile, and the cost is resolution
+
+§ Startup attributes ~40 ms to "resolving + compiling ~33 modules". The measurement above splits
+that: **compiling all of capwall's shipped JavaScript is 6.5–7.7 ms.** The rest is resolution and
+per-module loader machinery, which no compile cache touches.
+
+Priced directly — 35 trivial ES modules behind a barrel versus the identical code in one file, in
+a cold process, min of 7:
+
+| Node | 35 modules via a barrel | the same source, 1 module |
+|---|---|---|
+| 22.22.3 | 24.93 ms | 7.10 ms |
+| 24.18.0 | 21.02 ms | 5.96 ms |
+| 26.5.0 | 20.40 ms | 5.60 ms |
+
+~15–18 ms, or ~450–500 µs per module, that exists only because the graph has 35 nodes in it.
+capwall ships 35 on the main thread and ~10 more on the loader thread. That is the largest
+remaining capwall-side term in § Startup after #78's capture and the undici materialization, and
+unlike those two it is not bought by a guarantee — it is bought by the source layout. Bundling
+`dist` would collect it, and is emphatically not a drive-by: `real-builtins.cts` has to stay a
+separate CJS module for #78's proof to mean anything, and `test/esm-hook-graph.test.ts` holds the
+loader thread's graph in place with a *static scan of the import graph* that a bundle would
+invalidate. Filed as **#171** with these numbers rather than attempted.
+
 ## Where the budget does not hold
 
 `{...process.env}` — the shape `dotenv`, config loaders and Node's own spawn use — runs the env
@@ -454,9 +704,11 @@ covers it on Node 22, 24 and 26. `CI_BENCH=0 pnpm ci:local` skips it.
 
 ```
 scripts/bench/
-  bench.mjs                                          the harness ("pnpm bench")
+  bench.mjs                                          the per-CALL harness ("pnpm bench")
+  startup.mjs                                        the per-PROCESS harness ("pnpm bench:startup")
   fixtures/node_modules/bench-dep/index.js           granted fixture dependency (CJS arms)
   fixtures/node_modules/bench-dep/esm.mjs            the ESM arm, imported under two URLs
   fixtures/node_modules/bench-dep-denied/index.js    granted-nothing twin (deny-path arms)
+  fixtures/startup-app.cjs                           startup.mjs's target: the clock + the premise check
   README.md                                          this file
 ```

@@ -95,6 +95,31 @@ same table lives in `src/preload.ts`'s header, which is the authority; if the tw
 `preload.ts` is right. Note that `CAPWALL_*` keys are never gated or recorded by the `env` shim
 (they are capwall's own plumbing, not the target's environment).
 
+#### `NODE_COMPILE_CACHE` — Node's, not capwall's, and worth setting
+
+capwall costs a mediated process ~180 ms of startup, most of it module loading
+([`scripts/bench/README.md` § Startup](../../scripts/bench/README.md)). Node's own on-disk V8
+compile cache recovers a slice of that, and it needs no capwall code at all — the CLI passes the
+environment through, so it applies to capwall's graph and the app's alike:
+
+```sh
+NODE_COMPILE_CACHE="$PWD/node_modules/.cache/node" capwall enforce -- node app.js
+```
+
+Measured across the three supported majors it is worth **~7–15 ms on Node 22 and ~15–35 ms on 24
+and 26** off a mediated child, growing with the V8 in the release; the per-arm table is in
+`scripts/bench/README.md` § The V8 compile cache, and `pnpm bench:startup --compile-cache`
+re-derives it. capwall's gates are unaffected: the suite and the benchmark's 21 self-checks are
+green with it on.
+
+**capwall does not turn it on for you, and that is deliberate.** It is process-wide with no way
+to switch off, so enabling it writes the *host application's* compiled code to disk as well as
+capwall's — a side effect an injected security tool does not get to choose on the host's behalf.
+Its reads and writes are also performed below the JS `fs` surface, so they are the one class of
+disk activity capwall would be causing that its own `fs` gate cannot see or record. Both points,
+and the cache-integrity question, are in
+[`docs/node-api-dependencies.md` § The V8 compile cache](../../docs/node-api-dependencies.md).
+
 ### Hardened mode (`hardened: true` / `CAPWALL_HARDENED=1`)
 
 capwall's shims are ordinary mutable objects by default, so a dependency can do

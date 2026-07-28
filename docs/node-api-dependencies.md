@@ -56,6 +56,7 @@ changelog summary. See § Reproducing the measurement.
 | `globalThis.fetch` / `WebSocket` / `EventSource` | The global egress guard (#80). `shims/global-egress.ts` | `fetch` documented+stable on all four; `WebSocket` global from 22; **`EventSource` is still flag-only (`--experimental-eventsource`) on 26.5** | n/a — these are the API | Egress via globals is un-gated. Each guard installs only if the global exists, so a flag-only API is picked up when the flag is on and nothing is invented when it is not |
 | `process.binding()` | **Not used.** Named in the threat model as an escape route capwall does not claim to stop | **Docs-only deprecated, DEP0111** (supports `--pending-deprecation`); unavailable under the permission model | `process.getBuiltinModule()` for the module cases | Nothing. Confirmed by a `--pending-deprecation` run of the whole suite: the only DEP0111 warnings come from `@vitest/snapshot`, a dev dependency |
 | `Module._cache`, `require.extensions` | **Not used.** Referenced only in comments explaining why the shim is a `Proxy` over the real `Module` class | `require.extensions`: docs-only deprecated, **DEP0039** | n/a | Nothing |
+| `module.enableCompileCache()` / `NODE_COMPILE_CACHE` | **Not used, deliberately.** Evaluated for startup and declined — see § The V8 compile cache below, and `scripts/bench/README.md` § The V8 compile cache | **Documented, Stability 1.2 (Release candidate)** on all three supported majors (env var since 22.1, function since 22.8) | n/a | Nothing. It is an operator's switch, and it works on capwall today with no capwall code at all |
 
 Two things capwall depends on that are ordinary public API and therefore not in this table:
 `module.createRequire()` (Stability 2) and `require()` inside `real-builtins.cts`.
@@ -191,6 +192,43 @@ including 26.5.0. The guard is therefore inert by default on every shipping Node
 `shims/global-egress.ts` installs each guard only if the global is actually present, so the
 coverage appears when the flag does. `test/global-egress-inventory.test.ts` is what catches a new
 global egress API arriving in a minor.
+
+### The V8 compile cache — available, effective, and still not capwall's to turn on
+
+`module.enableCompileCache()` and its `NODE_COMPILE_CACHE` env channel are the obvious answer to
+the ~40 ms capwall's own module graph costs at startup, and they work: measured on a mediated
+child, the cache is populated with **49 blobs / 268 KiB** and every one of capwall's ESM modules
+is reported `accepted` on the next run, on 22, 24 and 26 alike. The saving is real and grows with
+the V8 in the release — the numbers are in `scripts/bench/README.md` § The V8 compile cache.
+
+It is listed here as an API capwall deliberately does **not** rest on, for three reasons that are
+properties of the API rather than of the measurement:
+
+1. **It is process-wide and cannot be scoped or switched off.** There is no
+   `disableCompileCache()`. To cover capwall's own graph it must be enabled before capwall's
+   first module compiles, and from that moment every module the *host application* compiles is
+   serialized to disk too. capwall is injected into someone else's process through
+   `NODE_OPTIONS`; writing that process's compiled code to a directory of capwall's choosing is
+   not a decision an injected security tool gets to take on the host's behalf.
+2. **The cache I/O is invisible to capwall's own `fs` gate.** Verified: with
+   `NODE_COMPILE_CACHE` set and a trace file attached, a mediated run records the fixture's
+   `fs:read` and records **nothing at all** for the cache directory. The reads and writes are
+   performed natively, below the JS `fs` surface capwall mediates, so capwall would be causing
+   disk activity that its own control can neither see nor record.
+3. **Integrity is against corruption, not against an adversary.** Node stores a hash of the
+   payload in each blob's header and rejects a mismatch — verified by flipping bytes in a
+   populated cache on 22, which produces `cache hash mismatch` and a clean recompile. That hash
+   is Node's own non-cryptographic checksum over a file Node itself wrote, so it stops bit rot
+   and does not stop anyone who can write the directory. The default location
+   (`os.tmpdir()/node-compile-cache/<version>-<arch>-<hash>-<uid>`, mode 0700, uid-suffixed on
+   all three majors) keeps that to the same-uid case, which is already lost — but it is a
+   directory capwall would be *creating*, and putting a deserialize-and-execute path on the
+   critical boot line of a supply-chain firewall wants an operator's yes, not a default.
+
+None of this is an argument against **using** it: `NODE_COMPILE_CACHE=<dir> capwall enforce -- …`
+needs no capwall code, since the CLI passes the environment through to the child. capwall's gates
+are unaffected by it — the whole suite and the benchmark's 21 self-checks are green with the cache
+enabled. That is the recommendation, and it is documented rather than defaulted.
 
 ## The one migration that matters
 
