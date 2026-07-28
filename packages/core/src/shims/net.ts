@@ -139,7 +139,11 @@ import {
   realNet,
   realTls,
 } from "../real-builtins.cjs";
-import { APP_ROOT, attributeCaller } from "../attribution/index.js";
+import {
+  APP_ROOT,
+  attributeCallerVia,
+  type StackBoundary,
+} from "../attribution/index.js";
 import { evaluate, type CapabilityRequest } from "../policy/evaluate.js";
 // #72 — IPC destinations carry their concrete socket path now, canonicalized here (once, at the
 // point of observation) exactly as `shims/fs.ts` canonicalizes an fs argument.
@@ -827,9 +831,11 @@ function resolveHttpCall(args: unknown[], defaultPort: number): ResolvedCall {
  * in ONE pass (see the module header's PINNING INVARIANT), so nothing that decided the guard is
  * ever read a second time. */
 function wrapFn(orig: AnyFn, resolve: (args: unknown[]) => ResolvedCall, ctx: ShimContext): AnyFn {
+  // `wrapped` is what a dependency holds as `net.connect`, so it is also the frame below which
+  // the caller sits — hand it to `guard` and V8 builds 3 CallSites instead of 25 (#143).
   const wrapped: AnyFn = function (this: unknown, ...args: unknown[]) {
     const call = resolve(args);
-    guard(ctx, targetRequest(call)); // throws on enforce-deny, before any socket opens
+    guard(ctx, wrapped, targetRequest(call)); // throws on enforce-deny, before any socket opens
     return orig.apply(this, call.args); // pinned clone, never the original
   };
   Object.defineProperty(wrapped, "name", { value: orig.name, configurable: true });
@@ -855,11 +861,13 @@ function guardedSubclassMethod(
   if (typeof realMethod !== "function") return RealClass;
   const Guarded = class extends RealClass {};
   Object.defineProperty(Guarded.prototype, method, {
-    value: function (this: unknown, ...args: unknown[]) {
+    // A NAMED function expression so it can hand itself to `guard` (#143): `socket.connect(…)`
+    // is the frame a dependency runs, so the caller is the frame directly below this one.
+    value: function guardedMethod(this: unknown, ...args: unknown[]) {
       const call = resolve(args);
       let forwardArgs = args;
       if (call) {
-        guard(ctx, targetRequest(call));
+        guard(ctx, guardedMethod, targetRequest(call));
         forwardArgs = call.args; // pinned clone, never the original
       }
       return (realMethod as AnyFn).apply(this, forwardArgs);
@@ -880,7 +888,7 @@ function guardedSubclassMethod(
 function wrapHttpFn(orig: AnyFn, defaultPort: number, ctx: ShimContext): AnyFn {
   const wrapped: AnyFn = function (this: unknown, ...args: unknown[]) {
     const resolved = resolveHttpCall(args, defaultPort);
-    guard(ctx, targetRequest(resolved)); // before any socket opens
+    guard(ctx, wrapped, targetRequest(resolved)); // before any socket opens
     return orig.apply(this, resolved.args); // pinned/synthesized args, never the original
   };
   Object.defineProperty(wrapped, "name", { value: orig.name, configurable: true });
@@ -892,7 +900,8 @@ function guardedClientRequestClass(RealClass: AnyCtor, ctx: ShimContext, default
   const Guarded = class extends RealClass {
     constructor(...args: unknown[]) {
       const resolved = resolveHttpCall(args, defaultPort);
-      guard(ctx, targetRequest(resolved)); // before super()
+      // `Guarded` is the constructor frame `new http.ClientRequest(…)` runs (#143).
+      guard(ctx, Guarded as unknown as StackBoundary, targetRequest(resolved)); // before super()
       super(...resolved.args); // pinned/synthesized args, never the original
     }
   };
@@ -1145,7 +1154,7 @@ export function createHttp2Shim(ctx: ShimContext): typeof import("node:http2") {
         ipcPath = p.ipcPath;
       }
     }
-    guard(ctx, targetRequest(ipc ? ipcCall(ipcPath, out) : { host, port, args: out }));
+    guard(ctx, guardedConnect, targetRequest(ipc ? ipcCall(ipcPath, out) : { host, port, args: out }));
     return realConnect.apply(this, out); // pinned authority + options, never the originals
   };
   // ISSUE #96 — every guarded wrapper capwall hands out reports the REAL function's `name`, and
@@ -1166,9 +1175,14 @@ export function createHttp2Shim(ctx: ShimContext): typeof import("node:http2") {
  * attribution no longer falls off the end of the stack into `<app>`, it returns `<unknown>`,
  * which is evaluated like any other principal. The auto-bind replay this exemption used to
  * absorb is handled properly, by state, in {@link applyAuthorizedDgramSend}.
+ *
+ * `via` is the guarded `send`/`connect` a dependency actually called — the frame below which the
+ * caller sits, so the capture materializes 3 CallSites instead of 25 (#143). It selects where V8
+ * starts building frames and nothing else: the `<app>` exemption below is still decided by the
+ * same walk over the same frames.
  */
-function guardDgram(ctx: ShimContext, host: string, port: number): void {
-  const pkg = attributeCaller(attributionOptionsFor(ctx));
+function guardDgram(ctx: ShimContext, via: StackBoundary, host: string, port: number): void {
+  const pkg = attributeCallerVia(via, attributionOptionsFor(ctx));
   if (pkg === APP_ROOT) return;
   const decision = evaluate(ctx.policy, ctx.mode, pkg, { kind: "net", host, port });
   ctx.onDecision(pkg, decision);
@@ -1377,7 +1391,7 @@ function deriveDgramConnect(args: unknown[], receiver: unknown): DgramTarget {
 function guardedDgramSend(ctx: ShimContext, realSend: AnyFn): AnyFn {
   const guarded: AnyFn = function (this: unknown, ...args: unknown[]): unknown {
     const target = deriveDgramSend(args, this);
-    if (target) guardDgram(ctx, target.host, target.port);
+    if (target) guardDgram(ctx, guarded, target.host, target.port);
     return forwardAuthorizedDgramSend(this, target, realSend, guarded, args);
   };
   // #96, same rule as every other wrapper: report the REAL method's name, whatever it is — for
@@ -1396,7 +1410,7 @@ function guardedDgramSend(ctx: ShimContext, realSend: AnyFn): AnyFn {
 function guardedDgramConnect(ctx: ShimContext, realConnect: AnyFn): AnyFn {
   const guarded: AnyFn = function (this: unknown, ...args: unknown[]): unknown {
     const target = deriveDgramConnect(args, this);
-    guardDgram(ctx, target.host, target.port);
+    guardDgram(ctx, guarded, target.host, target.port);
     return realConnect.apply(this, args);
   };
   Object.defineProperty(guarded, "name", { value: realConnect.name, configurable: true }); // #96

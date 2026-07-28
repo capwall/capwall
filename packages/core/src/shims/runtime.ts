@@ -9,9 +9,10 @@
  * mode `evaluate` always allows, so `guard` records and returns without throwing.
  */
 import {
-  attributeCallerDetailed,
+  attributeCallerDetailedVia,
   type Attribution,
   type AttributionOptions,
+  type StackBoundary,
 } from "../attribution/index.js";
 import { evaluate, type CapabilityRequest, type Decision } from "../policy/evaluate.js";
 import { CapabilityError } from "../errors.js";
@@ -242,16 +243,24 @@ export function defineGuardedClassIdentity(Guarded: AnyCtor, RealClass: AnyCtor)
  * decided the guard is handed to the real class instead of the caller's object, so nothing Node
  * reads afterwards can disagree with what was guarded. Returning nothing forwards the caller's
  * arguments untouched, which is what the pure boolean gates (`vm`, `worker_threads`) do.
+ *
+ * `check` ALSO RECEIVES THE GUARDED CLASS ITSELF, as the {@link StackBoundary} to hand
+ * {@link guard} (#143). This class IS the entry point — `new fs.ReadStream(p)` runs its
+ * constructor frame, and `class Mine extends fs.ReadStream {}` runs `Mine`'s frame directly below
+ * it — so it is the right frame to start materializing CallSites at, and it is not reachable from
+ * the call site (`Guarded` is built here). Verified on Node 20/22 that V8 accepts a class
+ * constructor as `captureStackTrace`'s `constructorOpt` and that a further subclass's own frame
+ * survives the skip, which is what keeps the caller attributable.
  */
 export function guardedConstructorSubclass<T extends AnyCtor>(
   RealClass: T,
-  check: (args: unknown[]) => unknown[] | undefined,
+  check: (args: unknown[], via: StackBoundary) => unknown[] | undefined,
   ctx: ShimContext,
 ): T {
   const Guarded = class extends RealClass {
     constructor(...args: any[]) {
       // Throws on enforce-deny, before the real constructor does anything.
-      const forwarded = check(args) ?? args;
+      const forwarded = check(args, Guarded as unknown as StackBoundary) ?? args;
       super(...forwarded);
     }
   };
@@ -513,9 +522,42 @@ export function guardedInstanceMethods<T extends object>(
  * Attribute the current caller, evaluate `req`, report the decision, and throw on an
  * enforce-mode denial. Returns the attributed package name (useful when a shim wants to log
  * or branch on it). Never throws in observe mode.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────────────────────
+ * `hideAbove` — WHERE THE STACK CAPTURE STARTS, AND WHY IT IS MANDATORY (#143)
+ * ─────────────────────────────────────────────────────────────────────────────────────────────
+ * SAME DECISION, FEWER CALLSITES BUILT. Attribution's cost is dominated by how many V8 CallSites
+ * the capture materializes — ~4 µs of floor plus ~1.4 µs per frame — and `Error.stackTraceLimit`
+ * applies AFTER `Error.captureStackTrace`'s boundary skip. So a shim that hands in its own entry
+ * frame pays for the frames BELOW it (3, of which the first is nearly always the answer) instead
+ * of the whole `maxFrames` budget (25). Measured on Node 22 that is ~38 µs against ~8 µs per
+ * mediated call, and #132 measured attribution as ~70% of capwall's added latency, so it moves
+ * every row. #133 proved the shape on the `process.env` traps; #143 pointed it at the rest.
+ *
+ * PASS THE SHIM'S ENTRY POINT — the function a dependency's own code calls (`fs.readFileSync`,
+ * `net.connect`, the guarded subclass constructor), not an inner helper. Handing in a helper is
+ * not a correctness problem (the walk skips capwall's own frames either way); it just wastes
+ * prefix budget on frames that are materialized and then discarded. See
+ * {@link attributeCallerDetailedVia} for why this is not a trust decision, not a cache, and why a
+ * boundary that is wrong or absent makes the call SLOWER and never more permissive.
+ *
+ * IT IS A REQUIRED PARAMETER, not an option with a default, because the default would be silent:
+ * a new shim that forgot it would work perfectly and cost 30 µs a call, which is exactly the kind
+ * of regression this project keeps having to re-measure to find.
+ *
+ * NOT EVERY GATE SHOULD USE THIS FUNCTION. A surface whose callers reach it through a long run of
+ * Node internals — the `dlopen` gate, where `require('x.node')` is seven `node:internal/modules/*`
+ * frames away — would DECLINE on every real call and pay the short capture on top of the full
+ * one. Those gates attribute with `attributeCallerDetailed` and come here through
+ * {@link guardAttributed} instead. The choice is measured per surface, not assumed;
+ * `scripts/bench/README.md` records the prefix depths that were measured.
  */
-export function guard(ctx: ShimContext, req: CapabilityRequest): string {
-  return guardAttributed(ctx, attributeCallerDetailed(attributionOptionsFor(ctx)), req);
+export function guard(ctx: ShimContext, hideAbove: StackBoundary, req: CapabilityRequest): string {
+  return guardAttributed(
+    ctx,
+    attributeCallerDetailedVia(hideAbove, attributionOptionsFor(ctx)),
+    req,
+  );
 }
 
 /**

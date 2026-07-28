@@ -32,6 +32,7 @@ import {
   type ShimContext,
   type ShimRegistry,
 } from "./runtime.js";
+import type { StackBoundary } from "../attribution/index.js";
 import { harden } from "./harden.js";
 
 type AnyFn = (...args: unknown[]) => unknown;
@@ -62,13 +63,16 @@ const GATED_CLASSES = ["Script", "SourceTextModule", "SyntheticModule"] as const
  * through — see the module doc comment for why those are out of scope for this gate.
  */
 export function createVmShim(ctx: ShimContext): typeof import("node:vm") {
-  function check(): void {
-    guard(ctx, { kind: "vm" });
+  // `via` is the shimmed entry point a dependency called — `vm.runInNewContext`, or the guarded
+  // `vm.Script` class. Handing it to `guard` starts the CallSite capture at the caller's own
+  // frame instead of building 25 frames' worth (#143); it is a position, never an identity.
+  function check(via: StackBoundary): void {
+    guard(ctx, via, { kind: "vm" });
   }
 
   function wrapFn(orig: AnyFn): AnyFn {
     const wrapped: AnyFn = function (this: unknown, ...args: unknown[]) {
-      check(); // throws on enforce-deny, before the real call runs
+      check(wrapped); // throws on enforce-deny, before the real call runs
       return orig.apply(this, args);
     };
     Object.defineProperty(wrapped, "name", { value: orig.name, configurable: true });
@@ -88,8 +92,8 @@ export function createVmShim(ctx: ShimContext): typeof import("node:vm") {
   function wrapClass(RealClass: AnyCtor): AnyCtor {
     return guardedConstructorSubclass(
       RealClass,
-      () => {
-        check(); // throws on enforce-deny, before super() compiles anything
+      (_args, via) => {
+        check(via); // throws on enforce-deny, before super() compiles anything
         return undefined; // nothing to pin — `vm` is a boolean gate with no target to derive
       },
       ctx, // hardened mode (#17) freezes the guarded subclass; no-op by default

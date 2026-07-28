@@ -36,3 +36,8 @@ packages/core/test/fixtures/scratch*/
 # and by the Release workflow. Never committed; the published artifact is the one CI builds.
 dist-tarballs/
 *.tgz
+
+# Benchmark scratch tree — generated CJS modules and a placeholder .node for the startup rows
+# (scripts/bench/bench.mjs, issue #134). Created per run, removed at teardown; only left behind
+# by a crashed run.
+scripts/bench/fixtures/node_modules/bench-dep/.bench-scratch/

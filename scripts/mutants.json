@@ -1,25 +1,25 @@
 {
   "_readme": [
-    "MUTATION CATALOG \u2014 the structural guard for 'tests that pass for the wrong reason' (issue #112).",
+    "MUTATION CATALOG — the structural guard for 'tests that pass for the wrong reason' (issue #112).",
     "",
     "Each entry names ONE security-critical mechanism, an exact anchor string in the source that",
     "IS that mechanism, a mutation that removes it, and the test files that CLAIM to cover it.",
     "`node scripts/mutation-guard.mjs` applies each mutation in turn, runs only the claimed tests,",
     "and reports SURVIVED for any mutant those tests still pass against. A survivor is not a bug in",
-    "the source \u2014 it is a hole in the tests, which is the thing #112 found six of.",
+    "the source — it is a hole in the tests, which is the thing #112 found six of.",
     "",
     "`packages/core/test/mutation-catalog.test.ts` runs in the ordinary `pnpm test` and asserts that",
     "every `anchor` still occurs EXACTLY ONCE in its `file`, and that every `tests` path exists. That",
     "is what keeps this catalog from rotting into a no-op: a refactor that moves a mechanism breaks",
     "the catalog loudly instead of silently turning its mutant into a no-op edit.",
     "",
-    "`needsBuild` marks mutants whose claimed tests spawn a subprocess against `dist/` \u2014 those need",
+    "`needsBuild` marks mutants whose claimed tests spawn a subprocess against `dist/` — those need",
     "a rebuild after mutating and after restoring."
   ],
   "mutants": [
     {
       "id": "glob-star-collapse",
-      "mechanism": "#21 \u2014 collapse runs of `**` segments so a glob compiles to ONE unbounded group (ReDoS hardening)",
+      "mechanism": "#21 — collapse runs of `**` segments so a glob compiles to ONE unbounded group (ReDoS hardening)",
       "file": "packages/core/src/policy/glob.ts",
       "anchor": "if (seg === \"**\" && segments[segments.length - 1] === \"**\") continue;",
       "mutation": "if (false && seg === \"**\" && segments[segments.length - 1] === \"**\") continue;",
@@ -31,7 +31,7 @@
     },
     {
       "id": "nodeglob-dotdot-fail-closed",
-      "mechanism": "#106/#120 \u2014 every segment at or after the first magic segment must be provably downward-only; anything not proven bounded is unbounded (fail closed to the filesystem root)",
+      "mechanism": "#106/#120 — every segment at or after the first magic segment must be provably downward-only; anything not proven bounded is unbounded (fail closed to the filesystem root)",
       "file": "packages/core/src/policy/glob.ts",
       "anchor": "if (!segmentIsDownwardOnly(segments[i]!)) return null;",
       "mutation": "if (false && !segmentIsDownwardOnly(segments[i]!)) return null;",
@@ -43,7 +43,7 @@
     },
     {
       "id": "nodeglob-brace-escape",
-      "mechanism": "#120 \u2014 an unbalanced brace is a construct capwall refuses to expand, so the pattern is unbounded rather than parsed optimistically",
+      "mechanism": "#120 — an unbalanced brace is a construct capwall refuses to expand, so the pattern is unbounded rather than parsed optimistically",
       "file": "packages/core/src/policy/glob.ts",
       "anchor": "if (close === -1) return null; // unbalanced open",
       "mutation": "if (false && close === -1) return null; // unbalanced open",
@@ -66,7 +66,7 @@
     },
     {
       "id": "native-two-subjects",
-      "mechanism": "#49/#99 \u2014 a `.node` load is charged to BOTH the caller and the package that owns the addon file; caller-only makes a shared resolver a skeleton key",
+      "mechanism": "#49/#99 — a `.node` load is charged to BOTH the caller and the package that owns the addon file; caller-only makes a shared resolver a skeleton key",
       "file": "packages/core/src/loader/native.ts",
       "anchor": "const subjects = caller === owner ? [caller] : [caller, owner];",
       "mutation": "const subjects = [caller];",
@@ -77,9 +77,9 @@
     },
     {
       "id": "native-filename-pin",
-      "mechanism": "#99 \u2014 the dlopen filename argument is stringified ONCE and the pinned string is forwarded, so a toString that answers twice cannot load a file the gate never saw",
+      "mechanism": "#99 — the dlopen filename argument is stringified ONCE and the pinned string is forwarded, so a toString that answers twice cannot load a file the gate never saw",
       "file": "packages/core/src/loader/native.ts",
-      "anchor": "    const converted = String(raw); // the ONE conversion \u2014 Node's `node::Utf8Value`, in JS\n    return { path: normalizeAddonPath(converted), forward: converted };",
+      "anchor": "    const converted = String(raw); // the ONE conversion — Node's `node::Utf8Value`, in JS\n    return { path: normalizeAddonPath(converted), forward: converted };",
       "mutation": "    return { path: UNKNOWN_ADDON, forward: undefined };",
       "tests": [
         "packages/core/test/native.test.ts"
@@ -88,7 +88,7 @@
     },
     {
       "id": "attribution-unattributed-not-app",
-      "mechanism": "#60 \u2014 an unattributable call charges `<unknown>`, an ordinary deny-by-default principal, and NOT the exempt `<app>` trust root",
+      "mechanism": "#60 — an unattributable call charges `<unknown>`, an ordinary deny-by-default principal, and NOT the exempt `<app>` trust root",
       "file": "packages/core/src/attribution/index.ts",
       "anchor": "  if (chain.length === 0) return UNATTRIBUTED;",
       "mutation": "  if (chain.length === 0) return APP_ROOT;",
@@ -101,7 +101,7 @@
     },
     {
       "id": "harden-freeze-namespace",
-      "mechanism": "#17 \u2014 hardened mode freezes the shim namespaces capwall hands out, so `fs.readFileSync = evil` cannot remove a guard",
+      "mechanism": "#17 — hardened mode freezes the shim namespaces capwall hands out, so `fs.readFileSync = evil` cannot remove a guard",
       "file": "packages/core/src/shims/harden.ts",
       "anchor": "  if (ctx.hardened === true) Object.freeze(o);",
       "mutation": "  if (false && ctx.hardened === true) Object.freeze(o);",
@@ -112,7 +112,7 @@
     },
     {
       "id": "harden-freeze-class",
-      "mechanism": "#17/#70 \u2014 hardened mode freezes guarded SUBCLASSES and their prototypes, closing `net.Socket.prototype.connect = evil`",
+      "mechanism": "#17/#70 — hardened mode freezes guarded SUBCLASSES and their prototypes, closing `net.Socket.prototype.connect = evil`",
       "file": "packages/core/src/shims/harden.ts",
       "anchor": "  if (ctx.hardened !== true) return;\n  if (typeof Cls !== \"function\") return;",
       "mutation": "  if (ctx.hardened !== true) return;\n  if (typeof Cls !== \"function\") return;\n  if (Cls) return;",
@@ -124,9 +124,9 @@
     },
     {
       "id": "global-egress-hardened-pin",
-      "mechanism": "#97 \u2014 a hardened install pins the capwall-installed global egress functions writable:false, even when an un-hardened install built them",
+      "mechanism": "#97 — a hardened install pins the capwall-installed global egress functions writable:false, even when an un-hardened install built them",
       "file": "packages/core/src/shims/global-egress.ts",
-      "anchor": "    slot.pin(replacement); // best-effort \u2014 a global someone made non-configurable is reported below",
+      "anchor": "    slot.pin(replacement); // best-effort — a global someone made non-configurable is reported below",
       "mutation": "    void slot; void replacement;",
       "tests": [
         "packages/core/test/global-egress.test.ts",
@@ -136,7 +136,7 @@
     },
     {
       "id": "env-authorized-key-scoping",
-      "mechanism": "#98 \u2014 the env-gate suspension during a real spawn is scoped to the exact keys Node itself reads, not a blanket 'gate off' window",
+      "mechanism": "#98 — the env-gate suspension during a real spawn is scoped to the exact keys Node itself reads, not a blanket 'gate off' window",
       "file": "packages/core/src/shims/runtime.ts",
       "anchor": "  return authorizedEnvKeys !== null && authorizedEnvKeys.has(key);",
       "mutation": "  return authorizedEnvKeys !== null;",
@@ -149,7 +149,7 @@
     },
     {
       "id": "dgram-replay-single-use",
-      "mechanism": "#60/#86 \u2014 the dgram auto-bind replay token is single-use, so a dependency that reads `socket.send` cannot keep an un-gated send around",
+      "mechanism": "#60/#86 — the dgram auto-bind replay token is single-use, so a dependency that reads `socket.send` cannot keep an un-gated send around",
       "file": "packages/core/src/shims/net.ts",
       "anchor": "      spent ||\n      this !== auth.socket ||",
       "mutation": "      this !== auth.socket ||",
@@ -158,6 +158,44 @@
         "packages/core/test/net.test.ts"
       ],
       "needsBuild": false
+    },
+    {
+      "id": "fastpath-declines-to-full-walk",
+      "mechanism": "#133/#143 — when the shortened capture reaches nothing it may believe, attribution re-runs the VERBATIM full walk; 'found nothing' is never an answer, and never the `<app>` trust root",
+      "file": "packages/core/src/attribution/index.ts",
+      "anchor": "    if (near.found !== null) return near.found;\n  }\n  return attributeCallerDetailed(options);",
+      "mutation": "    return near.found ?? { pkg: APP_ROOT, budgetExhausted: false, initiatedByNode: false };\n  }\n  return attributeCallerDetailed(options);",
+      "tests": [
+        "packages/core/test/attribution-boundary.test.ts",
+        "packages/core/test/attribution-fast-path.test.ts"
+      ],
+      "needsBuild": false,
+      "note": "The fail-open the boundary fast path could reintroduce: three nested evals fill the whole prefix with OPAQUE frames, and a decline that answers `<app>` hands the trust root to any dependency willing to call eval."
+    },
+    {
+      "id": "fastpath-min-budget",
+      "mechanism": "#133/#143 — the fast path stands down entirely below the frame budget at which 'the short capture found it' still implies 'the full capture would have found it too', rather than offering a second opinion the full walk could not reach",
+      "file": "packages/core/src/attribution/index.ts",
+      "anchor": "  if (maxFrames >= FAST_PATH_MIN_BUDGET) {",
+      "mutation": "  if (maxFrames >= 1) {",
+      "tests": [
+        "packages/core/test/attribution-boundary.test.ts",
+        "packages/core/test/attribution-fast-path.test.ts"
+      ],
+      "needsBuild": false
+    },
+    {
+      "id": "walk-skips-capwall-frames",
+      "mechanism": "#143 — capwall's OWN frames are never a principal. V8 skips them on the fast path and the walk skips them on the fallback; the two must agree, or a declined capture attributes the shim itself",
+      "file": "packages/core/src/attribution/index.ts",
+      "anchor": "    if (source.startsWith(CAPWALL_ROOT + path.sep)) continue; // capwall's own machinery",
+      "mutation": "    if (false && source.startsWith(CAPWALL_ROOT + path.sep)) continue; // capwall's own machinery",
+      "tests": [
+        "packages/core/test/attribution-boundary.test.ts",
+        "packages/core/test/attribution.test.ts"
+      ],
+      "needsBuild": false,
+      "note": "Only observable on the FALLBACK path, which is exactly why it needs a mutant: the fast path skips those frames in V8 and would hide the loss."
     }
   ]
 }

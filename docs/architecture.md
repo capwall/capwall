@@ -317,18 +317,25 @@ The implementing agent should treat these as the real work, not incidentals:
   (false-positive fatigue). Mitigations: make "add a missing capability" a one-liner,
   support staged/partial enforcement, and merge (not overwrite) on repeated observe runs.
 - **Performance (<1ms per intercepted call).** The S4 benchmark (`pnpm bench`) puts every
-  mediated surface at ~30–90 µs of added latency per interception, well inside the budget. Two
+  mediated surface at ~20–70 µs of added latency per interception, well inside the budget. Two
   corrections to what this bullet used to say, both from the broadened harness:
-  **(1) the cost is attribution-dominant after all, at realistic stack depths.** Issue #34's
+  **(1) the cost was attribution-dominant after all, at realistic stack depths.** Issue #34's
   "roughly 50/50 between the stack walk and the wrapper's dispatch" was measured from a
   three-frame stack. Attribution materializes up to `maxFrames` (25) V8 CallSites per call, so
-  the cost scales with the caller's depth: ~16 µs at depth 0, ~30 µs at the cap, which is ~70%
-  of the added latency for a call made from a realistic stack. The walk is where the headroom
-  is — and issue #133 took the first slice of it: the depth-dependence is V8 *materializing*
-  CallSites (~4 µs floor, ~1.4 µs each), and `Error.stackTraceLimit` applies after the
-  `captureStackTrace` boundary skip, so a shim that passes its own trap function as the boundary
-  can materialize 3 frames instead of 25 and get the same principal from the same walk. Only the
-  env shim opts in so far. **(2) the per-call budget does not hold where one JS call is many
+  the cost scaled with the caller's depth: ~16 µs at depth 0, ~30 µs at the cap, which was ~70%
+  of the added latency for a call made from a realistic stack. The walk was where the headroom
+  was, and issues #133 and #143 took it: the depth-dependence is V8 *materializing* CallSites
+  (~4–5 µs floor, ~1.4 µs each), and `Error.stackTraceLimit` applies after the
+  `captureStackTrace` boundary skip, so a shim that passes **its own entry frame** as the
+  boundary materializes 3 frames instead of 25 and gets the same principal from the same walk.
+  #133 did the `process.env` traps; #143 did `fs`, `net`/`http`/`https`/`http2`/`tls`/`dgram`,
+  `child_process`, the global egress guards, `vm`, `worker_threads` and the `_compile` gate —
+  measured 2.8x on `fs` at the frame cap, 1.9x on `net.connect`, 1.7–2.0x on the deny paths.
+  The one gate left on the full walk is `process.dlopen`, whose callers sit seven
+  `node:internal/modules/*` frames away, where a short prefix would decline on every real load
+  and cost the short capture on top of the full one. A short capture that reaches nothing it may
+  believe always falls back to the verbatim full walk, so a wrong or absent boundary is slower
+  and never more permissive. **(2) the per-call budget does not hold where one JS call is many
   interceptions** — `{...process.env}` costs ~2 attributions per environment variable and
   measures ~2 ms on an 81-key environment (~4.4 ms before #133, and it will not go below ~1 ms:
   both env traps must decide per key, and neither the decision nor the capture can be shared

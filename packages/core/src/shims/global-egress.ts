@@ -141,6 +141,7 @@ import {
   type AnyFn,
   type ShimContext,
 } from "./runtime.js";
+import type { StackBoundary } from "../attribution/index.js";
 import { harden, hardenClass } from "./harden.js";
 import { coercePort, snapshotUrl, stripIpv6Brackets } from "./url-snapshot.js";
 
@@ -385,7 +386,9 @@ function guardedFetch(realFetch: AnyFn, ctx: ShimContext): AnyFn {
       // No target = an inert scheme or an unparseable input: nothing to gate, and the pinned
       // argument still goes out so Node's own error is unchanged.
       if (call.target === null) return realFetch.apply(this, call.args);
-      const pkg = guard(ctx, { kind: "net", ...call.target }); // before any socket opens
+      // `wrapped` IS `globalThis.fetch` as a dependency sees it, so the caller's frame is
+      // directly below it — a 3-CallSite capture instead of 25 (#143).
+      const pkg = guard(ctx, wrapped, { kind: "net", ...call.target }); // before any socket opens
       const result = realFetch.apply(this, call.args);
       if (!isThenable(result)) return result;
       const first = call.target;
@@ -422,7 +425,12 @@ function guardedUrlClass(RealClass: AnyCtor, ctx: ShimContext): AnyCtor {
     constructor(...args: unknown[]) {
       const call = pinUrlArgument(args);
       if (call.target !== null) {
-        guard(ctx, { kind: "net", host: call.target.host, port: call.target.port }); // before super()
+        // `Guarded` is the constructor frame `new WebSocket(url)` runs (#143).
+        guard(ctx, Guarded as unknown as StackBoundary, {
+          kind: "net",
+          host: call.target.host,
+          port: call.target.port,
+        }); // before super()
       }
       super(...call.args); // pinned string, never the caller's object
     }

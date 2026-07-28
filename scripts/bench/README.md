@@ -20,7 +20,8 @@ Exits `0` on PASS, non-zero on FAIL. Deliberately dependency-free — timing is
 Two figures, and conflating them is how a benchmark tells a comfortable lie:
 
 - **Per intercepted call**, every mediated surface measured here costs tens of microseconds:
-  ~30–90 µs on a development box. That is 10–30x inside the 1ms budget, and the budget holds.
+  ~20–70 µs on a development box since #143 (~30–90 µs before it). That is 15–50x inside the 1ms
+  budget, and the budget holds.
 - **Per JS call**, one operation is not always one interception. `{...process.env}` on an 80-key
   environment is ~80 interceptions and costs **milliseconds**. A request handler that does it
   once has spent its entire per-request budget several times over.
@@ -57,11 +58,11 @@ has roughly doubled since the harness was written.
 | `Module._load` relink chain (#22) | yes | mediated and non-mediated specifiers |
 | ESM `import` path (M5, on by default) | yes | the same fixture file imported under two URLs, before and after install |
 | hardened mode (#17) | yes | a second, stacked hardened install; both arms mediated |
-| `Module.prototype._compile` gate (#93) | **no** | fires once per CJS module load, and the loader-called path is a 1-frame capture. Pairing it needs an install/uninstall per block — #134. |
-| `process.dlopen` native gate (S2) | **no** | once per `.node` addon load; no vendored addon in the bench tree — #134. |
+| `Module.prototype._compile` gate (#93) | yes (#134) | `[G]` — N generated CJS modules `require`d fresh, with the real and the patched `_compile` swapped into the prototype slot per arm |
+| `process.dlopen` native gate (S2) | yes (#134) | `[G]` — a placeholder `.node` inside the fixture package, so the gate's two subjects (#49) are one principal |
+| ESM cold resolution (loader-thread hooks) | yes (#134) | `[G]` — a fresh `?n=` URL per iteration; paired against the same import with a NON-mediated specifier |
 | `node:module` loader-hook registration gate (#61) | **no** | once per process. |
 | `vm` / `worker_threads` gates | **no** | one `guard()` each, identical in shape to the `child_process` deny row, and the allowed form is dominated by thread/context creation. |
-| ESM cold resolution (loader-thread hooks) | **no** | startup cost, not per-request — #134. |
 | observe mode | **no** | the sink here is a no-op; a real `observe` run writes a trace line per decision, and that cost is the embedder's, not capwall's. |
 | end-to-end request latency (express-app) | **no** | still the follow-up it always was: this harness measures the shim hot path in isolation. |
 
@@ -113,6 +114,13 @@ object itself, so an "un-mediated" arm that reaches an env read through Node's o
 (`fs.glob` does; `spawnSync` reads `NODE_V8_COVERAGE` by name) still trips the gate. Those rows
 declare `["env"]` as an allowed baseline decision kind, and it cancels in the delta.
 
+The second named exception, added with the startup section (#134): the **`_compile` gate's own
+premise is the opposite one.** On a loader-driven compile the gate's job is to recognize Node's
+frame and charge *nobody*, so "the mediated arm produces a decision" would be a failure there.
+That row asserts the inverse — the patched implementation is in the path, and it stays silent —
+which is what makes its delta the cost of `calledByNodeLoader()` rather than of a policy
+evaluation. If the loader path ever started attributing, that check flips.
+
 ### Why a vendored fixture, not app-code calls
 
 Attribution short-circuits app-code frames to the `<app>` sentinel (`packageForPath` never runs
@@ -130,7 +138,7 @@ The single most important thing the old harness got wrong. Attribution captures 
 each frame it materializes. The old benchmark called `fs.readFileSync` from three frames down —
 the cheapest stack a program can have — and reported that as capwall's overhead.
 
-Measured on one machine, one run:
+Measured on one machine, one run, **before #143**:
 
 | stack depth below the call | `attributeCaller()` | fs read added latency |
 |---|---|---|
@@ -138,18 +146,113 @@ Measured on one machine, one run:
 | 8 | ~22 µs | — |
 | 24 (the budget cap) | ~30 µs | ~42 µs |
 
-So the realistic figure is **~40% higher** than the number this file used to print, and
-attribution is **~70%** of it at a realistic depth rather than the ~50% issue #34 recorded from a
+So the realistic figure was **~40% higher** than the number this file used to print, and
+attribution was **~70%** of it at a realistic depth rather than the ~50% issue #34 recorded from a
 shallow stack. Express, promise chains and `async_hooks`-heavy frameworks all put you at the cap.
-If you are looking for headroom, the stack walk is where it is.
+That is where the headroom was.
 
-That depth-dependence is *materialization*, not walking, and #133 turned it into a lever. Timed
-in isolation on Node 22, a capture costs a ~4 µs floor plus ~1.4 µs per frame it materializes:
-a 25-frame capture from a 24-deep stack is ~38 µs, a 3-frame one ~9 µs. `Error.stackTraceLimit`
-applies *after* the `Error.captureStackTrace` boundary skip, so a shim that hands its own trap
-function in as the boundary pays for the frames below it and nothing else. The env shim does
-this; **no other shim opts in yet**, so every non-env row above is still a 25-frame capture and
-still has that ~4x sitting in it.
+That depth-dependence is *materialization*, not walking, and it is a lever. Timed in isolation on
+Node 22, a capture costs a ~4–5 µs floor plus ~1.4 µs per frame it materializes: 1 frame ~6.1 µs,
+3 frames ~7.6 µs, 6 frames ~12.2 µs, 25 frames ~37.8 µs. `Error.stackTraceLimit` applies *after*
+the `Error.captureStackTrace` boundary skip, so a shim that hands **its own entry frame** in as
+the boundary pays for the frames below it and nothing else.
+
+#133 did this for the `process.env` traps. **#143 did it for every other guarded surface**, and
+the depth-dependence above is largely gone with it: what a mediated call now pays is a 3-frame
+capture regardless of how deep the caller's stack is, because the frames below the caller are
+never materialized. `attributeCaller()` — the public full-walk API, which has no boundary to hand
+in — still costs what the table says, which is why the `[D]` rows are unchanged and are the
+control group for the measurement below.
+
+### Measured prefix depth, per surface (#143)
+
+The fast path materializes `FAST_PATH_FRAMES` (3) CallSites below the boundary and falls back to
+the verbatim full walk when none of them qualifies. Whether 3 is enough is a fact about each
+shim's own call chain, so it was measured rather than assumed — by dumping the frames V8 builds
+below each candidate boundary on Node 22:
+
+| surface | boundary handed in | frames between it and the caller | fast path |
+|---|---|---|---|
+| `fs.*` (sync, callback, promises, `glob`) | the wrapped method | 0 | hits |
+| `fs.existsSync` / `fs.exists` | the probe function itself | 0 | hits |
+| `new fs.ReadStream` / `WriteStream` | the guarded subclass | 0 | hits |
+| `net.connect`, `Socket.prototype.connect`, `http(s).request`, `ClientRequest`, `http2.connect` | the wrapper / guarded class | 0 | hits |
+| `dgram` `send` / `connect` | the guarded method | 0 | hits |
+| `child_process.*`, `ChildProcess.prototype.spawn` | the wrapper | 0 | hits |
+| `fetch`, `WebSocket`, `EventSource` | the wrapper / guarded class | 0 | hits |
+| `vm.*`, `worker_threads.Worker` | the wrapper / guarded class | 0 | hits |
+| `Module.prototype._compile`, direct call | the patched method | 0 | hits |
+| `process.env` traps (#133) | the trap | 0–2 (builtin/`node:` hops) | hits |
+| **`process.dlopen`** | — | **7** (`node:internal/modules/*` + capwall's `_load`) | **not used** |
+
+`fs` needed the boundary to be *threaded* to reach 0: there are three capwall frames between the
+wrapped method and the decision (`wrapped` → `guardCall` → `check`), and letting `guard` use its
+own frame instead would have materialized and discarded all three — measured at ~4 µs a call for
+nothing. The `via` parameter through those helpers is what buys that back.
+
+The `dlopen` row is the honest negative result. `require('x.node')` is seven frames of Node's
+loader away from the gate, so a 3-frame prefix would find nothing but neutral machinery, decline,
+and pay the short capture **on top of** the full walk. Sizing the shared prefix for it would make
+every `fs` and `net` call subsidise a gate that fires a handful of times per process and is
+dominated by `dlopen` itself. That gate stays on the full walk, and the `[G]` row below confirms
+it did not move.
+
+### Before / after (#143)
+
+Five full runs of each build, **alternated** (before/after, after/before, …) with the same
+harness, on a contended 16-core box; the figure is the minimum over runs of each run's own
+min-over-blocks estimate, with the run-to-run range beside it. Alternating the *builds* is the
+same discipline the harness applies to blocks, one level up — a single run of each is exactly the
+estimator artifact that produced a phantom +5% regression once before.
+
+| row | before | after | |
+|---|---|---|---|
+| `fs.readFileSync` (3-frame stack) | 36.5 µs (36.5–43.3) | **19.8 µs** (19.8–41.5) | 1.85x |
+| `fs.readFileSync` (27-frame stack) | 57.8 µs (57.8–101.1) | **20.5 µs** (20.5–46.1) | **2.82x** |
+| `fs.globSync('*.txt')` | 49.6 µs (49.6–170.0) | **28.1 µs** (28.1–100.8) | 1.77x |
+| `net.connect` (6-key options bag) | 32.1 µs (32.1–82.0) | **17.2 µs** (17.2–33.8) | 1.87x |
+| `fs.readFileSync` via ESM import | 44.5 µs (44.5–90.2) | **20.6 µs** (20.6–27.9) | 2.16x |
+| `fs` read, denied | 52.0 µs (52.0–56.6) | **28.7 µs** (28.7–61.4) | 1.81x |
+| `net` connect, denied | 36.3 µs (36.3–40.6) | **21.3 µs** (21.3–46.1) | 1.70x |
+| `spawnSync`, denied | 38.6 µs (38.6–40.4) | **19.9 µs** (19.9–42.2) | 1.95x |
+| `fetch`, denied | 46.0 µs (46.0–86.8) | **24.7 µs** (24.7–34.6) | 1.86x |
+| `fs` read via opaque frame → `<unknown>` | 54.6 µs (54.6–60.8) | **30.7 µs** (30.7–64.9) | 1.78x |
+| `fetch` (allowed, real localhost HTTP) | ≲102.5 µs (102.5–223.0) | ≲68.8 µs (68.8–143.0) | below resolution in both |
+| `child_process.spawnSync` (allowed) | ≲ (negative, 3 ms baseline) | ≲ (negative) | **no resolvable change** |
+| `process.env` read | 13.6 µs (13.6–28.1) | 13.9 µs (13.9–33.7) | unchanged — #133 already did it |
+| `{...process.env}` (81 keys) | 2.341 ms (2.341–5.296) | 2.369 ms (2.369–5.196) | unchanged, same reason |
+| `http.globalAgent` property read | ≲102 ns | ≲104 ns | unchanged (no guard on the read) |
+| `Module._load` passthrough / mediated | ≲114 ns / −1.8 µs | ≲104 ns / −1.9 µs | unchanged |
+| hardened vs plain `fs.readFileSync` | ≲−1.9 µs | ≲−1.6 µs | unchanged |
+| `attributeCaller()` at depth 0 / 8 / 24 | 19.6 / 34.7 / 44.9 µs | 19.8 / 28.7 / 42.1 µs | unchanged (the control group) |
+| `attributeCaller()` opaque / budget-exhausted | 23.3 / 45.1 µs | 20.3 / 39.8 µs | unchanged |
+| `evaluate()` | 184 ns | 170 ns | unchanged |
+| `packageForPath` cold flat / chain / warm | 1.8 µs / 3.6 µs / ≲28 ns | 1.5 µs / 3.2 µs / ≲29 ns | unchanged |
+| `[G]` `Module._compile` gate, per CJS load | ≲7.2 µs | ≲6.6 µs | unchanged **by design** |
+| `[G]` `process.dlopen` gate, per addon | ≲30.9 µs | ≲27.8 µs | unchanged **by design** |
+| `[G]` ESM cold resolve, mediated specifier | ≲ (negative) | ≲ (negative) | below resolution in both |
+| **RATIO gate** (fs delta ÷ co-sampled cpu) | **2.49 – 4.14** | **0.89 – 1.73** | ~2.8x |
+
+Reading the table honestly:
+
+- **The rows that should not have moved did not.** The `[D]` attribution rows call the public
+  `attributeCaller()`, which takes no boundary and still walks the full budget; `evaluate()`,
+  `packageForPath` and `Module._load` are untouched code. They are the control group, and a
+  version of this table where they *had* moved would mean the two builds differed in something
+  other than the change.
+- **The env rows did not move either, and this change does not claim them.** `shims/env.ts` is
+  byte-identical; #133 had already converted it. An earlier three-run pass showed the env rows
+  moving ~2x, which was a machine-mood artifact of too few runs — exactly the failure mode the
+  five-run alternation exists to catch. It is recorded here rather than quietly dropped.
+- **`spawnSync` did not benefit and was left alone in the reporting.** A real `/bin/true` spawn is
+  ~3 ms with hundreds of microseconds of block-to-block spread; the gate's ~20 µs is far under
+  that, so the paired delta is noise in both builds. The **deny** row (1.95x) is where that gate's
+  own cost is visible.
+- **The `_compile` and `dlopen` gates did not move, and that was predicted before it was
+  measured.** `_compile`'s per-module-load path never reaches attribution at all — it recognizes
+  Node's loader frame with a one-frame capture and returns — and `dlopen` was deliberately left on
+  the full walk for the prefix-depth reason above. Both rows exist (thanks to #134) so that
+  "no change" is a measurement rather than an assumption.
 
 ## Where the budget does not hold
 
@@ -199,11 +302,18 @@ printing a confident number:
 
 - **`spawnSync`** — a real `/bin/true` spawn costs ~3 ms with hundreds of microseconds of
   block-to-block spread. capwall's added cost is far below that, so the row is marked `≲` and
-  should be read as "somewhere under a few hundred microseconds". The **deny** row (~26 µs) is
-  the trustworthy figure for the gate machinery itself.
-- **`fetch`** — real localhost HTTP, ~500 µs baseline; the ~90 µs delta is resolvable but noisy.
+  should be read as "somewhere under a few hundred microseconds". The **deny** row (~20 µs) is
+  the trustworthy figure for the gate machinery itself. This is also why #143 reports **no
+  resolvable change** for this row: the improvement it made to every other gate is real here too,
+  and it is invisible under a 3 ms syscall.
+- **`fetch`** — real localhost HTTP, a ~500 µs–3 ms baseline; the delta is noisy enough that both
+  the before and after #143 figures print `≲`. The **`fetch`, denied** row is the resolvable one.
 - **hardened mode** — measured at or below resolution, i.e. hardening costs nothing per call,
   which is what you would expect from an `Object.freeze` that happens at shim-build time.
+- **`[G]` ESM cold resolve** — a loader-thread round trip is milliseconds with millisecond spread,
+  and capwall's synthetic-module half is far under it, so the paired delta prints `≲` and is
+  frequently negative. Read it as "the mediated half of a cold resolution is below the noise floor
+  of the resolution itself", which is a genuine answer to #134's question and not a measurement.
 
 ## The regression gate
 
@@ -219,7 +329,7 @@ headroom that a 3x regression would sail through it. Contention that inflates th
 inflates the reference in the same block, at the same moment, so the ratio barely moves even when
 the absolute figures swing 40%.
 
-How the limit was derived, so it can be re-derived rather than nudged:
+How the limit was derived, so it can be re-derived rather than nudged (all figures **pre-#143**):
 
 | condition | observed ratio |
 |---|---|
@@ -231,6 +341,16 @@ How the limit was derived, so it can be re-derived rather than nudged:
 The limit is **7**: ~1.5x above the worst contention ever observed, and low enough that a 2.7x
 algorithmic regression fails the run. Override with `CAPWALL_BENCH_RATIO_LIMIT`. If you change
 `CAL_REPEATS` or the calibration body, this number is invalid until it is re-derived the same way.
+
+**#143 moved the numerator, and the limit is deliberately NOT nudged down to match.** The observed
+ratio fell from 2.49–4.14 to **0.89–1.73** across five alternated runs on a contended box, so the
+gate now has far more headroom than it was designed with — and a change that undid #143 entirely
+would come back at ~2.5 and still pass. Tightening it properly means re-running the contention
+sweep in the table above (8 and 16 concurrent processes) on an otherwise idle machine, which is
+the one thing this README says not to shortcut; deriving a new limit from a busy box would be
+exactly the nudge it warns about. Left as a follow-up, stated here rather than silently accepted.
+The `[A]` and `[C]` absolute figures in § Before / after are the interim guard against a #143
+reversion.
 
 **SELF-CHECKS.** Every premise above, verified per run.
 
