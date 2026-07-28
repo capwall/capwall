@@ -114,13 +114,14 @@ if (active) {
   // `eval`. An ALLOWED decision is not logged in enforce mode, so the hatch would otherwise be
   // silent — hence a one-time note at startup.
   //
-  // But only for a BROAD grant. Every run under the CLI produces one unattributable env read
-  // (Node's own ESM loader reads WATCH_REPORT_DEPENDENCIES from a stack with no caller frame),
-  // so a concrete `env` key list under `<unknown>` is the normal, expected shape — warning on
-  // it would fire on essentially every correctly-authored policy and train operators to ignore
-  // the line, the same cry-wolf failure #67 removed from the env trace. What is worth saying
-  // out loud is authority that unnamed code should never hold: a capability other than `env`,
-  // or an `env: ["*"]` wildcard.
+  // But only for a BROAD grant. A concrete `env` key list under `<unknown>` is a narrow,
+  // reviewed line, and warning on it would train operators to ignore the warning — the same
+  // cry-wolf failure #67 removed from the env trace. (It used to be the near-universal shape:
+  // every run produced one unattributable env read because Node's own ESM loader reads
+  // WATCH_REPORT_DEPENDENCIES from a stack with no caller frame. Since #119 that read is not
+  // recorded and most policies grant `<unknown>` nothing at all.) What is worth saying out loud
+  // is authority that unnamed code should never hold: a capability other than `env`, or an
+  // `env: ["*"]` wildcard.
   // Enforce only: in observe nothing is denied anyway, so the warning would just be noise.
   const unknownGrant =
     mode === "enforce" && Object.hasOwn(policy.packages, UNATTRIBUTED)

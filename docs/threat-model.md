@@ -403,6 +403,45 @@ Per-capability notes:
   the attacker they target or catch only an attacker who has already adapted to capwall, and a
   spoofable heuristic inside the anti-exfiltration control is worse than a documented gap.
 
+  **Node-initiated env reads (#119).** `process.env` is the one mediated surface Node's own code
+  shares with dependencies: the other shims are handed out through `require`, which Node's
+  internals do not use to reach `fs` or `net`, but the env proxy replaces a live object that
+  everything in the process shares. Attribution skips `node:` frames (they carry no package
+  identity) and charges the nearest frame that has one — so a variable Node read while some
+  dependency happened to be underneath was recorded as that dependency's read.
+  `node:internal/source_map/source_map_cache` reading `NODE_V8_COVERAGE` while compiling a
+  package that ships a source map put that key on three unrelated express dependencies; the ESM
+  loader's `WATCH_REPORT_DEPENDENCIES` put an entry on `<unknown>` in every policy capwall ever
+  generated. Six of twelve events in a stock `express` + `pino` policy described Node, not the
+  tree — and a reviewer cannot review a grant no package asked for.
+
+  An env read is therefore **recorded only when the nearest frame above it, after capwall's own,
+  is not one of Node's own scripts**. This is a rule about the *origin of the read*, not about
+  the key's name: a package's own read of a `NODE_*` variable is kept (`thread-stream` genuinely
+  reads `NODE_V8_COVERAGE`; `express` genuinely reads `NODE_ENV`), and a name denylist could not
+  tell those from the false ones because the names are identical.
+
+  **It changes recording only, never gating** — the same shape as the #67 decision above. The
+  read is still attributed, still evaluated against the attributed package's grants, and still
+  hidden when they do not cover it. It has to be: a dependency *can* put a `node:` frame directly
+  above a read it caused (`util.inspect(process.env)` runs in `node:internal/util/inspect`), so a
+  "Node did it, allow it" rule would be a one-call laundering route around the whole
+  anti-exfiltration control. A frame that merely *claims* a `node:` name does not qualify either:
+  an `eval` frame is opaque before its self-reported name is consulted (§ `eval` and
+  `new Function`), a native frame has no name at all and fails closed, and compiling under a
+  `node:` filename is what the `compile` gate denies.
+
+  *Residuals, both bounded:* (1) a denied Node-initiated read is not logged, so a
+  `util.inspect(process.env)` probe is blocked but silent — the same trade the descriptor trap
+  makes, and for the same reason. (2) `vm` compiles under a caller-chosen filename, so a package
+  holding a `vm` grant can synthesize a `node:`-named frame and read env unrecorded; it still
+  cannot read a value it is not granted, and `vm` is already documented as identity-granting
+  (§ `compile`). *Operational cost:* Node's own reads no longer generate grants, so under
+  `enforce` those variables read as unset to Node — `--watch` does not report dependencies
+  through this path, `NODE_V8_COVERAGE` does not reach the source-map cache, cluster uses its
+  default scheduling policy. They are Node's own configuration knobs and they degrade to the
+  unset default.
+
   **Spawning and env (#89).** Node reads `process.env` while assembling a child's environment
   block, from a stack whose nearest frame is the spawning dependency — indistinguishable from
   that dependency reading the key itself. Gating those reads would launch the child with no
@@ -686,10 +725,11 @@ See § `eval` and `new Function` below for the one place capwall got that wrong.
 
 `<unknown>` is an ordinary principal, not an exemption: deny-by-default in `enforce`, recorded
 in `observe`, and grantable with an explicit `"<unknown>"` entry in `capabilities.json`. That
-entry is the **escape hatch**, and it is needed in practice: Node's own ESM loader reads
-`process.env.WATCH_REPORT_DEPENDENCIES` from a stack with no caller frame, so every run under
-the CLI produces one unattributable env read. `capwall observe` emits the corresponding grant
-automatically. Granting `<unknown>` broadly (`"env": ["*"]`, a wide `net` grant) hands that
+entry is the **escape hatch** for a setup that legitimately runs from path-less frames.
+(Until #119 every generated policy carried one, because Node's own ESM loader reads
+`process.env.WATCH_REPORT_DEPENDENCIES` from such a stack on every run. That read is Node's own
+and is no longer recorded — see the § Node-initiated env reads residual — so a fresh policy no
+longer grants `<unknown>` anything.) Granting `<unknown>` broadly (`"env": ["*"]`, a wide `net` grant) hands that
 authority to **every** call capwall cannot attribute, including a dependency deliberately
 running from a `data:` module — so the preload prints a one-line warning at startup when a
 policy grants it. Keep the grant as narrow as the observed keys.

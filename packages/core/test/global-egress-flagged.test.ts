@@ -121,9 +121,9 @@ describe("#80 — WebSocket and EventSource under their experimental flags", () 
     const r = await runApp({ CAPWALL_MODE: "enforce", CAPWALL_POLICY_FILE: grantPolicy });
     expect(r.stdout).toContain("WS:ALLOWED");
     expect(r.stdout).toContain("ES:ALLOWED");
-    // No `net` denial. (An unrelated `<unknown>` env denial is expected on every CLI run —
-    // Node's own ESM loader reads WATCH_REPORT_DEPENDENCIES from a stack with no caller frame,
-    // see docs/threat-model.md § attribution outcomes.)
+    // No `net` denial. (There used to be an unrelated `<unknown>` env denial on every run, from
+    // Node's own ESM loader reading WATCH_REPORT_DEPENDENCIES on a stack with no caller frame;
+    // since #119 a read Node initiated is not recorded. See docs/threat-model.md § residuals.)
     expect(r.stderr).not.toMatch(/DENY '[^']*' net /);
   });
 

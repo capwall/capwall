@@ -70,10 +70,11 @@ describe("capwall diff", () => {
             "trace-dep": {
               fs: { read: ["./node_modules/trace-dep/data.txt"], write: [] },
             },
-            // Node's own ESM loader reads this from a stack with no caller frame, so it
-            // attributes to `<unknown>` (#60) and is real drift until it is granted. This is
-            // the documented escape hatch in use — an explicit line, not a silent exemption.
-            "<unknown>": { env: ["WATCH_REPORT_DEPENDENCIES"] },
+            // This used to need `"<unknown>": { env: ["WATCH_REPORT_DEPENDENCIES"] }` as well:
+            // Node's own ESM loader reads that variable from a stack with no caller frame, and
+            // the read was recorded, so it was drift until granted. Since #119 a read Node
+            // itself initiated is not recorded — the one grant every project needed for a
+            // reason that was never the project's is gone.
           },
         },
         null,
@@ -124,8 +125,9 @@ describe("capwall diff", () => {
           version: 1,
           mode: "enforce",
           default: {},
-          // Granted so the only drift left is trace-dep's — see the note above on `<unknown>`.
-          packages: { "<unknown>": { env: ["WATCH_REPORT_DEPENDENCIES"] } },
+          // Empty: the only drift left is trace-dep's. (Pre-#119 this needed an `<unknown>`
+          // env grant to keep Node's own loader read out of the array — see above.)
+          packages: {},
         },
         null,
         2,

@@ -163,6 +163,37 @@ export interface Attribution {
    * `pkg` is the {@link UNATTRIBUTED} fallback and the real owner may lie beyond the cap.
    */
   budgetExhausted: boolean;
+  /**
+   * True when the NEAREST frame above the mediated call — the first one that is not capwall's
+   * own machinery — is Node's own JS (a `node:…` script). The call was therefore *initiated by
+   * the runtime*, not written by `pkg`: `pkg` is simply the nearest frame with a package
+   * identity, sitting below however many Node frames it took to get here (issue #119).
+   *
+   * WHY THIS IS A SEPARATE QUESTION FROM `pkg`. Attribution answers "whose code is nearest",
+   * and to answer it the walk SKIPS `node:` frames, because Node's internals carry no package
+   * identity. That is right for deciding who to charge — Node cannot be held responsible, and
+   * something has to be — but it erases the distinction between `express` reading
+   * `process.env.NODE_ENV` in `application.js` (its own frame is nearest) and Node's cluster
+   * module reading `NODE_CLUSTER_SCHED_POLICY` while `express` happens to be the nearest
+   * package on the stack below (`node:internal/cluster/primary` is nearest). Both come back as
+   * `express`; only the first is something `express` did.
+   *
+   * NOT AN EXEMPTION, AND MUST NOT BECOME ONE. This flag is deliberately *not* consulted by any
+   * gate: every consumer still evaluates the request against `pkg`'s grants and still enforces
+   * the outcome. It exists so a consumer can decide whether the event is worth RECORDING — see
+   * `shims/env.ts`, the one mediated surface Node's own code shares with dependencies, and the
+   * `hidesWithoutRecording` reasoning #67 established. Treating it as "Node did this, allow it"
+   * would hand any code that can arrange a `node:` frame above its call (`util.inspect(env)`)
+   * an ungated read, which is precisely the class of hole #60 closed.
+   *
+   * FAILS CLOSED. Only an explicit `node:`-prefixed script name counts. A native frame (no file
+   * name at all), an `eval` frame, and a stack with no frames whatsoever are all `false`, so an
+   * attacker who detaches from their own stack gets recorded, not suppressed. A frame reporting
+   * a `node:` name cannot be forged for the same reason `calledByNodeLoader` may trust one
+   * (`shims/module.ts`): acquiring it means having compiled under that name, which the compile
+   * gate denies before the first such frame can exist.
+   */
+  initiatedByNode: boolean;
 }
 
 /**
@@ -325,6 +356,21 @@ function frameSource(site: NodeJS.CallSite): string | null | typeof OPAQUE {
 }
 
 /**
+ * Is this frame one of Node's OWN scripts (`node:internal/…`, `node:fs`, …)?
+ *
+ * Only ever asked of a frame {@link frameSource} already classified as neutral machinery, which
+ * is what makes the check cheap and total: at that point the frame either has no file name (a
+ * native frame — `false`, fail closed) or has a non-path script name that starts with `node:`.
+ * `eval` frames never reach here; `frameSource` calls them {@link OPAQUE} first, so a
+ * `//# sourceURL=node:internal/x` cannot answer this question. See
+ * {@link Attribution.initiatedByNode} for what the answer is used for and why it is not a gate.
+ */
+function isNodeScriptFrame(site: NodeJS.CallSite): boolean {
+  const fileName = site.getFileName();
+  return typeof fileName === "string" && fileName.startsWith("node:");
+}
+
+/**
  * Return the name of the package that owns the current call site (nearest-package policy),
  * {@link APP_ROOT} when the nearest qualifying frame is application code, or
  * {@link UNATTRIBUTED} when the call cannot be tied to either (issue #60).
@@ -351,22 +397,40 @@ export function attributeCallerDetailed(options: AttributionOptions = {}): Attri
   const maxFrames = coerceMaxFrames(options.maxFrames) ?? DEFAULT_MAX_FRAMES;
   const sites = captureCallSites(maxFrames);
   let sawOpaque = false;
+  // Was the FIRST non-capwall frame Node's own JS? Set once, by whichever frame gets there
+  // first, and never revised — see `Attribution.initiatedByNode`. `undefined` means the walk
+  // has seen nothing but capwall's own frames so far; it resolves to `false` if it stays that
+  // way, so "capwall is the only thing on the stack" is not mistaken for "Node initiated it".
+  let initiatedByNode: boolean | undefined;
   for (const site of sites) {
     const source = frameSource(site);
-    if (source === null) continue; // node:* internals, native frames
+    if (source === null) {
+      // Neutral machinery: a `node:` internal (Node initiated this) or a native frame (no
+      // identity at all — fail closed and call it not-Node).
+      initiatedByNode ??= isNodeScriptFrame(site);
+      continue; // node:* internals, native frames
+    }
     if (source === OPAQUE) {
+      initiatedByNode ??= false;
       sawOpaque = true;
       continue;
     }
     if (source.startsWith(CAPWALL_ROOT + path.sep)) continue; // capwall's own machinery
+    initiatedByNode ??= false;
     const pkg = packageForPath(source, options.projectRoot);
     // A dependency frame is a positive identification of untrusted code, so it stands even
     // below opaque code (and is stricter than `<unknown>` would be). `<app>` is the opposite:
     // it is the TRUST ROOT and carries exemptions, so it may only be claimed when nothing
     // opaque ran above it. Otherwise a `data:` module invoked from app code would inherit the
     // app's authority — the same fail-open, one frame up.
-    if (pkg === APP_ROOT && sawOpaque) return { pkg: UNATTRIBUTED, budgetExhausted: false };
-    return { pkg, budgetExhausted: false };
+    if (pkg === APP_ROOT && sawOpaque) {
+      // Opaque code laundering the trust root. Report `initiatedByNode: false` even if a
+      // `node:` frame sat on top: the interesting fact about this stack is the laundering, and
+      // a consumer that suppresses recording for Node-initiated calls must not be talked out
+      // of recording this one.
+      return { pkg: UNATTRIBUTED, budgetExhausted: false, initiatedByNode: false };
+    }
+    return { pkg, budgetExhausted: false, initiatedByNode: initiatedByNode ?? false };
   }
   // Fell off the end of the walk: no dependency frame, no app frame, nothing to charge.
   //
@@ -381,7 +445,11 @@ export function attributeCallerDetailed(options: AttributionOptions = {}): Attri
   // longer "charge it to the trust root and hope". The flag now tells the operator WHY the
   // call was unattributable (raise `CAPWALL_MAX_FRAMES`) rather than warning them after the
   // fact that a call may have been wrongly allowed.
-  return { pkg: UNATTRIBUTED, budgetExhausted: sites.length >= maxFrames };
+  return {
+    pkg: UNATTRIBUTED,
+    budgetExhausted: sites.length >= maxFrames,
+    initiatedByNode: initiatedByNode ?? false,
+  };
 }
 
 /**
