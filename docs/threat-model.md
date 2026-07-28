@@ -16,7 +16,12 @@ As of roadmap **M5**, all core capability surfaces are mediated on **both the CJ
 path and the ESM `import` path**: `fs`, `net`/`http`/`https`/`tls`/`http2`/`dgram`,
 `child_process`, `worker_threads`, `vm`, and `process.env`. Roadmap **S2** adds `native`, a
 load-time gate on `.node` addons that is module-system-independent (it patches
-`process.dlopen`, not a loader). Three surfaces are mediated **outside** both module systems,
+`process.dlopen`, not a loader). Two further capabilities are decided at **module-load time**
+rather than at a capability call: `compile` (#93, a direct `Module.prototype._compile`) and, since
+#123, an `fs.read` decision on a `require`/`import` of a file **outside every `node_modules`
+tree** — the module system was previously a second, completely un-gated route to the same bytes
+`fs` guards. See § The module system as a read channel. Three surfaces are mediated **outside**
+both module systems,
 because they never route through one: `process.env` (a `Proxy` on the live object), the `native`
 gate above, and Node's **global egress APIs** — `globalThis.fetch`/`WebSocket`/`EventSource`,
 replaced on `globalThis` since #80 (see "Global egress surfaces" below). ESM interception uses a
@@ -190,6 +195,9 @@ Per-capability notes:
   **no decision recorded and nothing denied**. Absent on Node 20, where the wrapper is a clean
   no-op (asserted, not skipped). See "`fs.glob` semantics" below for what the grant means, what a
   glob can still learn, and the residuals.
+  **`fs` is not the only route to a file's bytes.** `require`/`import` of a path is a read too,
+  and for `.json` it hands the contents back as data; that is gated as `fs.read` since #123, for
+  files outside every `node_modules` tree. See § The module system as a read channel.
 - **`fs.glob` semantics (#106).** A glob is an ENUMERATION, and capwall already had a shape for
   that: `readdir` is gated as `fs.read` on the DIRECTORY, not on each entry it returns. `glob` is
   `readdir` with a filter and a recursion rule, so it is gated the same way — **one `fs.read`
@@ -206,12 +214,54 @@ Per-capability notes:
   their literal prefix — `**` followed by `..` (because `**` also matches *zero* segments),
   `{.,..}/…`, and a brace group with absolute alternatives such as `{/etc,/tmp}/*.conf`, which
   reaches `/etc` whatever `cwd` says. #106's own suggestion — "gate the non-magic prefix" — would
-  therefore have been **fail-open**. A brace group is treated as unbounded unless it contains
-  neither `/` nor `..` (in which case it can only name alternatives within one segment), and a
-  backslash — minimatch's POSIX escape character — makes a pattern unbounded rather than guessed
-  at. `options.cwd` is read **exactly once** and the single answer is what Node receives, on the
-  same pinning rule as every other capability-relevant option (#26/#56/#89); a URL `cwd` is
-  converted once and the converted *string* is forwarded.
+  therefore have been **fail-open**. `options.cwd` is read **exactly once** and the single answer
+  is what Node receives, on the same pinning rule as every other capability-relevant option
+  (#26/#56/#89); a URL `cwd` is converted once and the converted *string* is forwarded.
+
+  **A `..` spelled as a glob expansion (#120), and the rule that replaced the one it broke.** The
+  #106 derivation asked two *string* questions of the pattern text: is a post-prefix segment
+  literally `".."`, and does a brace group contain a `/` or a `..`. minimatch is a *matcher*, and
+  it will spell a `..` in ways neither question can see: `[.][.]`, `[.].`, `.[.]`, `[.-.][.-.]`,
+  `..{,}`, `.{.,.}`, `{a,[.][.]}`, `[.][.]{,}` all walk to the parent of `cwd` — and they chain,
+  so four of them walk four levels up — while capwall recorded one *allowed* read of the
+  package's own granted directory and `enforce` printed nothing. That was the third instance of
+  the same failure shape as #84's `getEvalOrigin` regex and #95's port heuristic: a parser
+  deciding a security boundary while modelling a narrower grammar than its consumer accepts.
+
+  capwall no longer tries to *see* a `..` through the pattern text. Two rules replace the
+  string tests, and both are conservative by construction — anything not proven bounded is
+  unbounded:
+
+  1. **Braces are expanded, not inspected.** capwall performs the expansion the matcher performs
+     and analyses each concrete alternative, so a braced pattern has one base per alternative and
+     the decision is taken on their **common ancestor**. `{/etc,/tmp}/*.conf` is gated on `/`;
+     `{.,..}/*.conf` is gated on the parent of `cwd`, exactly where it walks. Constructs capwall
+     will not expand exactly are refused outright: an unbalanced brace, a group with no top-level
+     comma (a range such as `{1..3}`, or a single-alternative `{a}` that minimatch does not expand
+     at all), and any expansion beyond 256 alternatives.
+  2. **Every segment at or after the first magic segment must be provably downward-only.** The
+     only way a glob walk moves *upward* is a segment the implementation resolves to a literal
+     `..` path component; a segment that survives as a *matcher* cannot, because matching runs
+     against directory entries and `readdir` never yields `.` or `..`. So a segment containing a
+     `*` or `?` is bounded (nothing in the grammar removes those — `**`, `*.conf`, `.*`, `*.*`,
+     `[.]*` and `..*` all keep working, verified against real `fs.globSync`), a segment carrying
+     any ordinary character is bounded, and a segment built only from dots and glob punctuation is
+     **unbounded**. A backslash — minimatch's POSIX escape character — still makes a pattern
+     unbounded rather than guessed at.
+
+  Rule 2 is deliberately blunter than the truth: `dir/[.]/x`, `dir/@(..)/x` and `dir/[..]/x` are
+  harmless in practice and are nonetheless treated as unbounded, because the alternative is
+  modelling character-class and extglob reduction — which is the grammar-modelling that produced
+  #84, #95 and #120. Adding a `*` or any ordinary character to the segment, or globbing from a
+  directory the package is granted, both work.
+
+  **The divergence itself is now a test, not a list.** `test/fs-glob.test.ts` generates patterns
+  from a token grammar (exhaustive over token pairs, plus a seeded random pass) and asserts, for
+  each, that every entry **real `fs.globSync`** returns resolves inside the directory capwall
+  decided about. If minimatch grows a new way to spell `..`, or capwall's expansion ever disagrees
+  with the real one, that fails — whether or not anybody thought to write the spelling down. A
+  companion assertion rules out the trivially "safe" implementation that answers "the filesystem
+  root" to everything.
 
   **Why not check each result path**, which would be more precise:
   - It cannot be done before the walk, and *the walk is the leak*. `options.exclude` is a
@@ -825,7 +875,9 @@ string-formatting helper that reads environment secrets, is a policy violation.
 When a package's declared capabilities are tight, capwall denies (in `enforce` mode) or logs
 (in `observe` mode) attempts by that package to:
 
-- Read/write files outside its allowed path globs (`fs`).
+- Read/write files outside its allowed path globs (`fs`) — including through the module system:
+  `require("/abs/secrets.json")` / `import(url, { with: { type: "json" } })` is an `fs.read`
+  decision on the resolved file whenever that file belongs to no installed package (#123).
 - Open network connections to hosts/ports outside its allowlist — through the `net`, `http(s)`,
   `tls`, `http2` and `dgram` **module** surfaces, and (since #80) through the **global** APIs
   `fetch`, `WebSocket` and `EventSource`. All of them evaluate against the same `net` grant. See
@@ -878,6 +930,12 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
   and the guarded global is replaceable unless hardened mode is on.
 - **fd / symlink escapes** — using an already-open file descriptor, or a symlink, to reach a
   path outside the allowed globs.
+- **The module system as a read channel** — `require`/`import` of a path reads a file too, and
+  for `.json` it hands the contents back as data. Since #123 that is an `fs.read` decision, but
+  only for files **outside every `node_modules` tree**: any file inside the dependency graph is
+  loadable by any dependency without a grant, and a module already in `Module._cache` / the ESM
+  registry never reaches a loader hook. See § The module system as a read channel for the full
+  rule and the rest of its residuals.
 - **`vm` / `eval` / `node:sqlite`** and similar reflective or alternate-execution surfaces
   that can sidestep the shimmed API. What these surfaces buy an attacker is reaching APIs
   capwall does not mediate at all, and (with a `vm` grant) choosing the filename its frames
@@ -1313,6 +1371,95 @@ other legitimate `fs` monkey-patcher. Enabling hardened mode is a deliberate tra
 `graceful-fs`-class compatibility — the no-SES-tax property that is capwall's whole adoption
 argument — and gain the closure of the reassignment escape only. Try it in `observe` mode
 first; a load-time `TypeError` from a patcher is what failure looks like.
+
+## The module system as a read channel (`require` / `import`) — #123
+
+**What this is.** `fs` is not the only route to a file's bytes. `require("/abs/x.json")` reads
+through `Module._extensions['.json']` and hands the parsed contents back as a value;
+`import("/abs/x.json", { with: { type: "json" } })` does the same through Node's JSON translator.
+Until #123 neither took a capability decision: capwall's `Module._load` patch only routed
+*mediated builtin specifiers* to shims, so a **path** specifier fell straight through, and the ESM
+side never reached the `fs` shim at all. Under a deny-all `enforce` policy with zero grants — no
+`eval`, no `vm`, no `compile`, no write — a dependency read any file on disk with **no decision
+recorded at all**: nothing denied, nothing in the `observe` trace, nothing for `capwall diff`.
+That last part was the compounding cost — `observe` cannot record what it never sees, so a
+generated policy under-reported the package's real filesystem reach.
+
+**The gate, in one sentence.** *A module load is free when the resolved file belongs to an
+installed package (any `node_modules` tree) or when the loader is the application; otherwise it is
+an `fs.read` decision on the resolved path.* It applies to **both** module systems and to every
+format Node's loaders can return (`.json`, `.js`/`.cjs`/`.mjs`, `.wasm`), with one carve-out
+below.
+
+**Why the line is drawn there.** Loading a dependency's own files is the most common thing any
+program does. Gating every `require` as `fs.read` would make every policy grant every package its
+own directory — unusable, and it would train operators to write wide `fs.read` globs, which is a
+net loss. Every file a package owns, and every file any other installed package owns, is by
+construction inside somebody's `node_modules` tree — or is reached through a symlink in one, which
+#127's link map recovers — so "does this file belong to an installed package?" is an exact test for
+"this is the dependency graph" that needs no policy grant. It is asked BOTH ways, and each covers
+a real case the other misses: the literal path position (which does not depend on how
+`projectRoot` was declared, so a root pointed at the tree's own `node_modules` does not turn an
+ordinary `require("some-dep")` into a denial), and `packageForPath` (which undoes Node's `realpath`
+for the symlinked installs every `npm link` / `npm i file:` / workspace layout produces). What is
+left after that exemption is precisely the interesting case: a **dependency** naming a file that
+belongs to no
+package — `~/.docker/config.json`, `~/.aws/sso/cache/*.json`,
+`~/.config/gcloud/application_default_credentials.json`, `<project>/package-lock.json`, an
+app-local `secrets.json`, `/tmp/x`. The application itself is exempt because it is the trust root,
+the same rule the `compile`, loader-hook and `process.env` gates use; since #60 that is a
+*positive* identification, so a load capwall cannot attribute is `<unknown>` and is gated.
+
+**Why `fs.read` and not a new capability.** `native` (#49) and `compile` (#93) are boolean grants
+because their subject cannot be narrowed to a file list. A module read has no such problem: it
+names a real file, the policy already has a glob vocabulary for exactly that, and "may this
+package `require` `<project>/config.json`" and "may it `readFileSync` it" are the same question.
+`observe` emits the grant automatically, so the observe→enforce round trip needs no hand editing.
+
+**Subjects, and why they differ by module system.** On the CJS path the subject is the
+**attributed caller** (capwall's ordinary stack walk), deliberately not the `parent` module the
+loader supplies: `createRequire()` builds a module record whose filename is whatever string it was
+given, so trusting `parent.filename` would let any dependency present itself as a granted package.
+On the ESM path there is no JavaScript stack to walk — the hook runs on Node's loader thread — so
+the subject is `context.parentURL`, which the host sets from the module record containing the
+`import` and which in-process code cannot choose. An importer with no filesystem identity (a
+`data:` URL module) is charged to `<unknown>`, never inferred to be the trust root.
+
+**How the ESM half reaches a policy at all.** The loader hooks run on a separate thread, and the
+main thread *blocks* on their results during synchronous module loads, so a round trip back to the
+main thread would deadlock. The hook therefore holds a **copy** of the policy, refreshed
+synchronously from a `MessagePort` (`receiveMessageOnPort`, no event-loop turn) at the top of every
+invocation; `install()` posts the new snapshot before it returns, so there is no window in which an
+import is evaluated against a policy the main thread has already replaced. The copy is evaluated by
+the *same* `evaluate()` / `packageForPath()` / `matchesGlob()` functions the main thread uses — one
+decision procedure, not two. Decisions travel back over the same port and land in `onDecision`;
+that direction is recording, not enforcement, which happens on the loader thread.
+
+**Carve-out: `.node`.** An addon load is already gated as `native` at `process.dlopen`, which is
+*stricter* than this gate — it charges both the caller and the addon file's owner, and an addon
+outside the project owns to `<unknown>`. Adding an `fs.read` decision on top would emit a second
+grant from `observe` and change no outcome, so `.node` skips this gate and keeps #49's.
+
+**What this does NOT close — residuals, stated plainly:**
+
+- **Any file inside any `node_modules` tree remains freely loadable** by any dependency —
+  a sibling package's `package.json` or shipped fixtures. That is the price of the graph
+  exemption, and it is what keeps `require("mime-db")` (whose `main` *is* a `.json` file) working
+  without a grant. It is bounded to published artifacts of packages the project already installed,
+  and a dependency could already `require` such a package and run its code.
+- **The gate is on the load, not on the cache.** A module some other principal already loaded is
+  served from `Module._cache` / the ESM registry without reaching a loader hook, so the decision is
+  taken once, for whoever loaded it first.
+- **Reaching past the loader entirely** — calling `Module._extensions[".json"](m, file)` directly,
+  or `process.binding` — is the same class of escape as un-patching any shim, which capwall does
+  not claim to stop. So is a hostile module-customization hook registered ahead of capwall's (see
+  § ESM known limits).
+- **Network imports** (`import("https://…")`) read no local file and are not mediated by this gate
+  or any other.
+- **A compatibility change worth knowing about:** a test runner, bundler or framework that loads
+  the *application's own* files (`mocha` requiring `test/*.spec.js`, a config loader requiring
+  `<project>/app.config.js`) now needs an `fs.read` grant covering them. That is a true statement
+  about what those tools do, and `capwall observe` generates the grant from the trace.
 
 ## Native `.node` addons
 

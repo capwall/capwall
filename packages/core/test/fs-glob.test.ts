@@ -18,10 +18,12 @@
  */
 import { createRequire } from "node:module";
 import * as nodeFs from "node:fs";
+import * as nodeOs from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { install, loadPolicyFromObject, type Decision, type Policy } from "../src/index.js";
+import { nodeGlobBase } from "../src/policy/glob.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const requireCjs = createRequire(import.meta.url);
@@ -255,18 +257,30 @@ describe.skipIf(!HAS_GLOB)("fs.glob — deny by default, allow when granted (#10
   });
 });
 
+/** `/`-separated absolute form, the shape a decision's `path` carries. */
+const asPolicyPath = (nativePath: string): string => nativePath.split(path.sep).join("/");
+const FS_ROOT = asPolicyPath(path.parse(SCRATCH).root);
+
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 // ESCAPE EVIDENCE. #106's own suggestion was to gate the pattern's non-magic prefix. These
 // three shapes are why that would have been fail-open: measured against the REAL, un-shimmed
 // `fs.globSync`, each one reaches outside the directory its literal prefix names.
+//
+// Since #120 the guarded directory for a BRACED pattern is the common ancestor of its
+// alternatives rather than the filesystem root — tighter, and still outside the grant, because
+// the expansion is now performed instead of being pattern-matched for a `/` or a `..`.
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 describe.skipIf(!HAS_GLOB)("fs.glob — patterns really do escape their literal prefix", () => {
-  const escaping: Array<[name: string, pattern: string]> = [
-    ["`**` then `..` (** matches zero segments)", "**/../secrets/*.txt"],
-    ["a brace group containing `..`", "{.,..}/secrets/*.txt"],
-    ["a brace group with ABSOLUTE alternatives", `{${SECRETS},${DATA}}/*.txt`],
+  const escaping: Array<[name: string, pattern: string, base: string]> = [
+    ["`**` then `..` (** matches zero segments)", "**/../secrets/*.txt", FS_ROOT],
+    ["a brace group containing `..`", "{.,..}/secrets/*.txt", asPolicyPath(SCRATCH)],
+    [
+      "a brace group with ABSOLUTE alternatives",
+      `{${SECRETS},${DATA}}/*.txt`,
+      asPolicyPath(SCRATCH),
+    ],
   ];
-  for (const [name, pattern] of escaping) {
+  for (const [name, pattern, base] of escaping) {
     it(`un-shimmed, ${name} reaches SECRETS from a cwd of DATA`, () => {
       const reached = realGlobSync!(pattern, { cwd: DATA }).map((m) =>
         path.resolve(DATA, m as string),
@@ -274,15 +288,240 @@ describe.skipIf(!HAS_GLOB)("fs.glob — patterns really do escape their literal 
       expect(reached).toContain(path.join(SECRETS, "key.txt"));
     });
 
-    it(`shimmed, ${name} is gated on the filesystem root and denied`, () => {
+    it(`shimmed, ${name} is gated outside the grant and denied`, () => {
       const { decisions } = withCapwall(DATA_GRANT(), "enforce", (dep) => {
         expect(() => dep.globSync(pattern, { cwd: DATA })).toThrowError(
           expect.objectContaining({ name: "CapabilityError" }),
         );
       });
-      expectOneDecision(decisions, false, path.parse(DATA).root.split(path.sep).join("/"));
+      expectOneDecision(decisions, false, base);
     });
   }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// #120 — a `..` SPELLED AS A GLOB EXPANSION.
+//
+// The pre-#120 resolver asked a STRING question ("is this segment literally `..`?", "does this
+// brace group contain a `/` or a `..`?") of a pattern language whose consumer is a MATCHER. Each
+// spelling below walks to the parent of `cwd` while capwall predicted the walk could not leave
+// `cwd` at all — so the only decision recorded was an ALLOWED read of the package's own granted
+// directory, and `enforce` printed nothing.
+//
+// This block is the PoC, end to end, under the most ordinary grant there is: the package may read
+// its own directory and nothing else. It is EVIDENCE, not the mechanism — the property test below
+// is what checks capwall against real `fs.globSync` over patterns nobody wrote down.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+describe.skipIf(!HAS_GLOB)("fs.glob — a `..` written as an expansion cannot escape (#120)", () => {
+  /** #120's table, plus the two spellings its "same shape from the other side" note describes. */
+  const spellings = [
+    "[.][.]",
+    "[.].",
+    ".[.]",
+    "[.-.][.-.]",
+    "..{,}",
+    ".{.,.}",
+    "{a,[.][.]}",
+    "[.][.]{,}",
+  ];
+
+  for (const token of spellings) {
+    it(`un-shimmed, '${token}' really does reach the parent of the cwd`, () => {
+      const reached = realGlobSync!(`${token}/*.txt`, { cwd: SUB }).map((m) =>
+        path.resolve(SUB, m as string),
+      );
+      expect(reached).toContain(path.join(DATA, "a.txt"));
+    });
+
+    it(`shimmed, '${token}' is denied — the walk's real root is what gets decided`, () => {
+      // The grant covers `sub` and nothing above it, which is exactly the shape of #120's PoC
+      // ("a read grant on its own directory and nothing else").
+      const policy = readGrant(["./fixtures/scratch-glob/data/sub/**"]);
+      const { decisions } = withCapwall(policy, "enforce", (dep) => {
+        expect(() => dep.globSync(`${token}/*.txt`, { cwd: SUB })).toThrowError(
+          expect.objectContaining({ name: "CapabilityError" }),
+        );
+      });
+      expect(decisions).toHaveLength(1);
+      expect(decisions[0]!.decision.allowed).toBe(false);
+      // Either the exact parent (when the expansion resolves to a literal `..` capwall can
+      // resolve) or the filesystem root (when capwall refuses to prove the segment bounded).
+      // What must NEVER happen is a decision on `sub` itself, which is what shipped before #120.
+      const decided = (decisions[0]!.decision.observed as { path: string }).path;
+      expect([asPolicyPath(DATA), FS_ROOT]).toContain(decided);
+    });
+  }
+
+  it("chaining the spelling four deep is still denied", () => {
+    const pattern = ["[.][.]", "[.][.]", "[.][.]", "[.][.]", "**"].join("/");
+    const policy = readGrant(["./fixtures/scratch-glob/data/sub/**"]);
+    const { decisions } = withCapwall(policy, "enforce", (dep) => {
+      expect(() => dep.globSync(pattern, { cwd: SUB })).toThrowError(
+        expect.objectContaining({ name: "CapabilityError" }),
+      );
+    });
+    expectOneDecision(decisions, false, FS_ROOT);
+  });
+
+  it("does NOT over-deny a segment that stays a matcher", () => {
+    // `.*`, `*.*`, `[.]*` and `..*` all contain a `*`, so nothing in the grammar can reduce them
+    // to a literal path component; they match directory entries, and `readdir` never yields `.`
+    // or `..`. Denying these would have been the cheap way to close #120 and would have broken
+    // every dotfile glob in the ecosystem.
+    for (const pattern of [".*", "*.*", "[.]*", "..*", "?.txt"]) {
+      const policy = readGrant(["./fixtures/scratch-glob/data/sub/**"]);
+      const { decisions } = withCapwall(policy, "enforce", (dep) =>
+        dep.globSync(pattern, { cwd: SUB }),
+      );
+      expectOneDecision(decisions, true, SUB);
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// THE PROPERTY, over GENERATED patterns (#120).
+//
+// #84, #95 and #120 are the same failure three times: a parser deciding a security boundary while
+// modelling a narrower grammar than its consumer accepts. Three more hand-picked cases in the
+// table above would be the fourth. So the divergence itself is the test:
+//
+//     for every generated pattern p,
+//       every entry real fs.globSync(p, {cwd}) returns
+//       resolves INSIDE the directory nodeGlobBase(p, cwd) names.
+//
+// If minimatch grows a new way to spell `..` — or capwall's expansion ever disagrees with the
+// real one — this fails, whether or not anybody thought to write that spelling down.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+describe.skipIf(!HAS_GLOB)("fs.glob — capwall's base bounds where Node really walks (#120)", () => {
+  /**
+   * A DEEP, TINY sandbox, and both adjectives are load-bearing.
+   *
+   * Deep: the generator composes at most three upward tokens, so four padding levels above the
+   * walk's cwd mean even a fully-escaping pattern stays inside the sandbox. Tiny: a `**` that
+   * escapes into a real source tree turns this test into a filesystem crawl (measured: minutes),
+   * and a slow property test is a property test somebody deletes.
+   */
+  const PROP_ROOT = nodeFs.realpathSync(
+    nodeFs.mkdtempSync(path.join(nodeOs.tmpdir(), "capwall-globprop-")),
+  );
+  const LEVELS = ["p1", "p2", "p3", "p4"];
+  const WALK_CWD = path.join(PROP_ROOT, ...LEVELS, "cwd");
+
+  beforeEach(() => {
+    nodeFs.mkdirSync(path.join(WALK_CWD, "sub"), { recursive: true });
+    // One marker file per level, so a walk that escapes N levels RETURNS something and the
+    // property has an entry to judge. A silent escape that matched nothing would pass vacuously.
+    nodeFs.writeFileSync(path.join(PROP_ROOT, "up5.txt"), "5");
+    for (let i = 0; i < LEVELS.length; i++) {
+      nodeFs.writeFileSync(
+        path.join(PROP_ROOT, ...LEVELS.slice(0, i + 1), `up${LEVELS.length - i}.txt`),
+        String(i),
+      );
+    }
+    nodeFs.writeFileSync(path.join(WALK_CWD, "here.txt"), "0");
+    nodeFs.writeFileSync(path.join(WALK_CWD, ".dot.txt"), "d");
+    nodeFs.writeFileSync(path.join(WALK_CWD, "sub", "deep.txt"), "s");
+  });
+  afterEach(() => {
+    nodeFs.rmSync(path.join(PROP_ROOT, LEVELS[0]!), { recursive: true, force: true });
+  });
+
+  /**
+   * Segment-shaped tokens the generator composes. Deliberately weighted towards dots and
+   * punctuation — the region of the grammar where "is this a `..`?" stops being a string
+   * question — with ordinary segments and plain wildcards mixed in so the corpus also proves the
+   * analysis does not simply answer "unbounded" to everything.
+   */
+  const TOKENS = [
+    "..", ".", "...", "[.]", "[.].", ".[.]", "[.][.]", "[.-.][.-.]", "[..]",
+    "..{,}", ".{.,.}", "{.,..}", "{a,[.][.]}", "[.][.]{,}", "{,..}", "{..,.}",
+    "@(..)", "+(.)", "!(x)", "[!q][!q]", "?.", ".?", "*.", ".*", "*.*", "[.]*",
+    "..*", "*", "**", "?", "sub", "p4", "{sub,p4}", "[sp]*", "s?b",
+  ];
+  const TAILS = ["*", "*.txt", "**"];
+
+  /** Deterministic 32-bit PRNG — a fixed seed, so a failure is reproducible from the message. */
+  function makeRandom(seed: number): () => number {
+    let state = seed >>> 0;
+    return () => {
+      state = (state * 1664525 + 1013904223) >>> 0;
+      return state / 0x100000000;
+    };
+  }
+
+  function generatePatterns(): string[] {
+    const patterns = new Set<string>();
+    // Exhaustive over PAIRS of tokens: 2 levels of escape is enough to leave the sandbox, and
+    // every spelling gets composed with every other one.
+    for (const a of TOKENS) {
+      for (const b of TOKENS) patterns.add(`${a}/${b}/*`);
+      for (const tail of TAILS) patterns.add(`${a}/${tail}`);
+    }
+    // Plus a seeded random pass over 1–3 tokens and a random tail, so the corpus is not only the
+    // shapes the cross-product happens to produce.
+    const random = makeRandom(0x120c0de);
+    const pick = <T>(xs: readonly T[]): T => xs[Math.floor(random() * xs.length)]!;
+    for (let i = 0; i < 400; i++) {
+      const depth = 1 + Math.floor(random() * 3);
+      const segments: string[] = [];
+      for (let d = 0; d < depth; d++) segments.push(pick(TOKENS));
+      segments.push(pick(TAILS));
+      patterns.add(segments.join("/"));
+    }
+    return [...patterns];
+  }
+
+  it("every entry Node returns is inside the directory capwall decided about", () => {
+    const cwdPolicy = asPolicyPath(WALK_CWD);
+    const violations: string[] = [];
+    let withResults = 0;
+    let escapedCwd = 0;
+
+    const fsRoot = asPolicyPath(path.parse(WALK_CWD).root);
+    for (const pattern of generatePatterns()) {
+      const base = nodeGlobBase(pattern, WALK_CWD);
+      // Nothing to check, and nothing to learn: when capwall already answers "the filesystem
+      // root" the property holds for any result whatsoever, so running the walk only costs time
+      // — and some of these really are rooted at `/` (`{,..}/**` expands to `/**`, which crawls
+      // the whole machine). The complementary risk, an implementation that answers `/` to
+      // EVERYTHING and passes vacuously, is what the next test rules out.
+      if (base === fsRoot) continue;
+      let matches: unknown[];
+      try {
+        matches = realGlobSync!(pattern, { cwd: WALK_CWD });
+      } catch {
+        // Node itself rejected the pattern — no walk, so nothing was disclosed.
+        continue;
+      }
+      if (matches.length === 0) continue;
+      withResults++;
+      let escaped = false;
+      for (const match of matches) {
+        const resolved = asPolicyPath(path.resolve(WALK_CWD, match as string));
+        if (!(resolved === base || resolved.startsWith(base.endsWith("/") ? base : base + "/"))) {
+          violations.push(`${JSON.stringify(pattern)} -> ${resolved} escapes base ${base}`);
+        }
+        if (!(resolved === cwdPolicy || resolved.startsWith(cwdPolicy + "/"))) escaped = true;
+      }
+      if (escaped) escapedCwd++;
+    }
+
+    expect(violations.slice(0, 10).join("\n")).toBe("");
+    // The corpus has to be doing work: patterns that match nothing prove nothing, and patterns
+    // that never leave the cwd would not have caught #120 in the first place.
+    expect(withResults).toBeGreaterThan(100);
+    expect(escapedCwd).toBeGreaterThan(20);
+  }, 120_000);
+
+  it("does not answer `unbounded` to everything — ordinary patterns still name a real base", () => {
+    // The trivially "safe" implementation returns the filesystem root for every pattern and
+    // passes the property above while making `fs.glob` unusable. These assertions are what stops
+    // that from being an acceptable fix.
+    const root = asPolicyPath(path.parse(WALK_CWD).root);
+    for (const pattern of ["**", "*.txt", "sub/*", ".*", "*.*", "{a,b}*.txt", "[sl]*/*"]) {
+      expect(nodeGlobBase(pattern, WALK_CWD), pattern).not.toBe(root);
+    }
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════

@@ -19,11 +19,17 @@
 // registers the hook — and a URL already in that cache never consults the load chain, which is
 // precisely what left the hook's re-mediation backstop dead (#78). `node:url`/`node:path` are not
 // mediated and stay ordinary imports.
-import { realModule } from "../real-builtins.cjs";
+// `node:worker_threads` is mediated too, so `MessageChannel` comes out of the same CJS capture as
+// `register` — a static ESM import of it here would cache that specifier raw and leave the #78
+// backstop dead for it, which `test/real-builtins.test.ts`'s source scan exists to catch.
+import { realModule, realWorkerThreads } from "../real-builtins.cjs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import * as path from "node:path";
 import { pushEsmContext, popEsmContext, esmExportNames } from "./esm-runtime.js";
+import { liveCtx, onLiveContextChange } from "./live-context.js";
+import type { EsmGateSnapshot } from "./module-read.js";
 import type { ShimContext } from "../shims/runtime.js";
+import type { Decision } from "../policy/evaluate.js";
 
 export interface EsmHookHandle {
   /** Best-effort teardown; ESM hooks cannot be fully unregistered (Node limitation). */
@@ -32,6 +38,39 @@ export interface EsmHookHandle {
 
 /** module.register is one-shot per process for our hook; track it so a second install is a no-op. */
 let hookRegistered = false;
+
+/**
+ * THE MODULE-READ GATE'S CHANNEL to the loader thread (issue #123), created once with the hook.
+ *
+ * WHY THE HOOK NEEDS A CHANNEL AT ALL. The `resolve` hook decides whether a dependency may
+ * `import()` a file outside the dependency graph, and it runs on Node's separate loader thread —
+ * which holds no capwall state and cannot synchronously ask this one, because the main thread
+ * BLOCKS on hook results during synchronous module resolution and any round trip would deadlock.
+ * So the policy is COPIED to that thread and re-copied whenever it changes. See
+ * `loader/esm-hooks.ts` for the drain-on-every-invocation discipline that makes the copy
+ * race-free, and `loader/module-read.ts` for the decision itself.
+ *
+ * Main → loader carries {@link EsmGateSnapshot}s. Loader → main carries decisions to record, which
+ * is why this end has a listener at all: a denial is ENFORCED on the loader thread (it throws
+ * there), but it still has to reach `onDecision` so `observe`, the trace file and `capwall diff`
+ * see it.
+ *
+ * The subscription is never cancelled, deliberately: the hook it feeds cannot be unregistered
+ * either (a Node limitation this module already documents), so a live subscription and a live
+ * hook have exactly the same lifetime. Cancelling it would freeze the loader thread's copy at
+ * whatever policy was in force when the last install went away — the stale-policy failure #62/#87
+ * exist to prevent — instead of telling it that capwall is no longer installed.
+ */
+
+/** Build the snapshot the loader thread evaluates against, from the live context. */
+function snapshotFor(ctx: ShimContext, installed: boolean): EsmGateSnapshot {
+  return {
+    installed,
+    policy: ctx.policy,
+    mode: ctx.mode,
+    projectRoot: ctx.projectRoot,
+  };
+}
 
 export function registerEsmHook(ctx: ShimContext): EsmHookHandle {
   // Make the shims resolvable on this (main) thread for the synthetic modules to import. This
@@ -50,11 +89,41 @@ export function registerEsmHook(ctx: ShimContext): EsmHookHandle {
     const here = path.dirname(fileURLToPath(import.meta.url));
     const hooksUrl = pathToFileURL(path.join(here, "esm-hooks.js")).href;
     const bridgeUrl = pathToFileURL(path.join(here, "esm-runtime.js")).href;
+
+    // The module-read gate's channel (#123). `unref`ed so an idle port never holds the process
+    // open — capwall must not change when a host app exits.
+    const { port1, port2 } = new realWorkerThreads.MessageChannel();
+    port1.on("message", (outcome: { pkg: string; decision: Decision }) => {
+      // Report through the LIVE context, not the registering install's: a decision arriving one
+      // event-loop turn later must land in whichever install is in force now, exactly as a
+      // captured shim's decision would (#87).
+      liveCtx.onDecision(outcome.pkg, outcome.decision);
+    });
+    port1.unref();
+    // Push every subsequent policy change to the loader thread's copy. Subscribing invokes the
+    // listener immediately with the current state, which is also what posts the snapshot that
+    // covers the window between `register()` and the first import.
+    onLiveContextChange((live, installed) => {
+      try {
+        port1.postMessage(snapshotFor(live, installed));
+      } catch {
+        // The channel is gone (a torn-down loader thread). The gate then keeps its last
+        // snapshot, and the CJS half — which is a real patch and really is removed by
+        // `uninstall()` — is unaffected.
+      }
+    });
+
     // The REAL `register`, never the `node:module` shim — capwall's own hook registration must
     // not be attributed and gated by #61's own gate.
     realModule.register(hooksUrl, {
       parentURL: import.meta.url,
-      data: { bridgeUrl, exports: exportsBySpecifier },
+      data: {
+        bridgeUrl,
+        exports: exportsBySpecifier,
+        gatePort: port2,
+        gateSnapshot: snapshotFor(liveCtx, true),
+      },
+      transferList: [port2],
     });
     hookRegistered = true;
   }

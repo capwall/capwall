@@ -147,6 +147,29 @@ let installed = false;
 let hardenedRatchet = false;
 
 /**
+ * Subscribers notified whenever {@link liveCtx} is re-pointed (issue #123).
+ *
+ * WHY THIS EXISTS, given that the whole design is "everyone reads the same live box". Because
+ * one consumer cannot: the ESM module-customization hook runs on Node's separate LOADER THREAD
+ * and therefore holds a COPY of the policy, not a reference to this box (see
+ * `loader/esm-hooks.ts`). A copy has to be re-sent when the original changes, and this is the one
+ * place that knows when it did. Nothing else may use this to cache policy state — an in-process
+ * consumer that reads `liveCtx` directly is always correct and never needs a notification.
+ */
+type LiveContextListener = (ctx: ShimContext, installed: boolean) => void;
+const contextListeners = new Set<LiveContextListener>();
+
+/**
+ * Subscribe to live-context changes, and receive the CURRENT state immediately — so a subscriber
+ * registered mid-install never has to reconstruct what it missed. Returns an unsubscribe function.
+ */
+export function onLiveContextChange(listener: LiveContextListener): () => void {
+  contextListeners.add(listener);
+  notifyOne(listener);
+  return () => contextListeners.delete(listener);
+}
+
+/**
  * Re-point {@link liveCtx} at the newest install, or at the torn-down policy if there is none.
  *
  * ONE FIELD IS NOT THE NEWEST INSTALL'S: `hardened` is a ratchet over every install in the current
@@ -177,6 +200,7 @@ function applyTopOfStack(): void {
     // here and only here — the same boundary the egress pin uses.
     hardenedRatchet = false;
     installed = false;
+    notifyContextListeners();
     return;
   }
   liveBox.policy = top.policy;
@@ -189,6 +213,28 @@ function applyTopOfStack(): void {
   if (!hardenedRatchet && installs.some((ctx) => ctx.hardened === true)) hardenedRatchet = true;
   liveBox.hardened = hardenedRatchet;
   installed = true;
+  notifyContextListeners();
+}
+
+/**
+ * Run every subscriber, ISOLATING FAILURES. A listener that throws must not abort an install or
+ * an `uninstall()` partway through — that is #107's bug 3 in a new place, and the cure is the
+ * same: report and carry on, because a half-applied lifecycle transition is strictly worse than
+ * a noisy one.
+ */
+function notifyContextListeners(): void {
+  for (const listener of contextListeners) notifyOne(listener);
+}
+
+function notifyOne(listener: LiveContextListener): void {
+  try {
+    listener(liveCtx, installed);
+  } catch (err) {
+    process.stderr.write(
+      `[capwall] WARN a live-context listener threw and was ignored: ` +
+        `${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  }
 }
 
 /** Activate `ctx`. The newest install wins, exactly as the newest `_load` patch does. */

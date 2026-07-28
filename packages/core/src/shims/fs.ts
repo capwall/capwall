@@ -57,7 +57,7 @@ import { fileURLToPath } from "node:url";
 import { Readable, Writable } from "node:stream";
 import { isNodeUrlLike } from "./url-snapshot.js";
 import { copyOwnFieldsExcept } from "./pin.js";
-import { nodeGlobPrefix } from "../policy/glob.js";
+import { nodeGlobBase } from "../policy/glob.js";
 import {
   guard,
   guardedConstructorSubclass,
@@ -384,11 +384,18 @@ function accessSpecs(args: unknown[]): PathSpec[] {
  * PREFIX-ONLY WOULD HAVE BEEN FAIL-OPEN. #106's own inclination was "the non-magic prefix of the
  * pattern". Measured against real `fs.globSync` on Node 22, three shapes escape that prefix:
  * `{/etc,/tmp}/*.conf` (a brace group with absolute alternatives — the prefix is empty, the walk
- * is in `/etc`), `{.,..}/*.conf`, and `**` followed by `..`. So the prefix is computed by
- * `nodeGlobPrefix` (`policy/glob.ts`), which returns `null` — "unbounded" — for every construct
- * it cannot prove segment-local, and unbounded resolves to the FILESYSTEM ROOT here. That is the
- * fail-closed answer: no reasonable policy grants `/`, and one that does has already said yes to
- * everything else.
+ * is in `/etc`), `{.,..}/*.conf`, and `**` followed by `..`. So the base directory is computed by
+ * `nodeGlobBase` (`policy/glob.ts`), which answers with the FILESYSTEM ROOT for every construct it
+ * cannot prove downward-only. That is the fail-closed answer: no reasonable policy grants `/`, and
+ * one that does has already said yes to everything else.
+ *
+ * AND THE PREFIX ITSELF WAS FAIL-OPEN UNTIL #120, for the same reason one level down: it decided
+ * where the walk goes by looking for the STRING `..` in the pattern text, and minimatch will
+ * happily spell a `..` as `[.][.]`, `..{,}`, `.{.,.}` or `[.-.][.-.]`. `policy/glob.ts` no longer
+ * looks for it — it performs the brace expansion the matcher performs and then requires every
+ * post-prefix segment to be PROVABLY downward-only, refusing anything it cannot prove. See the
+ * `expandBraces` / `segmentIsDownwardOnly` doc comments there, and the property test in
+ * `test/fs-glob.test.ts` that checks capwall's answer against where real `fs.globSync` walked.
  */
 
 /**
@@ -477,17 +484,14 @@ function toPolicyPath(nativePath: string): string {
 /**
  * The directory a single glob pattern's walk is rooted at, resolved against `cwd` — the path the
  * `fs.read` decision is taken on. Falls back to the filesystem ROOT whenever the pattern's reach
- * cannot be bounded (see the block comment above and `nodeGlobPrefix`).
+ * cannot be bounded (see the block comment above and `nodeGlobBase`).
  */
 function globBase(pattern: unknown, cwd: GlobCwd): string {
-  const root = () => toPolicyPath(path.parse(cwd.dir).root);
-  if (!cwd.resolvable || typeof pattern !== "string") return root();
+  if (!cwd.resolvable || typeof pattern !== "string") return toPolicyPath(path.parse(cwd.dir).root);
   // On win32 `\` is a path SEPARATOR in a glob pattern; on POSIX it is minimatch's escape
-  // character, which `nodeGlobPrefix` refuses to model (it returns null → root).
+  // character, which `nodeGlobPrefixes` refuses to model (it returns null → root).
   const normalized = path.sep === "\\" ? pattern.replace(/\\/g, "/") : pattern;
-  const prefix = nodeGlobPrefix(normalized);
-  if (prefix === null) return root();
-  return toPolicyPath(path.resolve(cwd.dir, prefix));
+  return nodeGlobBase(normalized, cwd.dir);
 }
 
 type AnyFn = (...args: unknown[]) => unknown;
