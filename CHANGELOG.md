@@ -97,6 +97,53 @@ has to be findable without reading the diff.
 
 ### Changed
 
+- **`examples/express-app` moved from express 4.22.2 to express 5.2.1, and its committed policy
+  was re-observed and re-reviewed rather than carried over** (#168). This is the flagship
+  trace-to-policy fixture, so the point of the bump is the policy diff, not the version string.
+  Three grants moved and one principal disappeared:
+
+  - **`mime` is no longer a principal at all.** express 4 reached `mime@1` through `send`, and
+    `mime@1` reads `DEBUG_MIME` by name. express 5's `send@1` uses `mime-types@3` → `mime-db`,
+    neither of which touches `process.env`. The stale entry was deleted, and
+    `packages/cli/test/express-app-policy.test.ts` now asserts its **absence** — a grant to a
+    package that is not in the tree is decorative, and a hand-reviewed policy that accumulates
+    those has stopped being a review artifact.
+  - **`debug`'s five keys are a different five.** `debug@2` → `debug@4` drops `DEBUG_FD`
+    (debug 4 has no such read), renames `DEBUG_SHOWHIDDEN` to `DEBUG_SHOW_HIDDEN`, and adds
+    `DEBUG_HIDE_DATE`. Each was confirmed by an `observe` run with the key actually set, not by
+    reading debug's docs.
+  - **`express: NODE_ENV`, `depd`'s two keys and `<app>`'s two `fs.write` paths are unchanged**,
+    and **no new capability KIND appeared** — express 5 is still env + fs, with no `net`,
+    `child_process` or `vm` grant.
+
+  The re-review found one thing worth recording that the draft did *not* contain: `debug`'s
+  `/^debug_/i` filter records **any** `DEBUG_*` key the host happens to export, so a machine with
+  `DEBUG_FD` or `DEBUG_MIME` set produces a draft granting both — keys debug 4 accepts and never
+  acts on. The committed list is debug's four documented option keys plus `DEBUG`.
+  `examples/express-app/README.md` § What express 5 changed about this policy has the full
+  reasoning. #57's regression test (zero `DENY` under enforce, `capwall diff` exit 0, in a
+  scrubbed and deliberately noisy environment) passes against the new policy unchanged in shape.
+- **Every `uses:` in both workflows is pinned to a commit SHA, and four action majors were
+  crossed** (#168): `actions/checkout` v4.4.0 → **v7.0.1**, `actions/setup-node` v4.4.0 →
+  **v7.0.0**, `actions/upload-artifact` v4.6.2 → **v7.0.1**, `pnpm/action-setup` v4.4.0 →
+  **v6.0.9**. A mutable tag in the workflow that publishes to npm is capwall's own argument about
+  dependency surface not applied to itself; the SHA is immutable, and the trailing `# vX.Y.Z`
+  comment keeps it readable.
+
+  **None of it is verified, and it cannot be while #3 stands.** GitHub Actions is billing-blocked,
+  and `pnpm ci:local` reproduces the workflow *steps* in a container without ever running an
+  *action* — it checks out nothing, installs no toolchain through `setup-node`, uploads no
+  artifact. So these four lines were chosen by reading each project's release notes for every
+  major crossed, which is the "read, not measured" standard #153 and #157 exist to reject. What
+  the reading found: `pnpm/action-setup` **v6 is the first release declaring pnpm 11 support**,
+  and this repo has been `packageManager: pnpm@11.17.0` on a v4 pin since #162 — that one is a
+  latent break, not currency. `setup-node` v5 began auto-enabling the cache from `packageManager`
+  and v6 narrowed that to npm only; `cache: pnpm` is stated explicitly here and is unaffected by
+  both. `checkout` v7 blocks fork checkouts under `pull_request_target`/`workflow_run`, neither of
+  which this repo uses. `upload-artifact`'s v4 semantics change famously broke upload/download
+  *pairs* — there is no `download-artifact` anywhere here, and the one upload is a build record
+  inside the same job that packs and publishes. v5/v6 are Node-24 runtime bumps; v7's new
+  `archive:` input is left at its default because `path` is a multi-file glob.
 - **Tests that used to skip on Node 20 now run everywhere**: the `fs.glob` family (seven
   `describe` blocks, previously behind a `HAS_GLOB` predicate), `globalThis.WebSocket` and the
   `node:http` `WebSocket` re-export, `WebSocket` under hardened mode, and — the security-relevant

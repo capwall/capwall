@@ -47,12 +47,41 @@ policy contains no `"*"`.
 | `<app>` | `fs.write` on `./logs`, `./logs/requests.log` | observed, kept as-is |
 | `express` | `env: NODE_ENV` | observed; read by name in express's own source (`app.set('env', …)`) |
 | `depd` | `env: NO_DEPRECATION, TRACE_DEPRECATION` | observed; both are read by name in depd's source |
-| `mime` | `env: DEBUG_MIME` | observed; read by name in mime's source |
-| `debug` | `env: DEBUG, DEBUG_FD, DEBUG_COLORS, DEBUG_DEPTH, DEBUG_SHOWHIDDEN` | observed (`DEBUG`, `DEBUG_FD`), plus debug's three other documented option keys — see below |
+| `debug` | `env: DEBUG, DEBUG_COLORS, DEBUG_DEPTH, DEBUG_HIDE_DATE, DEBUG_SHOW_HIDDEN` | observed (`DEBUG`), plus debug 4's four other documented option keys — see below |
 
 The hand edits were: setting `"mode": "enforce"` (this is a reviewed policy, not a draft),
-adding `"$schema"` so editors validate it, and adding the three `DEBUG_*` option keys that a
+adding `"$schema"` so editors validate it, and adding the four `DEBUG_*` option keys that a
 run with those options unset does not exercise.
+
+### What express 5 changed about this policy (#168)
+
+This example moved from express 4.22 to **express 5.2** as part of issue #168, and the policy
+was **re-observed and re-reviewed** rather than carried over — the bump moves principals, not
+just a version string. Two grants changed and one principal disappeared:
+
+- **`mime` is gone entirely.** express 4 reached `mime@1` through `send`, and `mime@1` reads
+  `DEBUG_MIME` by name. express 5's `send@1` uses `mime-types@3` → `mime-db`, and **neither
+  reads `process.env` at all** (`grep -rn 'process\.env' mime-types/ mime-db/` is empty). The
+  `mime` entry was deleted rather than left in place: a grant to a package that is no longer in
+  the tree is decorative, and a reviewed policy that accumulates those stops being a review
+  artifact. `packages/cli/test/express-app-policy.test.ts` now asserts its *absence*.
+- **`debug` moved from `debug@2` to `debug@4`, and its key set is different.** `DEBUG_FD` is
+  gone — `debug@2` read it by name to choose its output stream; `debug@4` has no such read
+  (`grep -rn DEBUG_FD debug/` is empty). `DEBUG_SHOWHIDDEN` was renamed `DEBUG_SHOW_HIDDEN`,
+  and `DEBUG_HIDE_DATE` was added. All four are in debug 4's documented option table
+  (`debug/README.md`), and each was verified as an *observed* read by running `capwall observe`
+  with all of them set, not by reading the docs alone.
+- **`express`'s `NODE_ENV` and `depd`'s two keys are unchanged**, and `<app>`'s two `fs.write`
+  paths are unchanged. No new capability KIND appeared: express 5 is still env + fs only, with
+  no `net`, `child_process` or `vm` grant, so the "an inbound listener is not a mediated
+  capability" note above still holds.
+
+One thing the bump did **not** change but is worth recording, because it is the next grant a
+reviewer would be tempted to add: `finalhandler@2` contains `opts.env || process.env.NODE_ENV`.
+It is never observed, because express always passes `opts.env` explicitly, so the `||` short
+circuits and the read never happens. It is not granted. If a future express stops passing it,
+the read becomes a soft deny (`undefined` → finalhandler's own `'development'` default) and
+`capwall diff` reports the drift — which is the intended way to find out.
 
 ### Why `debug`'s grant is five concrete keys
 
@@ -71,18 +100,27 @@ next machine, so this policy previously granted `debug` a bare `env: ["*"]`.
 
 That is fixed (issue #67): enumerating key *names* is no longer treated as reading their
 *values*, so only the keys `debug` genuinely reads are recorded. The same `observe` command
-now yields the same two keys under a developer shell, under `env -i`, and with fake
+now yields the same one key under a developer shell, under `env -i`, and with fake
 credentials exported:
 
 ```
-debug  ["DEBUG", "DEBUG_FD"]
+debug  ["DEBUG"]
 ```
 
-The grant adds `DEBUG_COLORS`, `DEBUG_DEPTH` and `DEBUG_SHOWHIDDEN` — debug's other
-documented option variables, which it reads only when they are actually set, so a run without
-them never observes them. All five are `debug`'s own configuration namespace, not host
-secrets. An undocumented `DEBUG_*` variable would be denied; because a denied env read is a
-soft deny (the value comes back `undefined`), that degrades the option rather than crashing.
+The grant adds `DEBUG_COLORS`, `DEBUG_DEPTH`, `DEBUG_HIDE_DATE` and `DEBUG_SHOW_HIDDEN` —
+debug 4's other documented option variables, which it reads only when they are actually set,
+so a run without them never observes them. All five are `debug`'s own configuration namespace,
+not host secrets. An undocumented `DEBUG_*` variable would be denied; because a denied env read
+is a soft deny (the value comes back `undefined`), that degrades the option rather than
+crashing.
+
+**And the filter is why the reviewed list is shorter than the observed one.** That regex takes
+*any* key beginning `debug_`, so a host with `DEBUG_FD` or `DEBUG_MIME` exported has both
+recorded against `debug` — verified, by re-running `observe` with them set. debug 4 does not
+*use* either; it coerces them into an `inspectOpts` property nothing reads. Granting an
+observed key that the package does not act on is exactly the review step AGENTS.md § 2 means by
+"a raw `observe` policy is a draft": the draft is a function of the machine it ran on, and the
+committed list is the four keys debug's own documentation defines plus `DEBUG` itself.
 
 **Why this matters more than the key count.** `env` is exactly where the token-stealing worms
 capwall is aimed at go looking, so a `"*"` there is the largest capability this format can

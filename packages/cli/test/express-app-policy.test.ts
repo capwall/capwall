@@ -107,18 +107,31 @@ describe("examples/express-app committed policy (#57)", () => {
     // The env grants are the part that rots: they only appeared once the M4 env shim landed.
     expect(policy.packages["express"]?.env).toContain("NODE_ENV");
     expect(policy.packages["depd"]?.env).toContain("NO_DEPRECATION");
-    expect(policy.packages["mime"]?.env).toContain("DEBUG_MIME");
+    // `mime` is NOT a principal here, and asserting its ABSENCE is the express 5 half of this
+    // test (#168). express 4 pulled `mime@1`, which reads `DEBUG_MIME` by name; express 5
+    // routes through `mime-types@3` -> `mime-db`, neither of which reads the environment at
+    // all. A stale `mime` entry would be a grant to a package that is no longer in the tree —
+    // harmless at runtime and exactly the kind of decorative permission a reviewed policy is
+    // supposed to not accumulate.
+    expect(Object.keys(policy.packages)).not.toContain("mime");
     // `debug` enumerates the whole environment (Object.keys(process.env)) but only READS
     // `DEBUG_*`. That enumeration used to be recorded as a value read of every key, which
     // forced a bare `["*"]` grant here; since #67 it is not, so the grant is back to concrete
     // keys. Asserted exactly — a regression in the enumeration fix would show up as this list
     // re-acquiring host-specific keys, and asserting the exact set is what catches that.
+    //
+    // THE SET CHANGED WITH EXPRESS 5 (#168) and the change is not cosmetic. express 4 pulled
+    // `debug@2`, which reads `DEBUG_FD` by name to pick its output stream; express 5 pulls
+    // `debug@4`, which does not — and which renamed `DEBUG_SHOWHIDDEN` to `DEBUG_SHOW_HIDDEN`
+    // and added `DEBUG_HIDE_DATE`. Granting `DEBUG_FD` under express 5 would be granting a key
+    // nothing reads. See examples/express-app/README.md § Why `debug`'s grant is five concrete
+    // keys for how each one was checked against debug 4's source and documented option table.
     expect(policy.packages["debug"]?.env).toEqual([
       "DEBUG",
       "DEBUG_COLORS",
       "DEBUG_DEPTH",
-      "DEBUG_FD",
-      "DEBUG_SHOWHIDDEN",
+      "DEBUG_HIDE_DATE",
+      "DEBUG_SHOW_HIDDEN",
     ]);
     // No package in the committed policy holds a wildcard env grant (#67 removed the last one).
     for (const [name, grant] of Object.entries(policy.packages)) {
