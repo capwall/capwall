@@ -85,7 +85,7 @@ yourself when wiring the preload by hand.
 | `CAPWALL_PROJECT_ROOT` | `process.cwd()` | Project root for attribution and glob resolution. |
 | `CAPWALL_ESM` | on | `0` disables the ESM loader hook (the CJS path is unaffected). |
 | `CAPWALL_ENV` | on | `0` disables the `process.env` read guard (#125) — the CLI channel for `install()`'s `env: false`. **Warns on stderr when set**, because it makes every `env` grant in the policy unenforced and unrecorded while `enforce` keeps denying every other capability: the process looks guarded and is not. |
-| `CAPWALL_GLOBAL_EGRESS` | on | `0` disables the global egress guard — `globalThis.fetch`/`WebSocket`/`EventSource` (#80). They are the one surface capwall reaches by writing to `globalThis`; the switch exists for a process where that write is unacceptable. |
+| `CAPWALL_GLOBAL_EGRESS` | on | `0` disables the global egress guard — `globalThis.fetch`/`WebSocket`/`EventSource` (#80). They are the one surface capwall reaches by writing to `globalThis`; the switch exists for a process where that write is unacceptable. Read at capwall's module evaluation, not just at install: setting it also skips the `Request.prototype.url` capture that materializes undici, which is ~21 ms of startup (#170). |
 | `CAPWALL_MAX_FRAMES` | `25` | Attribution frame budget — see below. |
 | `CAPWALL_HARDENED` | off | `1` (exactly) enables hardened mode — see below. Any other value leaves it off. |
 | `CAPWALL_ALLOW_LOADER_HOOKS` | off | `1` (exactly) lets a **dependency** call `module.register`/`registerHooks`, which is otherwise application-only (#61). Still warns loudly. See [`docs/threat-model.md` § Loader-hook registration](../../docs/threat-model.md). |

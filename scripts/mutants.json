@@ -1,12 +1,12 @@
 {
   "_readme": [
-    "MUTATION CATALOG — the structural guard for 'tests that pass for the wrong reason' (issue #112).",
+    "MUTATION CATALOG \u2014 the structural guard for 'tests that pass for the wrong reason' (issue #112).",
     "",
     "Each entry names ONE security-critical mechanism, an exact anchor string in the source that",
     "IS that mechanism, a mutation that removes it, and the test files that CLAIM to cover it.",
     "`node scripts/mutation-guard.mjs` applies each mutation in turn, runs only the claimed tests,",
     "and reports SURVIVED for any mutant those tests still pass against. A survivor is not a bug in",
-    "the source — it is a hole in the tests, which is the thing #112 found six of.",
+    "the source \u2014 it is a hole in the tests, which is the thing #112 found six of.",
     "",
     "`packages/core/test/mutation-catalog.test.ts` runs in the ordinary `pnpm test` and asserts that",
     "every `anchor` still occurs EXACTLY ONCE in its `file`, and that every `tests` path exists. That",
@@ -15,18 +15,18 @@
     "",
     "MOSTLY security-critical mechanisms, and one (#152) that is not: whether capwall's ESM install",
     "starts Node's module-customization THREAD is a startup-cost invariant. It earns a mutant on the",
-    "same argument the security ones do — going back to `module.register()` breaks nothing and fails",
+    "same argument the security ones do \u2014 going back to `module.register()` breaks nothing and fails",
     "nothing, and silently puts ~53 ms of thread bootstrap back on every mediated process (and, on",
     "Node 26, a DEP0205 warning on stderr). A property no test asserts is a property that decays,",
     "whichever column it sits in.",
     "",
-    "`needsBuild` marks mutants whose claimed tests spawn a subprocess against `dist/` — those need",
+    "`needsBuild` marks mutants whose claimed tests spawn a subprocess against `dist/` \u2014 those need",
     "a rebuild after mutating and after restoring."
   ],
   "mutants": [
     {
       "id": "glob-star-collapse",
-      "mechanism": "#21 — collapse runs of `**` segments so a glob compiles to ONE unbounded group (ReDoS hardening)",
+      "mechanism": "#21 \u2014 collapse runs of `**` segments so a glob compiles to ONE unbounded group (ReDoS hardening)",
       "file": "packages/core/src/policy/glob.ts",
       "anchor": "if (seg === \"**\" && segments[segments.length - 1] === \"**\") continue;",
       "mutation": "if (false && seg === \"**\" && segments[segments.length - 1] === \"**\") continue;",
@@ -38,7 +38,7 @@
     },
     {
       "id": "nodeglob-dotdot-fail-closed",
-      "mechanism": "#106/#120 — every segment at or after the first magic segment must be provably downward-only; anything not proven bounded is unbounded (fail closed to the filesystem root)",
+      "mechanism": "#106/#120 \u2014 every segment at or after the first magic segment must be provably downward-only; anything not proven bounded is unbounded (fail closed to the filesystem root)",
       "file": "packages/core/src/policy/glob.ts",
       "anchor": "if (!segmentIsDownwardOnly(segments[i]!)) return null;",
       "mutation": "if (false && !segmentIsDownwardOnly(segments[i]!)) return null;",
@@ -50,7 +50,7 @@
     },
     {
       "id": "nodeglob-brace-escape",
-      "mechanism": "#120 — an unbalanced brace is a construct capwall refuses to expand, so the pattern is unbounded rather than parsed optimistically",
+      "mechanism": "#120 \u2014 an unbalanced brace is a construct capwall refuses to expand, so the pattern is unbounded rather than parsed optimistically",
       "file": "packages/core/src/policy/glob.ts",
       "anchor": "if (close === -1) return null; // unbalanced open",
       "mutation": "if (false && close === -1) return null; // unbalanced open",
@@ -73,7 +73,7 @@
     },
     {
       "id": "native-two-subjects",
-      "mechanism": "#49/#99 — a `.node` load is charged to BOTH the caller and the package that owns the addon file; caller-only makes a shared resolver a skeleton key",
+      "mechanism": "#49/#99 \u2014 a `.node` load is charged to BOTH the caller and the package that owns the addon file; caller-only makes a shared resolver a skeleton key",
       "file": "packages/core/src/loader/native.ts",
       "anchor": "const subjects = caller === owner ? [caller] : [caller, owner];",
       "mutation": "const subjects = [caller];",
@@ -84,9 +84,9 @@
     },
     {
       "id": "native-filename-pin",
-      "mechanism": "#99 — the dlopen filename argument is stringified ONCE and the pinned string is forwarded, so a toString that answers twice cannot load a file the gate never saw",
+      "mechanism": "#99 \u2014 the dlopen filename argument is stringified ONCE and the pinned string is forwarded, so a toString that answers twice cannot load a file the gate never saw",
       "file": "packages/core/src/loader/native.ts",
-      "anchor": "    const converted = String(raw); // the ONE conversion — Node's `node::Utf8Value`, in JS\n    return { path: normalizeAddonPath(converted), forward: converted };",
+      "anchor": "    const converted = String(raw); // the ONE conversion \u2014 Node's `node::Utf8Value`, in JS\n    return { path: normalizeAddonPath(converted), forward: converted };",
       "mutation": "    return { path: UNKNOWN_ADDON, forward: undefined };",
       "tests": [
         "packages/core/test/native.test.ts"
@@ -95,7 +95,7 @@
     },
     {
       "id": "attribution-unattributed-not-app",
-      "mechanism": "#60 — an unattributable call charges `<unknown>`, an ordinary deny-by-default principal, and NOT the exempt `<app>` trust root",
+      "mechanism": "#60 \u2014 an unattributable call charges `<unknown>`, an ordinary deny-by-default principal, and NOT the exempt `<app>` trust root",
       "file": "packages/core/src/attribution/index.ts",
       "anchor": "  if (chain.length === 0) return UNATTRIBUTED;",
       "mutation": "  if (chain.length === 0) return APP_ROOT;",
@@ -108,7 +108,7 @@
     },
     {
       "id": "harden-freeze-namespace",
-      "mechanism": "#17 — hardened mode freezes the shim namespaces capwall hands out, so `fs.readFileSync = evil` cannot remove a guard",
+      "mechanism": "#17 \u2014 hardened mode freezes the shim namespaces capwall hands out, so `fs.readFileSync = evil` cannot remove a guard",
       "file": "packages/core/src/shims/harden.ts",
       "anchor": "  if (ctx.hardened === true) Object.freeze(o);",
       "mutation": "  if (false && ctx.hardened === true) Object.freeze(o);",
@@ -119,7 +119,7 @@
     },
     {
       "id": "harden-freeze-class",
-      "mechanism": "#17/#70 — hardened mode freezes guarded SUBCLASSES and their prototypes, closing `net.Socket.prototype.connect = evil`",
+      "mechanism": "#17/#70 \u2014 hardened mode freezes guarded SUBCLASSES and their prototypes, closing `net.Socket.prototype.connect = evil`",
       "file": "packages/core/src/shims/harden.ts",
       "anchor": "  if (ctx.hardened !== true) return;\n  if (typeof Cls !== \"function\") return;",
       "mutation": "  if (ctx.hardened !== true) return;\n  if (typeof Cls !== \"function\") return;\n  if (Cls) return;",
@@ -131,9 +131,9 @@
     },
     {
       "id": "global-egress-hardened-pin",
-      "mechanism": "#97 — a hardened install pins the capwall-installed global egress functions writable:false, even when an un-hardened install built them",
+      "mechanism": "#97 \u2014 a hardened install pins the capwall-installed global egress functions writable:false, even when an un-hardened install built them",
       "file": "packages/core/src/shims/global-egress.ts",
-      "anchor": "    slot.pin(replacement); // best-effort — a global someone made non-configurable is reported below",
+      "anchor": "    slot.pin(replacement); // best-effort \u2014 a global someone made non-configurable is reported below",
       "mutation": "    void slot; void replacement;",
       "tests": [
         "packages/core/test/global-egress.test.ts",
@@ -143,7 +143,7 @@
     },
     {
       "id": "env-authorized-key-scoping",
-      "mechanism": "#98 — the env-gate suspension during a real spawn is scoped to the exact keys Node itself reads, not a blanket 'gate off' window",
+      "mechanism": "#98 \u2014 the env-gate suspension during a real spawn is scoped to the exact keys Node itself reads, not a blanket 'gate off' window",
       "file": "packages/core/src/shims/runtime.ts",
       "anchor": "  return authorizedEnvKeys !== null && authorizedEnvKeys.has(key);",
       "mutation": "  return authorizedEnvKeys !== null;",
@@ -156,7 +156,7 @@
     },
     {
       "id": "dgram-replay-single-use",
-      "mechanism": "#60/#86 — the dgram auto-bind replay token is single-use, so a dependency that reads `socket.send` cannot keep an un-gated send around",
+      "mechanism": "#60/#86 \u2014 the dgram auto-bind replay token is single-use, so a dependency that reads `socket.send` cannot keep an un-gated send around",
       "file": "packages/core/src/shims/net.ts",
       "anchor": "      spent ||\n      this !== auth.socket ||",
       "mutation": "      this !== auth.socket ||",
@@ -168,7 +168,7 @@
     },
     {
       "id": "fastpath-declines-to-full-walk",
-      "mechanism": "#133/#143 — when the shortened capture reaches nothing it may believe, attribution re-runs the VERBATIM full walk; 'found nothing' is never an answer, and never the `<app>` trust root",
+      "mechanism": "#133/#143 \u2014 when the shortened capture reaches nothing it may believe, attribution re-runs the VERBATIM full walk; 'found nothing' is never an answer, and never the `<app>` trust root",
       "file": "packages/core/src/attribution/index.ts",
       "anchor": "    if (near.found !== null) return near.found;\n  }\n  return attributeCallerDetailed(options);",
       "mutation": "    return near.found ?? { pkg: APP_ROOT, budgetExhausted: false, initiatedByNode: false };\n  }\n  return attributeCallerDetailed(options);",
@@ -181,7 +181,7 @@
     },
     {
       "id": "fastpath-min-budget",
-      "mechanism": "#133/#143 — the fast path stands down entirely below the frame budget at which 'the short capture found it' still implies 'the full capture would have found it too', rather than offering a second opinion the full walk could not reach",
+      "mechanism": "#133/#143 \u2014 the fast path stands down entirely below the frame budget at which 'the short capture found it' still implies 'the full capture would have found it too', rather than offering a second opinion the full walk could not reach",
       "file": "packages/core/src/attribution/index.ts",
       "anchor": "  if (maxFrames >= FAST_PATH_MIN_BUDGET) {",
       "mutation": "  if (maxFrames >= 1) {",
@@ -193,7 +193,7 @@
     },
     {
       "id": "walk-skips-capwall-frames",
-      "mechanism": "#143 — capwall's OWN frames are never a principal. V8 skips them on the fast path and the walk skips them on the fallback; the two must agree, or a declined capture attributes the shim itself",
+      "mechanism": "#143 \u2014 capwall's OWN frames are never a principal. V8 skips them on the fast path and the walk skips them on the fallback; the two must agree, or a declined capture attributes the shim itself",
       "file": "packages/core/src/attribution/index.ts",
       "anchor": "    if (source.startsWith(CAPWALL_ROOT + path.sep)) continue; // capwall's own machinery",
       "mutation": "    if (false && source.startsWith(CAPWALL_ROOT + path.sep)) continue; // capwall's own machinery",
@@ -206,7 +206,7 @@
     },
     {
       "id": "esm-no-loader-thread",
-      "mechanism": "#152/#153 — capwall's ESM interception uses the SYNCHRONOUS module.registerHooks(), so no module-customization thread is started (~53 ms) and no DEP0205 deprecation warning is printed. module.register() is Stability 0 with removal announced",
+      "mechanism": "#152/#153 \u2014 capwall's ESM interception uses the SYNCHRONOUS module.registerHooks(), so no module-customization thread is started (~53 ms) and no DEP0205 deprecation warning is printed. module.register() is Stability 0 with removal announced",
       "file": "packages/core/src/loader/esm-hook.ts",
       "anchor": "    hooks = realModule.registerHooks({ resolve, load }) as RegisteredHooks;",
       "mutation": "    hooks = realModule.registerHooks({ resolve, load }) as RegisteredHooks;\n    realModule.register(\"data:text/javascript,export function resolve(s,c,n){return n(s,c)}\", import.meta.url);",
@@ -214,11 +214,11 @@
         "packages/core/test/esm-hook-graph.test.ts"
       ],
       "needsBuild": true,
-      "note": "The one mutant in this catalog that ADDS rather than removes, because the invariant is an absence. It re-creates exactly the cost #152 removed — the loader thread — without changing a single behaviour, which is why nothing but a dedicated probe catches it."
+      "note": "The one mutant in this catalog that ADDS rather than removes, because the invariant is an absence. It re-creates exactly the cost #152 removed \u2014 the loader thread \u2014 without changing a single behaviour, which is why nothing but a dedicated probe catches it."
     },
     {
       "id": "esm-hooks-deregistered-on-teardown",
-      "mechanism": "#62/#152 — the LAST uninstall() deregisters the module hooks, so ESM teardown is real rather than best-effort and a never-imported specifier is un-mediated afterwards exactly as it is on the CJS path, instead of throwing a bridge error that permanently poisons the specifier",
+      "mechanism": "#62/#152 \u2014 the LAST uninstall() deregisters the module hooks, so ESM teardown is real rather than best-effort and a never-imported specifier is un-mediated afterwards exactly as it is on the CJS path, instead of throwing a bridge error that permanently poisons the specifier",
       "file": "packages/core/src/loader/esm-hook.ts",
       "anchor": "        live.deregister();",
       "mutation": "        void live;",
@@ -226,11 +226,11 @@
         "packages/core/test/esm.test.ts"
       ],
       "needsBuild": true,
-      "note": "module.register() could not offer this line at all — the asymmetry docs/threat-model.md used to carry as a known limit. Without it the hooks outlive their install and #62's swap fixture reports the pre-#152 behaviour."
+      "note": "module.register() could not offer this line at all \u2014 the asymmetry docs/threat-model.md used to carry as a known limit. Without it the hooks outlive their install and #62's swap fixture reports the pre-#152 behaviour."
     },
     {
       "id": "esm-gate-stands-down-only-for-require",
-      "mechanism": "#152 — the ESM resolve hook stands down for the #123 module-read decision ONLY when loader/require.ts already took it: inside a gated Module._load AND for a `require` export condition. require(esm) pulls a whole ES subgraph in synchronously inside one Module._load, so the depth test alone would disarm the gate for every import below it",
+      "mechanism": "#152 \u2014 the ESM resolve hook stands down for the #123 module-read decision ONLY when loader/require.ts already took it: inside a gated Module._load AND for a `require` export condition. require(esm) pulls a whole ES subgraph in synchronously inside one Module._load, so the depth test alone would disarm the gate for every import below it",
       "file": "packages/core/src/loader/esm-hooks.ts",
       "anchor": "  return insideGatedCjsLoad() && conditions.includes(\"require\");",
       "mutation": "  return insideGatedCjsLoad();",
@@ -242,7 +242,7 @@
     },
     {
       "id": "esm-load-remediation-backstop",
-      "mechanism": "#78/#61 — the load hook re-mediates any raw node:<mediated> URL it is handed, since capwall's own resolve never emits one. Since #152 this is reachable only from a SYNCHRONOUS hook registered after capwall's, which is the one attacker position still ahead of capwall in the chain",
+      "mechanism": "#78/#61 \u2014 the load hook re-mediates any raw node:<mediated> URL it is handed, since capwall's own resolve never emits one. Since #152 this is reachable only from a SYNCHRONOUS hook registered after capwall's, which is the one attacker position still ahead of capwall in the chain",
       "file": "packages/core/src/loader/esm-hooks.ts",
       "anchor": "    const mediated = mediatedSpecifierForUrl(url);",
       "mutation": "    const mediated: string | null = null;",
@@ -254,7 +254,7 @@
     },
     {
       "id": "module-read-resolve-options-unwrapped",
-      "mechanism": "#157 — Module._load's fourth argument is an INTERNAL bag, not _resolveFilename's options, so the #123 gate unwraps `requireResolveOptions` instead of forwarding the bag. Conflating them made resolution throw on Node >=24.18, resolveQuietly return null, and the gate read that as 'nothing to decide' — a dependency read a file outside the project under a deny-all enforce policy and produced ZERO decisions",
+      "mechanism": "#157 \u2014 Module._load's fourth argument is an INTERNAL bag, not _resolveFilename's options, so the #123 gate unwraps `requireResolveOptions` instead of forwarding the bag. Conflating them made resolution throw on Node >=24.18, resolveQuietly return null, and the gate read that as 'nothing to decide' \u2014 a dependency read a file outside the project under a deny-all enforce policy and produced ZERO decisions",
       "file": "packages/core/src/loader/require.ts",
       "anchor": "  if (bag.requireResolveOptions !== undefined) return bag.requireResolveOptions;",
       "mutation": "  if (bag.requireResolveOptions !== undefined) return internal;",
@@ -262,7 +262,56 @@
         "packages/core/test/module-read.test.ts"
       ],
       "needsBuild": true,
-      "note": "The mutation IS the pre-#157 defect: hand _resolveFilename the bag where the unwrapped options belong. It is caught on every supported Node because module-read.test.ts asserts the CLASSIFICATION directly as well as end-to-end (#176) — the end-to-end rows need a _load that honours the four-argument form, which Node 22.15 (the engines floor) does not, so on the floor they it.skipIf out and a mutant resting on them alone would report a false SURVIVED. If you add a mutant whose property is genuinely unobservable on some supported major, do not copy this row: make the property runtime-independent first, or the catalog reports 'the tests did not fail' for a test that never ran."
+      "note": "The mutation IS the pre-#157 defect: hand _resolveFilename the bag where the unwrapped options belong. It is caught on every supported Node because module-read.test.ts asserts the CLASSIFICATION directly as well as end-to-end (#176) \u2014 the end-to-end rows need a _load that honours the four-argument form, which Node 22.15 (the engines floor) does not, so on the floor they it.skipIf out and a mutant resting on them alone would report a false SURVIVED. If you add a mutant whose property is genuinely unobservable on some supported major, do not copy this row: make the property runtime-independent first, or the catalog reports 'the tests did not fail' for a test that never ran."
+    },
+    {
+      "id": "global-egress-eager-request-capture",
+      "mechanism": "#170 \u2014 the real Request.prototype.url getter is captured at MODULE EVALUATION, before any dependency can replace it; only a process that has already switched the guard off (CAPWALL_GLOBAL_EGRESS=0) defers it",
+      "file": "packages/core/src/shims/global-egress.ts",
+      "anchor": "const GLOBAL_EGRESS_OFF_BY_ENV = process.env[\"CAPWALL_GLOBAL_EGRESS\"] === \"0\";",
+      "mutation": "const GLOBAL_EGRESS_OFF_BY_ENV = true;",
+      "tests": [
+        "packages/core/test/global-egress-capture.test.ts"
+      ],
+      "needsBuild": true,
+      "note": "Deferring the capture to install() for EVERYONE is the obvious way to buy back the ~21 ms and it reopens #26/#56 on the embedder path: a dependency required between `import @capwall/core` and `install()` replaces the prototype getter, undici keeps dialing the real URL, and capwall guards the attacker's chosen one."
+    },
+    {
+      "id": "http-websocket-stays-lazy",
+      "mechanism": "#170 \u2014 a getter-only member of the real `http` namespace is mirrored onto the shim as a getter, so building the shim does not read `WebSocket`/`CloseEvent`/`MessageEvent` and does not materialize undici",
+      "file": "packages/core/src/shims/net.ts",
+      "anchor": "return desc !== undefined && desc.get !== undefined && desc.set === undefined;",
+      "mutation": "return false;",
+      "tests": [
+        "packages/core/test/global-egress-capture.test.ts"
+      ],
+      "needsBuild": true,
+      "note": "A startup-cost invariant rather than a security property, on the same argument as `esm-no-loader-thread`: flattening the copy breaks nothing and fails nothing, and silently puts ~21 ms of undici materialization back on every mediated process that requires `http` \u2014 including every ESM one, which builds the registry eagerly."
+    },
+    {
+      "id": "web-storage-no-op-without-the-flag",
+      "mechanism": "#156 \u2014 the Web Storage guard patches NOTHING unless this process actually has Web Storage, and it answers that question with Object.keys(globalThis) rather than by reading the global (which prints an ExperimentalWarning on Node 26)",
+      "file": "packages/core/src/shims/web-storage.ts",
+      "anchor": "  return Object.keys(globalThis).includes(\"localStorage\");",
+      "mutation": "  return true;",
+      "tests": [
+        "packages/core/test/web-storage.test.ts"
+      ],
+      "needsBuild": false,
+      "note": "Runs on every supported Node \u2014 it is the ABSENT case, which is the half a version-gated feature usually leaves unasserted. A guard that installs unconditionally registers a process-patch site on 22 and 24 where there is nothing to patch."
+    },
+    {
+      "id": "web-storage-gate",
+      "mechanism": "#156 \u2014 localStorage's six members take an fs decision on the resolved --localstorage-file path (read for getItem/key/length, write for setItem/removeItem/clear) before Node performs the file I/O below the fs shim",
+      "file": "packages/core/src/shims/web-storage.ts",
+      "anchor": "  if (!localStorageAvailable()) return INERT;",
+      "mutation": "  if (true) return INERT;",
+      "tests": [
+        "packages/core/test/web-storage.test.ts"
+      ],
+      "needsBuild": true,
+      "minNodeMajor": 26,
+      "note": "The mechanism only exists on Node >=26 with --localstorage-file, so its claimed tests skipIf away below that and the mutant would report SURVIVED for a reason that is not about the tests. Reported SKIPPED by name instead. Verified CAUGHT on a real 26.5.0 binary."
     }
   ]
 }

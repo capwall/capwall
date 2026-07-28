@@ -789,7 +789,11 @@ globals with guarded equivalents for the life of the install. What it covers and
   too. While the global was un-mediated, shimming that copy bought nothing; now that the global is
   guarded, the module copy would be the remaining one-liner. Note the one deviation: the two
   guarded copies are not `===` to each other the way the real ones are. `instanceof` still answers
-  correctly for both.
+  correctly for both. It is exposed on the shim as a **getter, not a value** (#170): it is
+  getter-only on the real namespace, and reading it materializes undici — flattening it charged
+  ~21 ms of startup to every process that required `http`, and to every mediated process at all on
+  the ESM path, which builds the shim registry eagerly. The guarded subclass is still built before
+  anything can use it; only the read that produces it is deferred to a caller that wants it.
 - **Policy shape: the existing `net` grant**, not a new capability. A dependency dialing
   `example.com:443` holds the same authority whether it got there through `http.request`,
   `net.connect` or `fetch`; splitting them would let a policy grant one and not the other by
@@ -801,9 +805,27 @@ globals with guarded equivalents for the life of the install. What it covers and
   read sends the request to the **second** value; and a `Request` with an OWN shadowed `url`
   accessor reports whatever the attacker chose while undici dials the real internal URL — so the
   guard reads a `Request`'s destination through the **real `Request.prototype.url` getter**, which
-  reaches the same state undici dials from and steps over the shadow. For strings and `URL`s,
-  capwall performs exactly one `String(input)` — the same conversion undici performs — and forwards
-  that immutable string, so there is no second read left to diverge.
+  reaches the same state undici dials from and steps over the shadow. The same is true one level
+  up: replacing `Request.prototype.url` itself makes every later `Request` lie, and a getter
+  captured beforehand still returns the true URL (verified on 22.22.3 and 26.5.0). For strings and
+  `URL`s, capwall performs exactly one `String(input)` — the same conversion undici performs — and
+  forwards that immutable string, so there is no second read left to diverge.
+- **WHEN that getter is captured, and the one configuration where it is late (#170).** The capture
+  happens at `shims/global-egress.ts`'s **module evaluation** — as early as capwall itself loads,
+  before any dependency has run — because a capture taken at `install()` would be behind anything
+  an embedder required in between. It is skipped only when `CAPWALL_GLOBAL_EGRESS=0` is already in
+  the environment, i.e. when this process has said it does not want the guard; that variable is
+  read at module evaluation too, so the condition is exactly as early as the capture it replaces,
+  and reading `globalThis.Request` costs ~21 ms of startup that a process which switched the guard
+  off should not pay. An embedder can nevertheless set that variable and still pass
+  `globalEgress: true` (the option is a code-level default the variable does not reach); capwall
+  takes the capture at install time there, and **warns on stderr** if undici had already been
+  materialized in between, because it then cannot prove the getter is Node's own. The residual it
+  cannot detect is a dependency that replaces `globalThis.Request` **without** materializing
+  undici: the only route to Node's `Request` class is that property, so there is nothing left to
+  compare against. It is reachable only by code running before `install()` — which has already
+  captured raw `fs`, `net` and `child_process` — and only in that self-contradictory
+  configuration.
 - **Attribution is unchanged and lands on the dependency.** The guard runs synchronously, on the
   caller's own stack, before the first `await`, so a dependency's `fetch` is charged to that
   dependency — not `<app>`, and not `<unknown>` (which would have forced every real app to grant

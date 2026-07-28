@@ -312,7 +312,7 @@ and fails nothing.
 |---|---|---|
 | ~~Node's loader-thread bootstrap~~ | ~~53~~ | **Gone — #152 moved the hooks to `module.registerHooks()`.** See § After #152 below; it took considerably more than the 53 ms with it. |
 | `real-builtins.cts`'s twelve `require`s on the MAIN thread | 13 | #78. They must be eager and inside `index.js`'s static graph: that is the whole proof that they run against a pristine `Module._load` rather than capturing capwall's own shims. Narrowing helps a realm that needs two of them; it cannot help the realm that needs all twelve. |
-| `globalThis.Request` → undici | 21 | `global-egress.ts` captures the real `Request.prototype.url` getter at module scope, and V8 materializes undici on the first *observation* of that global (even `getOwnPropertyDescriptor` triggers it — verified). The capture is load-bearing: it is what stops a `Request` with a shadowed own `url` accessor reporting a granted destination while undici dials another (#26/#56). Deferring it to first `fetch()` would put that capture *after* dependencies have run, which is the window it exists to close. Note the guard itself is nearly free once undici is resident — `installGlobalEgressGuard` is ~1 ms — so this is the price of the TOCTOU capture, not of the guard. |
+| `globalThis.Request` → undici | 21 | `global-egress.ts` captures the real `Request.prototype.url` getter at module scope, and V8 materializes undici on the first *observation* of that global (even `getOwnPropertyDescriptor` triggers it — verified). The capture is load-bearing: it is what stops a `Request` with a shadowed `url` accessor — own OR on the prototype — reporting a granted destination while undici dials another (#26/#56). Deferring it to first `fetch()` would put that capture *after* dependencies have run, which is the window it exists to close. Note the guard itself is nearly free once undici is resident — `installGlobalEgressGuard` is ~1 ms — so this is the price of the TOCTOU capture, not of the guard. **Since #170 a process that has switched the guard OFF (`CAPWALL_GLOBAL_EGRESS=0`) no longer pays it** — see § 5. |
 | zod on the MAIN thread | 4 (zod 3) / **~62** (zod 4) | `parsePolicy` is real validation of a real document, and the preload always parses one. See § zod 4 below for the measured breakdown of the increase and why none of it is recoverable without giving that sentence up. |
 | the ESM shim registry being built eagerly | 3 | #150 opened by asking whether lazy shim construction was the win. **It is worth 3 ms.** `registerEsmHook` needs every specifier's export names before the hooks go live, so the registry cannot be lazy — and it turns out not to matter. Recorded because "we checked and it was small" is a result. |
 
@@ -566,15 +566,52 @@ re-checked at the new floor:
   that slot — a read, a `getOwnPropertyDescriptor`, or a `defineProperty` over it — triggers the
   lazy initializer. There is no interposition that is cheaper than the capture it would defer.
 
-One thing did fall out of re-checking it, and it is a defect rather than a lead:
-**`CAPWALL_GLOBAL_EGRESS=0` does not avoid this cost.** The capture is an IIFE at module scope of
-`global-egress.ts`, which is on capwall's static graph, so the 21 ms is paid whether or not the
-guard is installed — measured at 188.98 vs 187.78 ms on 22 and 148.76 vs 159.36 ms on 26, i.e. no
-difference at all. The switch removes the control and keeps its dominant startup cost. Filed as
-**#170** rather than fixed here: moving the capture into `installGlobalEgressGuard()` is provably
-window-free for the preload path (`install()` runs before the target's entry point) and widens the
-window for an embedder who imports `@capwall/core` early and calls `install()` late, which is the
-#26/#56/#80/#97 perimeter and deserves its own PR for the same reason #152 does.
+One thing did fall out of re-checking it, and it was a defect rather than a lead:
+**`CAPWALL_GLOBAL_EGRESS=0` did not avoid this cost.** The capture was an IIFE at module scope of
+`global-egress.ts`, which is on capwall's static graph, so the 21 ms was paid whether or not the
+guard was installed — measured at 188.98 vs 187.78 ms on 22 and 148.76 vs 159.36 ms on 26, i.e. no
+difference at all. The switch removed the control and kept its dominant startup cost. Filed as
+**#170**, and fixed there.
+
+#### How #170 fixed it without deferring the capture
+
+The obvious fix — move the capture into `installGlobalEgressGuard()`, where `ctx` says whether the
+guard is wanted — is provably window-free for the preload path (`install()` runs before the
+target's entry point) and **widens** the window for an embedder who imports `@capwall/core` early
+and calls `install()` late. That is the #26/#56/#80/#97 perimeter, so it was not taken. Instead
+the capture is conditional on something knowable at MODULE EVALUATION, which is as early as the
+capture it replaces: `process.env.CAPWALL_GLOBAL_EGRESS`. Every configuration that does not
+contradict itself is byte-identical to before; the table is in `shims/global-egress.ts` next to
+the code.
+
+Two undici materializations had to go, not one, and the second is the interesting half:
+
+  1. the `Request.prototype.url` capture, above;
+  2. **building the `http` shim.** `node:http` carries three members that are the same lazy
+     undici binding — `WebSocket`, `CloseEvent`, `MessageEvent` — and `wrapHttpModule`'s copy loop
+     read all of them. On the CJS path that charged 21 ms to the first `require("http")`; on the
+     ESM path, which builds the whole shim registry eagerly inside `install()`, it charged it to
+     **every mediated process**. So switching the guard off refunded nothing on the default
+     configuration until this was fixed too. `shims/net.ts` now mirrors a getter-only member of
+     the real namespace as a getter rather than flattening it to a value — which is also a more
+     faithful shim, since `http.WebSocket` is getter-only on the real namespace and the copy was
+     assignable. Reading the DESCRIPTOR does not trigger the binding (measured), which is what
+     makes the shape test free; that is *not* true of `globalThis`, where even
+     `getOwnPropertyDescriptor` materializes, and is why the global-scope capture had to be
+     conditioned on the environment instead of probed for.
+
+Measured after, on a 16-core box at load average 10 (min of 15 cold children per cell, ABBA'd,
+`CAPWALL_MODE=enforce`), as the delta between the guard on and `CAPWALL_GLOBAL_EGRESS=0`:
+
+| | guard on | `CAPWALL_GLOBAL_EGRESS=0` | delta |
+|---|---|---|---|
+| `CAPWALL_ESM=0` | 228–240 ms | 200–221 ms | **19–29 ms** |
+| `CAPWALL_ESM=1` (default) | 238–249 ms | 212–220 ms | **25–29 ms** |
+
+The absolute numbers are a busy box and are not comparable with § Startup's; the DELTA is the
+result, and it was 0 before. `test/global-egress-capture.test.ts` gates it on
+`process.moduleLoadList` rather than on a clock (AGENTS.md § 7), and two mutants in
+`scripts/mutants.json` pin both halves.
 
 ### What none of this touches: the compile cache's ceiling is compile, and the cost is resolution
 

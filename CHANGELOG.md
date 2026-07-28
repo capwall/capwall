@@ -23,6 +23,30 @@ has to be findable without reading the diff.
 
 ### Changed
 
+- **`CAPWALL_GLOBAL_EGRESS=0` now refunds the startup cost it was supposed to avoid** (#170).
+  The switch turned the global egress guard off and kept its dominant price: the real
+  `Request.prototype.url` capture — ~21 ms of undici materialization, the largest single line in
+  `scripts/bench/README.md` § Startup — was an IIFE at module scope, so it ran whether or not the
+  guard installed. Measured 188.98 vs 187.78 ms on Node 22 and 148.76 vs 159.36 on 26: no
+  difference at all.
+
+  The capture is **not** deferred to `install()`, which is the obvious fix and reopens #26/#56 for
+  an embedder who imports `@capwall/core` early and installs late — a dependency in between can
+  replace `Request.prototype.url` and capwall would guard the URL it claims while undici dials the
+  real one. It is conditional on `CAPWALL_GLOBAL_EGRESS`, which is read at module evaluation, so
+  the condition is exactly as early as the capture it replaces and every configuration that does
+  not contradict itself is unchanged. The one that does — the variable set AND `globalEgress: true`
+  passed to `install()` — takes the capture late and warns on stderr if it cannot prove the getter
+  is Node's own.
+
+  A second undici materialization had to go with it: `node:http` carries three members that are the
+  same lazy binding (`WebSocket`, `CloseEvent`, `MessageEvent`), and building the `http` shim read
+  them, so the ESM path — which builds the whole registry inside `install()` — paid the 21 ms on
+  **every** mediated process regardless of the switch. Getter-only members of the real namespace
+  are now mirrored as getters rather than flattened to values, which is also a more faithful shim:
+  `http.WebSocket` is getter-only on Node and capwall's copy was assignable. Measured delta between
+  the guard on and off, previously 0: **19–29 ms**.
+
 - **The ESM path no longer uses `module.register()`** (issues #152, #153). capwall's `resolve` and
   `load` hooks are now registered with **`module.registerHooks()`** — synchronous, and running in
   capwall's own realm rather than on Node's separate module-customization thread. Four things
