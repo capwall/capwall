@@ -74,6 +74,7 @@
  * the dgram replay-token theft cases (dgram.test.ts), the `_load` chain's out-of-order relink
  * (loader-uninstall.test.ts), and the `_compile` refcount (compile-gate-lifecycle.test.ts).
  */
+import * as nodeHttp from "node:http";
 import { createRequire } from "node:module";
 import * as net from "node:net";
 import * as path from "node:path";
@@ -406,25 +407,60 @@ describe("S12 × the net shims — one grant, one authority, however it is spell
     });
   });
 
-  it("guards the WebSocket the http namespace re-exports as well as the global (S13)", async () => {
+  /*
+   * S13, SPLIT SO EACH HALF ASSERTS SOMETHING (#112 item 3).
+   *
+   * This used to be one test that (a) `return`ed silently after installing capwall when
+   * `globalThis.WebSocket` was absent — reporting green with zero assertions on the Node 20 leg
+   * of the CI matrix, invisible in the report, against the convention `fs-glob.test.ts:165`
+   * argues for in prose — and (b) accepted `TypeError` as proof of guarding. `TypeError` is the
+   * UN-guarded outcome: `new undefined(...)` when `http.WebSocket` does not exist. "The property
+   * is missing" satisfied "the property is guarded".
+   *
+   * Availability differs per surface, so the skip conditions do too:
+   *   `globalThis.WebSocket` — on from Node 22; `--experimental-websocket` on Node 20.
+   *   `http.WebSocket`       — the same class object, re-exported from Node 22 only.
+   */
+  const HAS_GLOBAL_WEBSOCKET = typeof (globalThis as { WebSocket?: unknown }).WebSocket === "function";
+  const HAS_HTTP_WEBSOCKET =
+    typeof (nodeHttp as unknown as { WebSocket?: unknown }).WebSocket === "function";
+  const DENIED_WS = "ws://10.0.0.1:9999/";
+
+  it.skipIf(!HAS_GLOBAL_WEBSOCKET)("guards the global WebSocket (S12/S13)", async () => {
     const dep = capwall(policyGranting(ALLOWED_PORT)) as FixtureDep & {
       openWebSocket(url: string): Promise<string>;
-      openWebSocketViaHttpNamespace(url: string): unknown;
     };
-    if (typeof (globalThis as { WebSocket?: unknown }).WebSocket !== "function") return; // flag off
-    const denied = `ws://10.0.0.1:9999/`;
-    await expect(dep.openWebSocket(denied)).rejects.toMatchObject({ name: "CapabilityError" });
-    // Node >=22 re-exports the SAME class object onto `http`; on older Node the property is
-    // absent and `new undefined(...)` is a TypeError, which is not a capwall answer.
-    const viaHttp = ((): string => {
-      try {
-        dep.openWebSocketViaHttpNamespace(denied);
-        return "unguarded";
-      } catch (err) {
-        return (err as { name: string }).name;
-      }
-    })();
-    expect(viaHttp).toMatch(/^(CapabilityError|TypeError)$/);
+    await expect(dep.openWebSocket(DENIED_WS)).rejects.toMatchObject({ name: "CapabilityError" });
+  });
+
+  it.skipIf(!HAS_HTTP_WEBSOCKET)(
+    "guards the SAME class through the http namespace re-export (S13)",
+    () => {
+      const dep = capwall(policyGranting(ALLOWED_PORT)) as FixtureDep & {
+        openWebSocketViaHttpNamespace(url: string): unknown;
+      };
+      // Strictly `CapabilityError`. Nothing else counts: a `TypeError` here would mean the shim
+      // dropped the property, and "unguarded" means it forwarded the real class.
+      const viaHttp = ((): string => {
+        try {
+          dep.openWebSocketViaHttpNamespace(DENIED_WS);
+          return "unguarded";
+        } catch (err) {
+          return (err as { name: string }).name;
+        }
+      })();
+      expect(viaHttp).toBe("CapabilityError");
+    },
+  );
+
+  it("the http shim neither invents nor drops `WebSocket` relative to the real module", () => {
+    // The always-running half, and the honest Node-20 statement: on a runtime where real
+    // `node:http` has no `WebSocket`, the dependency must not see one either — that, and not a
+    // bare `TypeError`, is why the previous assertion could not fail there.
+    const dep = capwall(policyGranting(ALLOWED_PORT)) as FixtureDep & {
+      httpNamespaceWebSocketType(): string;
+    };
+    expect(dep.httpNamespaceWebSocketType()).toBe(HAS_HTTP_WEBSOCKET ? "function" : "undefined");
   });
 });
 

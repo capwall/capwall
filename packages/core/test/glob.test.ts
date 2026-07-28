@@ -26,15 +26,128 @@ describe("matchesGlob", () => {
     expect(matchesGlob("/app/a.txt", "/app/axtxt")).toBe(false);
   });
 
-  it("collapses adjacent ** segments (ReDoS hardening) without changing semantics", () => {
-    // `dir/**/**` must behave exactly like `dir/**` and not build adjacent unbounded groups.
+  it("adjacent ** segments do not change semantics", () => {
+    // `dir/**/**` must behave exactly like `dir/**`. This is the SEMANTIC half only — it holds
+    // with or without the #21 collapse, because the two regexes accept the same language. The
+    // collapse itself is asserted separately below; see that block for why.
     expect(matchesGlob("/app/**/**", "/app/a/b.log")).toBe(true);
     expect(matchesGlob("/app/**/**", "/app")).toBe(true);
     expect(matchesGlob("/app/**/**", "/other")).toBe(false);
-    // A pathological pattern against a long non-matching path must return promptly, not hang.
-    const long = "/app/" + "a/".repeat(40) + "nope.txt";
-    expect(matchesGlob("/app/**/**/**/**/x", long)).toBe(false);
   });
+});
+
+/*
+ * ───────────────────────────────────────────────────────────────────────────────────────────
+ * THE #21 `**`-COLLAPSE, ASSERTED AS THE THING IT IS (issue #112 item 1)
+ * ───────────────────────────────────────────────────────────────────────────────────────────
+ *
+ * `compile()` collapses runs of `**` segments so a pattern whose segments are `dir`, `**`, `**`
+ * builds ONE `(?:/[^/]+)*` group instead of two adjacent ones. Adjacent unbounded groups are
+ * the catastrophic-backtracking
+ * shape, and the candidate path is attacker-adjacent (a dependency's fs argument) on the hot
+ * guard path.
+ *
+ * WHY THE OLD TEST DID NOT TEST THIS. Collapsing changes no semantics — `(?:/[^/]+)*` twice
+ * accepts exactly the language `(?:/[^/]+)*` accepts — so NO input/output assertion can see
+ * it. The only two observables are the compiled regex's SHAPE and the time it takes. The
+ * previous version of this test asserted neither: its "pathological" case used four `**`
+ * groups against 41 segments, which is 17ms uncollapsed — under every timeout, with no timing
+ * assertion. All four of its assertions passed with the collapse deleted, verified by revert.
+ *
+ * SO BOTH OBSERVABLES ARE ASSERTED HERE:
+ *
+ *  1. STRUCTURALLY (deterministic, the primary assertion). `matchesGlob` ends in exactly one
+ *     `compile(pattern).test(candidate)` call, so a temporary `RegExp.prototype.test` hook
+ *     hands us the compiled matcher's `source` without `glob.ts` needing a test-only export.
+ *  2. TEMPORALLY (the backstop, in case the matcher stops being a regex and the structural
+ *     probe silently stops observing anything). Parameters are chosen OFF the flat part of the
+ *     backtracking curve, measured on this checkout:
+ *
+ *       ** groups × segments | uncollapsed | collapsed
+ *       4 × 41  (the old test)|      17 ms  |  0.24 ms
+ *       6 × 80                |    8347 ms  |  0.01 ms
+ *       8 × 40  (used here)   |    8125 ms  |  0.02 ms
+ *
+ *     The threshold is 500ms: ~30,000x the collapsed measurement (so a loaded `pnpm ci:local`
+ *     Docker container on a shared machine has enormous headroom) and ~16x under the
+ *     uncollapsed one. Both directions were re-verified by actually deleting the collapse from
+ *     `glob.ts` and re-running this file: it goes red, and the pathological case took 40.5s
+ *     under the vitest runner (versus 8.1s in bare `node`), so the real margin is wider still.
+ *     The explicit 60s test timeout is there so a REVERT fails on the elapsed assertion — with
+ *     a number in the message — instead of on an opaque vitest timeout.
+ */
+describe("matchesGlob — `**` collapse is real, not just semantics-preserving (#21)", () => {
+  /**
+   * The `source` of the regex `matchesGlob(pattern, candidate)` actually tested against, with
+   * `\/` normalized back to `/`. (`RegExp.prototype.source` runs EscapeRegExpPattern, which
+   * escapes `/` outside character classes so the value stays usable between `/` delimiters —
+   * an engine detail that has nothing to do with what is being asserted here.)
+   */
+  function compiledSourceFor(pattern: string, candidate: string): string | undefined {
+    const realTest = RegExp.prototype.test;
+    let captured: string | undefined;
+    // `no-extend-native` is exactly right in general and wrong here: `glob.ts` deliberately does
+    // not export its compiled matcher (and #112 asks for no source change to it), so the ONE
+    // observable is the `.test` call `matchesGlob` ends in. The patch is synchronous, spans a
+    // single call with no `await` inside, and is restored in the `finally` below.
+    // oxlint-disable-next-line eslint/no-extend-native
+    RegExp.prototype.test = function (this: RegExp, s: string): boolean {
+      captured = this.source;
+      return realTest.call(this, s);
+    };
+    try {
+      matchesGlob(pattern, candidate);
+    } finally {
+      // oxlint-disable-next-line eslint/no-extend-native
+      RegExp.prototype.test = realTest;
+    }
+    return captured?.replaceAll("\\/", "/");
+  }
+
+  const UNBOUNDED_GROUP = "(?:/[^/]+)*";
+  const countGroups = (source: string): number => source.split(UNBOUNDED_GROUP).length - 1;
+
+  it("the probe sees the compiled matcher at all (guards the two assertions below)", () => {
+    // If `matchesGlob` ever stops routing through `RegExp.prototype.test`, this fails loudly
+    // rather than letting the structural assertion below pass vacuously on `undefined`.
+    const source = compiledSourceFor("/app/logs/**", "/app/logs/a.log");
+    expect(source).toBeDefined();
+    expect(source).toBe("^/app/logs" + UNBOUNDED_GROUP + "$");
+  });
+
+  it("compiles a run of N `**` segments to exactly ONE unbounded group", () => {
+    for (const groups of [2, 3, 8]) {
+      const pattern = "/app" + "/**".repeat(groups) + "/x";
+      const source = compiledSourceFor(pattern, "/app/a/x");
+      expect({ pattern, groups: countGroups(source!) }).toEqual({ pattern, groups: 1 });
+      // …and the collapsed form is byte-identical to the singular pattern's.
+      expect(source).toBe(compiledSourceFor("/app/**/x", "/app/a/x"));
+    }
+  });
+
+  it("non-adjacent `**` segments are NOT collapsed — only runs are", () => {
+    // The collapse must not quietly widen a pattern with `**` on either side of a literal
+    // segment; two separated groups are not the ReDoS shape and must survive.
+    const source = compiledSourceFor("/app/**/mid/**/x", "/app/a/mid/b/x");
+    expect(countGroups(source!)).toBe(2);
+    expect(matchesGlob("/app/**/mid/**/x", "/app/a/b/mid/c/x")).toBe(true);
+    expect(matchesGlob("/app/**/mid/**/x", "/app/a/b/x")).toBe(false);
+  });
+
+  it(
+    "a pathological pattern returns promptly instead of backtracking catastrophically",
+    () => {
+      // 8 `**` groups against 40 non-matching segments: ~8s uncollapsed, ~0.02ms collapsed.
+      const pattern = "/app" + "/**".repeat(8) + "/x";
+      const candidate = "/app/" + "a/".repeat(40) + "nope.txt";
+      const started = process.hrtime.bigint();
+      const matched = matchesGlob(pattern, candidate);
+      const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+      expect(matched).toBe(false);
+      expect(elapsedMs).toBeLessThan(500);
+    },
+    60_000,
+  );
 });
 
 // Windows-style drive paths (issue #18). These are pure string tests — no real Windows FS or

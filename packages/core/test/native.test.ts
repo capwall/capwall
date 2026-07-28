@@ -16,7 +16,7 @@
  *     precisely because the file is not a real addon: when the gate passes, dlopen is reached
  *     and fails with the platform loader's own error. `CapabilityError` vs. "not an ELF file"
  *     is an unambiguous "gate fired" vs. "gate passed" signal — no faked pass.
- *  2. For a genuinely loadable addon, {@link findRealAddon} borrows one out of the installed
+ *  2. For a genuinely loadable addon, `helpers/real-addon.ts` borrows one out of the installed
  *     dependency tree (pnpm pulls platform-keyed native bindings for `rollup`/`oxlint`). That
  *     covers the end-to-end "granted, and the addon really loads" case on the platforms where
  *     such a binding exists, and skips with an explicit message where it does not.
@@ -34,9 +34,9 @@ import {
   type Decision,
   type Policy,
 } from "../src/index.js";
+import { REAL_ADDON } from "./helpers/real-addon.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = path.resolve(here, "..", "..", "..");
 const requireCjs = createRequire(import.meta.url);
 const FIXTURE = path.join(here, "fixtures", "node_modules", "fixture-dep");
 const FIXTURE_ADDON = path.join(FIXTURE, "build", "Release", "fixture-addon.node");
@@ -114,53 +114,6 @@ const GRANT = (packages: Record<string, unknown>): Record<string, unknown> => ({
 });
 const OBSERVE = { version: 1, mode: "observe" };
 
-/**
- * Borrow a real, loadable `.node` from the installed dependency tree.
- *
- * pnpm materializes platform-keyed native bindings (e.g. `@rollup/rollup-linux-x64-gnu`,
- * `@oxlint/binding-linux-x64-gnu`) under `node_modules/.pnpm`, and those package directory
- * names embed `process.platform` — which is what keeps this scan cheap and targeted rather
- * than a walk of the whole store. Returns `null` when no such binding is installed (a
- * different package manager's layout, or a platform with no prebuilt binding), in which case
- * the dependent test skips loudly instead of pretending to pass.
- */
-function findRealAddon(): string | null {
-  const store = path.join(REPO_ROOT, "node_modules", ".pnpm");
-  let budget = 3000;
-  const walk = (dir: string, depth: number): string | null => {
-    if (depth > 4 || budget <= 0) return null;
-    let entries: nodeFs.Dirent[];
-    try {
-      entries = nodeFs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return null;
-    }
-    for (const entry of entries) {
-      if (--budget <= 0) return null;
-      const full = path.join(dir, entry.name);
-      if (entry.isFile() && entry.name.endsWith(".node")) return full;
-      if (entry.isDirectory()) {
-        const hit = walk(full, depth + 1);
-        if (hit) return hit;
-      }
-    }
-    return null;
-  };
-  let candidates: nodeFs.Dirent[];
-  try {
-    candidates = nodeFs.readdirSync(store, { withFileTypes: true });
-  } catch {
-    return null;
-  }
-  for (const entry of candidates) {
-    if (!entry.isDirectory() || !entry.name.includes(process.platform)) continue;
-    const hit = walk(path.join(store, entry.name), 0);
-    if (hit) return hit;
-  }
-  return null;
-}
-
-const REAL_ADDON = findRealAddon();
 
 describe("native gate — the grant itself", () => {
   it("is deny-by-default and ignores the addon path (the grant is a boolean)", () => {
@@ -286,6 +239,11 @@ describe("native gate — resolver wrappers (bindings / node-gyp-build shape)", 
       "enforce",
       (dep) => dep.loadNativeViaResolver(),
     );
+    // `every()` on an EMPTY array is `true`, and the placeholder addon throws a format error
+    // whose name is not `CapabilityError` whether the gate ran or not — so those two assertions
+    // alone survive deletion of the whole native gate. Pinning the subjects is what makes this
+    // row discriminating, exactly as its four siblings above do (#112).
+    expect(subjects(o)).toEqual(["fixture-native-loader", "fixture-dep"]);
     expect(nativeDecisions(o).every((d) => d.decision.allowed)).toBe(true);
     expect(o.error!.name).not.toBe("CapabilityError");
   });

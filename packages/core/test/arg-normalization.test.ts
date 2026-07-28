@@ -486,8 +486,11 @@ describe("#99 dgram — an absent address defaults to an IP, per socket type", (
     expect(first!.decision.observed).toEqual({ kind: "net", host: "127.0.0.1", port: 9 });
   });
 
-  it("records ::1 for a udp6 send with no address", async () => {
-    if (!hasIpv6Loopback()) return; // container without an IPv6 loopback — detected, not assumed
+  // `skipIf`, not a silent `return`: a body that returns after doing nothing reports GREEN with
+  // zero assertions and is invisible in the report, so a container without an IPv6 loopback
+  // looks like coverage. `net.test.ts:901,917,1017` guard the identical predicate this way and
+  // `net.test.ts:71-75` documents why the predicate is needed at all (#112 item 4).
+  it.skipIf(!hasIpv6Loopback())("records ::1 for a udp6 send with no address", async () => {
     await new Promise<void>((resolve) => load().udpSendNoAddress("udp6", 9, () => resolve()));
     const first = decisions.find((d) => (d.decision.observed as { kind?: string }).kind === "net");
     expect(first!.decision.observed).toEqual({ kind: "net", host: "::1", port: 9 });

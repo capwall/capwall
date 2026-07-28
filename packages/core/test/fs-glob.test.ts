@@ -157,7 +157,15 @@ describe("fs.glob — Node version matrix (#106)", () => {
     // The Node-20 no-op in one assertion: an unrelated, always-present method still works, so a
     // table entry for a name the runtime does not define costs nothing.
     const { decisions } = withCapwall(readGrant(["./fixtures/**"]), "enforce", (dep) => {
-      expect(dep.globSurface()).toBeTruthy();
+      // The exact surface, not `toBeTruthy()` — which accepts any non-empty object and would
+      // hold with the glob table emptied entirely (#112). Same expectation as the row above,
+      // asserted here under a GRANTING policy so the two differ only in the policy.
+      const expected = HAS_GLOB ? "function" : "undefined";
+      expect(dep.globSurface()).toEqual({
+        glob: expected,
+        globSync: expected,
+        promisesGlob: expected,
+      });
       expect(nodeFs.existsSync(path.join(DATA, "a.txt"))).toBe(true);
     });
     expect(decisions).toHaveLength(0);

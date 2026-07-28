@@ -43,6 +43,12 @@ import * as realBuiltins from "../src/real-builtins.cjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const SRC_ROOT = path.join(here, "..", "src");
+
+/** `process.getBuiltinModule` — Node ≥20.16 / ≥22.3, so present on every runtime in the CI
+ * matrix. Read at module scope anyway, so the one test that needs it can `skipIf` visibly
+ * rather than `return` invisibly if that ever stops being true (#112). */
+const GET_BUILTIN_MODULE = (process as unknown as { getBuiltinModule?: (id: string) => unknown })
+  .getBuiltinModule;
 const CAPTURE_FILE = "real-builtins.cts";
 
 /** The distinct builtins capwall mediates, `node:`-prefixed — `fs` and `node:fs` are one module. */
@@ -194,16 +200,16 @@ describe("#78 — every real mediated builtin is captured in src/real-builtins.c
 });
 
 describe("#78 — the capture is the genuine builtin, not one of capwall's own shims", () => {
-  it("still matches process.getBuiltinModule after a real install()", () => {
+  it.skipIf(GET_BUILTIN_MODULE === undefined)("still matches process.getBuiltinModule after a real install()", () => {
     // The runtime post-condition behind the ordering argument. If the capture ever ran after
     // `Module._load` was patched, `require("node:fs")` would have handed back the fs SHIM and
     // every guarded call would be double-mediated — silently, since a shim over a shim still
     // enforces. `process.getBuiltinModule` is the one reference to the real module a mediated
     // process retains (Node ≥20.16 / ≥22.3; skipped where absent rather than guessed at).
-    const getBuiltinModule = (
-      process as unknown as { getBuiltinModule?: (id: string) => unknown }
-    ).getBuiltinModule;
-    if (typeof getBuiltinModule !== "function") return;
+    // `skipIf` at the `it`, not `if (…) return` in the body: this is the single strongest
+    // anti-double-mediation assertion in the repo, and a silent no-op is how it would disappear
+    // without anyone noticing on a runtime that dropped the API (#112).
+    const getBuiltinModule = GET_BUILTIN_MODULE!;
 
     const captures: ReadonlyArray<readonly [string, unknown]> = [
       ["node:fs", realBuiltins.realFs],

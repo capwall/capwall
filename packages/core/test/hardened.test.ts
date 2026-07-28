@@ -218,9 +218,20 @@ describe("hardened mode ON — namespace-property patching cannot remove a guard
     });
   });
 
-  it("`delete fs.readFileSync` no-ops — the method is still a function", () => {
-    const { result } = withCapwall(true, (dep) => dep.deleteShimMethod());
+  it("`delete fs.readFileSync` no-ops AND the original guard still denies", () => {
+    // `typeof === "function"` alone is NOT the load-bearing assertion (see this file's header):
+    // a `delete` that fell through to the raw, unguarded builtin would satisfy it exactly as
+    // well as a `delete` that was refused. What distinguishes the two is whether the property
+    // that reads back still ENFORCES. (#112 item 6.)
+    const { result, decisions } = withCapwall(true, (dep) => {
+      const typeAfterDelete = dep.deleteShimMethod();
+      expect(() => dep.readData()).toThrowError(
+        expect.objectContaining({ name: "CapabilityError" }),
+      );
+      return typeAfterDelete;
+    });
     expect(result).toBe("function");
+    expect(decisions.some((d) => d.pkg === "fixture-dep" && !d.decision.allowed)).toBe(true);
   });
 
   it("Object.defineProperty over a guarded method throws TypeError", () => {
@@ -358,23 +369,60 @@ describe("hardened mode ON — which surfaces are (and are not) frozen", () => {
   });
 
   it("does NOT freeze process.env (documented gap — the guard is a Proxy over the live object)", () => {
+    /*
+     * THE READ-BACK HAPPENS AFTER UNINSTALL, ON PURPOSE (#112 item 7).
+     *
+     * This test is about FREEZING, and its title is accurate — but it used to read the key back
+     * through the installed env guard under a deny-all `enforce` policy and assert `"1"`. That
+     * succeeded only because this test FILE is `<app>`, which `shims/env.ts` waves through
+     * before `evaluate()` ever runs. The assertion was therefore true for a reason that has
+     * nothing to do with what is being tested, and it must never be citable as evidence that
+     * env reads work under enforce — they do not, for anything that is not `<app>`.
+     *
+     * Reading after `uninstall()` takes the guard out of the picture entirely: what is asserted
+     * is that the write LANDED ON THE REAL `process.env`, which is the actual content of "not
+     * frozen".
+     */
     const handle = install(emptyEnforcePolicy(), "enforce", { projectRoot: here, hardened: true });
+    let frozenWhileInstalled: boolean;
+    let extensibleWhileInstalled: boolean;
     try {
-      expect(Object.isFrozen(process.env)).toBe(false);
+      frozenWhileInstalled = Object.isFrozen(process.env);
+      extensibleWhileInstalled = Object.isExtensible(process.env);
       process.env["CAPWALL_HARDENED_TEST"] = "1"; // must still be assignable
-      expect(process.env["CAPWALL_HARDENED_TEST"]).toBe("1");
-      delete process.env["CAPWALL_HARDENED_TEST"];
     } finally {
       handle.uninstall();
     }
+    expect(frozenWhileInstalled).toBe(false);
+    expect(extensibleWhileInstalled).toBe(true);
+    expect(process.env["CAPWALL_HARDENED_TEST"]).toBe("1");
+    delete process.env["CAPWALL_HARDENED_TEST"];
   });
 
-  it("a frozen guarded class can still be extended by a dependency (compatibility)", () => {
+  it("a frozen guarded class can still be extended by a dependency, and the subclass is still guarded", () => {
+    /*
+     * `class X extends Y {}` throws only when `Y` is not a constructor or `Y.prototype` is not
+     * an object — neither of which freezing ever affected — so `.not.toThrow()` on its own
+     * passed with hardened mode removed entirely (#112 item 7). Two assertions make it about
+     * hardening: that the class really IS frozen (otherwise "frozen guarded class" names
+     * nothing), and that a subclass of it still reaches the guard (otherwise "compatibility"
+     * would be satisfied by a shim that handed out the raw builtin).
+     */
     const fs = createFsShim(ctxFor(true));
+    const Guarded = fs.ReadStream as unknown as new (...a: never[]) => object;
+    expect(Object.isFrozen(Guarded)).toBe(true);
+    expect(Object.isFrozen(Guarded.prototype)).toBe(true);
+
+    let Mine!: new (...a: never[]) => object;
     expect(() => {
-      class Mine extends (fs.ReadStream as unknown as new (...a: never[]) => object) {}
-      return Mine;
+      Mine = class extends Guarded {};
     }).not.toThrow();
+    expect(Object.getPrototypeOf(Mine)).toBe(Guarded);
+    // Deny-all policy (`ctxFor`), and `fs` does not exempt `<app>` — so constructing through the
+    // subclass must still be refused by the guard the frozen parent carries.
+    expect(() => new Mine(...([path.join(here, "fixtures", "data.txt")] as never[]))).toThrowError(
+      expect.objectContaining({ name: "CapabilityError" }),
+    );
   });
 });
 

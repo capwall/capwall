@@ -534,10 +534,18 @@ describe("#80 — the guarded globals keep their observable shape", () => {
       const shape = dep.globalEgressShape();
       expect(shape["fetchName"]).toBe("fetch");
       expect(shape["fetchLength"]).toBe(globalThis.fetch.length);
-      if (hasWebSocket) {
-        expect(shape["webSocketName"]).toBe("WebSocket");
-        expect(shape["webSocketPrototypeConstructorIsGuarded"]).toBe(true);
-      }
+      // Both legs of the CI matrix assert something. On a runtime without `WebSocket` the claim
+      // is that capwall did not INVENT one — an `if (hasWebSocket)` with no `else` silently
+      // dropped half this test on Node 20 (#112). The guarded-shape claim for `WebSocket` on
+      // Node 20 is covered by `global-egress-flagged.test.ts`, which runs under the flag.
+      expect({
+        name: shape["webSocketName"],
+        guarded: shape["webSocketPrototypeConstructorIsGuarded"],
+      }).toEqual(
+        // `null`, not `undefined`: the fixture reports the absent case explicitly, so a shape
+        // object that simply stopped carrying the two keys would not satisfy this either.
+        hasWebSocket ? { name: "WebSocket", guarded: true } : { name: null, guarded: null },
+      );
     });
   });
 

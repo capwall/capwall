@@ -265,9 +265,15 @@ describe("#90 — a reinstall reuses the same shim objects (no forwarder, no str
     open.pop();
     track(install(tight(), "enforce", OPTS));
     for (const m of MODULES) {
-      expect(Object.isFrozen(requireCjs(m) as object), `${m} froze without hardened mode`).toBe(
-        false,
+      const handedOut = requireCjs(m) as object;
+      // BOTH halves of the title. `Object.isFrozen(...) === false` alone is also true of the RAW
+      // builtin, so the "hands out shims" half survived deletion of the whole shim registry
+      // (#112). `process.getBuiltinModule` is the one un-mediated reference a mediated process
+      // retains — see real-builtins.test.ts.
+      expect(handedOut, `${m} was not mediated at all after the swap`).not.toBe(
+        process.getBuiltinModule(m),
       );
+      expect(Object.isFrozen(handedOut), `${m} froze without hardened mode`).toBe(false);
     }
   });
 });

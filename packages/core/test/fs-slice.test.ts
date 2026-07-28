@@ -148,17 +148,23 @@ describe("fs slice — stream-class + existence-probe surfaces (review findings)
     await expect(result).resolves.toBe("fixture data\n");
   });
 
-  it("also mediates the deprecated FileReadStream alias (same bypass class)", () => {
-    withCapwall(emptyEnforcePolicy(), "enforce", () => {
-      const fs = requireCjs("fs") as typeof import("node:fs") & {
-        FileReadStream?: new (p: string) => unknown;
-      };
-      if (typeof fs.FileReadStream !== "function") return; // alias not present on this Node
-      expect(() => new fs.FileReadStream!(path.join(FIXTURE, "data.txt"))).toThrowError(
-        expect.objectContaining({ name: "CapabilityError" }),
-      );
-    });
-  });
+  // `skipIf`, not a silent `return` — and a `return` from inside the `withCapwall` CALLBACK was
+  // doubly invisible: the test reported green with zero assertions and the reporter showed
+  // nothing at all (#112). The alias is present on Node 20/22/24; the predicate reads the REAL
+  // `fs` so a runtime that finally drops the deprecated alias shows up as a skip.
+  it.skipIf(typeof (nodeFs as { FileReadStream?: unknown }).FileReadStream !== "function")(
+    "also mediates the deprecated FileReadStream alias (same bypass class)",
+    () => {
+      withCapwall(emptyEnforcePolicy(), "enforce", () => {
+        const fs = requireCjs("fs") as typeof import("node:fs") & {
+          FileReadStream: new (p: string) => unknown;
+        };
+        expect(() => new fs.FileReadStream(path.join(FIXTURE, "data.txt"))).toThrowError(
+          expect.objectContaining({ name: "CapabilityError" }),
+        );
+      });
+    },
+  );
 
   it("existsSync returns false (never throws) for a denied probe in enforce", () => {
     // Regression: existsSync is contractually non-throwing; a denial must return false.
