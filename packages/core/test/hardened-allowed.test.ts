@@ -44,7 +44,11 @@ import {
   type Policy,
 } from "../src/index.js";
 import { packageForPath } from "../src/attribution/index.js";
-import { REAL_ADDON } from "./helpers/real-addon.js";
+import {
+  REAL_ADDON,
+  REAL_ADDON_SKIP_REASON,
+  titleWithSkipReason,
+} from "./helpers/real-addon.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const requireCjs = createRequire(import.meta.url);
@@ -216,6 +220,12 @@ interface Surface {
    * `native.test.ts`'s `REAL, loadable addon` suite (same helper, same discovery).
    */
   available?: () => boolean;
+  /**
+   * What to say when `available()` is false, when "not available on this runtime" is not the
+   * whole story. The borrowed-addon row has a real diagnosis to report (#140) — which `.node`
+   * files were found and why none of them is loadable here.
+   */
+  unavailableReason?: () => string;
 }
 
 const hasGlobal = (name: string): boolean =>
@@ -315,6 +325,7 @@ const SURFACES: Surface[] = [
     name: "native .node load (process.dlopen)",
     run: (dep) => refused(() => dep.loadNativeViaDlopen(REAL_ADDON!)),
     available: () => REAL_ADDON !== null,
+    unavailableReason: () => `native .node load: ${REAL_ADDON_SKIP_REASON}`,
   },
   {
     // `Module.prototype._compile` (#93). Also not a shim, also refcounted, also unaffected by
@@ -328,7 +339,9 @@ describe("#90 — hardened mode lets GRANTED operations through, on every guarde
   for (const surface of SURFACES) {
     it(`${surface.name}: granted works and ungranted is denied, hardened ON and OFF`, async (ctx) => {
       if (surface.available !== undefined && !surface.available()) {
-        ctx.skip(`${surface.name} is not available on this runtime`);
+        ctx.skip(
+          surface.unavailableReason?.() ?? `${surface.name} is not available on this runtime`,
+        );
       }
       const outcomes: Record<string, boolean> = {};
       for (const hardened of [false, true]) {
@@ -354,7 +367,9 @@ describe("#90 — hardened mode lets GRANTED operations through, on every guarde
 });
 
 describe.skipIf(REAL_ADDON === null)(
-  "#90 — a GRANTED native load genuinely initializes, hardened ON and OFF (#112)",
+  titleWithSkipReason(
+    "#90 — a GRANTED native load genuinely initializes, hardened ON and OFF (#112)",
+  ),
   () => {
     /**
      * The matrix row above can only say "capwall did not refuse". This says the load actually
