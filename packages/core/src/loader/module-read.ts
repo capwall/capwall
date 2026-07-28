@@ -215,6 +215,45 @@ export function moduleLoadNeedsDecision(
   return !isDependencyGraphFile(resolvedPath, projectRoot);
 }
 
+/*
+ * ═════════════════════════════════════════════════════════════════════════════════════════════
+ * WHICH OF THE GATES DECIDES A GIVEN LOAD (#152)
+ * ═════════════════════════════════════════════════════════════════════════════════════════════
+ * Until the ESM path moved to `module.registerHooks()`, the two halves of this gate could not
+ * see the same load: `Module._load` saw `require`, and a `module.register()` hook saw `import`,
+ * and nothing was both. `registerHooks` is broader — its `resolve` is consulted for `require()`
+ * as well — so without a discriminator every `require` of an out-of-graph file would now take
+ * TWO decisions: two `DENY` lines, two trace entries, two grants out of `observe`.
+ *
+ * The rule is that `loader/require.ts` wins, because it has the better subject: a STACK WALK,
+ * which a `createRequire()` filename cannot spoof, where the hook has only `parentURL`. So the
+ * hook stands down for the dynamic extent of a `Module._load` that actually reached
+ * {@link guardCjsModuleRead} with a resolved path.
+ *
+ * IT IS A DEPTH COUNTER AND NOT A FLAG because module loads nest: a required module's body runs
+ * inside its own `Module._load`, and every `require` it makes opens another. It is entered only
+ * on the path that DID take a decision, so a `Module._load` whose resolution failed — the shape
+ * of the ≥24.18 bypass the 2026-07 Node audit found — leaves the hook armed and the hook becomes
+ * a real second layer for it rather than a duplicate. See `loader/esm-hooks.ts`
+ * § `alreadyDecidedByCjsGate` for the other half of the test and why one alone is not enough.
+ */
+let gatedCjsLoadDepth = 0;
+
+/** Enter the dynamic extent of a `Module._load` whose module-read decision has been taken. */
+export function beginGatedCjsLoad(): void {
+  gatedCjsLoadDepth += 1;
+}
+
+/** Leave it. Clamped at zero so an unbalanced call can never leave the gate permanently off. */
+export function endGatedCjsLoad(): void {
+  if (gatedCjsLoadDepth > 0) gatedCjsLoadDepth -= 1;
+}
+
+/** True while at least one such load is in progress. Read by the `resolve` hook. */
+export function insideGatedCjsLoad(): boolean {
+  return gatedCjsLoadDepth > 0;
+}
+
 /** The capability request a module read raises. Identical in shape to a `readFileSync`. */
 function moduleReadRequest(resolvedPath: string): {
   kind: "fs";
@@ -269,20 +308,29 @@ export interface EsmGateOutcome {
 /**
  * ESM half: decide whether the module at `importerUrl` may load `resolvedUrl`.
  *
- * WHY THE IMPORTER'S URL IS THE SUBJECT HERE, when the CJS half insists on a stack walk. The
- * loader thread has no JavaScript stack belonging to the importing package — there is nothing to
- * walk. What it does have is `context.parentURL`, which the HOST sets from the module record that
- * actually contains the `import`, and which no in-process code can choose the way it can choose a
- * `createRequire` filename. The two spellings a dependency CAN reach — a `data:` URL module and a
- * synthetic/`vm` module — are not `file:` URLs, and this function charges those to `<unknown>`
- * rather than inferring the trust root from them, which is #60's rule applied on this path.
+ * WHY THE IMPORTER'S URL IS THE SUBJECT HERE, when the CJS half insists on a stack walk.
+ * `context.parentURL` is set by the HOST from the module record that actually contains the
+ * `import`, and no in-process code can choose it the way it can choose a `createRequire`
+ * filename. The two spellings a dependency CAN reach — a `data:` URL module and a synthetic/`vm`
+ * module — are not `file:` URLs, and this function charges those to `<unknown>` rather than
+ * inferring the trust root from them, which is #60's rule applied on this path.
  *
- * `installed: false` makes this inert, and that is deliberate rather than an oversight. Node
- * cannot fully unregister a module-customization hook, so this code outlives `uninstall()`; the
- * fail-closed `TORN_DOWN_POLICY` that a captured shim correctly falls back to would here mean
- * "capwall was uninstalled, so the host process may no longer import its own files". Restoring
- * the un-mediated behaviour is the only honest answer for a hook that cannot be removed, and it
- * matches the CJS side, where `uninstall()` genuinely does restore `Module._load`.
+ * UNTIL #152 THAT WAS ALSO A CONSTRAINT: `module.register()` ran the hook on Node's loader
+ * thread, which has no JavaScript stack belonging to the importing package, so there was nothing
+ * to walk even in principle. `module.registerHooks()` runs it in this realm and a walk is now
+ * possible. It is deliberately NOT taken. `parentURL` is the stronger answer here — it is the
+ * host's own record of which module contains the `import`, where a stack at ESM resolution time
+ * is Node's loader machinery with the importer somewhere below it — and swapping a working,
+ * unspoofable subject for a stack walk would be re-litigating #60 on the one path where the host
+ * hands us the answer.
+ *
+ * `installed: false` makes this inert, and that is deliberate rather than an oversight. It used
+ * to be load-bearing — the hook could not be unregistered, so this code outlived `uninstall()`
+ * and the fail-closed `TORN_DOWN_POLICY` a captured shim falls back to would have meant "capwall
+ * was uninstalled, so the host process may no longer import its own files". Since #152 the last
+ * `uninstall()` really does deregister the hooks, so this is now belt-and-braces for the window
+ * between them. The answer is unchanged either way, and it is the CJS answer: teardown restores,
+ * it does not deny.
  */
 export function decideEsmModuleRead(
   snapshot: EsmGateSnapshot,

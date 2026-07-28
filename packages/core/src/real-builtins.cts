@@ -10,7 +10,7 @@
  * the shim-backed synthetic source instead of the raw module.
  *
  * That backstop was DEAD CODE for as long as capwall captured its real builtins with static ESM
- * `import realFs from "node:fs"`. Those imports run before `module.register()` does, so by the
+ * `import realFs from "node:fs"`. Those imports run before the hooks are registered, so by the
  * time the hook existed every mediated builtin was already cached raw, and the cache — not the
  * hook chain — answered. Measured, not assumed: with `node:fs` pre-cached a later resolve
  * short-circuit to `node:fs` reaches the raw builtin; without it, the backstop fires and

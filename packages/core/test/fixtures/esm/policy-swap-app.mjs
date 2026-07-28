@@ -37,17 +37,30 @@ console.log("SWAP:loose:" + attempt(readFromDep));
 first.uninstall();
 console.log("SWAP:uninstalled:" + attempt(readFromDep));
 
-// A specifier never imported before teardown keeps the explicit, visible bridge error.
-try {
-  await import("node:net");
-  console.log("SWAP:never-imported:NO_ERROR");
-} catch (err) {
-  console.log("SWAP:never-imported:" + (/no longer installed/.test(String(err && err.message)) ? "FAILS_CLOSED" : "OTHER"));
-}
+// A specifier NEVER IMPORTED before teardown. Since #152 the hooks are really deregistered on
+// the last `uninstall()` (`module.registerHooks()` returns a `deregister()`; `module.register()`
+// did not), so a FRESH import now reaches the real builtin — exactly as a fresh `require` does
+// on the CJS path, which is the parity docs/threat-model.md used to have to carve out.
+//
+// Before #152 this threw "capwall is no longer installed" from the bridge. That was fail-closed
+// but it was also a TRAP: an ESM module that throws during evaluation is cached in its errored
+// state, so the specifier stayed permanently poisoned for the rest of the process — including
+// for the later, legitimate install below.
+const netDuringGap = await import("node:net");
+const rawNet = process.getBuiltinModule("node:net");
+console.log("SWAP:never-imported:" + (netDuringGap.default === rawNet ? "UNMEDIATED" : "MEDIATED"));
 
 // Tightening must take effect on the already-imported specifier — the actual finding.
 const second = install(strict, "enforce", opts);
 console.log("SWAP:strict:" + attempt(readFromDep));
+
+// …and the gap import above must not have DE-MEDIATED `node:net` for this install. It cannot:
+// the raw `node:` URL went into the ESM registry, but a mediated import now resolves to a
+// `capwall-esm:` URL, which is a different key and is not in it.
+const netAfterReinstall = await import("node:net");
+console.log(
+  "SWAP:after-gap-reinstall:" + (netAfterReinstall.default === rawNet ? "UNMEDIATED" : "MEDIATED"),
+);
 
 // …and so must loosening again, so this is a live policy and not a one-way ratchet.
 second.uninstall();

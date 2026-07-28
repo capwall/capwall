@@ -130,8 +130,9 @@ const identities = (sites: readonly TrustRootSite[]): string[] =>
  * count check below holds them to it.
  *
  * `gate` groups SITES into the gates the documents count: the module-load read gate (#123) is
- * one gate implemented twice, once for CJS and once for ESM, because the ESM loader thread has
- * no stack to walk and has to reach the same decision from `parentURL` instead.
+ * one gate implemented twice, once for CJS and once for ESM, because the ESM resolve hook takes
+ * its subject from `parentURL` — the host's own record of which module contains the `import` —
+ * rather than from a stack walk. See `loader/module-read.ts` § `decideEsmModuleRead`.
  *
  * ADDING A ROW IS ADDING AN EXEMPTION. Say in the PR why the trust root may skip that gate, and
  * update the four documents — the count is stated in words in all of them.

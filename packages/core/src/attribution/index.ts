@@ -69,7 +69,7 @@
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 // Its OWN subpath, not `@capwall/policy-schema`'s barrel: the barrel builds the Zod schema tree at
-// module scope, and this file is on the ESM loader thread's graph, where no schema is ever parsed
+// module scope, and this file is on `install()`'s graph, where no schema is ever parsed
 // (#150 — see the note in `policy/evaluate.ts`).
 import { CHAIN_SEP } from "@capwall/policy-schema/package-key";
 import {
@@ -79,10 +79,9 @@ import {
   normalizeSeparators,
   rewriteThroughLinks,
 } from "./link-map.js";
-// The NARROW capture, not `../real-builtins.cjs` — never `import … from "node:fs"` (#78), and
-// never the twelve-wide aggregate from a module the ESM loader thread evaluates (#150). See
-// `src/real-builtins/fs.cts`.
-import { realFs } from "../real-builtins/fs.cjs";
+// Never `import … from "node:fs"` (#78) — the capture has to leave the ESM module cache empty
+// for the `load` hook's re-mediation backstop to stay reachable. See `src/real-builtins.cts`.
+import { realFs } from "../real-builtins.cjs";
 
 /**
  * Sentinel for the APPLICATION's own code — the trust root.

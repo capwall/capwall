@@ -40,18 +40,30 @@ package's slice of the policy.
   `Module.prototype.require`) so that when a package requires a capability-sensitive core
   module (`fs`, `net`, …), it receives capwall's **shimmed** version rather than the raw
   builtin. This is the primary, first-implemented path.
-- **ESM (`esm-hook.ts` + `esm-hooks.ts` + `esm-runtime.ts`)** — implemented (M5). A
-  `module.register()` hook on the loader thread (`esm-hooks.ts`) rewrites a mediated builtin
-  specifier to a synthetic `capwall-esm:` module; its `load` returns generated source that
-  re-exports the shim members from the main-thread bridge (`esm-runtime.ts`). The
-  "static bindings are immutable" concern is sidestepped: because the hook supplies the module
-  source up front, the binding is to the shim from the start — no post-hoc swap. Export names
-  are enumerated on the main thread at registration and passed to the hook, so the loader
-  thread never imports the real builtin (which would recurse). Covers static and dynamic
-  `import`; attribution and `onDecision` run on the main thread exactly as for CJS.
+- **ESM (`esm-hook.ts` + `esm-hooks.ts` + `esm-runtime.ts`)** — implemented (M5), moved to
+  `module.registerHooks()` in #152. A **synchronous, same-realm** `resolve` hook
+  (`esm-hooks.ts`) rewrites a mediated builtin specifier to a synthetic `capwall-esm:` module;
+  its `load` returns generated source that re-exports the shim members from the bridge
+  (`esm-runtime.ts`). The "static bindings are immutable" concern is sidestepped: because the
+  hook supplies the module source up front, the binding is to the shim from the start — no
+  post-hoc swap. Export names are enumerated before the hooks go live and passed to them, so
+  `load` never imports the real builtin (which would recurse through `resolve`). Covers static
+  and dynamic `import`; attribution and `onDecision` behave exactly as for CJS.
   `esm-hooks.ts`'s `load` also **re-mediates** a raw `node:<mediated>` URL it is handed, the
   backstop for a resolution route capwall's `resolve` never saw — which only works because of
   the capture rule below.
+
+  Three consequences of `registerHooks()` being synchronous and same-realm rather than
+  `module.register()`'s asynchronous loader thread, all of them in #152:
+
+  - **No thread, no policy copy.** The #123 module-read gate reads `liveCtx` directly instead of
+    a `MessagePort`-shipped snapshot, so there is no copy to keep in step. ~100 ms off a mediated
+    process's startup, measured — `scripts/bench/README.md` § Startup.
+  - **The hooks see `require()` too.** So `loader/require.ts` and the `resolve` hook can both see
+    one load, and the arbitration between them is explicit: `Module._load` wins, and marks the
+    extent of what it decided. See `loader/module-read.ts` § WHICH OF THE GATES DECIDES A GIVEN LOAD.
+  - **Teardown is real.** `registerHooks()` returns a `deregister()`, so the last `uninstall()`
+    removes the hooks and the ESM path matches CJS instead of carrying its own known limit.
 
 ### Real-builtin capture (`core/src/real-builtins.cts`)
 
@@ -59,8 +71,8 @@ Every real mediated builtin capwall holds is captured in this one file, and it i
 CommonJS source file in the package. That is a security property rather than a style quirk
 (#78): Node's ESM module cache is keyed by resolved URL, and a URL already in it is served from
 cache **without the `load` hook chain being consulted at all**. A static
-`import realFs from "node:fs"` in a shim therefore cached `node:fs` raw before
-`module.register()` ran and left the re-mediation backstop above as dead code. A CommonJS
+`import realFs from "node:fs"` in a shim therefore cached `node:fs` raw before capwall's hooks
+were registered and left the re-mediation backstop above as dead code. A CommonJS
 `require` populates the CJS cache and leaves the ESM cache untouched, and in a `.cjs` file
 `require` is ambient — so the capture needs no ESM import of `node:module` either, which is
 itself mediated.

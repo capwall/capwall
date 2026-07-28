@@ -1,17 +1,21 @@
 /**
- * ESM runtime bridge (roadmap M5). The MAIN-THREAD half of the ESM interception.
+ * ESM runtime bridge (roadmap M5). What capwall's synthetic modules import.
  *
- * Node's module customization hooks (`resolve`/`load`, in `esm-hooks.ts`) run on a separate
- * loader thread and cannot touch the installed policy, attribution, or the `onDecision` sink
- * (all main-thread state). The trick capwall uses: the `load` hook returns synthetic module
- * SOURCE that re-exports capwall's shim members, and that source is EVALUATED on the main
- * thread — where it calls {@link getEsmShim} to obtain a shim built from the SAME
- * {@link ShimContext} the CJS path uses (`live-context.ts`'s `liveCtx`). So attribution (a
- * main-thread stack walk) and decision logging behave identically to CJS. NOTE: this is a
- * SEPARATE shim registry from the CJS loader's — `buildShimRegistry` makes fresh shim objects —
- * so enforcement is identical (both read the same live context) but a monkey-patch a dependency
- * makes on the CJS `fs` shim is not visible on the ESM one and vice versa. The loader thread only
- * rewrites specifiers, it never sees policy.
+ * The `load` hook (`esm-hooks.ts`) returns synthetic module SOURCE that re-exports capwall's shim
+ * members, and that source calls {@link getEsmShim} to obtain a shim built from the SAME
+ * {@link ShimContext} the CJS path uses (`live-context.ts`'s `liveCtx`). So attribution (a stack
+ * walk) and decision logging behave identically to CJS. NOTE: this is a SEPARATE shim registry
+ * from the CJS loader's — `buildShimRegistry` makes fresh shim objects — so enforcement is
+ * identical (both read the same live context) but a monkey-patch a dependency makes on the CJS
+ * `fs` shim is not visible on the ESM one and vice versa.
+ *
+ * UNTIL #152 THIS FILE WAS THE WHOLE POINT of the design: `module.register()` ran the hooks on a
+ * separate loader thread that could not touch the policy, attribution or the `onDecision` sink,
+ * and evaluating generated SOURCE was the only way to get the decision back onto the thread that
+ * owns them. `module.registerHooks()` runs the hooks in this realm, so the indirection is no
+ * longer forced — it is kept because a `load` hook must return source either way, and because
+ * the generated `export const` bindings are exactly what makes a STATIC `import { readFile } from
+ * "node:fs"` bind to the shim with no post-hoc swap.
  *
  * WHY THE CONTEXT IS A MUTABLE BOX AND THE REGISTRY IS BUILT EXACTLY ONCE (issue #62). A
  * synthetic module runs `getEsmShim(spec)` once, at evaluation, and captures the result in `const`
@@ -32,8 +36,8 @@ import type { ShimContext } from "../shims/runtime.js";
 export function pushEsmContext(ctx: ShimContext): void {
   pushInstall(ctx);
   // Force the ESM registry into existence while an install is active, because
-  // `registerEsmHook` needs its keys (below) to tell the loader thread which specifiers to
-  // mediate — and to build the shims with this install's hardened-ness.
+  // `registerEsmHook` needs its keys (below) to tell the hooks which specifiers to mediate —
+  // and to build the shims with this install's hardened-ness.
   liveRegistry("esm");
 }
 
@@ -48,9 +52,9 @@ export function popEsmContext(ctx: ShimContext): void {
 
 /**
  * specifier → the named exports its synthetic module must declare, for every specifier the ESM
- * path mediates. This is the whole payload `registerEsmHook` ships to the loader thread: the
- * thread cannot import a mediated builtin itself (that would recurse through `resolve` and loop),
- * so the export names have to be enumerated here, on the main thread.
+ * path mediates. This is the whole payload `registerEsmHook` hands the hooks: the `load` hook
+ * cannot import a mediated builtin itself to read its exports (that would recurse through
+ * `resolve` and loop), so the names have to be enumerated here, before the hooks go live.
  *
  * Enumerated from the ESM SHIMS — the very objects `getEsmShim` will hand the synthetic modules —
  * rather than from the real builtins. The two key sets are the same (the shims copy every own

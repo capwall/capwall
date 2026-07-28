@@ -18,7 +18,7 @@
  *    The same trap runs the other way, so if this is ever turned off it is `oxc: false`.
  *
  * 2. `testTimeout` / `hookTimeout` — a dozen suites here spawn `node --import dist/preload.js`
- *    because hardened mode, ESM caching and `module.register()` are process-sticky. vitest's
+ *    because hardened mode, ESM caching and loader-hook registration are process-sticky. vitest's
  *    default 5000 ms was the only bound on those children, and it is a DEFAULT, not a budget:
  *    under CPU contention the suite failed with a rotating set of opaque 5000 ms timeouts
  *    (issue #145). The numbers come from `test/helpers/subprocess.ts`, which states the

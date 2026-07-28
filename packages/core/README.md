@@ -250,8 +250,8 @@ src/loader/module-read.ts  the module system as a read channel: an fs.read decis
                            require/import of a file outside every node_modules tree (#123)
 src/loader/live-context.ts the live install-context box every guard reads (#62/#87) + the
                            hardened ratchet and the per-hardened-ness shim registries (#129)
-src/loader/esm-hook.ts     ESM module.register() registration (main-thread side)
-src/loader/esm-hooks.ts    the loader-thread resolve/load hooks themselves
+src/loader/esm-hook.ts     module.registerHooks() registration + teardown lifecycle
+src/loader/esm-hooks.ts    the synchronous resolve/load hooks themselves
 src/loader/esm-runtime.ts  main-thread bridge the synthetic ESM modules re-export from
 src/loader/native.ts       process.dlopen patch — the `native` .node load gate (S2)
 src/loader/linked-packages.ts

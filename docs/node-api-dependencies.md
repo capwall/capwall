@@ -8,9 +8,10 @@ here is a bug.
 ## One-sentence summary
 
 **capwall's enforcement mechanism rests on a small set of Node.js module-system internals that
-are undocumented, unsupported, and in one case formally deprecated with removal announced.** It
-works on every current Node release, it is written defensively against their churn, and it has
-no supported substitute for most of them.
+are undocumented and unsupported, plus one documented release-candidate API.** It works on every
+current Node release, it is written defensively against their churn, and it has no supported
+substitute for most of them. Until #152 the "one documented API" row was `module.register()`,
+which was formally deprecated with removal announced; the ESM path is now on its named successor.
 
 That is not a disclaimer bolted on for form. It is the central engineering fact about this
 project, and a security tool whose mechanism rests on internals should say so out loud rather
@@ -49,8 +50,8 @@ changelog summary. See § Reproducing the measurement.
 | `Module.prototype._compile` | The `compile` capability gate (#93) — the primitive that lets a caller choose what V8 reports as `getFileName()`, i.e. execute as an arbitrary principal. `shims/module.ts` | **Undocumented**, no DEP code. Signature **changed** in 22.18 (gained `format`) — this is #128 | **None** | **The `compile` capability dies.** Identity forgery via a chosen filename becomes ungated again |
 | `Module._extensions[".node"]` | Not patched — it is the *reason* `process.dlopen` is the right hook. Body confirmed as `process.dlopen(module, path.toNamespacedPath(filename))` on 20.20 / 22.22 / 22.23 / 24.18 / 26.5 | **Docs-only deprecated** as `require.extensions` (**DEP0039**, since v0.10.6 — `require.extensions === Module._extensions`, verified on all four); `Module._extensions` itself undocumented | none | Nothing directly — capwall does not depend on it, by design |
 | `process.dlopen` | The native-addon load gate (`native`, #49). The single JS-reachable chokepoint every `.node` load funnels through. `loader/native.ts` | **Undocumented**, no DEP code. Own writable+configurable property of `process` on all four; `.length` is 0 (C++ binding) | **None** | **The `native` capability dies.** A dependency can load arbitrary compiled code un-gated, which makes every other control moot |
-| `module.register()` | Registers capwall's ESM loader hook (M5). `loader/esm-hook.ts` | **Deprecated. Stability 0.** Docs-only in v25.9.0, **Runtime deprecation (DEP0205) in v26.0.0.** Removal announced | **`module.registerHooks()`** (Stability 1.2, Release candidate; Node ≥22.15/23.5) | **The entire ESM path.** `import` of a mediated builtin is un-mediated |
-| `module.registerHooks()` | Not used by capwall. **Gated** (#61) so a dependency cannot register a hook ahead of capwall's. `shims/module.ts` | **Documented, Stability 1.2 (Release candidate).** Absent on 20 | n/a | The #61 loader-hook gate loses half its coverage |
+| `module.registerHooks()` | Registers capwall's `resolve`/`load` hooks (M5, moved here by #152). Also **gated** (#61) so a dependency cannot register a hook ahead of capwall's. `loader/esm-hook.ts`, `shims/module.ts` | **Documented, Stability 1.2 (Release candidate).** Present on 22.15+/23.5+, i.e. every runtime in the support range | n/a — this *is* the replacement | **The entire ESM path.** `import` of a mediated builtin is un-mediated |
+| `module.register()` | **Not used by capwall since #152.** Still **gated** (#61) — a dependency must not register a hook ahead of capwall's through either API. `shims/module.ts` | **Deprecated. Stability 0.** Docs-only in v25.9.0, **Runtime deprecation (DEP0205) in v26.0.0.** Removal announced | `module.registerHooks()` | Nothing. The #61 gate keeps covering it for as long as Node ships it |
 | `Error.prepareStackTrace` + `Error.captureStackTrace` + structured CallSites | **All of attribution**, plus the `compile` gate's one-frame loader check and the "initiated by Node?" discriminator (#119). `attribution/index.ts`, `shims/module.ts` | **V8, not Node.** `prepareStackTrace` is non-standard and unspecified; `captureStackTrace` is at **TC39 Stage 2** (`proposal-error-capturestacktrace`, which does *not* specify `prepareStackTrace`). Writable on all four | none | **Everything.** capwall answers exactly one question — whose code is calling — and this is how |
 | `Error.stackTraceLimit` | Bounds the frame budget; the #143 optimization depends on the limit applying *after* `captureStackTrace`'s boundary skip | **V8, non-standard.** Writable on all four | none | The frame budget and the #143 cost reduction; attribution still works |
 | `globalThis.fetch` / `WebSocket` / `EventSource` | The global egress guard (#80). `shims/global-egress.ts` | `fetch` documented+stable on all four; `WebSocket` global from 22; **`EventSource` is still flag-only (`--experimental-eventsource`) on 26.5** | n/a — these are the API | Egress via globals is un-gated. Each guard installs only if the global exists, so a flag-only API is picked up when the flag is on and nothing is invented when it is not |
@@ -63,35 +64,48 @@ Two things capwall depends on that are ordinary public API and therefore not in 
 
 ## Direction of travel, per API
 
-### `module.register()` — the only scheduled removal, and it is load-bearing
+### `module.register()` — the only scheduled removal, and capwall is off it (#152, #153)
 
-This is the one item on the list with an announced end. Node 25.9.0 marked it Stability 0; Node
+**Resolved.** capwall's ESM path moved to `module.registerHooks()`; `module.register()` no longer
+appears anywhere in `packages/*/src` except in the #61 gate's list of APIs a dependency may not
+call. The rest of this section is kept because it is the record of *why*, and because the gate
+still has to know about the API.
+
+This was the one item on the list with an announced end. Node 25.9.0 marked it Stability 0; Node
 26.0.0 made it a **Runtime** deprecation, DEP0205; and the entry says, in Node's own words, that
 it "will be removed in a future version of Node.js". Node's stated reason is not cosmetic:
 
 > Supporting async hooks has proven to be complex, involving worker threads orchestration, and
 > there are issues that have proven unresolveable.
 
-Measured on the real binary, not inferred. On **Node 26.5.0**, a capwall-mediated process:
+Measured on the real binary, not inferred. On **Node 26.5.0**, a capwall-mediated process **before
+#152**:
 
-- prints, on **stderr, on every run**:
+- printed, on **stderr, on every run**:
 
   ```
   (node:…) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
   ```
 
-- and, under `--throw-deprecation`, **fails to start at all** — `install()` throws from
-  `registerEsmHook` with `code: 'DEP0205'`, exit 1, and the mediated app never runs.
+- and, under `--throw-deprecation`, **failed to start at all** — `install()` threw from
+  `registerEsmHook` with `code: 'DEP0205'`, exit 1, and the mediated app never ran.
+
+**After #152, on the same 26.5.0 binary, over the same app:** `capwall enforce` prints nothing on
+stderr and exits 0, and `NODE_OPTIONS=--throw-deprecation capwall enforce` runs the app and exits
+0. Both are asserted rather than left to a one-off check —
+`packages/core/test/esm-hook-graph.test.ts` requires a mediated child's stderr to be **exactly
+empty**, which is stronger than a `not.toContain("DEP0205")` and also catches the next warning.
 
 Both matter more for capwall than they would for a library. capwall's stderr is where `DENY`
 lines live; a tool that unconditionally prints a Node deprecation warning there is training its
 operator to skim the channel that carries its output. And `--throw-deprecation` is an ordinary
 thing for a careful CI to set.
 
-Node 26 becomes LTS in October 2026. The migration is tracked in **issue #152** (which found it
-first from the other direction — `module.register()` is ~93 ms of capwall's ~180 ms startup, of
-which ~53 ms is Node bootstrapping a loader thread) and in **issue #153**, which is the currency
-half. Nothing in this repository suppresses the warning: the honest signal is the accurate one.
+Node 26 becomes LTS in October 2026. The migration was tracked in **issue #152** (which found it
+first from the other direction — `module.register()` was ~93 ms of capwall's ~180 ms startup, of
+which ~53 ms was Node bootstrapping a loader thread) and **issue #153**, the currency half; both
+are closed by the same change. Nothing in this repository ever suppressed the warning: the honest
+signal is the accurate one, and the fix was to stop calling the deprecated API.
 
 ### `Module._load` — no deprecation, and no stable shape either
 
@@ -230,45 +244,75 @@ needs no capwall code, since the CLI passes the environment through to the child
 are unaffected by it — the whole suite and the benchmark's 21 self-checks are green with the cache
 enabled. That is the recommendation, and it is documented rather than defaulted.
 
-## The one migration that matters
+## The one migration that mattered — done (#152)
 
-`module.registerHooks()` is the supported successor to `module.register()`. Measured on
-22.23.1, 24.18.0 and 26.5.0, it is also more than that: **a synchronous `registerHooks` `load`
-hook intercepts `require()` as well as `import()`, including builtins, and can replace a
-builtin's source for both.** Verified — a `load` hook returning
+`module.registerHooks()` is the supported successor to `module.register()`, and the ESM path is
+on it. Measured on 22.23.1 / 24.18.0 / 26.5.0 when this was written, and re-measured on 22.22.3 /
+24.18.0 / 26.5.0 when it landed, it is also more than a like-for-like replacement: **a synchronous
+`registerHooks` `load` hook intercepts `require()` as well as `import()`, including builtins, and
+can replace a builtin's source for both.** Verified — a `load` hook returning
 `{ format: "commonjs", source: "module.exports={SHIMMED:true}", shortCircuit: true }` for
 `node:fs` is observed by `require("node:fs")` and by `await import("node:fs")` alike.
 
 So the API Node offers as the replacement for `module.register()` is *also* the first **documented**
 thing to exist in the space capwall's `Module._load` patch occupies — builtin-specifier
-interception on `require`. That is the most consequential finding here for capwall's long-run
-exposure: the two mechanisms it is most structurally committed to — an undocumented loader patch
-and a deprecated hook API — have one documented successor between them, and it removes a loader
-thread, a `MessageChannel` policy snapshot, an export-name enumeration payload and ~53 ms of
-startup on the way.
+interception on `require`.
 
-"Documented" is not "stable", and it does not cover everything `Module._load` does for capwall:
-like the `_load` patch, a `registerHooks` hook never sees the requires Node's own internal
-bootstrap makes (the reason each egress module is shimmed separately —
-[`architecture.md`](architecture.md) § Capability shims), and Node runs the most recently
-registered hook first, so it inherits exactly the chain-ordering exposure #61 gates against
-rather than resolving it.
+### Could it SUBSUME the `Module._load` patch? Assessed, and the answer is no — not yet
 
-It is not free, and the objections in **#152** are real: `registerHooks` is Stability **1.2
-(Release candidate)**, not stable; it is absent on Node 20; and a version-gated second
-implementation of the security-critical hook doubles the surface where #59, #61 and #62 can
-regress asymmetrically. It also does not make `Module._load` redundant on its own — the
-`Module._resolveFilename` call, the `_findPath` observer and the `_compile` and `dlopen` gates
-are all untouched by it. It does bring one thing capwall currently documents as impossible: a
-`deregister()` that actually removes the hooks, where `module.register()`'s teardown is
-best-effort by Node's own admission.
+This is the tempting version of the migration and #152 deliberately did not attempt it. The
+assessment, so the next person does not have to redo it:
 
-**Recommendation, recorded here so it does not live only in an issue:** move the ESM path to
-`registerHooks()` once the support floor clears Node 20 (`registerHooks` needs ≥22.15 / ≥23.5),
-keeping `module.register()` as the fallback only for as long as a supported Node lacks the
-replacement. Prove the two paths behaviourally identical against #59's laundering routes, #61's
-hook-chain PoC and #78's backstop proof, on the runtimes where both exist — not each on its own
-version.
+**What a `registerHooks` `load` hook would cover.** Returning
+`{ format: "commonjs", source, shortCircuit: true }` for a mediated builtin specifier does reach
+`require()`, on 22/24/26. That is genuinely the same ground `Module._load`'s specifier
+interception occupies, and it is documented where `_load` is not.
+
+**Four things it would not cover, and they are most of what `loader/require.ts` is for.**
+
+1. **The `Module._resolveFilename` call.** The #123 module-read gate needs to know *which file a
+   load will open* before it opens it. A `resolve` hook does learn that — but it learns it for the
+   load Node is performing, not for the load a caller *described*, and the two differ: the ≥24.18
+   bypass this document records came from `Module._load`'s fourth argument carrying
+   `requireResolveOptions`. A hook sees the specifier and the parent, never the caller's
+   `{ paths }`.
+2. **The subject.** The CJS gate's subject is a **stack walk**, precisely because
+   `createRequire()` lets a caller choose the `parent.filename` a hook would be handed. A
+   `registerHooks` hook runs in capwall's realm now, so a walk is *possible* there — but at
+   resolution time the stack is Node's loader machinery, and getting the importer out of it
+   reliably is a different problem from the one attribution solves today.
+3. **`Module._findPath`.** #127's link observer needs Node's *ordered search-path list* to give a
+   symlinked workspace package an identity. A `resolve` hook does not receive it.
+4. **`Module.prototype._compile` and `process.dlopen`.** Untouched by any hook, and the `native`
+   gate is the capability that subsumes the rest.
+
+**And two things that would get worse.** A hook chain is *composable and process-wide*, so moving
+CJS interception into it would put the whole `require` path behind the same chain-ordering
+exposure #61 gates against — today the `Module._load` patch is **outside** the hook system
+entirely and a hostile hook cannot displace it, which is why the CJS path held while the ESM path
+needed #59/#61/#78. And a hook never sees the requires Node's own internal bootstrap makes, the
+same blind spot `_load` has (the reason each egress module is shimmed separately —
+[`architecture.md`](architecture.md) § Capability shims).
+
+**Verdict: not a replacement, a second layer at best.** The honest framing is that
+`registerHooks` is the *documented* successor for the ESM path and a *possible* defence-in-depth
+addition on the CJS path — never a reason to remove the `Module._load` patch, which is both
+outermost and the only site that sees a caller's own resolve options. Filed as a follow-up rather
+than done here.
+
+### What the migration cost, stated plainly
+
+- `registerHooks` is Stability **1.2 (Release candidate)**, not stable. It can change in a minor.
+  That is still a strict improvement on Stability 0 with removal announced.
+- **The hooks are now consulted for every `require()` in the process**, which is work that did not
+  exist before — `module.register()` hooks never saw `require`. Measured on a 123-module
+  `express` tree at 2 cores: with ESM on, module loading costs **~11 ms (Node 22) / ~18 ms (24) /
+  ~24 ms (26)** more than with `CAPWALL_ESM=0`, where on a tiny entry point the difference is
+  4–8 ms. Net the change is still **−63 to −120 ms** on that tree, because the loader thread it
+  removed cost far more. See `scripts/bench/README.md` § After #152.
+- It brings one thing capwall used to document as impossible: a `deregister()` that actually
+  removes the hooks. `docs/threat-model.md` § ESM known limits used to carry the ESM/CJS teardown
+  asymmetry as a named limitation; it no longer does.
 
 ## What this audit changed (2026-07)
 
@@ -377,11 +421,13 @@ be repeated when Node 27 lands:
 Being direct, because the rest of this document is detail:
 
 **capwall's exposure to Node internal churn is real, structural, and currently well-managed
-rather than reduced.** Of the seven things that make capwall work, five are undocumented Node
-internals with no support commitment (`Module._load`, `_resolveFilename`, `_findPath`,
-`Module.prototype._compile`, `process.dlopen`), one is formally deprecated with removal announced
-(`module.register()`), and one is not a Node API at all (V8's `prepareStackTrace` / CallSites,
-which is all of attribution). Exactly zero are documented, stable Node API.
+rather than reduced — though #152 reduced it by exactly one item.** Of the seven things that make
+capwall work, five are undocumented Node internals with no support commitment (`Module._load`,
+`_resolveFilename`, `_findPath`, `Module.prototype._compile`, `process.dlopen`), one is
+**documented but at Stability 1.2, release candidate** (`module.registerHooks()`), and one is not
+a Node API at all (V8's `prepareStackTrace` / CallSites, which is all of attribution). Exactly
+zero are documented *and stable*. That middle row was `module.register()` — Stability 0, removal
+announced — until #152.
 
 Four of them have moved under the project already, and the tempo is roughly one per major:
 `Module.prototype._compile` gained `format` in 22.18 (#128, which broke every TypeScript user);
@@ -405,14 +451,15 @@ What is not managed, and cannot be from inside this repository:
 - **Attribution has no standardization path.** `Error.prepareStackTrace` and structured CallSites
   are V8-specific and unspecified, and the TC39 proposal in this area explicitly declines to
   specify the part capwall uses.
-- **The CI matrix cannot see this class of defect.** Node 20 and 22 are what `ci.yml` runs; the
-  gap found here existed only on 24.18+ and 26. Testing a mechanism built on internals against a
-  subset of the majors those internals ship in is a coverage gap, not a scheduling detail
-  (issue #154).
+- **The CI matrix has to cover every major those internals ship in.** The ≥24.18 gap found in
+  this audit could not be observed on the Node 20/22 matrix `ci.yml` ran at the time. That is why
+  the matrix is now **22, 24 and 26** (issue #154, and the floor move that followed).
 
-The direction of travel is, unusually, favourable: `module.registerHooks()` is the first
-documented API Node has offered that covers both of capwall's loader-interception mechanisms, and
-adopting it would move the ESM path from "deprecated with removal announced" to "documented,
-release candidate" while retiring a loader thread. It would not touch `_compile`, `dlopen` or
-attribution. Those three stay where they are, and this document exists so that nobody has to
-discover that for themselves.
+The direction of travel is, unusually, favourable, and #152 is the first instalment of it:
+`module.registerHooks()` is the only documented API Node has offered in the space capwall's
+loader interception occupies, and the ESM path is now on it — from "deprecated with removal
+announced" to "documented, release candidate", with a loader thread, a `MessageChannel` policy
+copy and ~100 ms of startup retired on the way. It did **not** subsume the `Module._load` patch
+and should not be expected to; see § The one migration that mattered for the four things it does
+not cover and the two that would get worse. `_compile`, `dlopen` and attribution stay exactly
+where they are, and this document exists so that nobody has to discover that for themselves.

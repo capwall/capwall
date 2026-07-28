@@ -1,30 +1,74 @@
 /**
- * ESM module customization hooks (roadmap M5) — the LOADER-THREAD half of ESM interception.
+ * MODULE CUSTOMIZATION HOOKS (roadmap M5) — capwall's `resolve`/`load` pair, ON THE MAIN THREAD.
  *
- * Registered via `module.register()` from `esm-hook.ts`. Runs on Node's separate loader thread.
+ * Registered via `module.registerHooks()` from `esm-hook.ts`. **Synchronous, same realm, same
+ * thread as everything else in capwall** — which is the whole of #152/#153 and the reason most of
+ * the machinery this file used to carry is gone.
  *
- * TWO JOBS, and they take opposite approaches to that thread for reasons worth reading before
- * changing either:
+ * ── WHY THIS IS NOT `module.register()` ANY MORE ────────────────────────────────────────────
+ * `module.register()` is **Stability 0, runtime-deprecated as DEP0205 in Node 26.0.0**, with Node
+ * stating it "will be removed in a future version of Node.js". On Node 26 every mediated process
+ * printed a `DeprecationWarning` on the channel capwall's own `DENY` lines live on, and under
+ * `--throw-deprecation` `install()` threw and the mediated application did not start at all — an
+ * availability failure, which is the one thing a preload must never be (#153). `registerHooks()`
+ * is Node's named replacement, it is **documented** (Stability 1.2, release candidate) where
+ * `register()` is documented-and-dying, and it needs Node ≥22.15 — exactly the supported floor,
+ * so there is no version gate and no second implementation of a security-critical hook (#152).
  *
- *  1. BUILTIN MEDIATION (M5). No policy state is needed here at all: the hook rewrites mediated
- *     builtin specifiers to a synthetic `capwall-esm:` URL and, for that URL, returns generated
- *     module source that re-exports capwall's shim members from the main-thread bridge
- *     (`esm-runtime.ts`). The synthetic source is evaluated on the MAIN thread, where the
- *     re-exported shim functions attribute the caller and evaluate policy exactly as the CJS
- *     shims do — so the decision never happens on this thread.
- *  2. THE MODULE-READ GATE (#123). This one cannot be deferred to the main thread: the decision
- *     has to be taken at RESOLUTION time, which is here, and a round trip back to main deadlocks
- *     (main blocks on hook results during synchronous module loads). So this thread holds a
- *     policy SNAPSHOT, refreshed synchronously from a `MessagePort` on every invocation. See the
- *     block comment above {@link refreshSnapshot}.
+ * ── WHAT WENT AWAY WITH THE LOADER THREAD ───────────────────────────────────────────────────
+ * `module.register()` ran this module on Node's separate module-customization thread, which held
+ * no capwall state. Everything that existed to bridge that gap is deleted rather than ported:
+ *
+ *  - the `MessagePort` channel and its `EsmGateSnapshot` copies (#123). The module-read gate now
+ *    reads {@link liveCtx} — the same box the CJS shims read — so there is no COPY that can go
+ *    stale, no `receiveMessageOnPort` drain, and no drain-on-every-invocation discipline to get
+ *    right. The class of bug #62/#87 are about cannot arise here at all now, because there is
+ *    nothing to keep in step.
+ *  - the `initialize(data)` payload, the `transferList`, and the "the loader thread must never
+ *    import a mediated builtin or it will recurse through `resolve`" constraint that shaped it.
+ *  - the export-name enumeration crossing a thread boundary. It is still computed on this thread
+ *    (see `esm-runtime.ts`'s `esmExportNames`), because the hook must not import a real builtin
+ *    itself — that would recurse through `resolve` — but it is now handed over by a plain
+ *    function call.
+ *  - ~53 ms of Node's loader-thread bootstrap on every mediated process. See
+ *    `scripts/bench/README.md` § Startup.
+ *
+ * ── TWO JOBS, UNCHANGED IN SUBSTANCE ────────────────────────────────────────────────────────
+ *  1. BUILTIN MEDIATION (M5). The hook rewrites mediated builtin specifiers to a synthetic
+ *     `capwall-esm:` URL and, for that URL, returns generated module source that re-exports
+ *     capwall's shim members from the bridge (`esm-runtime.ts`). That source is evaluated in this
+ *     realm, where the re-exported shim functions attribute the caller and evaluate policy exactly
+ *     as the CJS shims do.
+ *  2. THE MODULE-READ GATE (#123). `import("/home/u/.aws/x.json", { with: { type: "json" } })`
+ *     returns a file's contents as a value through Node's JSON translator without ever touching
+ *     capwall's `fs` shim, so the decision has to be taken at RESOLUTION time. See
+ *     {@link gateModuleRead} and `loader/module-read.ts`.
  *
  * Job 1 covers BOTH `import()` (dynamic) and static `import { x } from 'node:fs'` — the load hook
  * intercepts the module graph before evaluation, so the static binding is to our shim from the
  * start (there is no "immutable binding" problem because we never swap after the fact).
  *
- * Export names are supplied by the main thread at registration (it can enumerate the real
- * builtins without triggering this hook), so the load hook never imports the real module
- * itself — which would recurse through `resolve` and loop.
+ * ── THE ONE GENUINELY NEW THING: THESE HOOKS ALSO SEE `require()` ───────────────────────────
+ * `registerHooks()` is broader than `register()`: its `resolve` and `load` are consulted for
+ * `require()` as well as `import()`, **including builtins** — measured on 22.23.1 / 24.18.0 /
+ * 26.5.0, and again on 22.22.3 / 24.18.0 / 26.5.0 for this change. That is the first documented
+ * API to cover the ground `Module._load` occupies, and it has one immediate consequence here that
+ * is a correctness matter rather than an opportunity:
+ *
+ *   **the module-read gate must not decide the same load twice.** `loader/require.ts` already
+ *   takes an `fs.read` decision for every `require` of a file outside the dependency graph, with
+ *   a STACK WALK for the subject — strictly better attribution than a `parentURL`. Left alone,
+ *   this hook would take a second decision for the identical load: two `DENY` lines, two trace
+ *   entries, two grants out of `observe`. {@link gateModuleRead} therefore declines exactly when
+ *   the CJS gate has already decided — see there for why that takes two independent tests and not
+ *   one.
+ *
+ * Builtin MEDIATION is deliberately NOT restricted to the `import` path: `Module._load` intercepts
+ * every mediated builtin before Node's loader is reached, so in a healthy process a `require` never
+ * arrives here for one. If it ever does, serving the shim-backed synthetic module is the fail-closed
+ * answer and reaching the raw builtin is not. Whether `registerHooks` could REPLACE the
+ * `Module._load` patch is a separate and much larger question — see `docs/node-api-dependencies.md`
+ * § The one migration that matters; it is not attempted here.
  *
  * SECURITY — why classification happens on the RESOLVED URL, not the specifier string (#59):
  * a specifier does not have to NAME a builtin to reach one. Node's subpath imports let a
@@ -36,39 +80,26 @@
  * `capwall diff`. The rule is therefore: whatever Node says a specifier RESOLVES to decides
  * whether it is mediated. See `mediatedSpecifierForUrl`.
  */
-
-// `node:worker_threads` is mediated, so it comes out of the CJS capture rather than a static ESM
-// import: this module IS the load hook, and caching a mediated specifier's node: URL in an ESM
-// registry is precisely what left the #78 backstop dead. `test/real-builtins.test.ts`'s source
-// scan enforces the rule across `src`.
-//
-// …and it comes out of the NARROW capture rather than the twelve-wide aggregate (#150). THIS
-// module is the one Node's loader thread evaluates, and `module.register()` blocks the main thread
-// while that happens, so every builtin the aggregate would `require` here — `http2`, `dgram`,
-// `tls`, `vm`, `child_process`, the lot — is serial startup cost for a realm that uses none of
-// them. `src/real-builtins/fs.cts` carries the full argument for why narrowing takes nothing away
-// from #78; `test/esm-hook-graph.test.ts` enforces it.
-import { realWorkerThreads } from "../real-builtins/worker_threads.cjs";
 import { CapabilityError } from "../errors.js";
-import { decideEsmModuleRead, type EsmGateOutcome, type EsmGateSnapshot } from "./module-read.js";
+import { isInstalled, liveCtx } from "./live-context.js";
+import {
+  decideEsmModuleRead,
+  insideGatedCjsLoad,
+  type EsmGateOutcome,
+  type EsmGateSnapshot,
+} from "./module-read.js";
 
 const PREFIX = "capwall-esm:";
 
 /** `Object.prototype.hasOwnProperty` bound once — never reached through a polluted prototype. */
 const hasOwn = (o: object, k: string): boolean => Object.prototype.hasOwnProperty.call(o, k);
 
-interface InitData {
+/** What {@link initialize} needs from the registering side. Both are main-thread facts now. */
+export interface HookInit {
   /** file:// URL of the built `esm-runtime.js` bridge, imported by every synthetic module. */
   bridgeUrl: string;
   /** specifier → its ESM named-export identifiers (default handled separately). */
   exports: Record<string, string[]>;
-  /**
-   * Two-way channel to the main thread, for the module-read gate (#123). Main → here carries
-   * policy snapshots; here → main carries decisions to record. See {@link refreshSnapshot}.
-   */
-  gatePort: GatePort;
-  /** The policy in force at registration time; later ones arrive over `gatePort`. */
-  gateSnapshot: EsmGateSnapshot;
 }
 
 let bridgeUrl = "";
@@ -76,98 +107,74 @@ let exportsBySpecifier: Record<string, string[]> = {};
 /** Specifiers already warned about in `load`'s re-mediation path — one line each, not per import. */
 const reMediationWarned = new Set<string>();
 
-/*
- * ═════════════════════════════════════════════════════════════════════════════════════════════
- * THE MODULE-READ GATE ON THIS THREAD (issue #123)
- * ═════════════════════════════════════════════════════════════════════════════════════════════
- * `import("/home/u/.aws/x.json", { with: { type: "json" } })` returns a file's contents as a
- * value, through Node's JSON translator, without ever touching capwall's `fs` shim. Closing that
- * needs a policy decision at resolution time — and resolution happens HERE, on a thread that by
- * design holds no capwall state.
- *
- * WHY THE DECISION IS TAKEN ON THIS THREAD RATHER THAN DELEGATED TO THE MAIN ONE. It cannot be
- * delegated. The loader hooks are asynchronous, but the main thread BLOCKS on their result for
- * synchronous module resolution (`require(esm)`, the initial graph), so any round trip from here
- * back to main deadlocks the process the moment it happens during a blocking load. Handing the
- * hook a policy COPY and evaluating locally is the only shape that cannot deadlock.
- *
- * WHAT THAT COSTS, AND WHY IT IS NOT A SECOND IMPLEMENTATION. The copy is evaluated by the SAME
- * `evaluate()` / `packageForPath()` / `matchesGlob()` functions the main thread uses — imported,
- * not reimplemented — so there is one decision procedure, not two that can drift. What is
- * genuinely duplicated is the policy DATA, and the risk that carries is staleness, which
- * {@link refreshSnapshot} closes: `receiveMessageOnPort` drains the port SYNCHRONOUSLY, with no
- * event-loop turn, at the top of every hook invocation. `install()` posts the new snapshot
- * synchronously before it returns, so by the time any subsequent import reaches this thread the
- * message is already queued and the very next drain sees it. There is no window in which an
- * import is evaluated against a policy the main thread has already replaced.
- *
- * DECISIONS TRAVEL THE OTHER WAY over the same port, fire-and-forget. They are RECORDING, not
- * enforcement — enforcement is the throw below, which happens here and now — so the main thread
- * delivering them on its next event-loop turn is fine, and waiting for an acknowledgement would
- * reintroduce exactly the deadlock this design avoids.
- */
-
 /**
- * The `MessagePort` type, DERIVED from the captured `node:worker_threads` rather than imported
- * from it. A `import("node:worker_threads").MessagePort` annotation would be erased at build
- * time and is harmless at runtime, but `test/real-builtins.test.ts`'s source scan cannot tell an
- * erased type reference in that form from a live one — and the rule it enforces (#78: nothing in
- * `src` names a mediated builtin except `real-builtins.cts`) is worth more than the convenience.
+ * Hand the hooks the two facts they cannot derive themselves, before they are registered.
+ *
+ * Both used to cross a thread boundary as `module.register()`'s `data` payload; the shape is kept
+ * (rather than reaching back into `esm-runtime.ts` from here) because it keeps the ORDER explicit:
+ * the export names must be enumerated while an install is active and BEFORE the hooks go live, or
+ * a resolve arriving between the two would see an empty registry and mediate nothing.
  */
-type GatePort = Parameters<typeof realWorkerThreads.receiveMessageOnPort>[0];
-
-/** The channel to the main thread; `null` until {@link initialize}, and on a Node without it. */
-let gatePort: GatePort | null = null;
-
-/**
- * The policy the gate evaluates against. Starts INERT (`installed: false`) so a hook that somehow
- * runs before `initialize` gates nothing rather than denying everything — the host process's own
- * imports must not become collateral damage of capwall's bootstrap.
- */
-let gateSnapshot: EsmGateSnapshot = {
-  installed: false,
-  policy: { version: 1, mode: "enforce", default: {}, packages: {} },
-  mode: "enforce",
-  projectRoot: undefined,
-};
-
-export async function initialize(data: InitData): Promise<void> {
+export function initialize(data: HookInit): void {
   bridgeUrl = data.bridgeUrl;
   exportsBySpecifier = data.exports;
-  gatePort = data.gatePort ?? null;
-  if (data.gateSnapshot) gateSnapshot = data.gateSnapshot;
+}
+
+/*
+ * ═════════════════════════════════════════════════════════════════════════════════════════════
+ * THE MODULE-READ GATE (issue #123), NOW WITH NOTHING BETWEEN IT AND THE POLICY
+ * ═════════════════════════════════════════════════════════════════════════════════════════════
+ * The decision still has to be taken at RESOLUTION time — that is what makes it a gate rather
+ * than an audit — but resolution now happens on the thread that owns the policy. So the snapshot
+ * is BUILT FROM {@link liveCtx} on each invocation instead of being shipped across a port and
+ * refreshed, and a decision is reported by calling `liveCtx.onDecision` directly instead of
+ * posting it back for the main thread to deliver a turn later.
+ *
+ * What that removes is not just code. The old shape had a COPY of the policy on another thread,
+ * and a copy is a thing that can be stale — the failure mode #62 and #87 are both instances of.
+ * `refreshSnapshot`'s synchronous port drain existed to make the window empty; there is now no
+ * window, because there is no copy.
+ */
+
+/** The live policy, in the shape `decideEsmModuleRead` takes. Allocated per resolution, at
+ * module-load frequency rather than per request — see `scripts/bench/README.md` § coverage. */
+function currentSnapshot(): EsmGateSnapshot {
+  return {
+    installed: isInstalled(),
+    policy: liveCtx.policy,
+    mode: liveCtx.mode,
+    projectRoot: liveCtx.projectRoot,
+  };
 }
 
 /**
- * Adopt the newest policy snapshot the main thread has posted, synchronously.
+ * Has `loader/require.ts` ALREADY taken the module-read decision for the load this resolution
+ * belongs to?
  *
- * `receiveMessageOnPort` pops from the port's queue WITHOUT an event-loop turn, which is what
- * makes this race-free: a `postMessage` from `install()` is queued the instant it is called, so
- * the next hook invocation sees it even though the port's `"message"` event has not fired. The
- * loop drains to the END of the queue rather than taking one message, so a burst of
- * install/uninstall transitions leaves the LAST one in force, not the oldest unread one.
+ * TWO INDEPENDENT TESTS, AND BOTH ARE LOAD-BEARING. Either one alone is wrong, in opposite
+ * directions, and the `require(esm)` case is what shows it:
+ *
+ *  - **`insideGatedCjsLoad()`** is true for the dynamic extent of a `Module._load` call that
+ *    reached `guardCjsModuleRead` with a successfully resolved path. It is FALSE when
+ *    `resolveQuietly` returned `null` — which is exactly the shape of the live bypass the 2026-07
+ *    Node audit found on ≥24.18 (`Module._load`'s fourth argument put the internal options bag
+ *    where `_resolveFilename` expected `{ paths }`, resolution threw, and the gate read that as
+ *    "nothing to decide"). Keeping this hook live for those loads makes it a genuine second layer
+ *    for that whole class rather than a duplicate of the first.
+ *  - **the `require` condition** is how Node itself distinguishes a `require` resolution from an
+ *    `import` one, and it is what stops the depth test from over-reaching. `require("./x.mjs")` is
+ *    synchronous: the ENTIRE ESM subgraph — including an `import "/home/u/.aws/x.json"` three
+ *    modules down — resolves inside that one `Module._load` call, so the depth test alone would
+ *    silently disarm the gate for it. Measured on 22/24/26: the direct `require("./x.mjs")`
+ *    resolves with `["require", …]` and the nested `import` inside it resolves with
+ *    `["node", "import", …]`, so the conjunction declines the first and gates the second.
+ *
+ * The failure directions are worth stating because they are not symmetric. A false "already
+ * decided" is FAIL-OPEN — one load goes un-gated. A false "not yet decided" is a duplicate
+ * decision: noisy, visible, and fail-closed. The conjunction is the conservative one.
  */
-function refreshSnapshot(): void {
-  if (gatePort === null) return;
-  let message = realWorkerThreads.receiveMessageOnPort(gatePort);
-  while (message !== undefined) {
-    gateSnapshot = message.message as EsmGateSnapshot;
-    message = realWorkerThreads.receiveMessageOnPort(gatePort);
-  }
-}
-
-/** Report a decision to the main thread's `onDecision` sink. Never throws, never waits. */
-function reportDecision(outcome: EsmGateOutcome): void {
-  if (gatePort === null) return;
-  try {
-    // This is a `worker_threads` MessagePort, not `window.postMessage` — there is no target
-    // origin to pass, and adding one would be a TypeError.
-    // eslint-disable-next-line unicorn/require-post-message-target-origin
-    gatePort.postMessage(outcome);
-  } catch {
-    // A closed port (teardown raced with an in-flight import). The enforcement half below has
-    // already happened; losing the trace line is the lesser failure and must not break the load.
-  }
+function alreadyDecidedByCjsGate(conditions: readonly string[]): boolean {
+  return insideGatedCjsLoad() && conditions.includes("require");
 }
 
 /**
@@ -178,23 +185,42 @@ function reportDecision(outcome: EsmGateOutcome): void {
  * import never reads the bytes at all. Node surfaces the throw to the importer as a failed
  * import, which is what a caller already has to handle for a missing module.
  */
-function gateModuleRead(parentURL: string | undefined, url: string): void {
-  refreshSnapshot();
-  const outcome = decideEsmModuleRead(gateSnapshot, parentURL, url);
+function gateModuleRead(context: ResolveContext, url: string): void {
+  if (alreadyDecidedByCjsGate(context.conditions)) return;
+  const outcome: EsmGateOutcome | null = decideEsmModuleRead(
+    currentSnapshot(),
+    context.parentURL,
+    url,
+  );
   if (outcome === null) return;
-  reportDecision(outcome);
+  // Report through the LIVE context, exactly as a captured shim does (#87) — never through a
+  // context captured when the hooks were registered.
+  liveCtx.onDecision(outcome.pkg, outcome.decision);
   if (!outcome.decision.allowed) throw new CapabilityError(outcome.decision.reason, outcome.pkg);
 }
 
+/**
+ * The hook signatures, written out STRUCTURALLY rather than imported from `node:module`.
+ *
+ * `node:module` is mediated, and `test/real-builtins.test.ts`'s source scan cannot tell an erased
+ * `import type … from "node:module"` from a live one — the rule it enforces (#78: nothing in `src`
+ * names a mediated builtin except the capture modules) is worth more than the convenience. `tsc`
+ * still checks these against Node's real `ResolveHookSync`/`LoadHookSync` at the
+ * `registerHooks({ resolve, load })` call site in `esm-hook.ts`, so a shape that drifts from
+ * Node's fails the build there rather than at runtime.
+ */
 interface ResolveContext {
   conditions: string[];
-  importAttributes: Record<string, string>;
-  parentURL?: string;
+  importAttributes: Record<string, string | undefined>;
+  parentURL: string | undefined;
 }
-type NextResolve = (
-  specifier: string,
-  context: ResolveContext,
-) => Promise<{ url: string; format?: string | null; shortCircuit?: boolean }>;
+interface ResolveResult {
+  url: string;
+  format?: string | null | undefined;
+  shortCircuit?: boolean | undefined;
+  importAttributes?: Record<string, string | undefined> | undefined;
+}
+type NextResolve = (specifier: string, context?: Partial<ResolveContext>) => ResolveResult;
 
 /**
  * Given a URL Node's resolution machinery produced, return the REGISTERED specifier whose
@@ -215,11 +241,11 @@ function mediatedSpecifierForUrl(url: string): string | null {
   return null;
 }
 
-export async function resolve(
+export function resolve(
   specifier: string,
   context: ResolveContext,
   nextResolve: NextResolve,
-): Promise<{ url: string; format?: string | null; shortCircuit?: boolean }> {
+): ResolveResult {
   // Fast path: the specifier NAMES a mediated builtin (`import "node:fs"`). No resolution work
   // is needed and this is the overwhelmingly common case, so it stays a single lookup.
   if (hasOwn(exportsBySpecifier, specifier)) {
@@ -231,27 +257,29 @@ export async function resolve(
   // subpath imports (`"imports": {"#x": "fs"}`), conditional and `*`-pattern import targets,
   // and any future spelling that lands on a builtin all pass through here, and all of them
   // produce a `node:<builtin>` URL that we mediate exactly as if it had been named directly.
-  // `nextResolve` was already being awaited for every non-mediated specifier, so the added
+  // `nextResolve` was already being called for every non-mediated specifier, so the added
   // cost is the string check above and nothing else.
-  const result = await nextResolve(specifier, context);
+  const result = nextResolve(specifier, context);
   const mediated = mediatedSpecifierForUrl(result.url);
   if (mediated !== null) return { url: PREFIX + mediated, shortCircuit: true };
   // Not a builtin, so it is a file (or a `data:`/`https:` target the gate ignores). This is the
-  // ESM half of #123 — see `gateModuleRead`. It runs AFTER `nextResolve` because the decision is
-  // about the resolved target, never about the specifier text.
-  gateModuleRead(context.parentURL, result.url);
+  // #123 gate — see `gateModuleRead`. It runs AFTER `nextResolve` because the decision is about
+  // the resolved target, never about the specifier text.
+  gateModuleRead(context, result.url);
   return result;
 }
 
 interface LoadContext {
-  format?: string | null | undefined;
+  format: string | null | undefined;
   conditions: string[];
-  importAttributes: Record<string, string>;
+  importAttributes: Record<string, string | undefined>;
 }
-type NextLoad = (
-  url: string,
-  context: LoadContext,
-) => Promise<{ format: string; source: string | ArrayBuffer | Uint8Array; shortCircuit?: boolean }>;
+interface LoadResult {
+  format: string | null | undefined;
+  source?: string | ArrayBuffer | NodeJS.TypedArray | undefined;
+  shortCircuit?: boolean | undefined;
+}
+type NextLoad = (url: string, context?: Partial<LoadContext>) => LoadResult;
 
 /** A valid, non-reserved ES identifier that can appear in `export const <name> = …`. */
 const RESERVED = new Set([
@@ -281,29 +309,30 @@ function synthesize(specifier: string): { format: string; source: string; shortC
   return { format: "module", source: lines.join("\n"), shortCircuit: true };
 }
 
-export async function load(
-  url: string,
-  context: LoadContext,
-  nextLoad: NextLoad,
-): Promise<{ format: string; source: string; shortCircuit?: boolean } | Awaited<ReturnType<NextLoad>>> {
+export function load(url: string, context: LoadContext, nextLoad: NextLoad): LoadResult {
   if (!url.startsWith(PREFIX)) {
     // DEFENSE IN DEPTH (#59, #61): capwall's own `resolve` never emits a bare `node:<mediated>`
     // URL, so reaching here with one means SOMETHING ELSE produced it — a resolution route we
     // did not anticipate, or another module-customization hook that short-circuited ahead of
-    // us (Node runs the most recently registered hook first, and the synchronous
-    // `registerHooks` chain runs entirely before the asynchronous `register` chain). Rather
-    // than hand back the raw builtin, re-mediate: serve the same shim-backed synthetic source
-    // we would have served had our `resolve` seen it. This holds against a hostile resolve
-    // short-circuit registered via BOTH `module.register()` and `module.registerHooks()` — the
-    // load chain still descends to us in both cases, even though the synchronous resolve chain
-    // runs first.
+    // us. Node runs the most recently registered hook first, so a hook registered AFTER capwall
+    // is ahead of capwall's `resolve`; the load chain still descends to us, which is what makes
+    // this reachable. Rather than hand back the raw builtin, re-mediate: serve the same
+    // shim-backed synthetic source we would have served had our `resolve` seen it.
+    //
+    // WHAT CHANGED WITH `registerHooks` (#152), because it changes which attacker this catches.
+    // capwall now lives in the SYNCHRONOUS chain, which Node runs entirely ahead of the
+    // asynchronous `module.register()` chain. So a hostile hook registered with `register()` no
+    // longer gets ahead of capwall's `resolve` at all: capwall's `resolve` runs first, calls
+    // `nextResolve` (which descends into the async chain), sees the `node:<builtin>` URL that
+    // chain returned and mediates it there — verified on 22/24/26. The remaining attacker this
+    // branch is for is a SYNCHRONOUS hook registered after capwall's, which does run first.
     //
     // HOW FAR THIS ACTUALLY REACHES (measured, not assumed — #78). A `node:` URL already
     // resident in the ESM module cache is served from cache and the load chain is never
     // consulted at all, so this branch only exists for a specifier capwall itself has kept OUT
     // of that cache. From #74 until #78 it did the opposite: the shims captured their real
     // modules with static ESM `import realFs from "node:fs"`, every mediated builtin was cached
-    // raw before `module.register()` ran, and this was dead code for the whole mediated set.
+    // raw before the hooks were registered, and this was dead code for the whole mediated set.
     // Since #78 the capture goes through a CommonJS `require` (`src/real-builtins.cts`), which
     // populates the CJS cache and leaves the ESM cache untouched, and this branch fires for all
     // twelve mediated builtins — verified end-to-end in `test/esm.test.ts` § #78 against a hook

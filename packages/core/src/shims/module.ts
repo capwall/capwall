@@ -10,15 +10,29 @@
  * Gate 1 — loader-hook registration (#61).
  *
  * WHY THIS EXISTS. M5 makes Node's loader-hook chain part of capwall's enforcement path, and
- * that chain is deliberately composable: **Node runs the most recently registered hook first**,
- * and the synchronous `module.registerHooks()` chain runs entirely ahead of the asynchronous
- * `module.register()` chain capwall lives in. So a dependency that reaches `register` /
- * `registerHooks` can short-circuit a mediated specifier straight to the real `node:` URL
- * before capwall's `resolve` is ever consulted. Because the ESM module cache is keyed by
- * resolved URL and the hook is process-wide, that de-mediates **every** package that imports
- * a mediated builtin afterwards — an innocent third dependency's ordinary
- * `import * as fs from "node:fs"` binds to the raw builtin — with no capwall log line.
- * `node:module` was not mediated, so nothing stood in the way.
+ * that chain is deliberately composable: **Node runs the most recently registered hook first**.
+ * So a dependency that reaches `register` / `registerHooks` can short-circuit a mediated
+ * specifier straight to the real `node:` URL before capwall's `resolve` is ever consulted.
+ * Because the ESM module cache is keyed by resolved URL and the hook is process-wide, that
+ * de-mediates **every** package that imports a mediated builtin afterwards — an innocent third
+ * dependency's ordinary `import * as fs from "node:fs"` binds to the raw builtin — with no
+ * capwall log line. `node:module` was not mediated, so nothing stood in the way.
+ *
+ * BOTH ENTRY POINTS ARE STILL GATED, and #152 narrowed WHICH of them can actually get ahead of
+ * capwall. There are two chains, and Node runs the synchronous one entirely before the
+ * asynchronous one. capwall used to live in the ASYNCHRONOUS chain (`module.register()`), so
+ * either API beat it. It now lives in the SYNCHRONOUS one (`module.registerHooks()`), so:
+ *
+ *   - `module.register()` from a dependency no longer reaches a mediated specifier ahead of
+ *     capwall at all — capwall's `resolve` runs first, calls `nextResolve`, and classifies on
+ *     whatever URL that chain returns (#59's rule). Verified end to end on 22/24/26 in
+ *     `test/esm.test.ts` § #78.
+ *   - `module.registerHooks()` from a dependency registered AFTER capwall's IS newer and does run
+ *     first. That is the residual this gate exists for, and the `load`-level re-mediation
+ *     backstop is the second layer behind it.
+ *
+ * The gate covers both regardless, because "which chain wins" is a Node implementation detail and
+ * this is a security control.
  *
  * WHAT THIS DOES. Registering a loader hook is treated as an app-only operation: capwall
  * attributes the caller exactly as every other shim does and, for anything that is not the

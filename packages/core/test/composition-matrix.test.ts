@@ -28,7 +28,10 @@
  *  S6  the `Module.prototype._compile` patch — exactly ONE per process, REFERENCE-COUNTED
  *      (`compileGateInstalls`). shims/module.ts. Stacking it would make the inner patch see the
  *      outer patch's frame instead of Node's loader and gate EVERY `require` in the process.
- *  S7  `hookRegistered` — `module.register()` is one-shot per process. loader/esm-hook.ts.
+ *  S7  the `module.registerHooks()` registration — exactly ONE per process, REFERENCE-COUNTED
+ *      (`hooks` + `activations`). loader/esm-hook.ts. Was a one-shot `hookRegistered` boolean
+ *      until #152, because `module.register()` could not be undone; the last `uninstall()` now
+ *      calls the real `deregister()` and a later `install()` registers afresh.
  *  S8  `authorizedEnvKeys` — the key-scoped env authorization, live only for the dynamic extent
  *      of a real spawn. shims/runtime.ts. This is what #98 replaced `suspendEnvGate` with.
  *  S9  `unproxiedEnv` — the un-gated `process.env` reference the child_process shim builds a

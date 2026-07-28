@@ -39,10 +39,13 @@ in-process fix.
 undocumented, unsupported, and in one case formally deprecated with removal announced.**
 `Module._load` is the CJS interception point; `Module.prototype._compile` is the `compile` gate;
 `process.dlopen` is the `native` gate; `Module._findPath` and `Module._resolveFilename` feed
-attribution and the module-read gate; `module.register()` is the entire ESM path. Of those, only
-`module.register()` appears in Node's API documentation at all — and it is **Stability 0,
-runtime-deprecated as DEP0205 in Node 26.0.0**, with Node stating it "will be removed in a future
-version". The rest have no deprecation code because they have no support commitment to deprecate.
+attribution and the module-read gate; `module.registerHooks()` is the entire ESM path. Of those,
+only `module.registerHooks()` appears in Node's API documentation at all — and it is **Stability
+1.2, release candidate**, so it may still change in a minor. The rest have no deprecation code
+because they have no support commitment to deprecate. Until #152 that row was
+`module.register()`, which was **Stability 0 and runtime-deprecated as DEP0205 in Node 26.0.0**
+with removal announced; the ESM path is the one mechanism here whose direction of travel is
+towards support rather than away from it.
 
 What that costs, concretely rather than in principle: two of them have already changed shape under
 this project (#128, #135); a third changed shape in a **Node minor** (24.18) and opened a live,
@@ -74,12 +77,20 @@ gate above, the `Module.prototype._compile` gate (#93 — a prototype patch, ins
 `install()` rather than through the shim registry, because `_compile` is read off the prototype
 and `process.getBuiltinModule("node:module")` reaches it without touching the shim), and Node's
 **global egress APIs** — `globalThis.fetch`/`WebSocket`/`EventSource`,
-replaced on `globalThis` since #80 (see "Global egress surfaces" below). ESM interception uses a
-`module.register()` loader hook (`loader/esm-hook.ts` + `esm-hooks.ts` + `esm-runtime.ts`)
-that rewrites mediated builtin specifiers to a synthetic module re-exporting the same shims
-the CJS path uses; it covers **static AND dynamic** `import` (`import { readFile } from
+replaced on `globalThis` since #80 (see "Global egress surfaces" below). ESM interception uses
+**synchronous `module.registerHooks()` hooks** (`loader/esm-hook.ts` + `esm-hooks.ts` +
+`esm-runtime.ts`) that rewrite mediated builtin specifiers to a synthetic module re-exporting the
+same shims the CJS path uses; it covers **static AND dynamic** `import` (`import { readFile } from
 "node:fs"` and `await import("node:fs")`), attributing to the importing package exactly like
 CJS. It is **on by default** under the CLI preload (disable with `CAPWALL_ESM=0`).
+
+**#152 moved that path off `module.register()`**, which Node 26 runtime-deprecated (DEP0205) with
+removal announced. Three things follow, and each is picked up where it belongs below: the hooks
+run in capwall's own realm, so the #123 module-read gate reads the live policy instead of a
+snapshot copied to a loader thread; the hooks are consulted for **`require()` as well as
+`import()`**, so the CJS gate and the ESM hook can both see one load and `loader/require.ts` is
+the one that decides it; and the registration can be **deregistered**, which closes the ESM teardown asymmetry this
+document used to list as a known limit.
 
 Interception is decided on the URL a specifier **resolves to**, not on the specifier string
 (#59). A specifier does not have to *name* a builtin to reach one — Node's subpath imports let
@@ -168,15 +179,23 @@ be revoked.
   still does.
 - The set of mediated specifiers is fixed at install time; a mediated builtin not in the shim
   registry is not intercepted (the registry covers the capabilities above).
-- Unregistering the ESM hook is best-effort (Node cannot fully remove a registered hook), so ESM
-  teardown is **fail-closed rather than reversible** — this is the one place the lifecycle above
-  differs between the two paths. On CJS, a fresh `require` after the last `uninstall()` reaches the
-  real builtin; on ESM there is no equivalent, because the hook is still registered and an import
-  binding cannot be un-bound. A mediated builtin **not yet imported** when `uninstall()` ran
-  therefore throws an explicit "capwall is no longer installed" error on re-import, and one a
-  module **had already imported** denies under the deny-all torn-down policy (#62 — before that
-  fix it kept serving the torn-down install's grants, so this bullet previously overclaimed: it
-  was true only for never-imported specifiers).
+- **ESM teardown is now real, and the two paths agree (#152).** This bullet used to say the
+  opposite, and it was the one place the install lifecycle above differed between the two module
+  systems: `module.register()` had no working teardown, so the hook outlived `uninstall()` and a
+  mediated builtin **not yet imported** threw an explicit "capwall is no longer installed" error
+  on re-import. `module.registerHooks()` returns a real `deregister()`, which the LAST
+  `uninstall()` calls, so:
+  - a **fresh** `import` of a mediated builtin after the last `uninstall()` reaches the real
+    builtin, exactly as a fresh `require` does. Teardown restores; it does not deny.
+  - a specifier a module **had already imported** still denies under the deny-all torn-down
+    policy (#62), because a `const` import binding cannot be un-bound and serving revoked grants
+    is the fail-open option. That is the property that actually matters and it is unchanged.
+  - the old behaviour was not merely stricter, it was a trap: an ES module that throws during
+    evaluation is cached in its errored state, so importing a mediated builtin during an
+    uninstalled window **poisoned that specifier for the rest of the process**, including for a
+    later legitimate `install()`. It no longer can — a mediated import resolves to a
+    `capwall-esm:` URL, which is a different registry key from the raw `node:` one the gap import
+    cached. Both halves are asserted in `test/esm.test.ts` § #62.
 - **capwall cannot guarantee it stays outermost in the loader-hook chain** (#61). See
   "Loader-hook registration" below — this is the significant residual on the ESM path.
 - `process.env` is not import-routed; its Proxy guard (installed by `install()`) covers both
@@ -184,15 +203,31 @@ be revoked.
   `WebSocket` and `EventSource` are globals, so they are mediated by replacing them on
   `globalThis`, independently of either module system. See "Global egress surfaces" below.
 
-**Loader-hook registration (#61) — partially closed, residual named.** Node's module
-customization hooks are deliberately composable: the **most recently registered hook runs
-first**, and the synchronous `module.registerHooks()` chain runs entirely ahead of the
-asynchronous `module.register()` chain capwall lives in. A dependency that reaches
-`register`/`registerHooks` can therefore short-circuit a mediated specifier straight to the
-real `node:` URL before capwall's `resolve` is consulted — and because the hook is
-process-wide and the ESM cache is keyed by resolved URL, that de-mediates **every** package
-loaded afterwards, not just the attacker: an innocent third dependency's ordinary
-`import * as fs from "node:fs"` binds to the raw builtin, with no log line.
+**Loader-hook registration (#61) — partially closed, residual named and NARROWED by #152.**
+Node's module customization hooks are deliberately composable: the **most recently registered
+hook runs first**. A dependency that reaches `register`/`registerHooks` can therefore
+short-circuit a mediated specifier straight to the real `node:` URL before capwall's `resolve`
+is consulted — and because the hook is process-wide and the ESM cache is keyed by resolved URL,
+that de-mediates **every** package loaded afterwards, not just the attacker: an innocent third
+dependency's ordinary `import * as fs from "node:fs"` binds to the raw builtin, with no log line.
+
+**Which API can still get ahead of capwall changed in #152, and this is the one part of #61 that
+moved.** There are two chains and Node runs the synchronous one entirely before the asynchronous
+one. capwall used to live in the asynchronous chain (`module.register()`), so *either* API beat
+it. It now lives in the synchronous one, so:
+
+| attacker registers via | before #152 | now |
+|---|---|---|
+| `module.register()` (async) | ran ahead of capwall's `resolve`; only the `load` backstop was left | **cannot get ahead at all.** capwall's `resolve` runs first, calls `nextResolve` — which descends into the async chain — and classifies on the URL that chain returns |
+| `module.registerHooks()` (sync), registered after capwall | ran ahead of capwall's `resolve` | unchanged: still runs first. **This is the residual** |
+| either, registered *before* capwall installs | capwall is newer, so capwall runs first | unchanged |
+
+Re-verified on Node 22.22.3 / 24.18.0 / 26.5.0 rather than inferred: `test/esm.test.ts` § #78 now
+asserts that the `register()` attacker produces **no re-mediation warning at all** (capwall was
+never displaced), and that the `registerHooks()` attacker produces one for **all twelve** mediated
+builtins and every specifier still comes back as an enforcing shim. The gate below covers both
+APIs regardless, because "which chain wins" is a Node implementation detail and this is a security
+control.
 
 What capwall does about it: `node:module` is mediated, and `register`/`registerHooks` are
 treated as **application-only**. A registration attributed to a dependency is refused with a
@@ -227,7 +262,9 @@ What it does **not** do, plainly:
   **#78 this fires**, for all twelve mediated builtins, and is exercised end-to-end: a loader
   hook registered ahead of capwall's short-circuits every one of them straight to its `node:`
   URL (with `shortCircuit: true, format: "builtin"`, the strongest form) and each import comes
-  back as the shim, denying under a deny-all policy.
+  back as the shim, denying under a deny-all policy. Since **#152 its one remaining route is a
+  synchronous `registerHooks` hook** — the `register()` attacker is caught a layer earlier now —
+  so it is covered by exactly one test and has a mutant (`esm-load-remediation-backstop`).
   Whether it fires at all is decided by one thing — whether the URL is already in Node's ESM
   module cache, because a cached URL is served from cache and the load chain is never consulted.
   From #74 until #78 it was **dead code**: capwall's own shims captured their real modules with
@@ -1311,8 +1348,10 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
   which case that is what `require("lodash")` resolves to in that tree.
 
   **What this does not reach, stated plainly.**
-  - **ESM imports are recovered, not observed.** `module.register()` hooks run on Node's separate
-    loader thread, so capwall's ESM `resolve` hook cannot write the map. Recovery covers a link
+  - **ESM imports are recovered, not observed.** capwall's ESM `resolve` hook does not write the
+    map. Until #152 it could not — `module.register()` ran it on Node's separate loader thread —
+    and since #152 that is a choice rather than a constraint; wiring it in is worth doing and was
+    deliberately out of scope for the ESM perimeter's rewrite. Recovery covers a link
     sitting in a `node_modules` directory above the package itself or above the project root,
     which is every layout measured (`npm i file:`, `npm link`, npm/yarn workspaces, and pnpm
     workspaces when the project root is the consuming package — what `npm run -w` and
@@ -1611,20 +1650,34 @@ package `require` `<project>/config.json`" and "may it `readFileSync` it" are th
 **attributed caller** (capwall's ordinary stack walk), deliberately not the `parent` module the
 loader supplies: `createRequire()` builds a module record whose filename is whatever string it was
 given, so trusting `parent.filename` would let any dependency present itself as a granted package.
-On the ESM path there is no JavaScript stack to walk — the hook runs on Node's loader thread — so
-the subject is `context.parentURL`, which the host sets from the module record containing the
-`import` and which in-process code cannot choose. An importer with no filesystem identity (a
-`data:` URL module) is charged to `<unknown>`, never inferred to be the trust root.
+On the ESM path the subject is `context.parentURL`, which the host sets from the module record
+containing the `import` and which in-process code cannot choose. An importer with no filesystem
+identity (a `data:` URL module) is charged to `<unknown>`, never inferred to be the trust root.
+Until #152 that was forced — the hook ran on Node's loader thread and there was no JavaScript
+stack belonging to the importer to walk. Since #152 it is a **choice**, and the right one:
+`parentURL` is the host's own answer to the question a stack walk would be inferring, and at ESM
+resolution time the stack is Node's loader machinery with the importer somewhere below it.
 
-**How the ESM half reaches a policy at all.** The loader hooks run on a separate thread, and the
-main thread *blocks* on their results during synchronous module loads, so a round trip back to the
-main thread would deadlock. The hook therefore holds a **copy** of the policy, refreshed
-synchronously from a `MessagePort` (`receiveMessageOnPort`, no event-loop turn) at the top of every
-invocation; `install()` posts the new snapshot before it returns, so there is no window in which an
-import is evaluated against a policy the main thread has already replaced. The copy is evaluated by
-the *same* `evaluate()` / `packageForPath()` / `matchesGlob()` functions the main thread uses — one
-decision procedure, not two. Decisions travel back over the same port and land in `onDecision`;
-that direction is recording, not enforcement, which happens on the loader thread.
+**How the ESM half reaches a policy (#152 deleted the interesting half of this).** It reads
+`liveCtx` — the same single live-context box every CJS shim reads — so there is one policy and no
+copy. That is new. While the hooks ran on Node's loader thread, the main thread *blocked* on their
+results during synchronous module loads, so a round trip back would have deadlocked; the hook
+therefore held a **copy** of the policy, refreshed synchronously from a `MessagePort` at the top of
+every invocation, and `install()` posted a new snapshot before returning so no import could be
+evaluated against a superseded policy. The window that discipline existed to keep empty no longer
+exists. Decisions go straight into `onDecision` on the same call, and enforcement is a throw from
+`resolve`, before Node opens the file.
+
+**One load, one decision (#152).** `module.registerHooks()` is consulted for `require()` as well
+as `import()`, so the CJS half and the ESM half can now both see the same load. `loader/require.ts`
+decides it — it has the better subject — and marks the dynamic extent of what it decided; the
+`resolve` hook stands down only when it is inside such a load **and** the resolution carries the
+`require` export condition. Both halves are needed: `require(esm)` pulls a whole ES subgraph in
+synchronously inside one `Module._load`, so the extent test alone would disarm the gate for every
+`import` below it, and the condition test alone would let a load `Module._load` failed to resolve
+go undecided by either. Deciding twice would be an *audit* defect — two `DENY` lines, two grants
+out of `observe`, phantom drift in `capwall diff` — and both directions are asserted in
+`test/module-read.test.ts` § #152.
 
 **Carve-out: `.node`.** An addon load is already gated as `native` at `process.dlopen`, which is
 *stricter* than this gate — it charges both the caller and the addon file's owner, and an addon

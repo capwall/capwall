@@ -70,10 +70,8 @@
  * principal that changed across an `uninstall()`/`install()` pair would be the #62/#87 defect
  * wearing a different hat. There is deliberately no reset.
  */
-// Never `import … from "node:fs"` (#78); and the NARROW capture rather than the twelve-wide
-// aggregate, because this module is on the ESM loader thread's graph (#150) — see
-// `src/real-builtins/fs.cts`.
-import { realFs } from "../real-builtins/fs.cjs";
+// Never `import … from "node:fs"` (#78) — see `src/real-builtins.cts`.
+import { realFs } from "../real-builtins.cjs";
 
 /**
  * Normalize a path for segment scanning: back-slashes become forward slashes.
@@ -346,8 +344,12 @@ function declaredName(pkgRoot: string): string | null {
  * nameable package. It can never take `<app>` away from something that would have had it, which
  * is what keeps the trust-root sentinel a POSITIVE identification (#60) rather than a guess.
  *
- * It exists because {@link recordResolvedLink} only sees CJS resolution: `module.register()` hooks
- * run on Node's separate loader thread, so capwall's ESM `resolve` hook cannot write to this map.
+ * It exists because {@link recordResolvedLink} only sees CJS resolution — `Module._findPath`. The
+ * ESM `resolve` hook does not write to this map. Until #152 it COULD not: `module.register()` ran
+ * it on Node's separate loader thread, which has its own realm and its own copy of this module.
+ * Since #152 the hooks run in this realm and the obstacle is gone, so this is now a CHOICE, and
+ * the recovery path below is what it costs. Wiring the ESM hook into the map is worth doing and
+ * is deliberately not done here (#152 is already the ESM perimeter's rewrite).
  * An ESM `import "@w/lib"` of a linked package is therefore recovered here rather than observed —
  * which works whenever the link sits in a `node_modules` directory above the package itself or
  * above the project root (npm/yarn workspaces, `npm link`, `npm i file:`, and pnpm workspaces when

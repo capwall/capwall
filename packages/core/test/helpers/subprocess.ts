@@ -6,7 +6,7 @@
  *
  * A dozen suites cannot assert what they assert in-process: `CAPWALL_HARDENED` freezes
  * prototypes for the life of the process, ESM resolution is cached per process,
- * `module.register()` is one-shot, and the flag-only global egress classes need process-level
+ * the module hooks are one registration per process, and the flag-only global egress classes need process-level
  * flags. Those suites each grew a private `runVector()` around
  * `execFile(process.execPath, ["--import=…/dist/preload.js", …])` with no timeout of its own, so
  * vitest's DEFAULT 5000 ms `testTimeout` was the only bound on them. 5000 ms was never a budget

@@ -13,11 +13,12 @@
     "is what keeps this catalog from rotting into a no-op: a refactor that moves a mechanism breaks",
     "the catalog loudly instead of silently turning its mutant into a no-op edit.",
     "",
-    "MOSTLY security-critical mechanisms, and two (#150) that are not: the ESM loader thread's import",
-    "graph is a STARTUP-COST invariant. It earns a mutant on the same argument the security ones do —",
-    "reverting it breaks nothing, fails nothing, and silently puts zod and ten unused builtins back",
-    "on the blocking startup path of every mediated process. A property no test asserts is a property",
-    "that decays, whichever column it sits in.",
+    "MOSTLY security-critical mechanisms, and one (#152) that is not: whether capwall's ESM install",
+    "starts Node's module-customization THREAD is a startup-cost invariant. It earns a mutant on the",
+    "same argument the security ones do — going back to `module.register()` breaks nothing and fails",
+    "nothing, and silently puts ~53 ms of thread bootstrap back on every mediated process (and, on",
+    "Node 26, a DEP0205 warning on stderr). A property no test asserts is a property that decays,",
+    "whichever column it sits in.",
     "",
     "`needsBuild` marks mutants whose claimed tests spawn a subprocess against `dist/` — those need",
     "a rebuild after mutating and after restoring."
@@ -204,28 +205,52 @@
       "note": "Only observable on the FALLBACK path, which is exactly why it needs a mutant: the fast path skips those frames in V8 and would hide the loss."
     },
     {
-      "id": "loader-thread-no-zod",
-      "mechanism": "#150 — the ESM hook's graph reaches the policy-schema GRAMMAR by subpath, never the barrel that builds the Zod schema tree at module scope. module.register() blocks the main thread while that graph loads, so a barrel import puts zod on the blocking startup path of every mediated process",
-      "file": "packages/core/src/policy/evaluate.ts",
-      "anchor": "import { ANY_HOST, matchesHostPattern } from \"@capwall/policy-schema/host\";",
-      "mutation": "import { ANY_HOST, matchesHostPattern } from \"@capwall/policy-schema\";",
+      "id": "esm-no-loader-thread",
+      "mechanism": "#152/#153 — capwall's ESM interception uses the SYNCHRONOUS module.registerHooks(), so no module-customization thread is started (~53 ms) and no DEP0205 deprecation warning is printed. module.register() is Stability 0 with removal announced",
+      "file": "packages/core/src/loader/esm-hook.ts",
+      "anchor": "    hooks = realModule.registerHooks({ resolve, load }) as RegisteredHooks;",
+      "mutation": "    hooks = realModule.registerHooks({ resolve, load }) as RegisteredHooks;\n    realModule.register(\"data:text/javascript,export function resolve(s,c,n){return n(s,c)}\", import.meta.url);",
       "tests": [
         "packages/core/test/esm-hook-graph.test.ts"
       ],
-      "needsBuild": false,
-      "note": "A startup-cost invariant, not a security one — and the reason it needs a mutant is that the mutation is the most natural import in the repo, breaks nothing and fails nothing."
+      "needsBuild": true,
+      "note": "The one mutant in this catalog that ADDS rather than removes, because the invariant is an absence. It re-creates exactly the cost #152 removed — the loader thread — without changing a single behaviour, which is why nothing but a dedicated probe catches it."
     },
     {
-      "id": "loader-thread-narrow-capture",
-      "mechanism": "#150 — a module the ESM loader thread evaluates takes its real builtin from the NARROW capture under src/real-builtins/, not from the twelve-wide aggregate, so that realm does not require the ten builtins it never uses",
-      "file": "packages/core/src/attribution/index.ts",
-      "anchor": "import { realFs } from \"../real-builtins/fs.cjs\";",
-      "mutation": "import { realFs } from \"../real-builtins.cjs\";",
+      "id": "esm-hooks-deregistered-on-teardown",
+      "mechanism": "#62/#152 — the LAST uninstall() deregisters the module hooks, so ESM teardown is real rather than best-effort and a never-imported specifier is un-mediated afterwards exactly as it is on the CJS path, instead of throwing a bridge error that permanently poisons the specifier",
+      "file": "packages/core/src/loader/esm-hook.ts",
+      "anchor": "        live.deregister();",
+      "mutation": "        void live;",
       "tests": [
-        "packages/core/test/esm-hook-graph.test.ts"
+        "packages/core/test/esm.test.ts"
       ],
-      "needsBuild": false,
-      "note": "Reverting this is a no-op for correctness — both spellings hand back the identical object, which real-builtins.test.ts asserts — and that is exactly why nothing else would catch it."
+      "needsBuild": true,
+      "note": "module.register() could not offer this line at all — the asymmetry docs/threat-model.md used to carry as a known limit. Without it the hooks outlive their install and #62's swap fixture reports the pre-#152 behaviour."
+    },
+    {
+      "id": "esm-gate-stands-down-only-for-require",
+      "mechanism": "#152 — the ESM resolve hook stands down for the #123 module-read decision ONLY when loader/require.ts already took it: inside a gated Module._load AND for a `require` export condition. require(esm) pulls a whole ES subgraph in synchronously inside one Module._load, so the depth test alone would disarm the gate for every import below it",
+      "file": "packages/core/src/loader/esm-hooks.ts",
+      "anchor": "  return insideGatedCjsLoad() && conditions.includes(\"require\");",
+      "mutation": "  return insideGatedCjsLoad();",
+      "tests": [
+        "packages/core/test/module-read.test.ts"
+      ],
+      "needsBuild": true,
+      "note": "Fail-OPEN in one direction (a laundered import goes un-gated) and merely noisy in the other (two decisions for one require), which is why the conjunction is the conservative form and both halves are asserted."
+    },
+    {
+      "id": "esm-load-remediation-backstop",
+      "mechanism": "#78/#61 — the load hook re-mediates any raw node:<mediated> URL it is handed, since capwall's own resolve never emits one. Since #152 this is reachable only from a SYNCHRONOUS hook registered after capwall's, which is the one attacker position still ahead of capwall in the chain",
+      "file": "packages/core/src/loader/esm-hooks.ts",
+      "anchor": "    const mediated = mediatedSpecifierForUrl(url);",
+      "mutation": "    const mediated: string | null = null;",
+      "tests": [
+        "packages/core/test/esm.test.ts"
+      ],
+      "needsBuild": true,
+      "note": "Had no mutant while the register() chain also reached it and two tests covered it. It now has exactly one route and one test, so it needs one."
     }
   ]
 }

@@ -57,7 +57,7 @@
  *
  * Run: `pnpm -r build` first (this imports the BUILT packages/core/dist), then `pnpm bench`.
  * Flags: --quick (fewer blocks/iterations — what the CI gate runs), --json (machine-readable
- * results on stdout), --no-esm (skip the ESM arm and its loader thread).
+ * results on stdout), --no-esm (skip the ESM arm).
  */
 
 import { createRequire } from "node:module";
@@ -1360,7 +1360,7 @@ if (WITH_ESM) {
       mediated: importColdMediated,
       iters: 60,
       warmup: 20,
-      note: "both arms pay the loader-thread round trip; the delta is the synthetic module + getEsmShim",
+      note: "both arms pay Node's resolve/load hook chain; the delta is the synthetic module + getEsmShim",
     }),
   );
 }
