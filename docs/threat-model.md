@@ -13,17 +13,21 @@ in-process attacker.
 ## Implementation status (keep in sync with the roadmap)
 
 As of roadmap **M5**, all core capability surfaces are mediated on **both the CJS `require`
-path and the ESM `import` path**: `fs`, `net`/`http`/`https`/`tls`/`http2`/`dgram`,
+path and the ESM `import` path**: `fs`, `net`/`http`/`https`/`tls`/`http2`/`dgram` (with
+unix-socket and named-pipe destinations split out as their own `ipc` capability, #72),
 `child_process`, `worker_threads`, `vm`, and `process.env`. Roadmap **S2** adds `native`, a
 load-time gate on `.node` addons that is module-system-independent (it patches
 `process.dlopen`, not a loader). Two further capabilities are decided at **module-load time**
 rather than at a capability call: `compile` (#93, a direct `Module.prototype._compile`) and, since
 #123, an `fs.read` decision on a `require`/`import` of a file **outside every `node_modules`
 tree** — the module system was previously a second, completely un-gated route to the same bytes
-`fs` guards. See § The module system as a read channel. Three surfaces are mediated **outside**
+`fs` guards. See § The module system as a read channel. **Four** surfaces are mediated **outside**
 both module systems,
 because they never route through one: `process.env` (a `Proxy` on the live object), the `native`
-gate above, and Node's **global egress APIs** — `globalThis.fetch`/`WebSocket`/`EventSource`,
+gate above, the `Module.prototype._compile` gate (#93 — a prototype patch, installed eagerly by
+`install()` rather than through the shim registry, because `_compile` is read off the prototype
+and `process.getBuiltinModule("node:module")` reaches it without touching the shim), and Node's
+**global egress APIs** — `globalThis.fetch`/`WebSocket`/`EventSource`,
 replaced on `globalThis` since #80 (see "Global egress surfaces" below). ESM interception uses a
 `module.register()` loader hook (`loader/esm-hook.ts` + `esm-hooks.ts` + `esm-runtime.ts`)
 that rewrites mediated builtin specifiers to a synthetic module re-exporting the same shims
@@ -75,8 +79,9 @@ be revoked.
 - **Installs nest**, innermost wins, and they unwind in **any** order, not only LIFO (#22 for the
   `Module._load` chain, #87 for the policy stack). Unwinding one install re-exposes the one below
   it, including for already-captured shims.
-- **Each process-global replacement is installed exactly ONCE, reference-counted** — the
-  `process.env` proxy, the egress globals, and the `Module.prototype._compile` gate. Every guard
+- **Each process-global replacement is installed exactly ONCE, reference-counted** — `Module._load`,
+  `process.dlopen`, the `process.env` proxy, the egress globals, and the
+  `Module.prototype._compile` gate. Every guard
   reads the live context, so one patch already tracks whichever install is in force; the count
   only decides when to put the original back. Stacking them was a real defect found by the #90
   composition matrix: a second env guard proxied the FIRST guard's proxy and registered it as the
@@ -86,9 +91,20 @@ be revoked.
   above. Restoring an egress global is also best-effort in one direction: if code outside capwall
   made it non-configurable in the meantime, `uninstall()` skips it rather than throwing, because
   an escaping `TypeError` there would abort teardown and strand every other patch.
-- **`hardened` is the one setting that is not live.** It freezes objects as they are built and a
-  frozen object cannot be unfrozen, so a capture keeps the hardening of the install that built it.
-  A later install's `hardened` still governs shims handed out fresh after it.
+  #90 found the bugs; **#107 made the rule structural.** All five patch sites now go through one
+  reference-counted relink chain, `core/src/lifecycle/process-patch.ts`, which is the only file in
+  `core/src` permitted to write a process global — asserted by a source scan in
+  `test/process-patch-sites.test.ts`, so a sixth patch site cannot be added off to the side. See
+  `docs/architecture.md` § Process-patch lifecycle.
+- **`hardened` is the one setting that is not per-install: it is a process-wide RATCHET (#129).**
+  Every other option follows the newest install. `hardened` engages the moment **any** install
+  asks for it and lifts only when capwall **fully** uninstalls — so a later
+  `install({ hardened: false })` cannot downgrade a hardened install that is still active, and
+  passing `hardened: false` guarantees nothing about the surfaces you get. Before #129 only the
+  egress globals ratcheted while the shim registries were last-writer-wins, which left the
+  process half-hardened; see § Hardened mode for the whole accounting. It is still not
+  retroactive in either direction: `Object.freeze` is irreversible, so a shim reference a module
+  already captured keeps the hardening of the install that first built it.
 - **None of this is dependency-reachable** — a dependency cannot call `install()`. It matters for
   embedders swapping policy at runtime and for programmatic tests, which is why #87 is rated MEDIUM
   rather than a live bypass.
@@ -142,9 +158,16 @@ What it does **not** do, plainly:
 - It gates *reaching* the API through a mediated module, not the API itself.
   `process.getBuiltinModule("node:module")` hands over the real one and defeats this exactly as
   it defeats every other shim.
-- The gate allows `<app>`, so it inherits whatever attribution fails open to. The `data:` URL
-  escape tracked as **#60** walks past it exactly as it walks past the `process.env` and
-  `dgram` gates (verified). That is one bug in attribution, not three in the gates.
+- The gate allows `<app>`, so it inherits whatever attribution answers for the trust root.
+  **Before #60 that was a fail-open**: attribution fell off the end of the walk into `<app>`, so a
+  registration run from a detached `data:` module reached the gate as the trust root and was
+  waved through, exactly as it walked past the `process.env` and `dgram` gates. Since #60 an
+  unattributable caller is `<unknown>` (`attribution/index.ts` returns `UNATTRIBUTED` both on the
+  opaque-frame path and on the fall-off-the-end path), the gate waves through an exact `APP_ROOT`
+  only, and `<unknown>` reaches the deny — asserted for precisely that `data:` vector by
+  `test/attribution-laundering.test.ts`. What remains is narrower and is the design, not a bug: a
+  **positively identified** application frame is still allowed, so app code — and anything that
+  persuades app code to register a hook on its behalf — passes.
 - A hook registered **before** capwall installs is already ahead of it.
 - capwall does **not** re-assert first position after an allowed registration. It could — the
   synchronous chain can be rejoined — but that would silently override the application's own
@@ -186,7 +209,8 @@ Per-capability notes:
   **any `Uint8Array`** (not only a `Buffer`), and a **duck-typed** file URL — Node's `isURL` is
   `href && protocol && auth === undefined && path === undefined`, not `instanceof URL`, so a
   plain object with those fields is a real path to `fs`. Both of the latter two used to fall
-  through capwall's check and were therefore **not gated at all** (#99). A URL argument is
+  through capwall's check and were therefore **not gated at all** — found by the #99 sweep and
+  tracked as **#104** (`shims/fs.ts` names it at the site). A URL argument is
   converted once and the resulting **string** is what is forwarded, so a shadowed `pathname`
   accessor cannot make Node open a file other than the one that was guarded.
   **Directory enumeration through a pattern** — `fs.glob` / `fs.globSync` / `fs.promises.glob`,
@@ -308,7 +332,10 @@ Per-capability notes:
   a signature appears to say — see the note on argument normalization below, and #99 for why that
   distinction has produced real holes. Two spellings a policy author will notice: a positional
   numeric-string port (`net.connect("9999", host)`) is a **TCP** target, not an IPC path, because
-  Node's `isPipeName` says so; and a `dgram` `send`/`connect` that names no address is recorded
+  Node's `isPipeName` says so — capwall used to read every string first argument as an IPC path,
+  so a package holding any `ipc` grant reached arbitrary TCP egress through it (found by #99,
+  tracked as **#105**, named at `shims/net.ts` § `isPipeName`); and a `dgram` `send`/`connect`
+  that names no address is recorded
   as **`127.0.0.1`** (udp4) or **`::1`** (udp6), the literals Node's own `lookup4`/`lookup6`
   substitute — not `localhost`.
   `dgram` ops attributed to `<app>`
@@ -706,7 +733,11 @@ globals with guarded equivalents for the life of the install. What it covers and
   and it follows the live policy like any other capture — see § Install lifecycle (#87).
 - **Hardened mode (#17)** installs the guarded global `writable: false` (so `globalThis.fetch =
   evil` silently no-ops in sloppy-mode CJS and throws under `"use strict"`) and freezes the wrapper
-  function / guarded class. `Object.defineProperty(globalThis, "fetch", …)` remains open — the same
+  function / guarded class. The pin is a **ratchet**: it is applied by `refresh` on every install,
+  so a hardened install stacked on an un-hardened one still gets it, and it is never lifted while
+  any install remains — only the final restore of the saved descriptors removes it (#129; the
+  egress side is where that rule started, and #129 extended it to the shim registries too).
+  `Object.defineProperty(globalThis, "fetch", …)` remains open — the same
   class of residual as climbing past a guarded prototype, and the price of a restorable global.
 - **Switchable off**: `install(…, { globalEgress: false })` / `CAPWALL_GLOBAL_EGRESS=0`, for a
   process where writing to `globalThis` is unacceptable.
@@ -763,8 +794,33 @@ not a boundary.
 of three principals. A frame under `node_modules/<pkg>` charges that package — **including one
 that got there through a symlink**, which since #127 is resolved back to the `node_modules` entry
 it was reached through rather than to the realpath (see § Package identity). A real source file
-under **no** `node_modules` and **inside the project root** charges `<app>`, the trust root, which
-the `process.env` and `dgram` gates exempt. Everything else — no qualifying frame on the stack at
+under **no** `node_modules` and **inside the project root** charges `<app>`, the trust root.
+
+**What the trust root is actually exempt from — five gates, not two.** This list reads as
+exhaustive, so it is worth writing out in full, and it is worth **re-deriving** rather than
+edited: it said "two" for three releases while three more exemptions were added by later PRs,
+here and in `docs/architecture.md`, `docs/policy-format.md` and `packages/core/README.md` at
+once. The derivation is mechanical — every `pkg === APP_ROOT` early return in
+`packages/core/src` is one of these, and a new one means this table is stale:
+
+| Gate | Site | What `<app>` skips |
+|---|---|---|
+| `process.env` reads | `shims/env.ts` | the `env` read allowlist |
+| `dgram` send/connect | `shims/net.ts` | the `net` grant, for UDP only |
+| loader-hook registration (#61) | `shims/module.ts` `guardRegistration` | `module.register` / `registerHooks`, which are otherwise application-only |
+| `Module.prototype._compile` (#93) | `shims/module.ts` `guardCompile` | the **`compile`** capability |
+| module-load read (#123) | `loader/module-read.ts`, both the CJS and ESM halves | the `fs.read` decision on `require`/`import` of a file outside every `node_modules` tree — see § The module system as a read channel |
+
+The `_compile` row is the one to hold on to, because this document calls `compile` *"identity-granting:
+a package holding it can execute as any principal in the policy, including `<app>`"* and *"a grant
+of every other grant"* — and `<app>` needs no such grant. It already has it. So the blast radius of
+a misattribution to `<app>`, or of application code being persuaded to compile attacker-supplied
+source under a chosen filename, is not "the app's `env` and `dgram` grants": it is the ability to
+name any principal in the policy and run as it. Note also what is **not** on this list: the
+`native` `.node` gate does not exempt `<app>` — the project's own build output is charged to
+`<app>` and still needs a `native` grant (`loader/native.ts`).
+
+Everything else — no qualifying frame on the stack at
 all, app code reached only *through* code with no filesystem identity (a `data:`/`blob:` module,
 any `eval`/`new Function` frame, a bundler `//# sourceURL=`, `node -e`/stdin), or a real source
 file outside the project root that no `node_modules` entry points at — charges `<unknown>`.
@@ -782,7 +838,13 @@ and is no longer recorded — see the § Node-initiated env reads residual — s
 longer grants `<unknown>` anything.) Granting `<unknown>` broadly (`"env": ["*"]`, a wide `net` grant) hands that
 authority to **every** call capwall cannot attribute, including a dependency deliberately
 running from a `data:` module — so the preload prints a one-line warning at startup when a
-policy grants it. Keep the grant as narrow as the observed keys.
+policy grants it **broadly**. "Broadly" is a precise test, not a figure of speech
+(`preload.ts` § `isBroadGrant`): the warning fires in **`enforce` only**, and only when the
+`<unknown>` entry holds something other than a concrete, wildcard-free list of `env` keys — any
+other capability, or `env: ["*"]`. A concrete `env` list stays silent because it is a narrow,
+reviewed line, and warning on one is the cry-wolf failure #67 removed from the env trace.
+(It used to be the near-universal shape, which is why the exception exists; since #119 most
+policies grant `<unknown>` nothing at all.) Keep the grant as narrow as the observed keys.
 
 Before this split (issue #60), "could not attribute" and "this is the app" were the same value.
 See the § attribution laundering residual for what that cost and what remains.
@@ -951,8 +1013,10 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
   **What is now closed (issue #60).** This entry used to describe the whole risk, and it was
   wrong: laundering did not require a trusted helper at all. The walk discarded every frame
   with no filesystem path and then fell off the end into `<app>` — so "capwall could not work
-  out whose code this is" and "this is the application" were one value, and `<app>` is exempt
-  from the `process.env` and `dgram` gates. A dependency reached that state with ~15 lines of
+  out whose code this is" and "this is the application" were one value, and `<app>` was exempt
+  from the `process.env` and `dgram` gates (the only two of today's four that existed then; the
+  loader-hook and `_compile` gates inherited the same fail-open when they landed, and inherited
+  the fix with it). A dependency reached that state with ~15 lines of
   ordinary ESM: run the payload from a `data:` URL module (no path on any frame) and detach one
   tick through a timer (V8's async stack traces keep the dependency on the stack if it `await`s
   straight through, so the detachment was the essential part). It could then read any
@@ -1094,8 +1158,12 @@ frozen primordials, a **determined in-process attacker** can defeat it via, amon
   **The compatibility cost, stated.** A legitimately nested install is a new principal name, so a
   hand-written `"lodash": {…}` no longer covers `webpack>lodash`. `observe` and
   `capwall gen-policy` emit chain names automatically and `capwall diff` reports the difference,
-  so the upgrade path is to re-observe. `"*>lodash"` grants every *nested* install of `lodash` in
-  one line; it does not cover the top-level one, so "everywhere" is two keys. That widening is
+  so the upgrade path is to re-observe. Two wildcard forms widen a leaf name, and they are not the
+  same: `"*>lodash"` grants an install nested **exactly one level** (`webpack>lodash`, not
+  `webpack>babel>lodash`), while `"**>lodash"` grants it at **any depth**. Neither covers the
+  top-level `lodash`, so "everywhere" is still two keys — the exact one plus a wildcard. (The
+  grammar lives in `packages/policy-schema/src/package-key.ts`; a narrow `*>` key beats a broad
+  `**>` key, the same way an explicit entry beats `default`.) That widening is
   deliberately explicit, because writing it means *any* package in the tree may ship a directory
   called `lodash` and receive those grants — which for an `fs.read` glob is usually fine and for
   `child_process` is a bypass with extra steps. Trees installed with yarn 1, which nests far more
@@ -1275,9 +1343,13 @@ just replaced must be non-writable. If any is not, the partial install is **roll
 only objects capwall itself created, on only the paths that call is mediating — so it cannot
 produce a spurious startup throw for an option capwall *did* honor. What it does catch is the
 #97 class: a plumbing change that stops `hardened` reaching one of the two paths. The one
-realistic way to trip it is code outside capwall pinning an egress global non-configurable before
-a hardened install, after which nobody can harden or restore it; capwall refuses rather than
-running with the option quietly absent.
+realistic non-plumbing way to trip it is narrower than it first looks: un-mediated code has to
+make an egress global **non-configurable in the window between capwall replacing it and the
+hardened install arriving**. A pin that lands before *any* install is not a trip at all — a
+non-configurable location is declined outright by `GlobalPropertySlot.replace` ("a location
+capwall could not restore later is never replaced in the first place"), so it never enters the
+replaced set and the check never looks at it. Whichever way it arrives, capwall refuses rather
+than running with the option quietly absent.
 
 **`hardened` is a RATCHET for the process, not a per-install setting (#129).** Installs nest, and
 this is the one option that does **not** follow the newest one the way `policy` and `mode` do.

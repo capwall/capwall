@@ -10,7 +10,10 @@ types are exported from `@capwall/policy-schema`.
 
 ```jsonc
 {
-  "$schema": "./packages/policy-schema/schema.json",
+  // Editor validation + completion. From a project that has capwall installed:
+  "$schema": "./node_modules/@capwall/policy-schema/schema.json",
+  // (Inside a capwall checkout the schema is at "./packages/policy-schema/schema.json"
+  //  instead. `capwall observe` writes the node_modules form for you when it resolves.)
   "version": 1,               // policy format version
   "mode": "enforce",          // optional: "observe" | "enforce" — see § Enforcement mode
   "default": { /* PackagePolicy applied to any package with no explicit entry */ },
@@ -140,7 +143,7 @@ Besides real package names, `packages` accepts two sentinels:
 
 | Key | Charged when | Notes |
 |---|---|---|
-| `"<app>"` | the call came from the application's own code — a real source file not under `node_modules` | the trust root; also exempt from the `process.env` and `dgram` gates, so entries here only matter for `fs`, `net`, `child_process`, `worker_threads`, `vm` |
+| `"<app>"` | the call came from the application's own code — a real source file not under `node_modules`, inside the project root | the trust root; also exempt from **five** gates — `process.env` reads, `dgram`, loader-hook registration, `Module.prototype._compile` (so `<app>` needs no `compile` grant) and the module-load read gate (#123) — which is why entries here only matter for `fs`, `net`, `ipc`, `child_process`, `worker_threads`, `vm` and `native`. [`threat-model.md`](threat-model.md) § Attribution outcomes enumerates them |
 | `"<unknown>"` | capwall could not attribute the call to any source file | e.g. a `data:` URL module, `eval`'d code with no trustworthy origin, or a native function invoked straight from a timer |
 
 `<unknown>` is gated like any dependency — deny-by-default in `enforce` — so a legitimate
@@ -162,12 +165,14 @@ line. An existing policy that carries it is harmless — the key simply matches 
 to every call capwall cannot attribute, which includes a dependency deliberately running its
 payload from a path-less frame — the fail-open that
 [`threat-model.md`](threat-model.md) § attribution laundering describes. The preload prints a
-warning at startup when a policy grants `<unknown>`.
+warning at startup when a policy grants `<unknown>` **beyond a concrete `env` key list** — in
+`enforce` mode only. A plain, wildcard-free `env` list stays silent (it is a narrow, reviewed
+line); any other capability, or `env: ["*"]`, is not.
 
 Stated plainly, because it is the whole point of the sentinel: before issue #60, "capwall
 could not attribute this call" and "this is the application" were the same value, so
-unattributable calls silently inherited `<app>`'s exemptions from the `process.env` and
-`dgram` gates. Splitting `<unknown>` out closed that. **Writing `"<unknown>": { "env": ["*"] }`
+unattributable calls silently inherited the trust root's gate exemptions. Splitting
+`<unknown>` out closed that. **Writing `"<unknown>": { "env": ["*"] }`
 — or any comparably wide grant — re-opens it by hand**, for every call capwall cannot place.
 List the observed keys instead.
 

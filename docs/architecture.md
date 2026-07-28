@@ -206,8 +206,9 @@ shimmed call is charged. Cheap (the walk stops at the first qualifying frame),
 deterministic, and it matches the NodeShield model. Known blind spot, accepted and
 documented in the threat model: calls funneled through a shared helper attribute to the
 helper, so a malicious package can launder operations through a broadly-granted helper —
-keep helper grants tight. Files not under any `node_modules` attribute to the app sentinel
-`<app>`.
+keep helper grants tight. A file under no `node_modules`, inside the project root, and with no
+opaque frame above it on the stack attributes to the app sentinel `<app>`; the table below
+states all three conditions, and they all matter (see #60 and #127).
 
 **Frame budget.** The walk inspects at most `maxFrames` frames (default 25) to bound the
 hot-path cost. If the owning dependency's frame sits deeper — long promise chains,
@@ -226,7 +227,7 @@ the signal to raise the budget. See
 | Outcome | When | Treated as |
 |---|---|---|
 | `<pkg>` | a frame under `node_modules/<pkg>`; a nested install is its chain, `<host>><pkg>` | that principal's grants |
-| `<app>` | a real source file **not** under `node_modules`, with no opaque frame above it | the trust root — exempt from the `process.env` and `dgram` gates |
+| `<app>` | a real source file **not** under `node_modules`, inside the project root, with no opaque frame above it | the trust root — exempt from **five** gates: `process.env` reads, `dgram`, loader-hook registration (#61), `Module.prototype._compile` (#93, the identity-granting `compile` capability) and the module-load read gate (#123). Not exempt from the `native` gate. See [`threat-model.md`](threat-model.md) § Attribution outcomes, which enumerates them with their sites and says why `_compile` is the consequential one |
 | `<unknown>` | no qualifying frame at all, or app code reached only through opaque code | an ordinary untrusted principal — deny-by-default in enforce, recorded in observe, grantable by an explicit `"<unknown>"` policy entry |
 
 An **opaque** frame is user-controlled code with no filesystem identity: a `data:`/`blob:`

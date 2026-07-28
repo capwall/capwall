@@ -13,6 +13,13 @@ import { runGenPolicy } from "./commands/gen-policy.js";
 import { runExplain } from "./commands/explain.js";
 import { runDiff } from "./commands/diff.js";
 import { runRun } from "./commands/run.js";
+import { versionReport } from "./version.js";
+
+// The doc links are ABSOLUTE URLs on purpose (#124). From `node_modules/@capwall/cli` a
+// repo-relative `docs/policy-format.md` names nothing, and the CLI banner is the one place a
+// reader who installed the package meets this project's documentation. `roadmap.md` used to be
+// here and is gone: it is the internal build-order tracker, not something to send a user to.
+const DOCS = "https://github.com/williamzujkowski/capwall";
 
 const USAGE = `capwall — runtime per-package capability firewall for Node.js
 
@@ -23,9 +30,43 @@ Usage:
   capwall gen-policy [--from <trace>]         (re)generate policy from a trace
   capwall explain <package> <capability> [target]
   capwall diff -- <command...>                observe, then diff vs committed policy (CI drift check)
+  capwall --version                           print the CLI and @capwall/core versions
 
-Run 'capwall <command> --help' for details. Docs: docs/roadmap.md, docs/policy-format.md.
+Run 'capwall <command> --help' for details.
+Policy format: ${DOCS}/blob/main/docs/policy-format.md
+Threat model:  ${DOCS}/blob/main/docs/threat-model.md
 `;
+
+/**
+ * Format a policy-validation failure readably (#124).
+ *
+ * `parsePolicy` throws a ZodError whose `.message` is the raw issue array, so the best error
+ * text in the project — the package-key grammar explainer, for one — used to arrive as escaped
+ * JSON. The check is STRUCTURAL rather than `instanceof z.ZodError`: the CLI does not depend on
+ * zod, and adding a runtime dep to format an error message would be the wrong trade in a repo
+ * whose whole argument is that every dependency is attack surface.
+ */
+function formatError(err: unknown): string {
+  const issues: unknown = (err as { issues?: unknown }).issues;
+  if (!Array.isArray(issues) || issues.length === 0) return (err as Error).message;
+  return issues
+    .map((raw) => {
+      const issue = raw as { path?: unknown; message?: unknown };
+      const message = typeof issue.message === "string" ? issue.message : "invalid";
+      const segments: unknown[] = Array.isArray(issue.path) ? issue.path : [];
+      if (segments.length === 0) return message;
+      // `["packages", "sneak*", "net", 0]` -> `packages["sneak*"].net[0]`.
+      const [head, ...rest] = segments;
+      const where = rest.reduce<string>((acc, s) => {
+        if (typeof s === "number") return `${acc}[${String(s)}]`;
+        return /^[A-Za-z_$][\w$]*$/.test(String(s))
+          ? `${acc}.${String(s)}`
+          : `${acc}[${JSON.stringify(s)}]`;
+      }, String(head));
+      return `${where}: ${message}`;
+    })
+    .join("\n");
+}
 
 /** Split argv into capwall's own args and the target command after a `--` separator. */
 function splitArgs(argv: string[]): { own: string[]; target: string[] } {
@@ -44,6 +85,14 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     case "--help":
     case "help":
       process.stdout.write(USAGE);
+      return 0;
+    // `-v` too: it is what people type, and capwall has no other meaning for it (no verbose
+    // flag), so claiming it costs nothing and refusing it would only produce a usage error.
+    case "-V":
+    case "-v":
+    case "--version":
+    case "version":
+      process.stdout.write(versionReport());
       return 0;
     case "observe":
       return runObserve(rest, target);
@@ -66,6 +115,6 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
 main()
   .then((code) => process.exit(code))
   .catch((err: unknown) => {
-    process.stderr.write(`capwall: ${(err as Error).message}\n`);
+    process.stderr.write(`capwall: ${formatError(err)}\n`);
     process.exit(1);
   });

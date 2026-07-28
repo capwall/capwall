@@ -59,7 +59,7 @@ export async function runGenPolicy(args: string[]): Promise<number> {
   const policyPath = path.resolve(projectRoot, outFile);
   const existing = await loadExistingPolicy(policyPath);
   const policy = mergeTraceIntoPolicy(entries, existing, projectRoot);
-  await writePolicy(policyPath, policy);
+  await writePolicy(policyPath, policy, projectRoot);
   process.stderr.write(
     `[capwall] ${existing ? "merged" : "wrote"} ${entries.length} trace event(s) into ${outFile}\n`,
   );

@@ -33,6 +33,12 @@ capwall gen-policy [--from <trace>] [-o capabilities.json]
 capwall explain <package> <capability> [target]
                                 Explain why a (package, capability, target) tuple would be
                                 allowed or denied under the current policy.
+
+capwall --version               Print this CLI's version AND the @capwall/core version it
+                (-V, -v)        would inject. Those are two questions: the CLI runs the
+                                target in a CHILD process with core preloaded via
+                                NODE_OPTIONS, so "which core actually enforced this" is not
+                                answered by "which capwall did I type".
 ```
 
 Common flags: `-p, --policy <path>` for `enforce`/`run`/`diff`/`explain` and `-o, --out <path>`
@@ -48,3 +54,12 @@ CI](../../docs/ci-local.md).
 `observe`, `enforce` and `diff` name the mode themselves (they set `CAPWALL_MODE`, which
 outranks everything); `run` takes it from the policy document. Full precedence table:
 [`docs/policy-format.md` § Enforcement mode](../../docs/policy-format.md#enforcement-mode).
+
+## Generated policies point at the schema
+
+`observe` and `gen-policy` write a `"$schema"` key into a policy they create, so the file you
+are then told to hand-edit gets editor validation and completion — which is where it pays for
+itself, given the `outer>inner` package-key grammar. The pointer is
+`./node_modules/@capwall/policy-schema/schema.json`, and it is written **only when that path
+actually exists**: a dangling `$schema` shows up as a diagnostic on line 2 of a file capwall
+just wrote, which is worse than none. An existing `$schema` is never rewritten.

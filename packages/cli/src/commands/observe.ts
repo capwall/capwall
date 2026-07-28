@@ -69,7 +69,7 @@ export async function runObserve(args: string[], target: string[]): Promise<numb
     const entries = parseTrace(traceRaw);
     const existing = await loadExistingPolicy(policyPath);
     const policy = mergeTraceIntoPolicy(entries, existing, projectRoot);
-    await writePolicy(policyPath, policy);
+    await writePolicy(policyPath, policy, projectRoot);
 
     const pkgCount = Object.keys(policy.packages).length;
     process.stderr.write(
