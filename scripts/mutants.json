@@ -360,6 +360,18 @@
       ],
       "needsBuild": false,
       "note": "Deliberately claimed by a STRUCTURAL test, not a behavioural one. Since #181 moved the capability gate onto the two function objects, the raw class no longer behaves differently from the proxy \u2014 so no end-to-end fixture can catch this, and the property is worth keeping anyway: it is what stops the shim being the thing that undoes the NEXT member gate, which is exactly how #181 happened."
+    },
+    {
+      "id": "esm-resolve-answers-require-with-nodes-own-url",
+      "mechanism": "#183 \u2014 capwall's synthetic `capwall-esm:` URL is an `import`-path answer only. A `require` resolution's answer is a value the caller can see (`require.resolve`) and must be able to feed back into `require`, so it gets Node's own URL \u2014 otherwise `Module.isBuiltin` answers false for all 24 mediated spellings and `require(require.resolve('fs'))` throws MODULE_NOT_FOUND",
+      "file": "packages/core/src/loader/esm-hooks.ts",
+      "anchor": "    if (!isCjsResolution(context.conditions)) return { url: PREFIX + specifier, shortCircuit: true };",
+      "mutation": "    if (true) return { url: PREFIX + specifier, shortCircuit: true };",
+      "tests": [
+        "packages/core/test/primitive-arity.test.ts"
+      ],
+      "needsBuild": false,
+      "note": "Claimed by the IN-PROCESS rows that call the hook directly, not by the subprocess differential \u2014 Node only routes `require.resolve` through the hook chain on >=24.18, so a subprocess-only claim would make this mutant survive on the floor and need a `minNodeMajor` that major-granularity cannot express (24.5.0 behaves like 22 here). Calling the hook removes the version from the question entirely."
     }
   ]
 }

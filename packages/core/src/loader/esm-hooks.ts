@@ -64,10 +64,45 @@
  *   {@link gateModuleRead} therefore declines every `require`-conditioned resolution — see
  *   {@link decidedByCjsGate} for why that is now one test rather than the two #152 shipped.
  *
- * Builtin MEDIATION is deliberately NOT restricted to the `import` path: `Module._load` intercepts
- * every mediated builtin before Node's loader is reached, so in a healthy process a `require` never
- * arrives here for one. If it ever does, serving the shim-backed synthetic module is the fail-closed
- * answer and reaching the raw builtin is not. Whether `registerHooks` could REPLACE the
+ * ── THE SYNTHETIC URL IS AN `import`-PATH ANSWER ONLY (#183) ────────────────────────────────
+ * `resolve`'s answer is not always private to Node. On the `require` path the caller can SEE it
+ * (`require.resolve("fs")`) and is entitled to feed it back in (`require(require.resolve("fs"))`),
+ * and on Node ≥24.18 `require.resolve` goes through this chain where on 22 it does not. Answering
+ * `capwall-esm:fs` therefore broke, on ≥24.18 only:
+ *
+ *   require.resolve("fs")                     -> "capwall-esm:fs"      (should be "fs")
+ *   Module.isBuiltin(require.resolve("fs"))   -> false                 (should be true)
+ *   require(require.resolve("fs"))            -> MODULE_NOT_FOUND      (Node has no such scheme)
+ *
+ * which is not a security hole and is worse than one: builtin detection answers `false` for all
+ * 24 mediated spellings, and every instrumentation library that keys its cache on `require.resolve`
+ * (`mock-require`, `proxyquire`, `require-in-the-middle`, so `dd-trace` / `elastic-apm-node`)
+ * silently mis-keys. AGENTS.md § availability is about exactly this: the fix a user reaches for is
+ * to remove capwall.
+ *
+ * So a `require`-conditioned resolution gets NODE'S OWN URL. Nothing is given up, because nothing
+ * on the `require` path was relying on it: `Module._load` returns the shim for every mediated
+ * specifier before Node's resolver is reached, so a `require` for a mediated builtin does not get
+ * here in the first place, and the one CJS route that could have laundered a specifier onto a
+ * builtin — `require("#x")` with `"imports": {"#x": "fs"}` — is rejected by NODE with
+ * `ERR_INVALID_URL_SCHEME`, with or without capwall, on 22/24/26. The fail-closed claim below is
+ * unchanged and now carries the whole weight on this path: if a `require` ever does reach `load`
+ * with a raw `node:<mediated>` URL, the re-mediation branch serves the shim.
+ *
+ * `import.meta.resolve("fs")` still answers `capwall-esm:fs`, on all three versions, and that is
+ * NOT fixed here. Measured on 22.23.1 / 24.18.0 / 26.5.0: an `import.meta.resolve` reaches this
+ * hook with a context byte-for-byte identical to a static `import` of the same specifier — same
+ * `conditions`, same `importAttributes`, same `parentURL` — so there is no signal to branch on.
+ * The only shape that would fix it is dropping the resolve-side rewrite entirely and mediating a
+ * raw `node:` URL in `load`, and that trades a cosmetic deviation for a real one: the ESM registry
+ * is keyed by URL and permanent, so `node:fs` would be cached as the synthetic module and a FRESH
+ * import after the last `uninstall()` would keep returning it — the #152 teardown asymmetry, back,
+ * on every mediated builtin. The current behaviour is pinned by `test/primitive-arity.test.ts` so
+ * it cannot drift silently in either direction.
+ *
+ * Builtin MEDIATION is otherwise deliberately NOT restricted to the `import` path: if a `require`
+ * ever arrives at `load` for a mediated builtin, serving the shim-backed synthetic module is the
+ * fail-closed answer and reaching the raw builtin is not. Whether `registerHooks` could REPLACE the
  * `Module._load` patch is a separate and much larger question — see `docs/node-api-dependencies.md`
  * § The one migration that matters; it is not attempted here.
  *
@@ -148,6 +183,24 @@ function currentSnapshot(): EsmGateSnapshot {
 }
 
 /**
+ * Is this resolution the CJS loader's? Node's own statement, and the only one either rule below
+ * needs.
+ *
+ * `conditions` is how Node distinguishes a `require` resolution from an `import` one — the CJS
+ * resolver always asks with the `require` condition and the ESM resolver never does, measured on
+ * 22.22.3 / 22.23.1 / 24.18.0 / 26.5.0. TWO separate rules read it, and they are separate rules
+ * about the same fact rather than one rule used twice:
+ *
+ *  - {@link decidedByCjsGate} — WHO decides the module-read gate for this load (#180).
+ *  - {@link resolve} — WHAT URL capwall is allowed to answer with (#183). A `require` resolution's
+ *    answer is a value the caller can see (`require.resolve`) and must be able to feed back into
+ *    `require`, so capwall's synthetic URL has no business in it.
+ */
+function isCjsResolution(conditions: readonly string[]): boolean {
+  return conditions.includes("require");
+}
+
+/**
  * Is this resolution the CJS loader's, i.e. one `loader/require.ts` will decide?
  *
  * ONE TEST, AND IT IS NODE'S OWN. `conditions` is how Node distinguishes a `require` resolution
@@ -175,7 +228,7 @@ function currentSnapshot(): EsmGateSnapshot {
  * is decided here. Measured on 22/24/26.
  */
 function decidedByCjsGate(conditions: readonly string[]): boolean {
-  return conditions.includes("require");
+  return isCjsResolution(conditions);
 }
 
 /**
@@ -248,10 +301,13 @@ export function resolve(
   nextResolve: NextResolve,
 ): ResolveResult {
   // Fast path: the specifier NAMES a mediated builtin (`import "node:fs"`). No resolution work
-  // is needed and this is the overwhelmingly common case, so it stays a single lookup.
+  // is needed and this is the overwhelmingly common case, so it stays a single lookup — the
+  // `conditions` scan below is paid only by the handful of specifiers that reach it.
   if (hasOwn(exportsBySpecifier, specifier)) {
-    // Encode the ORIGINAL specifier in the URL so `load` knows which shim to re-export.
-    return { url: PREFIX + specifier, shortCircuit: true };
+    // Encode the ORIGINAL specifier in the URL so `load` knows which shim to re-export — but
+    // ONLY on the `import` path (#183). See {@link resolve}'s note on the synthetic URL.
+    if (!isCjsResolution(context.conditions)) return { url: PREFIX + specifier, shortCircuit: true };
+    return nextResolve(specifier, context);
   }
 
   // Slow path: let Node resolve, then classify on the RESULT (#59). This is the real gate —
@@ -262,7 +318,9 @@ export function resolve(
   // cost is the string check above and nothing else.
   const result = nextResolve(specifier, context);
   const mediated = mediatedSpecifierForUrl(result.url);
-  if (mediated !== null) return { url: PREFIX + mediated, shortCircuit: true };
+  if (mediated !== null && !isCjsResolution(context.conditions)) {
+    return { url: PREFIX + mediated, shortCircuit: true };
+  }
   // Not a builtin, so it is a file (or a `data:`/`https:` target the gate ignores). This is the
   // #123 gate — see `gateModuleRead`. It runs AFTER `nextResolve` because the decision is about
   // the resolved target, never about the specifier text.

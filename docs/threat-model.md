@@ -201,6 +201,32 @@ be revoked.
     cached. Both halves are asserted in `test/esm.test.ts` § #62.
 - **capwall cannot guarantee it stays outermost in the loader-hook chain** (#61). See
   "Loader-hook registration" below — this is the significant residual on the ESM path.
+- **`import.meta.resolve` of a mediated builtin answers `capwall-esm:<spec>`** rather than
+  `node:<spec>`, on 22/24/26 (#183). Not a security property in either direction — the URL
+  imports correctly and yields the enforcing shim — but a visible deviation from un-mediated
+  Node, so it is named rather than left to be discovered. It is not fixed because it *cannot* be
+  distinguished: measured on 22.23.1 / 24.18.0 / 26.5.0, an `import.meta.resolve` reaches
+  capwall's `resolve` hook with a context byte-for-byte identical to a static `import` of the
+  same specifier — same `conditions`, same `importAttributes`, same `parentURL`. The one shape
+  that would fix it (dropping the resolve-side rewrite and mediating a raw `node:` URL in `load`)
+  would cache `node:fs` **as the synthetic module**, and since the ESM registry is permanent that
+  brings back the teardown asymmetry two bullets up, on every mediated builtin — a real
+  regression traded for a cosmetic one. `test/primitive-arity.test.ts` § #183 pins the current
+  answer so it cannot drift in either direction.
+
+  **`require.resolve` WAS the same deviation and is fixed** (#183). `registerHooks`'s `resolve` is
+  consulted for `require()` too, and on Node **≥24.18** `require.resolve()` goes through the same
+  chain where on 22 it does not — so `require.resolve("fs")` answered `"capwall-esm:fs"`,
+  `Module.isBuiltin` went **false** for all 24 mediated spellings, and
+  `require(require.resolve("fs"))` threw `MODULE_NOT_FOUND` under capwall and not without it. That
+  is not a hole, it is worse: builtin detection, and every instrumentation library that keys its
+  cache on `require.resolve` (`mock-require`, `proxyquire`, `require-in-the-middle`, so `dd-trace`
+  / `elastic-apm-node`), silently mis-answer — the availability failure mode whose fix is to remove
+  capwall. A `require`-conditioned resolution now gets Node's own URL, on all three versions.
+  Nothing is given up: `Module._load` returns the shim for every mediated specifier before Node's
+  resolver is reached, and the one CJS route that could launder a specifier onto a builtin
+  (`require("#x")` with `"imports": {"#x": "fs"}`) is rejected by **Node** with
+  `ERR_INVALID_URL_SCHEME`, with or without capwall, on 22/24/26.
 - `process.env` is not import-routed; its Proxy guard (installed by `install()`) covers both
   module systems already. The same is true of the **global egress guard** (#80) — `fetch`,
   `WebSocket` and `EventSource` are globals, so they are mediated by replacing them on
