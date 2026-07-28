@@ -265,13 +265,21 @@ describe("#125 — CAPWALL_ENV is the preload channel for env: false", () => {
     await rm(tmpDir, { recursive: true, force: true });
   });
 
-  it("gates a dependency's read by default, exactly as before", async () => {
+  // THREE SPAWNS, NOT MORE. These are real `node --import` runs, and this file now competes with
+  // the other subprocess-heavy suites vitest runs in parallel. An eight-spawn version of this
+  // block (a per-value sweep over "", "false", "off", "1", plus a separate warn/no-warn pair)
+  // cost enough wall-clock under `pnpm ci:local` — Docker, two Node legs — to push UNRELATED
+  // suites past their 5s budget, non-deterministically. So each run below carries every
+  // observable it can rather than being one assertion each.
+
+  it("gates a dependency's read by default, and says nothing about the switch", async () => {
     const r = await runPreload({ CAPWALL_MODE: "enforce", CAPWALL_POLICY_FILE: denyPolicy });
     expect(r.stdout).toContain("ENV:undefined");
     expect(r.stderr).toContain(`DENY 'fixture-dep' env:${SECRET}`);
+    expect(r.stderr).not.toContain("CAPWALL_ENV=0");
   });
 
-  it("CAPWALL_ENV=0 leaves process.env un-proxied — the read succeeds and is not recorded", async () => {
+  it("CAPWALL_ENV=0 un-proxies process.env, records nothing, and warns loudly", async () => {
     const r = await runPreload({
       CAPWALL_MODE: "enforce",
       CAPWALL_POLICY_FILE: denyPolicy,
@@ -279,35 +287,24 @@ describe("#125 — CAPWALL_ENV is the preload channel for env: false", () => {
     });
     expect(r.stdout).toContain("ENV:s3cr3t");
     expect(r.stderr).not.toContain(`env:${SECRET}`);
+    // Why this switch warns and `CAPWALL_GLOBAL_EGRESS=0` does not: turning the env guard off
+    // makes every `env` grant in the policy decorative and records nothing, while `enforce` keeps
+    // printing DENY lines for every other capability. Silence is the "looks guarded, isn't" shape.
+    expect(r.stderr).toContain("CAPWALL_ENV=0");
   });
 
-  it("warns loudly when it is set, because the process still looks enforced", async () => {
-    // The reason this switch warns and `CAPWALL_GLOBAL_EGRESS=0` does not: turning the env guard
-    // off makes every `env` grant in the policy decorative and records nothing, while `enforce`
-    // keeps printing DENY lines for the other capabilities. Silence there is the "looks guarded,
-    // isn't" shape.
-    const off = await runPreload({
+  it("leaves the guard ON for any other value — only the exact '0' disables it", async () => {
+    // Same contract as CAPWALL_ESM / CAPWALL_GLOBAL_EGRESS: the comparison is `!== "0"` and not a
+    // truthiness test, so a typo cannot silently disarm the anti-exfiltration control. `"1"` is
+    // the probe rather than a sweep because it is the spelling somebody reaching for
+    // CAPWALL_HARDENED's on-switch would type, and it is the value a truthiness reading would
+    // wrongly treat as "disable".
+    const r = await runPreload({
       CAPWALL_MODE: "enforce",
       CAPWALL_POLICY_FILE: denyPolicy,
-      CAPWALL_ENV: "0",
+      CAPWALL_ENV: "1",
     });
-    expect(off.stderr).toContain("CAPWALL_ENV=0");
-    const on = await runPreload({ CAPWALL_MODE: "enforce", CAPWALL_POLICY_FILE: denyPolicy });
-    expect(on.stderr).not.toContain("CAPWALL_ENV=0");
-  });
-
-  it("only the exact value '0' disables it — any other value leaves the guard on", async () => {
-    // Same contract as CAPWALL_ESM / CAPWALL_GLOBAL_EGRESS: a typo must not silently disarm the
-    // anti-exfiltration control, so the comparison is `!== "0"` rather than a truthiness test.
-    for (const value of ["", "false", "off", "1"]) {
-      const r = await runPreload({
-        CAPWALL_MODE: "enforce",
-        CAPWALL_POLICY_FILE: denyPolicy,
-        CAPWALL_ENV: value,
-      });
-      expect(r.stdout, `CAPWALL_ENV=${JSON.stringify(value)} must not disable the guard`).toContain(
-        "ENV:undefined",
-      );
-    }
+    expect(r.stdout).toContain("ENV:undefined");
+    expect(r.stderr).toContain(`DENY 'fixture-dep' env:${SECRET}`);
   });
 });
