@@ -56,12 +56,13 @@
  * is a correctness matter rather than an opportunity:
  *
  *   **the module-read gate must not decide the same load twice.** `loader/require.ts` already
- *   takes an `fs.read` decision for every `require` of a file outside the dependency graph, with
- *   a STACK WALK for the subject — strictly better attribution than a `parentURL`. Left alone,
- *   this hook would take a second decision for the identical load: two `DENY` lines, two trace
- *   entries, two grants out of `observe`. {@link gateModuleRead} therefore declines exactly when
- *   the CJS gate has already decided — see there for why that takes two independent tests and not
- *   one.
+ *   takes an `fs.read` decision for every CJS load of a file outside the dependency graph, at
+ *   `Module.prototype.load` and with a STACK WALK for the subject — strictly better attribution
+ *   than a `parentURL`, which on THIS path is derived from the `parent` record the caller handed
+ *   `Module._load` (#180). Left alone, this hook would take a second, worse-attributed decision
+ *   for the identical load: two `DENY` lines, two trace entries, two grants out of `observe`.
+ *   {@link gateModuleRead} therefore declines every `require`-conditioned resolution — see
+ *   {@link decidedByCjsGate} for why that is now one test rather than the two #152 shipped.
  *
  * Builtin MEDIATION is deliberately NOT restricted to the `import` path: `Module._load` intercepts
  * every mediated builtin before Node's loader is reached, so in a healthy process a `require` never
@@ -84,7 +85,6 @@ import { CapabilityError } from "../errors.js";
 import { isInstalled, liveCtx } from "./live-context.js";
 import {
   decideEsmModuleRead,
-  insideGatedCjsLoad,
   type EsmGateOutcome,
   type EsmGateSnapshot,
 } from "./module-read.js";
@@ -148,33 +148,34 @@ function currentSnapshot(): EsmGateSnapshot {
 }
 
 /**
- * Has `loader/require.ts` ALREADY taken the module-read decision for the load this resolution
- * belongs to?
+ * Is this resolution the CJS loader's, i.e. one `loader/require.ts` will decide?
  *
- * TWO INDEPENDENT TESTS, AND BOTH ARE LOAD-BEARING. Either one alone is wrong, in opposite
- * directions, and the `require(esm)` case is what shows it:
+ * ONE TEST, AND IT IS NODE'S OWN. `conditions` is how Node distinguishes a `require` resolution
+ * from an `import` one — the CJS resolver always asks with the `require` condition and the ESM
+ * resolver never does, measured on 22.22.3 / 24.18.0 / 26.5.0. Every such resolution that goes on
+ * to read a file arrives at `Module.prototype.load`, which is where the CJS half now decides (see
+ * `loader/module-read.ts` § WHICH OF THE GATES DECIDES A GIVEN LOAD), and that half has the
+ * better subject: a STACK WALK, which a `createRequire()` filename cannot spoof, where this hook
+ * has only `parentURL` — and on THIS path `parentURL` is derived from the `parent` record the
+ * caller handed `Module._load`, which is exactly what made #180 a principal-selection bug.
  *
- *  - **`insideGatedCjsLoad()`** is true for the dynamic extent of a `Module._load` call that
- *    reached `guardCjsModuleRead` with a successfully resolved path. It is FALSE when
- *    `resolveQuietly` returned `null` — which is exactly the shape of the live bypass the 2026-07
- *    Node audit found on ≥24.18 (`Module._load`'s fourth argument put the internal options bag
- *    where `_resolveFilename` expected `{ paths }`, resolution threw, and the gate read that as
- *    "nothing to decide"). Keeping this hook live for those loads makes it a genuine second layer
- *    for that whole class rather than a duplicate of the first.
- *  - **the `require` condition** is how Node itself distinguishes a `require` resolution from an
- *    `import` one, and it is what stops the depth test from over-reaching. `require("./x.mjs")` is
- *    synchronous: the ENTIRE ESM subgraph — including an `import "/home/u/.aws/x.json"` three
- *    modules down — resolves inside that one `Module._load` call, so the depth test alone would
- *    silently disarm the gate for it. Measured on 22/24/26: the direct `require("./x.mjs")`
- *    resolves with `["require", …]` and the nested `import` inside it resolves with
- *    `["node", "import", …]`, so the conjunction declines the first and gates the second.
+ * WHAT USED TO BE HERE, AND WHY IT IS GONE. `insideGatedCjsLoad() && conditions.includes(...)` —
+ * a depth counter over the dynamic extent of a `Module._load` that had taken a decision. A module
+ * body runs inside its own `Module._load`, so the counter was non-zero for the whole of every
+ * module evaluation and the hook stood down for every nested load made from a module body, which
+ * is where a supply-chain payload runs (#179). It also stood down for a load the CJS half had
+ * merely RESOLVED rather than decided (#178). Both disappear with the counter: there is no state,
+ * no extent, and nothing to disarm, because the CJS half can no longer fail to decide a load it
+ * is handed.
  *
- * The failure directions are worth stating because they are not symmetric. A false "already
- * decided" is FAIL-OPEN — one load goes un-gated. A false "not yet decided" is a duplicate
- * decision: noisy, visible, and fail-closed. The conjunction is the conservative one.
+ * `require("./x.mjs")` is the case worth checking against this rule, because it is synchronous and
+ * the ENTIRE ES subgraph loads inside that one `Module._load`. The direct resolution carries
+ * `["require", …]` and is declined here — correctly, `Module.prototype.load` sees the `.mjs` file
+ * and decides it. Every nested `import` inside that subgraph carries `["node", "import", …]` and
+ * is decided here. Measured on 22/24/26.
  */
-function alreadyDecidedByCjsGate(conditions: readonly string[]): boolean {
-  return insideGatedCjsLoad() && conditions.includes("require");
+function decidedByCjsGate(conditions: readonly string[]): boolean {
+  return conditions.includes("require");
 }
 
 /**
@@ -186,7 +187,7 @@ function alreadyDecidedByCjsGate(conditions: readonly string[]): boolean {
  * import, which is what a caller already has to handle for a missing module.
  */
 function gateModuleRead(context: ResolveContext, url: string): void {
-  if (alreadyDecidedByCjsGate(context.conditions)) return;
+  if (decidedByCjsGate(context.conditions)) return;
   const outcome: EsmGateOutcome | null = decideEsmModuleRead(
     currentSnapshot(),
     context.parentURL,

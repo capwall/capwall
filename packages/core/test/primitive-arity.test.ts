@@ -21,8 +21,9 @@
  * asserts the PROPERTY — `arguments.length` and every element arrive unchanged, for any count,
  * including counts no current Node uses — which no future Node signature can invalidate.
  *
- * A subprocess per case, because both patch sites are process globals (`Module.prototype._compile`,
- * `Module._load`) and a leaked patch would contaminate every later test file in the same worker.
+ * A subprocess per case, because every patch site here is a process global
+ * (`Module.prototype._compile`, `Module._load`, `Module.prototype.load`, `Module._findPath`) and a
+ * leaked patch would contaminate every later test file in the same worker.
  */
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
@@ -139,6 +140,47 @@ handle.uninstall();
 `);
     expect(r.stderr).toBe("");
     expect(JSON.parse(r.stdout.trim())).toEqual([4, 3]);
+  });
+
+  it("Module.prototype.load forwards any argument count, unchanged", async () => {
+    // THE FOURTH WRAPPER SITE, added by #177 when the module-read gate (#123) moved here from
+    // inside the `Module._load` wrapper. It is the one internal in this file whose signature has
+    // NOT moved — `(filename)` on 20/22/23/24/26 — and that is exactly why it needs the row:
+    // "it has always been one argument" is the reasoning that produced #128 in the first place.
+    //
+    // The gate reads `args[0]` positionally and forwards the whole list, so a Node that adds a
+    // second parameter (a `format`, as `_compile` gained in 22.18) changes what is forwarded
+    // without changing what is gated.
+    //
+    // Loading the app's OWN file, so the `<app>` fast path applies and no denial is involved —
+    // the question here is purely what reached the primitive.
+    const r = await run(
+      `
+import Module from "node:module";
+import * as path from "node:path";
+const seen = [];
+const real = Module.prototype.load;
+Module.prototype.load = function (...args) { seen.push(args.length); return Reflect.apply(real, this, args); };
+${INSTALL}
+const patched = Module.prototype.load;
+const f = path.join(process.cwd(), "target.js");
+// Counts spanning the only signature Node has ever used plus two it never has. A fresh Module
+// per call because \`load\` asserts it has not already loaded.
+for (const extra of [[], ["future-2nd"], ["future-2nd", 3]]) {
+  const m = new Module(f, null);
+  m.paths = [];
+  patched.call(m, f, ...extra);
+}
+console.log(JSON.stringify(seen));
+handle.uninstall();
+`,
+      { "target.js": "module.exports = 1;\n" },
+    );
+    expect(r.stderr).toBe("");
+    // The install itself loads modules, so the recorder sees Node's own calls too; assert on the
+    // tail, which is the three this row made.
+    const seen = JSON.parse(r.stdout.trim()) as number[];
+    expect(seen.slice(-3)).toEqual([1, 2, 3]);
   });
 
   it("Module._findPath forwards any argument count, unchanged", async () => {

@@ -16,7 +16,13 @@
  * (installEnvGuard) and `native` .node addon loads (installNativeGate, a process.dlopen
  * patch — roadmap S2, gating only, never confinement).
  */
-import { patchRequire, type RequirePatchHandle } from "./loader/require.js";
+import {
+  installModuleReadGate,
+  patchRequire,
+  type ModuleReadGateHandle,
+  type RequirePatchHandle,
+} from "./loader/require.js";
+import { recordProcessEntryFromArgv } from "./loader/module-read.js";
 import { registerEsmHook, type EsmHookHandle } from "./loader/esm-hook.js";
 import { liveCtx, liveRegistry } from "./loader/live-context.js";
 import { installLinkObserver, type LinkObserverHandle } from "./loader/linked-packages.js";
@@ -296,6 +302,7 @@ export function install(
   const ctx: ShimContext = { policy, mode, onDecision, projectRoot, maxFrames, hardened };
   const handles: Array<
     | RequirePatchHandle
+    | ModuleReadGateHandle
     | EsmHookHandle
     | EnvGuardHandle
     | LinkObserverHandle
@@ -307,6 +314,14 @@ export function install(
   // First: this pushes `ctx` onto the install stack, so `liveCtx` below already describes THIS
   // install by the time the guards that read it are built.
   handles.push(patchRequire(ctx));
+  // THE PROCESS ENTRY POINT, from `process.argv[1]` — a fact Node wrote from the command line
+  // during bootstrap, read here BEFORE any dependency can run, and never `Module._load`'s
+  // caller-supplied `isMain` (#177). One of two independent host sources; the other is the
+  // `resolve` hook's root resolution. See loader/module-read.ts § hostRootTargets.
+  recordProcessEntryFromArgv(process.argv);
+  // The module-read gate (#123), at `Module.prototype.load` — the point Node commits to a
+  // filename. `liveCtx`, not `ctx`, and a SINGLE patch: see loader/require.ts.
+  handles.push(installModuleReadGate(liveCtx));
   // LINKED-PACKAGE OBSERVATION (#127). Installed FIRST among the guards, and before anything the
   // application requires, because it can only record a link it sees resolved: a package resolved
   // before the observer exists keeps the identity capwall can recover for it after the fact

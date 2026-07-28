@@ -232,6 +232,12 @@ describe("#107 — every process-level write goes through lifecycle/process-patc
  *    second patch in front of it means the inner patch sees capwall's own frame rather than
  *    `node:internal/modules/…`, decides a user called `_compile`, and gates EVERY `require` in
  *    the process. A second `install()` would make `require` a denied capability.
+ *  - `Module.prototype.load` MUST NOT either (#177). It is the module-read gate (#123), moved
+ *    here from inside the `Module._load` wrapper so the decision is taken on the filename NODE
+ *    resolved rather than on one reconstructed from `Module._load`'s caller-supplied argument
+ *    list. It evaluates a policy and every guard has read the policy out of `liveCtx` since #87,
+ *    so a second link would take a SECOND decision about one load: two `DENY` lines, two trace
+ *    entries, two grants out of `observe`.
  *  - `process.env` and the egress globals MUST NOT either: a stacked Proxy / wrapper double-gates
  *    and double-records every read, and the second `installEnvGuard` captured the FIRST guard's
  *    proxy as the "un-proxied" environment — which handed a GRANTED `spawn` an empty child
@@ -248,6 +254,7 @@ const REVIEWED_SITES: ReadonlyArray<{ name: string; kind: PatchKind }> = [
   { name: "Module._findPath", kind: "shared" },
   { name: "Module._load", kind: "relinked" },
   { name: "Module.prototype._compile", kind: "shared" },
+  { name: "Module.prototype.load", kind: "shared" },
   { name: "process.dlopen", kind: "relinked" },
   { name: "process.env", kind: "shared" },
   { name: "globalThis egress (fetch/WebSocket/EventSource)", kind: "shared" },

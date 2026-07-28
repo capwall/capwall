@@ -229,18 +229,6 @@
       "note": "module.register() could not offer this line at all \u2014 the asymmetry docs/threat-model.md used to carry as a known limit. Without it the hooks outlive their install and #62's swap fixture reports the pre-#152 behaviour."
     },
     {
-      "id": "esm-gate-stands-down-only-for-require",
-      "mechanism": "#152 \u2014 the ESM resolve hook stands down for the #123 module-read decision ONLY when loader/require.ts already took it: inside a gated Module._load AND for a `require` export condition. require(esm) pulls a whole ES subgraph in synchronously inside one Module._load, so the depth test alone would disarm the gate for every import below it",
-      "file": "packages/core/src/loader/esm-hooks.ts",
-      "anchor": "  return insideGatedCjsLoad() && conditions.includes(\"require\");",
-      "mutation": "  return insideGatedCjsLoad();",
-      "tests": [
-        "packages/core/test/module-read.test.ts"
-      ],
-      "needsBuild": true,
-      "note": "Fail-OPEN in one direction (a laundered import goes un-gated) and merely noisy in the other (two decisions for one require), which is why the conjunction is the conservative form and both halves are asserted."
-    },
-    {
       "id": "esm-load-remediation-backstop",
       "mechanism": "#78/#61 \u2014 the load hook re-mediates any raw node:<mediated> URL it is handed, since capwall's own resolve never emits one. Since #152 this is reachable only from a SYNCHRONOUS hook registered after capwall's, which is the one attacker position still ahead of capwall in the chain",
       "file": "packages/core/src/loader/esm-hooks.ts",
@@ -251,18 +239,6 @@
       ],
       "needsBuild": true,
       "note": "Had no mutant while the register() chain also reached it and two tests covered it. It now has exactly one route and one test, so it needs one."
-    },
-    {
-      "id": "module-read-resolve-options-unwrapped",
-      "mechanism": "#157 \u2014 Module._load's fourth argument is an INTERNAL bag, not _resolveFilename's options, so the #123 gate unwraps `requireResolveOptions` instead of forwarding the bag. Conflating them made resolution throw on Node >=24.18, resolveQuietly return null, and the gate read that as 'nothing to decide' \u2014 a dependency read a file outside the project under a deny-all enforce policy and produced ZERO decisions",
-      "file": "packages/core/src/loader/require.ts",
-      "anchor": "  if (bag.requireResolveOptions !== undefined) return bag.requireResolveOptions;",
-      "mutation": "  if (bag.requireResolveOptions !== undefined) return internal;",
-      "tests": [
-        "packages/core/test/module-read.test.ts"
-      ],
-      "needsBuild": true,
-      "note": "The mutation IS the pre-#157 defect: hand _resolveFilename the bag where the unwrapped options belong. It is caught on every supported Node because module-read.test.ts asserts the CLASSIFICATION directly as well as end-to-end (#176) \u2014 the end-to-end rows need a _load that honours the four-argument form, which Node 22.15 (the engines floor) does not, so on the floor they it.skipIf out and a mutant resting on them alone would report a false SURVIVED. If you add a mutant whose property is genuinely unobservable on some supported major, do not copy this row: make the property runtime-independent first, or the catalog reports 'the tests did not fail' for a test that never ran."
     },
     {
       "id": "global-egress-eager-request-capture",
@@ -312,6 +288,54 @@
       "needsBuild": true,
       "minNodeMajor": 26,
       "note": "The mechanism only exists on Node >=26 with --localstorage-file, so its claimed tests skipIf away below that and the mutant would report SURVIVED for a reason that is not about the tests. Reported SKIPPED by name instead. Verified CAUGHT on a real 26.5.0 binary."
+    },
+    {
+      "id": "module-read-gate-at-proto-load",
+      "mechanism": "#123/#177 \u2014 the module-read gate sits on `Module.prototype.load`, the point Node commits to a filename, and is handed Node's OWN resolution result. Every CJS route reaches it: require, require.resolve-then-require, a direct Module._load with any isMain/parent/options bag, require(esm), the entry point, and `new Module(f).load(f)` \u2014 which never touches Module._load at all, so the pre-#177 gate could not see it even in principle",
+      "file": "packages/core/src/loader/require.ts",
+      "anchor": "      if (typeof filename === \"string\") guardCjsModuleRead(ctx, filename);",
+      "mutation": "      if (typeof filename === \"string\" && filename === \"\") guardCjsModuleRead(ctx, filename);",
+      "tests": [
+        "packages/core/test/module-read.test.ts"
+      ],
+      "needsBuild": true,
+      "note": "The mutation leaves the call site and the import in place and makes the gate unreachable \u2014 so a test that only asserts 'capwall is installed', or that the patch site is registered, still passes. It is the whole of #123 at its new home: with it applied, a deny-all enforce policy lets any dependency require any file on disk with zero decisions."
+    },
+    {
+      "id": "module-read-ignores-node-main-marking",
+      "mechanism": "#177 \u2014 the gate consults NOTHING the caller can set. `Module._load(secret, undefined, true)` makes Node stamp `module.id = '.'` and `process.mainModule = module` for the forged load, exactly as it does for the real entry point, so neither is evidence of anything. The process root is identified from HOST facts instead (process.argv[1], and the resolve hook's parentless non-`require` resolution) \u2014 see loader/module-read.ts \u00a7 hostRootTargets",
+      "file": "packages/core/src/loader/require.ts",
+      "anchor": "      if (typeof filename === \"string\") guardCjsModuleRead(ctx, filename);",
+      "mutation": "      if (typeof filename === \"string\" && (this as { id?: unknown }).id !== \".\") guardCjsModuleRead(ctx, filename);",
+      "tests": [
+        "packages/core/test/module-read.test.ts"
+      ],
+      "needsBuild": true,
+      "note": "This is #177 rewritten against the new architecture, and it is the mutation a reviewer would actually propose: `id === '.'` LOOKS like Node's own statement that this is the entry point. It is Node's own statement \u2014 about an argument the caller passed. Sharing an anchor with `module-read-gate-at-proto-load` is deliberate: that one asks whether the gate is there, this one asks whether it can be talked out of firing."
+    },
+    {
+      "id": "esm-gate-declines-every-require-resolution",
+      "mechanism": "#177/#180 \u2014 the resolve hook decides `import` and nothing else. Since #152 it is consulted for `require()` too, and on THAT path `context.parentURL` is derived from the `parent` module record handed to Module._load, i.e. from an ordinary argument. Declining every `require`-conditioned resolution is what leaves those loads to guardCjsModuleRead, whose subject is a stack walk",
+      "file": "packages/core/src/loader/esm-hooks.ts",
+      "anchor": "  return conditions.includes(\"require\");",
+      "mutation": "  return false;",
+      "tests": [
+        "packages/core/test/module-read.test.ts"
+      ],
+      "needsBuild": true,
+      "note": "Replaces `esm-gate-stands-down-only-for-require`, whose mechanism (a depth counter over a whole Module._load) was #179. The mutation is fail-open in TWO ways at once: the hook charges whichever principal the caller named (#180), and a `require`-conditioned resolution with no `parent` reaches the parentless branch and RECORDS the attacker's target as a process root, which then exempts it from the CJS gate as well (#177). It is also merely noisy in a third (two decisions per require), which is what `records ONE decision for one require` pins."
+    },
+    {
+      "id": "module-read-host-root-only-from-parentless-resolution",
+      "mechanism": "#177 \u2014 the process-root record is written ONLY by a resolution Node performed for itself: no importer, and not the `require` condition. That is the one signal on this path no in-process caller can produce, and it is what replaced believing `isMain`. A record written for a load that HAS an importer would let any dependency nominate a file as the process root and then load it freely",
+      "file": "packages/core/src/loader/module-read.ts",
+      "anchor": "  if (importerUrl === undefined) {",
+      "mutation": "  recordHostRootTarget(resolvedPath);\n  if (importerUrl === undefined) {",
+      "tests": [
+        "packages/core/test/module-read.test.ts"
+      ],
+      "needsBuild": true,
+      "note": "The mutation is the plausible over-reach \u2014 'record every resolved target, the CJS half will only match the real entry anyway' \u2014 and it converts the entry-point exemption from a host fact back into something a dependency writes: one denied `import(secret)` makes the subsequent `require(secret)` free. Caught by the unit rows that assert a load WITH an importer records nothing."
     }
   ]
 }
