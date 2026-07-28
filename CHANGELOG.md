@@ -197,6 +197,14 @@ has to be findable without reading the diff.
   spelling of the same read was denied correctly, which is what kept it invisible. Node 20 and 22
   reject the form outright and were never affected.
 
+  **That last sentence is also why the fix needed coverage it did not have** (#176). The two
+  end-to-end regression rows can only run where `Module._load` honours the four-argument form, so
+  on Node **22.15 — the declared `engines` floor** — they feature-detect and skip, and `pnpm test`
+  exercised none of the fix on the version adopters are told to run. The classification rule is a
+  pure function of the argument list and is deliberately not version-keyed, so it is now asserted
+  directly on every runtime, and the catalog has a `module-read-resolve-options-unwrapped` mutant
+  that fails on 22 as well as on 24 and 26.
+
 ### Added
 
 - **[`docs/node-api-dependencies.md`](docs/node-api-dependencies.md)** — one row per Node API

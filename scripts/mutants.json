@@ -251,6 +251,18 @@
       ],
       "needsBuild": true,
       "note": "Had no mutant while the register() chain also reached it and two tests covered it. It now has exactly one route and one test, so it needs one."
+    },
+    {
+      "id": "module-read-resolve-options-unwrapped",
+      "mechanism": "#157 — Module._load's fourth argument is an INTERNAL bag, not _resolveFilename's options, so the #123 gate unwraps `requireResolveOptions` instead of forwarding the bag. Conflating them made resolution throw on Node >=24.18, resolveQuietly return null, and the gate read that as 'nothing to decide' — a dependency read a file outside the project under a deny-all enforce policy and produced ZERO decisions",
+      "file": "packages/core/src/loader/require.ts",
+      "anchor": "  if (bag.requireResolveOptions !== undefined) return bag.requireResolveOptions;",
+      "mutation": "  if (bag.requireResolveOptions !== undefined) return internal;",
+      "tests": [
+        "packages/core/test/module-read.test.ts"
+      ],
+      "needsBuild": true,
+      "note": "The mutation IS the pre-#157 defect: hand _resolveFilename the bag where the unwrapped options belong. It is caught on every supported Node because module-read.test.ts asserts the CLASSIFICATION directly as well as end-to-end (#176) — the end-to-end rows need a _load that honours the four-argument form, which Node 22.15 (the engines floor) does not, so on the floor they it.skipIf out and a mutant resting on them alone would report a false SURVIVED. If you add a mutant whose property is genuinely unobservable on some supported major, do not copy this row: make the property runtime-independent first, or the catalog reports 'the tests did not fail' for a test that never ran."
     }
   ]
 }
