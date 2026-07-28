@@ -78,11 +78,13 @@ has to be findable without reading the diff.
   documented as a **known, un-mediated, flag-gated file channel**: with `--localstorage-file`,
   Node's internal read/write of that one file happens below the `fs` shim. See
   `docs/threat-model.md` § Web Storage, tracked as #156.
-- **A startup-graph budget on the main thread** (#167), in `test/esm-hook-graph.test.ts`. #150
-  guards the blocking `module.register()` graph; nothing guarded the graph the main thread
+- **A startup-graph budget on the main thread** (#167), in `test/esm-hook-graph.test.ts`. #150 had
+  guarded the blocking `module.register()` graph; nothing guarded the graph the main thread
   evaluates before the target's entry point, where the policy is parsed — which is how zod 4's
   ~58 ms arrived with `test`, `bench:gate`, `mutation:gate` and `ci:local` on three Node versions
-  all green.
+  all green. #152 — the first entry under `[Unreleased]` — later removed the loader thread and
+  #150's scans with it, so as shipped this budget is the whole of the startup-graph coverage
+  rather than half of it.
 
   It gates a **module count, not a time**: AGENTS.md § 7 forbids a wall-clock threshold, and
   startup has no co-sampled reference for `bench.mjs`'s ratio trick. The count is immune to
@@ -118,8 +120,12 @@ has to be findable without reading the diff.
   *slower*. The remaining routes all buy the milliseconds by not validating the policy at
   startup, which is a fail-open in the component that decides what everything else may do. The
   full breakdown, the harness and the one lever left unpulled are in
-  `scripts/bench/README.md` § zod 4. zod is still **absent from the ESM loader thread's** graph;
-  #150's guard passes unchanged.
+  `scripts/bench/README.md` § zod 4. One clause of this entry did not survive the release it is
+  in: as written it added that zod was still absent from the **ESM loader thread's** graph and
+  that #150's guard passed unchanged. #152 — the first entry under `[Unreleased]` — removed that
+  thread, and #150's static scans with it. The cost and the decision are unchanged: zod reaches
+  every mediated process through `index.ts`'s re-export of `loadPolicyFromObject`, not through the
+  hook module, and what watches it now is #167's module-count ceiling above.
 
   One thing to know if you write a test against it: zod's own default message text changed
   (`"Required"` → `"Invalid input: expected string, received undefined"`). Nothing asserts on it
