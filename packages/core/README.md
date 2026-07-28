@@ -32,7 +32,8 @@ const handle = install(policy, "observe", {
 `install(policy, mode)` turns six things on:
 
 1. the **CJS loader patch** — a subsequent `require("fs")`, `require("node:net")`, … returns
-   capwall's shim;
+   capwall's shim, and a `require` of a file outside every `node_modules` tree takes an
+   `fs.read` decision (#123, `loader/module-read.ts`);
 2. the **`Module.prototype._compile` gate** (#93) — the `compile` capability, patched on the
    prototype rather than routed through the `node:module` shim, because `_compile` is read off
    the prototype and `process.getBuiltinModule("node:module")` reaches it either way;
@@ -197,7 +198,7 @@ A grant is keyed by package name, or by one of two sentinels:
 
 | Key | Meaning |
 |---|---|
-| `"<app>"` | the application's own code — a real source file not under `node_modules`, inside the project root, with no opaque frame above it. The trust root, and exempt from **four** gates: `process.env` reads (`shims/env.ts`), `dgram` (`shims/net.ts`), loader-hook registration (`shims/module.ts`, #61) and `Module.prototype._compile` (`shims/module.ts`, #93). The last is the one to know: `compile` is identity-granting — a grant of every other grant — and `<app>` holds it without a grant. Not exempt from the `native` gate. |
+| `"<app>"` | the application's own code — a real source file not under `node_modules`, inside the project root, with no opaque frame above it. The trust root, and exempt from **five** gates: `process.env` reads (`shims/env.ts`), `dgram` (`shims/net.ts`), loader-hook registration (`shims/module.ts`, #61), `Module.prototype._compile` (`shims/module.ts`, #93) and the module-load read gate (`loader/module-read.ts`, #123). `_compile` is the one to know: `compile` is identity-granting — a grant of every other grant — and `<app>` holds it without a grant. Not exempt from the `native` gate. |
 | `"<unknown>"` | a call capwall could not attribute to any source file: no qualifying frame on the stack, or app code reached only through a `data:`/`eval`/bundled frame. **Not** exempt — deny-by-default in enforce, recorded in observe. |
 
 `<unknown>` exists because "we could not attribute this" must not silently mean "this is the
@@ -219,6 +220,8 @@ src/lifecycle/process-patch.ts
                            the ONLY file allowed to write a process global; every process-level
                            patch is a refcounted relink chain (#107)
 src/loader/require.ts      CJS require/Module._load patch; MEDIATED_MODULES lives here
+src/loader/module-read.ts  the module system as a read channel: an fs.read decision on a
+                           require/import of a file outside every node_modules tree (#123)
 src/loader/live-context.ts the live install-context box every guard reads (#62/#87) + the
                            hardened ratchet and the per-hardened-ness shim registries (#129)
 src/loader/esm-hook.ts     ESM module.register() registration (main-thread side)

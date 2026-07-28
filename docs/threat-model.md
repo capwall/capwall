@@ -796,10 +796,12 @@ that got there through a symlink**, which since #127 is resolved back to the `no
 it was reached through rather than to the realpath (see § Package identity). A real source file
 under **no** `node_modules` and **inside the project root** charges `<app>`, the trust root.
 
-**What the trust root is actually exempt from — four gates, not two.** This list reads as
-exhaustive, so it is worth writing out in full; two of the four arrived with later PRs and were
-undercounted here, in `docs/architecture.md` and in `packages/core/README.md` at the same time.
-Every `pkg === APP_ROOT` early return in `packages/core/src` is one of these:
+**What the trust root is actually exempt from — five gates, not two.** This list reads as
+exhaustive, so it is worth writing out in full, and it is worth **re-deriving** rather than
+edited: it said "two" for three releases while three more exemptions were added by later PRs,
+here and in `docs/architecture.md`, `docs/policy-format.md` and `packages/core/README.md` at
+once. The derivation is mechanical — every `pkg === APP_ROOT` early return in
+`packages/core/src` is one of these, and a new one means this table is stale:
 
 | Gate | Site | What `<app>` skips |
 |---|---|---|
@@ -807,8 +809,9 @@ Every `pkg === APP_ROOT` early return in `packages/core/src` is one of these:
 | `dgram` send/connect | `shims/net.ts` | the `net` grant, for UDP only |
 | loader-hook registration (#61) | `shims/module.ts` `guardRegistration` | `module.register` / `registerHooks`, which are otherwise application-only |
 | `Module.prototype._compile` (#93) | `shims/module.ts` `guardCompile` | the **`compile`** capability |
+| module-load read (#123) | `loader/module-read.ts`, both the CJS and ESM halves | the `fs.read` decision on `require`/`import` of a file outside every `node_modules` tree — see § The module system as a read channel |
 
-The last one is the one to hold on to, because this document calls `compile` *"identity-granting:
+The `_compile` row is the one to hold on to, because this document calls `compile` *"identity-granting:
 a package holding it can execute as any principal in the policy, including `<app>`"* and *"a grant
 of every other grant"* — and `<app>` needs no such grant. It already has it. So the blast radius of
 a misattribution to `<app>`, or of application code being persuaded to compile attacker-supplied

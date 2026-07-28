@@ -227,7 +227,7 @@ the signal to raise the budget. See
 | Outcome | When | Treated as |
 |---|---|---|
 | `<pkg>` | a frame under `node_modules/<pkg>`; a nested install is its chain, `<host>><pkg>` | that principal's grants |
-| `<app>` | a real source file **not** under `node_modules`, inside the project root, with no opaque frame above it | the trust root — exempt from **four** gates: `process.env` reads, `dgram`, loader-hook registration (#61) and `Module.prototype._compile` (#93, the identity-granting `compile` capability). Not exempt from the `native` gate. See [`threat-model.md`](threat-model.md) § Attribution outcomes for why the last one is the consequential one |
+| `<app>` | a real source file **not** under `node_modules`, inside the project root, with no opaque frame above it | the trust root — exempt from **five** gates: `process.env` reads, `dgram`, loader-hook registration (#61), `Module.prototype._compile` (#93, the identity-granting `compile` capability) and the module-load read gate (#123). Not exempt from the `native` gate. See [`threat-model.md`](threat-model.md) § Attribution outcomes, which enumerates them with their sites and says why `_compile` is the consequential one |
 | `<unknown>` | no qualifying frame at all, or app code reached only through opaque code | an ordinary untrusted principal — deny-by-default in enforce, recorded in observe, grantable by an explicit `"<unknown>"` policy entry |
 
 An **opaque** frame is user-controlled code with no filesystem identity: a `data:`/`blob:`

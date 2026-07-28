@@ -143,7 +143,7 @@ Besides real package names, `packages` accepts two sentinels:
 
 | Key | Charged when | Notes |
 |---|---|---|
-| `"<app>"` | the call came from the application's own code — a real source file not under `node_modules`, inside the project root | the trust root; also exempt from **four** gates — `process.env` reads, `dgram`, loader-hook registration and `Module.prototype._compile` (so `<app>` needs no `compile` grant) — which is why entries here only matter for `fs`, `net`, `ipc`, `child_process`, `worker_threads`, `vm` and `native` |
+| `"<app>"` | the call came from the application's own code — a real source file not under `node_modules`, inside the project root | the trust root; also exempt from **five** gates — `process.env` reads, `dgram`, loader-hook registration, `Module.prototype._compile` (so `<app>` needs no `compile` grant) and the module-load read gate (#123) — which is why entries here only matter for `fs`, `net`, `ipc`, `child_process`, `worker_threads`, `vm` and `native`. [`threat-model.md`](threat-model.md) § Attribution outcomes enumerates them |
 | `"<unknown>"` | capwall could not attribute the call to any source file | e.g. a `data:` URL module, `eval`'d code with no trustworthy origin, or a native function invoked straight from a timer |
 
 `<unknown>` is gated like any dependency — deny-by-default in `enforce` — so a legitimate

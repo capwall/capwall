@@ -44,7 +44,10 @@ surfaces that are not import-routed and so are installed eagerly by `install()`*
 `core/src/shims/global-egress.ts`), and the **`Module.prototype._compile` gate** (#93 — the
 `compile` capability, `core/src/shims/module.ts`). Capability kinds in the policy language:
 `fs`, `net`, `ipc` (#72), `env`, `child_process`, `worker_threads`, `vm`, `native` (#49) and
-`compile` (#93). `capwall observe`
+`compile` (#93). Two of those are decided at **module-load time** rather than at a capability
+call: `compile`, and (since #123) an `fs.read` on a `require`/`import` of a file outside every
+`node_modules` tree — the module system was a second, un-gated route to the bytes `fs` guards.
+`capwall observe`
 emits/merges a starter `capabilities.json` covering all capability kinds, and `capwall
 enforce` denies-by-default (`malicious-dep-demo` is blocked on both env and fs; `express-app`
 runs clean — zero denials, `capwall diff` exits 0 — under the **observed-then-hand-reviewed**
@@ -121,6 +124,7 @@ Where each concern lives:
 | Native `.node` load gate (`process.dlopen`) | `packages/core/src/loader/native.ts` |
 | Core-API capability shims | `packages/core/src/shims/{fs,net,child_process,worker_threads,env,vm}.ts` (`net.ts` registers all six egress modules) |
 | Global egress guard — `globalThis.fetch`/`WebSocket`/`EventSource` (#80) | `packages/core/src/shims/global-egress.ts` |
+| The module system as a read channel — an `fs.read` decision on a `require`/`import` outside every `node_modules` tree (#123) | `packages/core/src/loader/module-read.ts` |
 | Loader-hook registration gate (`node:module`) **and** the `Module.prototype._compile` / `compile` gate (#93) | `packages/core/src/shims/module.ts` |
 | **Process-global patch lifecycle** — the ONLY file in `core/src` allowed to write a process global; every new patch site goes through it (#107, enforced by `test/process-patch-sites.test.ts`) | `packages/core/src/lifecycle/process-patch.ts` |
 | **The live install-context box** — what every guard reads, so a policy swap is live in both directions (#62/#87); also the `hardened` ratchet (#129) | `packages/core/src/loader/live-context.ts` |
