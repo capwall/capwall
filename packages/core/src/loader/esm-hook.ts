@@ -19,10 +19,17 @@
 // registers the hook — and a URL already in that cache never consults the load chain, which is
 // precisely what left the hook's re-mediation backstop dead (#78). `node:url`/`node:path` are not
 // mediated and stay ordinary imports.
-// `node:worker_threads` is mediated too, so `MessageChannel` comes out of the same CJS capture as
-// `register` — a static ESM import of it here would cache that specifier raw and leave the #78
-// backstop dead for it, which `test/real-builtins.test.ts`'s source scan exists to catch.
-import { realModule, realWorkerThreads } from "../real-builtins.cjs";
+// `node:worker_threads` is mediated too, so `MessageChannel` comes out of a CJS capture as well —
+// a static ESM import of it here would cache that specifier raw and leave the #78 backstop dead
+// for it, which `test/real-builtins.test.ts`'s source scan exists to catch. It comes from the
+// NARROW capture rather than this one; see the note on that import below.
+import { realModule } from "../real-builtins.cjs";
+// `MessageChannel` comes from the NARROW capture the LOADER-thread half of this channel uses
+// (#150), so both ends of the port pair come out of one `require` — and so that narrow module sits
+// inside `index.js`'s static import graph, which is what keeps its "captured before `install()`
+// could have patched `Module._load`" argument true on the main thread as well as on the loader
+// thread. See `src/real-builtins/worker_threads.cts`.
+import { realWorkerThreads } from "../real-builtins/worker_threads.cjs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import * as path from "node:path";
 import { pushEsmContext, popEsmContext, esmExportNames } from "./esm-runtime.js";

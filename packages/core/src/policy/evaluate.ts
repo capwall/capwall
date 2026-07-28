@@ -12,14 +12,19 @@
  *  - `observe` mode: never denies. Every request returns { allowed: true }, but
  *    `observed` carries what was seen so the CLI can synthesize a starter policy.
  */
-import {
-  ANY_HOST,
-  matchesHostPattern,
-  widenedPackageKeys,
-  type Mode,
-  type PackagePolicy,
-  type Policy,
-} from "@capwall/policy-schema";
+// The two grammar modules are imported by their OWN subpaths rather than through
+// `@capwall/policy-schema`'s barrel, and that is a startup-cost decision rather than a style one
+// (#150). The barrel builds the whole Zod schema tree at module scope, so importing `ANY_HOST`
+// through it drags `zod` into every realm that evaluates a decision — including Node's ESM LOADER
+// THREAD, which reaches this file through `loader/esm-hooks.ts` → `loader/module-read.ts` and
+// needs no schema at all (it is handed an already-parsed policy). `module.register()` BLOCKS the
+// main thread while that thread resolves and compiles its graph, so every module on it is paid for
+// serially at startup. `parsePolicy` — the one consumer that genuinely needs Zod — still imports
+// the barrel from `policy/load.ts`, on the main thread only, where a policy is actually parsed.
+// `test/esm-hook-graph.test.ts` holds this shape in place from both ends.
+import { ANY_HOST, matchesHostPattern } from "@capwall/policy-schema/host";
+import { widenedPackageKeys } from "@capwall/policy-schema/package-key";
+import type { Mode, PackagePolicy, Policy } from "@capwall/policy-schema";
 import { matchesGlob } from "./glob.js";
 import { IPC_PSEUDO_HOST, matchesIpcPath } from "./ipc.js";
 

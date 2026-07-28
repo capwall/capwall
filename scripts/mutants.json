@@ -13,6 +13,12 @@
     "is what keeps this catalog from rotting into a no-op: a refactor that moves a mechanism breaks",
     "the catalog loudly instead of silently turning its mutant into a no-op edit.",
     "",
+    "MOSTLY security-critical mechanisms, and two (#150) that are not: the ESM loader thread's import",
+    "graph is a STARTUP-COST invariant. It earns a mutant on the same argument the security ones do —",
+    "reverting it breaks nothing, fails nothing, and silently puts zod and ten unused builtins back",
+    "on the blocking startup path of every mediated process. A property no test asserts is a property",
+    "that decays, whichever column it sits in.",
+    "",
     "`needsBuild` marks mutants whose claimed tests spawn a subprocess against `dist/` — those need",
     "a rebuild after mutating and after restoring."
   ],
@@ -196,6 +202,30 @@
       ],
       "needsBuild": false,
       "note": "Only observable on the FALLBACK path, which is exactly why it needs a mutant: the fast path skips those frames in V8 and would hide the loss."
+    },
+    {
+      "id": "loader-thread-no-zod",
+      "mechanism": "#150 — the ESM hook's graph reaches the policy-schema GRAMMAR by subpath, never the barrel that builds the Zod schema tree at module scope. module.register() blocks the main thread while that graph loads, so a barrel import puts zod on the blocking startup path of every mediated process",
+      "file": "packages/core/src/policy/evaluate.ts",
+      "anchor": "import { ANY_HOST, matchesHostPattern } from \"@capwall/policy-schema/host\";",
+      "mutation": "import { ANY_HOST, matchesHostPattern } from \"@capwall/policy-schema\";",
+      "tests": [
+        "packages/core/test/esm-hook-graph.test.ts"
+      ],
+      "needsBuild": false,
+      "note": "A startup-cost invariant, not a security one — and the reason it needs a mutant is that the mutation is the most natural import in the repo, breaks nothing and fails nothing."
+    },
+    {
+      "id": "loader-thread-narrow-capture",
+      "mechanism": "#150 — a module the ESM loader thread evaluates takes its real builtin from the NARROW capture under src/real-builtins/, not from the twelve-wide aggregate, so that realm does not require the ten builtins it never uses",
+      "file": "packages/core/src/attribution/index.ts",
+      "anchor": "import { realFs } from \"../real-builtins/fs.cjs\";",
+      "mutation": "import { realFs } from \"../real-builtins.cjs\";",
+      "tests": [
+        "packages/core/test/esm-hook-graph.test.ts"
+      ],
+      "needsBuild": false,
+      "note": "Reverting this is a no-op for correctness — both spellings hand back the identical object, which real-builtins.test.ts asserts — and that is exactly why nothing else would catch it."
     }
   ]
 }

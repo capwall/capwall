@@ -20,6 +20,14 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
+    "./host": {
+      "types": "./dist/host.d.ts",
+      "default": "./dist/host.js"
+    },
+    "./package-key": {
+      "types": "./dist/package-key.d.ts",
+      "default": "./dist/package-key.js"
+    },
     "./schema.json": "./schema.json"
   },
   "files": ["dist", "schema.json"],

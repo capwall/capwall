@@ -70,7 +70,10 @@
  * principal that changed across an `uninstall()`/`install()` pair would be the #62/#87 defect
  * wearing a different hat. There is deliberately no reset.
  */
-import { realFs } from "../real-builtins.cjs"; // never `import … from "node:fs"` — see #78
+// Never `import … from "node:fs"` (#78); and the NARROW capture rather than the twelve-wide
+// aggregate, because this module is on the ESM loader thread's graph (#150) — see
+// `src/real-builtins/fs.cts`.
+import { realFs } from "../real-builtins/fs.cjs";
 
 /**
  * Normalize a path for segment scanning: back-slashes become forward slashes.

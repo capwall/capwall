@@ -65,6 +65,7 @@ has roughly doubled since the harness was written.
 | `vm` / `worker_threads` gates | **no** | one `guard()` each, identical in shape to the `child_process` deny row, and the allowed form is dominated by thread/context creation. |
 | observe mode | **no** | the sink here is a no-op; a real `observe` run writes a trace line per decision, and that cost is the embedder's, not capwall's. |
 | end-to-end request latency (express-app) | **no** | still the follow-up it always was: this harness measures the shim hot path in isolation. |
+| **process startup** (loading the preload + `install()`) | **no** | a different unit — milliseconds once per process, not microseconds per call — so folding it in would put two incomparable numbers in one table. Measured separately and written down in § Startup below (#150). |
 
 ## Methodology
 
@@ -253,6 +254,97 @@ Reading the table honestly:
   Node's loader frame with a one-frame capture and returns — and `dlopen` was deliberately left on
   the full walk for the prefix-depth reason above. Both rows exist (thanks to #134) so that
   "no change" is a measurement rather than an assumption.
+
+## Startup — what a mediated process pays before it runs (#150)
+
+Everything above is per intercepted CALL. This section is the other axis: the fixed cost of
+`node --import dist/preload.js`, paid once per process, by every user of capwall on every process
+they mediate — a CLI that shells out, a test runner spawning workers, a serverless cold start.
+`bench.mjs` does not measure it (see the coverage table); these numbers come from a separate
+ABBA-interleaved harness, described below so they can be re-derived rather than trusted.
+
+### The breakdown, before the fix
+
+Node 22.22, idle 16-core box. Phase marks are `Date.now()` stamps compiled into a throwaway copy of
+`dist`, so the main thread and the loader thread share one clock. **Read the shares, not the
+totals** — the totals move with the machine, the shares do not.
+
+| phase | ms | whose cost |
+|---|---|---|
+| Node's own bootstrap, before capwall's first module | ~48 | Node's (this is the `bare node` reference) |
+| **main thread — capwall's module graph** | **~81** | |
+| … resolving + compiling ~33 modules | ~40 | capwall's, and only a bundler would move it |
+| … `real-builtins.cts` — twelve `require`s | 13 | **immovable** (#78; see below) |
+| … `globalThis.Request` → undici materialization | 21 | **immovable** (see below) |
+| … `policy/evaluate` + policy-schema + zod | 4 | needed: the preload parses a policy |
+| … the other ~28 modules' evaluation | ~1 | |
+| preload body: read + `parsePolicy` the policy file | 2 | |
+| `install()` — require patch, link observer, `_compile` gate, native gate, env guard, egress guard | 2 | |
+| **`registerEsmHook()`** | **93** (min) / 112 (p50) | |
+| … Node's loader-thread bootstrap | ~53 | **Node's** — measured by registering a no-op hook module in the same process |
+| … capwall's hook graph on that thread | ~40 | 22 resolve+compile, 18 evaluate |
+| … ESM shim registry (all 11 specifiers) + `esmExportNames` + `MessageChannel` | 3 | |
+
+So of ~180 ms of capwall in a ~250 ms child: **`module.register()` is 93 ms of it, and 53 ms of
+that is Node starting a thread.** The ESM loader thread is the startup story; nothing else is close.
+
+### What moved, and what did not
+
+**Moved (#150): the ~40 ms capwall's own graph cost on the loader thread → ~17 ms.** That thread
+evaluates ~10 capwall modules and needs almost nothing they were dragging in:
+
+- **zod**, via `@capwall/policy-schema`'s barrel, which builds the whole schema tree at module
+  scope. The loader thread never parses a policy — it is handed an already-parsed one in an
+  `EsmGateSnapshot`. `policy/evaluate.ts` and `attribution/index.ts` now import
+  `@capwall/policy-schema/host` and `/package-key` instead, which are pure string grammar.
+- **ten of the twelve mediated builtins**, via `real-builtins.cts`. That realm uses `fs` (attribution
+  reads package.json) and `worker_threads` (#123's synchronous port drain). Narrow captures under
+  `src/real-builtins/` give it those two.
+
+`test/esm-hook-graph.test.ts` holds both in place — a static scan of the hook's transitive graph
+plus a runtime probe in a clean child with positive controls — and both have mutants in
+`scripts/mutants.json`, because the regression in each case is a one-line import that breaks nothing
+and fails nothing.
+
+**Did not move, with the reason rather than a shrug:**
+
+| cost | ms | why it stays |
+|---|---|---|
+| Node's loader-thread bootstrap | ~53 | Node's, and `register()` blocks until it is done. `module.registerHooks()` (synchronous, no thread) would remove it, but it is Node ≥22.15 — absent on the Node 20 leg of the CI matrix — and it would mean a second implementation of the security-critical hook, version-gated, with each leg exercising only one arm. A follow-up with a real design question in it, not a tweak. |
+| `real-builtins.cts`'s twelve `require`s on the MAIN thread | 13 | #78. They must be eager and inside `index.js`'s static graph: that is the whole proof that they run against a pristine `Module._load` rather than capturing capwall's own shims. Narrowing helps a realm that needs two of them; it cannot help the realm that needs all twelve. |
+| `globalThis.Request` → undici | 21 | `global-egress.ts` captures the real `Request.prototype.url` getter at module scope, and V8 materializes undici on the first *observation* of that global (even `getOwnPropertyDescriptor` triggers it — verified). The capture is load-bearing: it is what stops a `Request` with a shadowed own `url` accessor reporting a granted destination while undici dials another (#26/#56). Deferring it to first `fetch()` would put that capture *after* dependencies have run, which is the window it exists to close. Note the guard itself is nearly free once undici is resident — `installGlobalEgressGuard` is ~1 ms — so this is the price of the TOCTOU capture, not of the guard. |
+| zod on the MAIN thread | 4 | `parsePolicy` is real validation of a real document, and the preload always parses one. |
+| the ESM shim registry being built eagerly | 3 | #150 opened by asking whether lazy shim construction was the win. **It is worth 3 ms.** `registerEsmHook` needs every specifier's export names to ship to the loader thread, so the registry cannot be lazy there — and it turns out not to matter. Recorded because "we checked and it was small" is a result. |
+
+### Before / after
+
+ABBA-interleaved: the two builds' `dist` trees are swapped on disk between **every** sample, so both
+arms share the machine's mood — the same discipline the block estimator applies one level down.
+p90 over ≥15 samples per arm. `bare node` and `CAPWALL_ESM=0` are the **control rows**: this change
+is entirely on the loader-thread path, so a version of this table where either had moved would mean
+the two builds differed in something other than the change.
+
+| condition | child | before p90 | after p90 | |
+|---|---|---|---|---|
+| idle 16-core, Node 22 | mediated, esm ON | 253 ms | **221 ms** | −31 ms |
+| | `CAPWALL_ESM=0` (control) | 146 ms | 144 ms | −2 ms |
+| | bare node (control) | 48 ms | 54 ms | +6 ms — the noise floor |
+| `docker --cpus=2`, Node 22 | mediated, esm ON | 280 ms | **259 ms** | −21 ms |
+| | `CAPWALL_ESM=0` (control) | 156 ms | 158 ms | +2 ms |
+| `docker --cpus=2`, Node 20 | mediated, esm ON | 289 ms | **249 ms** | −40 ms |
+| | `CAPWALL_ESM=0` (control) | 166 ms | 160 ms | −5 ms |
+| 16-core, 24 spinners (load 21) | mediated, esm ON | 1102 ms | **950 ms** | −152 ms |
+| | `CAPWALL_ESM=0` (control) | 576 ms | 602 ms | +26 ms |
+
+**Every row of the per-call table above is unchanged**, which is the expected result for a change
+that only moves module loading: three alternated full `pnpm bench --json` runs of each build put
+every row inside its own run-to-run range, the RATIO gate at 0.89–0.90 in both, and all 21
+self-checks green in all six runs.
+
+Read honestly: this is **12–14%** off a mediated process's startup, not a rewrite of it. The
+dominant term is still Node starting a loader thread, and the two largest capwall-side terms
+(#78's capture and the undici materialization) are each bought by a guarantee that is worth more
+than the milliseconds.
 
 ## Where the budget does not hold
 

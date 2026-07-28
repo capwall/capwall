@@ -17,14 +17,21 @@
  * and takes the second layer away again, with nothing failing. Hence the scans below, in the
  * shape `process-patch-sites.test.ts` established for the process-patch rule (#107):
  *
- *   1. **THE IMPORT SCAN.** No file in `packages/core/src` except `real-builtins.cts` may name a
+ *   1. **THE IMPORT SCAN.** No file in `packages/core/src` outside the capture set may name a
  *      mediated builtin in an import or require position.
  *   2. **THE COVERAGE CHECK.** Every builtin `loader/require.ts` declares mediated must actually
  *      be captured in `real-builtins.cts`, so a new mediated module cannot be half-added.
- *   3. **THE ORDERING CHECK.** Nothing may reach `real-builtins.cjs` through a dynamic `import()`
+ *   3. **THE ORDERING CHECK.** Nothing may reach a capture file through a dynamic `import()`
  *      — the capture is correct because it happens during static module evaluation, before
  *      `install()` can possibly have patched `Module._load`, and a lazy route is what that
  *      argument needs to be false.
+ *   4. **THE NARROWING CHECK (#150).** The capture set is `real-builtins.cts` PLUS the narrow
+ *      per-builtin files under `src/real-builtins/`, which exist so that a module Node's ESM
+ *      loader thread evaluates does not drag all twelve builtins into that realm to reach one.
+ *      Each narrow file may only capture something the aggregate already captures — so narrowing
+ *      can shrink what a realm pays for and can never introduce a builtin the whole set misses —
+ *      and every narrow capture is asserted to be the SAME OBJECT as the aggregate's, by identity
+ *      rather than by argument.
  *
  * Plus a runtime post-condition: after a real `install()`, what capwall captured is still the
  * genuine builtin and not one of its own shims (which is what a `require` running AFTER the
@@ -40,6 +47,8 @@ import { describe, expect, it } from "vitest";
 import { install, loadPolicyFromObject } from "../src/index.js";
 import { MEDIATED_MODULES } from "../src/loader/require.js";
 import * as realBuiltins from "../src/real-builtins.cjs";
+import { realFs as narrowFs } from "../src/real-builtins/fs.cjs";
+import { realWorkerThreads as narrowWorkerThreads } from "../src/real-builtins/worker_threads.cjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const SRC_ROOT = path.join(here, "..", "src");
@@ -50,6 +59,17 @@ const SRC_ROOT = path.join(here, "..", "src");
 const GET_BUILTIN_MODULE = (process as unknown as { getBuiltinModule?: (id: string) => unknown })
   .getBuiltinModule;
 const CAPTURE_FILE = "real-builtins.cts";
+/**
+ * The narrow per-builtin captures (#150), relative to `src`. Separate from {@link CAPTURE_FILE}
+ * because they are held to a STRICTER rule: the aggregate defines the mediated set, and each of
+ * these may only re-capture a member of it.
+ */
+const NARROW_CAPTURE_DIR = "real-builtins";
+/** `src`-relative paths the import scan exempts: the aggregate and every narrow capture. */
+function isCaptureFile(rel: string): boolean {
+  const posix = rel.split(path.sep).join("/");
+  return posix === CAPTURE_FILE || posix.startsWith(`${NARROW_CAPTURE_DIR}/`);
+}
 
 /** The distinct builtins capwall mediates, `node:`-prefixed — `fs` and `node:fs` are one module. */
 const MEDIATED_BUILTINS = [
@@ -122,12 +142,13 @@ describe("#78 — every real mediated builtin is captured in src/real-builtins.c
     const offenders: Finding[] = [];
     for (const file of sourceFilesUnder(SRC_ROOT)) {
       const rel = path.relative(SRC_ROOT, file);
-      if (rel === CAPTURE_FILE) continue; // the one file allowed to load a mediated builtin
+      if (isCaptureFile(rel)) continue; // the only files allowed to load a mediated builtin
       offenders.push(...mediatedImports(rel, readFileSync(file, "utf8")));
     }
     expect(
       offenders,
-      `A mediated builtin is loaded outside src/${CAPTURE_FILE}. A static ESM import puts its ` +
+      `A mediated builtin is loaded outside the capture set (src/${CAPTURE_FILE} and ` +
+        `src/${NARROW_CAPTURE_DIR}/). A static ESM import puts its ` +
         `node: URL in the ESM module cache before capwall's loader hook registers, and a URL in ` +
         `that cache never consults the load chain — which silently turns the load()-level ` +
         `re-mediation backstop back into dead code for that specifier (issue #78). Import it ` +
@@ -179,6 +200,44 @@ describe("#78 — every real mediated builtin is captured in src/real-builtins.c
         `more (an un-mediated module does not belong here) and no less (a mediated module with ` +
         `no capture has to be imported from somewhere, which puts it back in the ESM cache).`,
     ).toEqual(MEDIATED_BUILTINS);
+  });
+
+  it("lets a narrow capture only re-capture what the aggregate already captures (#150)", () => {
+    // The narrow files under src/real-builtins/ exist so a module the ESM LOADER THREAD evaluates
+    // does not have to pull all twelve builtins into that realm to reach one of them. That is a
+    // startup-cost narrowing and must never become a coverage hole: if a narrow file could capture
+    // a builtin the aggregate does not, the aggregate would stop being the whole set and the
+    // coverage check above would be asserting something weaker than it reads.
+    const aggregate = new Set(
+      [
+        ...stripComments(readFileSync(path.join(SRC_ROOT, CAPTURE_FILE), "utf8")).matchAll(
+          /\brequire\(\s*["']([^"']+)["']\s*\)/g,
+        ),
+      ].map((m) => m[1] ?? ""),
+    );
+    const offenders: string[] = [];
+    for (const file of sourceFilesUnder(path.join(SRC_ROOT, NARROW_CAPTURE_DIR))) {
+      const code = stripComments(readFileSync(file, "utf8"));
+      for (const m of code.matchAll(/\brequire\(\s*["']([^"']+)["']\s*\)/g)) {
+        const spec = m[1] ?? "";
+        if (!aggregate.has(spec)) offenders.push(`${path.relative(SRC_ROOT, file)}: ${spec}`);
+      }
+    }
+    expect(
+      offenders,
+      `A narrow capture under src/${NARROW_CAPTURE_DIR}/ requires a builtin src/${CAPTURE_FILE} ` +
+        `does not. Add it to the aggregate first — it is the file the coverage check reads, and ` +
+        `the one that guarantees the mediated set comes out of the CJS cache whole.`,
+    ).toEqual([]);
+  });
+
+  it("hands out the SAME object from the narrow captures and the aggregate (#150)", () => {
+    // The narrowing rests on one fact: two `require("node:fs")` calls in two CommonJS files hit
+    // one CJS cache entry. Asserted rather than argued, because if it were ever false the loader
+    // thread and the main thread would be attributing against different `fs` objects and nothing
+    // else here would notice.
+    expect(narrowFs).toBe(realBuiltins.realFs);
+    expect(narrowWorkerThreads).toBe(realBuiltins.realWorkerThreads);
   });
 
   it("is never reached lazily — the no-recursion argument depends on static evaluation", () => {

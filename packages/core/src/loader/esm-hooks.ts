@@ -41,7 +41,14 @@
 // import: this module IS the load hook, and caching a mediated specifier's node: URL in an ESM
 // registry is precisely what left the #78 backstop dead. `test/real-builtins.test.ts`'s source
 // scan enforces the rule across `src`.
-import { realWorkerThreads } from "../real-builtins.cjs";
+//
+// …and it comes out of the NARROW capture rather than the twelve-wide aggregate (#150). THIS
+// module is the one Node's loader thread evaluates, and `module.register()` blocks the main thread
+// while that happens, so every builtin the aggregate would `require` here — `http2`, `dgram`,
+// `tls`, `vm`, `child_process`, the lot — is serial startup cost for a realm that uses none of
+// them. `src/real-builtins/fs.cts` carries the full argument for why narrowing takes nothing away
+// from #78; `test/esm-hook-graph.test.ts` enforces it.
+import { realWorkerThreads } from "../real-builtins/worker_threads.cjs";
 import { CapabilityError } from "../errors.js";
 import { decideEsmModuleRead, type EsmGateOutcome, type EsmGateSnapshot } from "./module-read.js";
 
