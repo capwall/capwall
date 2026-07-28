@@ -1,5 +1,6 @@
 {
-  // oxlint (MIT, dev-only, one prebuilt binary and zero npm dependencies) is the repo's ONLY
+  // oxlint (MIT, dev-only, zero REGULAR dependencies — 19 `@oxlint/binding-*` optionalDeps of
+  // which a machine installs exactly one) is the repo's ONLY
   // linter, and `pnpm lint` is its only invocation — see docs/ci-local.md. It exists to catch
   // defects tsc cannot see; it is deliberately NOT a style gate, so that a lint failure always
   // means something is wrong rather than something is differently-shaped.
