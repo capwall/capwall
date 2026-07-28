@@ -206,12 +206,54 @@ Per-capability notes:
   their literal prefix — `**` followed by `..` (because `**` also matches *zero* segments),
   `{.,..}/…`, and a brace group with absolute alternatives such as `{/etc,/tmp}/*.conf`, which
   reaches `/etc` whatever `cwd` says. #106's own suggestion — "gate the non-magic prefix" — would
-  therefore have been **fail-open**. A brace group is treated as unbounded unless it contains
-  neither `/` nor `..` (in which case it can only name alternatives within one segment), and a
-  backslash — minimatch's POSIX escape character — makes a pattern unbounded rather than guessed
-  at. `options.cwd` is read **exactly once** and the single answer is what Node receives, on the
-  same pinning rule as every other capability-relevant option (#26/#56/#89); a URL `cwd` is
-  converted once and the converted *string* is forwarded.
+  therefore have been **fail-open**. `options.cwd` is read **exactly once** and the single answer
+  is what Node receives, on the same pinning rule as every other capability-relevant option
+  (#26/#56/#89); a URL `cwd` is converted once and the converted *string* is forwarded.
+
+  **A `..` spelled as a glob expansion (#120), and the rule that replaced the one it broke.** The
+  #106 derivation asked two *string* questions of the pattern text: is a post-prefix segment
+  literally `".."`, and does a brace group contain a `/` or a `..`. minimatch is a *matcher*, and
+  it will spell a `..` in ways neither question can see: `[.][.]`, `[.].`, `.[.]`, `[.-.][.-.]`,
+  `..{,}`, `.{.,.}`, `{a,[.][.]}`, `[.][.]{,}` all walk to the parent of `cwd` — and they chain,
+  so four of them walk four levels up — while capwall recorded one *allowed* read of the
+  package's own granted directory and `enforce` printed nothing. That was the third instance of
+  the same failure shape as #84's `getEvalOrigin` regex and #95's port heuristic: a parser
+  deciding a security boundary while modelling a narrower grammar than its consumer accepts.
+
+  capwall no longer tries to *see* a `..` through the pattern text. Two rules replace the
+  string tests, and both are conservative by construction — anything not proven bounded is
+  unbounded:
+
+  1. **Braces are expanded, not inspected.** capwall performs the expansion the matcher performs
+     and analyses each concrete alternative, so a braced pattern has one base per alternative and
+     the decision is taken on their **common ancestor**. `{/etc,/tmp}/*.conf` is gated on `/`;
+     `{.,..}/*.conf` is gated on the parent of `cwd`, exactly where it walks. Constructs capwall
+     will not expand exactly are refused outright: an unbalanced brace, a group with no top-level
+     comma (a range such as `{1..3}`, or a single-alternative `{a}` that minimatch does not expand
+     at all), and any expansion beyond 256 alternatives.
+  2. **Every segment at or after the first magic segment must be provably downward-only.** The
+     only way a glob walk moves *upward* is a segment the implementation resolves to a literal
+     `..` path component; a segment that survives as a *matcher* cannot, because matching runs
+     against directory entries and `readdir` never yields `.` or `..`. So a segment containing a
+     `*` or `?` is bounded (nothing in the grammar removes those — `**`, `*.conf`, `.*`, `*.*`,
+     `[.]*` and `..*` all keep working, verified against real `fs.globSync`), a segment carrying
+     any ordinary character is bounded, and a segment built only from dots and glob punctuation is
+     **unbounded**. A backslash — minimatch's POSIX escape character — still makes a pattern
+     unbounded rather than guessed at.
+
+  Rule 2 is deliberately blunter than the truth: `dir/[.]/x`, `dir/@(..)/x` and `dir/[..]/x` are
+  harmless in practice and are nonetheless treated as unbounded, because the alternative is
+  modelling character-class and extglob reduction — which is the grammar-modelling that produced
+  #84, #95 and #120. Adding a `*` or any ordinary character to the segment, or globbing from a
+  directory the package is granted, both work.
+
+  **The divergence itself is now a test, not a list.** `test/fs-glob.test.ts` generates patterns
+  from a token grammar (exhaustive over token pairs, plus a seeded random pass) and asserts, for
+  each, that every entry **real `fs.globSync`** returns resolves inside the directory capwall
+  decided about. If minimatch grows a new way to spell `..`, or capwall's expansion ever disagrees
+  with the real one, that fails — whether or not anybody thought to write the spelling down. A
+  companion assertion rules out the trivially "safe" implementation that answers "the filesystem
+  root" to everything.
 
   **Why not check each result path**, which would be more precise:
   - It cannot be done before the walk, and *the walk is the leak*. `options.exclude` is a
