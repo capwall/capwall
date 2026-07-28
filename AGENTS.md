@@ -36,9 +36,15 @@ policy) → shims → policy evaluate, in both modes. Shims: `fs`; the six egres
 `net`/`http`/`https`/`tls`/`http2`/`dgram` (registered **separately** — one shim never covers
 another, see `docs/threat-model.md` for why that is a security property and not a style
 choice); `child_process`; `worker_threads`; `vm`; and `node:module` (gating loader-hook
-registration, #61) — all via the require registry in `core/src/shims/index.ts` — plus
-`process.env` (a read allowlist via a Proxy, installed in `install()`) and the `native`
-`.node` load gate (a `process.dlopen` patch, `core/src/loader/native.ts`). `capwall observe`
+registration, #61) — all via the require registry in `core/src/shims/index.ts` — plus **four
+surfaces that are not import-routed and so are installed eagerly by `install()`**:
+`process.env` (a read allowlist via a Proxy), the `native` `.node` load gate (a
+`process.dlopen` patch, `core/src/loader/native.ts`), the **global egress guard** (#80 —
+`globalThis.fetch`/`WebSocket`/`EventSource` replaced on `globalThis`,
+`core/src/shims/global-egress.ts`), and the **`Module.prototype._compile` gate** (#93 — the
+`compile` capability, `core/src/shims/module.ts`). Capability kinds in the policy language:
+`fs`, `net`, `ipc` (#72), `env`, `child_process`, `worker_threads`, `vm`, `native` (#49) and
+`compile` (#93). `capwall observe`
 emits/merges a starter `capabilities.json` covering all capability kinds, and `capwall
 enforce` denies-by-default (`malicious-dep-demo` is blocked on both env and fs; `express-app`
 runs clean — zero denials, `capwall diff` exits 0 — under the **observed-then-hand-reviewed**
@@ -78,10 +84,24 @@ exempt `<app>` sentinel — they charge `<unknown>`, an ordinary deny-by-default
 a policy can grant explicitly. Any doc that describes attribution as two-valued is stale; see
 `docs/threat-model.md` § attribution outcomes and `docs/policy-format.md` § Two sentinel keys.
 
-**Known open gap: global egress.** `globalThis.fetch` and `globalThis.WebSocket` are not
-module surfaces, so the loader-interception mechanism never sees them. They are un-mediated
-and un-logged. Do not describe capwall's egress control without that qualifier — see
-`docs/threat-model.md` § Global egress surfaces (tracked as #80).
+**Global egress IS mediated (#80, shipped in #85).** `globalThis.fetch`/`WebSocket`/
+`EventSource` are not module surfaces, so the loader mechanism never sees them — they are
+guarded by replacing them on `globalThis` instead, against the same `net` grant a module-surface
+egress call is checked against, on by default under the CLI (`CAPWALL_GLOBAL_EGRESS=0` to
+disable). Earlier revisions of this file called that an open gap; it is not, and describing it
+as one understates the tool. The residuals that *are* real — redirect hops guarded only after
+the request has gone out, `init.dispatcher`, pre-install capture, and
+`Object.defineProperty(globalThis, "fetch", …)` even under hardened mode — are named in
+`docs/threat-model.md` § Global egress surfaces. Quote those, not the old paragraph.
+
+**Nothing published yet, but the release path exists.** `docs/releasing.md` is the runbook and
+`.github/workflows/release.yml` is the workflow (whose *filename* is part of npm trusted
+publishing's trust configuration — do not rename it). Two guards enforce the one rule that
+matters: `scripts/assert-pnpm-pack.mjs` (`prepack`) refuses an `npm pack`, because only pnpm
+rewrites `workspace:*` into a real version (#116). `scripts/check-release-versions.mjs` is the
+pre-publish guard that keeps the four packages in **version lockstep** and matching the tag
+(#115) — so a version bump is all four manifests or none. All four are `0.0.0` today; read
+version numbers from `package.json`, never hardcode one.
 
 ## 3. Architecture orientation
 
@@ -98,10 +118,14 @@ Where each concern lives:
 | Real-builtin capture (the ONLY place a mediated builtin is loaded — CJS on purpose, #78) | `packages/core/src/real-builtins.cts` |
 | Native `.node` load gate (`process.dlopen`) | `packages/core/src/loader/native.ts` |
 | Core-API capability shims | `packages/core/src/shims/{fs,net,child_process,worker_threads,env,vm}.ts` (`net.ts` registers all six egress modules) |
-| Loader-hook registration gate (`node:module`) | `packages/core/src/shims/module.ts` |
-| Shared shim plumbing / opt-in hardened mode | `packages/core/src/shims/{runtime,harden}.ts` |
+| Global egress guard — `globalThis.fetch`/`WebSocket`/`EventSource` (#80) | `packages/core/src/shims/global-egress.ts` |
+| Loader-hook registration gate (`node:module`) **and** the `Module.prototype._compile` / `compile` gate (#93) | `packages/core/src/shims/module.ts` |
+| **Process-global patch lifecycle** — the ONLY file in `core/src` allowed to write a process global; every new patch site goes through it (#107, enforced by `test/process-patch-sites.test.ts`) | `packages/core/src/lifecycle/process-patch.ts` |
+| **The live install-context box** — what every guard reads, so a policy swap is live in both directions (#62/#87); also the `hardened` ratchet (#129) | `packages/core/src/loader/live-context.ts` |
+| Shared shim plumbing / opt-in hardened mode / option pinning | `packages/core/src/shims/{runtime,harden,pin,url-snapshot}.ts` |
 | Stack-walk → owning package | `packages/core/src/attribution/index.ts` |
-| Policy load / mode resolution / evaluate | `packages/core/src/policy/{load,mode,evaluate}.ts` |
+| Linked/workspace dependency identity — a link's source is its principal (#127) | `packages/core/src/attribution/link-map.ts`, `packages/core/src/loader/linked-packages.ts` |
+| Policy load / mode resolution / evaluate / IPC paths | `packages/core/src/policy/{load,mode,evaluate,glob,ipc}.ts` |
 | Policy schema + shared TS types (imported directly, never restated in core) | `packages/policy-schema` |
 | CLI (`observe`/`enforce`/`run`/`diff`/`gen-policy`/`explain`) | `packages/cli/src/commands/*` |
 | SBOM → policy (stretch) | `packages/sbom-import` |
