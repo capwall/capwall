@@ -1,0 +1,323 @@
+/**
+ * The MODULE-LOAD READ GATE — issue #123.
+ *
+ * ═════════════════════════════════════════════════════════════════════════════════════════════
+ * WHAT WAS WRONG
+ * ═════════════════════════════════════════════════════════════════════════════════════════════
+ * `fs.read` is capwall's flagship capability, and the module system was a second, completely
+ * un-gated route to the same bytes. Under a deny-all `enforce` policy with zero grants — no
+ * `eval`, no `vm`, no `compile`, no write — a dependency read any file on disk with **no decision
+ * recorded at all**:
+ *
+ *     require("/home/u/.docker/config.json")          // Module._extensions['.json'] + JSON.parse
+ *     import("/home/u/.docker/config.json", { with: { type: "json" } })
+ *
+ * `Module._load`'s patch only routed MEDIATED BUILTIN SPECIFIERS to shims; a path specifier fell
+ * straight through to the real loader, and the ESM side went through Node's JSON translator
+ * rather than capwall's `fs` shim. For `.js` that buys execution of code already on disk; for
+ * `.json` it hands the file's contents back as a value, which is a direct exfiltration primitive
+ * — and the highest-value files on a developer or CI machine are JSON (`~/.docker/config.json`,
+ * `~/.config/gcloud/application_default_credentials.json`, `~/.aws/sso/cache/*.json`, service
+ * account keys). Worse than the read itself: `observe` cannot record what it never sees, so a
+ * generated policy confidently under-reported the package's real filesystem reach.
+ *
+ * ═════════════════════════════════════════════════════════════════════════════════════════════
+ * THE GATE, AND WHY IT IS THIS ONE
+ * ═════════════════════════════════════════════════════════════════════════════════════════════
+ * The load-bearing question is not "should a module load be a capability" — it is **which module
+ * loads are a FILE READ rather than a MODULE LOAD.** Loading a dependency's own files is the
+ * single most common thing any program does; gating every `require` as `fs.read` would make every
+ * policy grant every package its own directory, which is unusable and would train operators to
+ * write wide `fs.read` globs — a net loss for a capability firewall.
+ *
+ * So the discriminator is the RESOLVED PATH'S RELATIONSHIP TO THE DEPENDENCY GRAPH:
+ *
+ *   **A module load is free when the resolved file belongs to an installed package (any
+ *   `node_modules/<pkg>` tree), or when the loader is the application. Otherwise — a dependency
+ *   naming a file that belongs to no package — it is an `fs.read` decision on the resolved path.**
+ *
+ * Each half, and what it costs:
+ *
+ *  - **Belongs to an installed package ⇒ free.** Every file a package owns, and every file any
+ *    other installed package owns, is by construction inside somebody's `node_modules` tree — or
+ *    is reached through a symlink in one, which #127's link map recovers. That makes it a cheap,
+ *    exact test for "this is the dependency graph", requiring no policy grant and therefore
+ *    changing no existing policy and nothing `observe` generates for an ordinary app. See
+ *    {@link isDependencyGraphFile} for why it takes two forms rather than one. It is deliberately
+ *    not narrowed to "the caller's OWN package": `require("mime-db")` resolves to
+ *    `node_modules/mime-db/db.json`, a cross-package `.json` load through Node's package
+ *    resolution, and that is the ordinary dependency graph, not a file read. See RESIDUALS below
+ *    for what this concedes.
+ *  - **`<app>` ⇒ free.** The application is the trust root. Every other gate in capwall treats it
+ *    the same way (`shims/module.ts`'s `_compile` and loader-hook gates, `shims/env.ts`). Since
+ *    #60 that is a POSITIVE identification — a real application source file on the stack — so a
+ *    load capwall cannot attribute is `<unknown>` and falls through to the policy rather than
+ *    being waved past.
+ *
+ * WHAT IS LEFT IS PRECISELY THE INTERESTING CASE: a dependency naming `/home/u/.aws/…`,
+ * `<project>/package-lock.json`, `<project>/src/config.json`, `/tmp/x`. Those take an `fs.read`
+ * decision on the resolved file, against the same `fs.read` globs the shim uses — the right
+ * vocabulary, because it is literally the same question ("may this package read this file?") and
+ * because `observe` already knows how to turn the resulting trace entries into grants.
+ *
+ * THE COMPATIBILITY CASE THIS DOES CHANGE, stated plainly: a test runner, bundler or framework
+ * that loads the APPLICATION'S OWN files (`mocha` requiring `test/*.spec.js`, a config loader
+ * requiring `<project>/app.config.js`) now needs an `fs.read` grant covering them. That is a true
+ * statement about what those tools do, `capwall observe` emits the grant automatically from the
+ * trace, and the observe→enforce round trip therefore still needs no hand editing.
+ *
+ * ═════════════════════════════════════════════════════════════════════════════════════════════
+ * WHY `fs.read` AND NOT A NEW CAPABILITY
+ * ═════════════════════════════════════════════════════════════════════════════════════════════
+ * `native` (#49) and `compile` (#93) are BOOLEAN grants because their subject cannot usefully be
+ * narrowed to a file list: a `.node` path is a platform/arch/ABI build artifact, and a `_compile`
+ * filename is a per-run label. A module read has neither problem — it names a real file, the
+ * policy already has a glob vocabulary for exactly that, and a package that may `require`
+ * `<project>/config.json` and a package that may `readFileSync` it are making the same request.
+ * A third grant kind would have been a second spelling of `fs.read` that `capwall diff` and
+ * `explain` would then have to keep in step.
+ *
+ * `.node` IS CARVED OUT, and it is the one carve-out: an addon load is already gated as `native`
+ * at `process.dlopen` (loader/native.ts), which is strictly stronger than this gate — it charges
+ * BOTH the caller and the file's owner, and an addon outside the project resolves to `<unknown>`
+ * for the owner subject, so it is denied unless the policy names `<unknown>`. Adding an `fs.read`
+ * decision on top would charge one load twice, emit a second grant from `observe`, and change no
+ * outcome. `.node` files therefore skip this gate and keep #49's.
+ *
+ * ═════════════════════════════════════════════════════════════════════════════════════════════
+ * RESIDUALS, not papered over (see docs/threat-model.md § The module system as a read channel)
+ * ═════════════════════════════════════════════════════════════════════════════════════════════
+ *  - A dependency can still `require`/`import` any file inside ANY `node_modules` tree — a
+ *    sibling package's `package.json`, its shipped fixtures. That is the price of the graph
+ *    exemption. It is bounded: those files are published artifacts of packages the project chose
+ *    to install, not the machine's secrets, and the dependency could already `require` the
+ *    package and run its code.
+ *  - The gate is on the LOAD, not on the cache. A module some other principal already loaded is
+ *    served from `Module._cache` / the ESM registry without reaching a loader hook, so the
+ *    decision is taken once, for whoever loaded it first.
+ *  - Reaching past the loader entirely — a direct `Module._extensions[".json"](m, file)` call, or
+ *    `process.binding` — is the same class of escape as un-patching any shim, which capwall does
+ *    not claim to stop.
+ */
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  APP_ROOT,
+  UNATTRIBUTED,
+  attributeCallerDetailed,
+  packageForPath,
+} from "../attribution/index.js";
+import { evaluate, type Decision } from "../policy/evaluate.js";
+import { attributionOptionsFor, guardAttributed, type ShimContext } from "../shims/runtime.js";
+import type { Mode, Policy } from "@capwall/policy-schema";
+
+/**
+ * Root of the capwall core package tree, computed exactly as `attribution/index.ts` computes its
+ * own. Files under it are capwall's own machinery — the ESM runtime bridge a synthetic module
+ * imports, `real-builtins.cjs` — and must never be charged to whoever happened to trigger the
+ * load. In a real install capwall lives under `node_modules/@capwall/core` and the graph
+ * exemption already covers it; this is for the checkout-relative layouts (this repo's own tests,
+ * a linked working copy) where it does not.
+ */
+const CAPWALL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+/**
+ * Extensions this gate deliberately does not take a decision for, because another capability
+ * already covers the same load — see the `.node` carve-out in the header.
+ */
+const GATED_BY_ANOTHER_CAPABILITY: ReadonlySet<string> = new Set([".node"]);
+
+/** The `/`-separated absolute shape `policy/glob.ts` matches against (same as `shims/fs.ts`). */
+function toPolicyPath(nativePath: string): string {
+  return nativePath.split(path.sep).join("/");
+}
+
+/**
+ * Is `resolvedPath` LITERALLY inside a `node_modules/<name>/` directory?
+ *
+ * One half of {@link isDependencyGraphFile} — see there for why the question is asked twice.
+ * The scan uses the LAST `node_modules/` segment (the deepest containing package) and requires at
+ * least one segment BELOW the package directory, so a loose `node_modules/x.json` is not mistaken
+ * for a package's file.
+ *
+ * The package-name shape (`name`, or `@scope/name`) is duplicated from `attribution/index.ts`
+ * rather than imported, because that module's copy is one step inside a root-relative derivation
+ * this function deliberately does not perform.
+ */
+function isUnderNodeModules(resolvedPath: string): boolean {
+  const normalized = resolvedPath.includes("\\")
+    ? resolvedPath.split("\\").join("/")
+    : resolvedPath;
+  const marker = "/node_modules/";
+  const at = normalized.lastIndexOf(marker);
+  if (at === -1) return false;
+  const segments = normalized.slice(at + marker.length).split("/");
+  const first = segments[0];
+  if (first === undefined || first === "") return false;
+  // `@scope/name/…` needs three segments; `name/…` needs two. Either way the file has to be
+  // BELOW the package directory, not the package directory (or a stray file) itself.
+  if (first.startsWith("@")) {
+    const second = segments[1];
+    return second !== undefined && second !== "" && segments.length > 2;
+  }
+  return segments.length > 1;
+}
+
+/**
+ * Does `resolvedPath` belong to an installed package — is loading it dependency-graph traversal
+ * rather than a file read?
+ *
+ * ASKED TWO WAYS, AND THE UNION IS THE ANSWER. Neither test alone is right, and both errors were
+ * found by the existing suite rather than reasoned about in advance:
+ *
+ *  - `packageForPath` alone MISSES nothing but ADDS a dependency on the declared project root
+ *    that this question does not have. It strips `projectRoot` before scanning (so a project that
+ *    itself lives inside a `node_modules` is not charged to its container — a deliberate feature
+ *    for ATTRIBUTION), and since #127 it reports `<unknown>` for anything outside the root. Under
+ *    a root pointed at the tree's own `node_modules` — which `test/install-option-parity.test.ts`
+ *    exercises for real — an ordinary `require("some-dep")` therefore looked like a read of a file
+ *    belonging to no package, and was denied.
+ *  - The literal path test alone misses SYMLINKED installs. `npm i file:`, `npm link` and every
+ *    workspace layout put a symlink in `node_modules`, Node resolves module paths through
+ *    `realpath`, and the resolved filename then has no `node_modules` segment at all
+ *    (`repo/packages/util/index.js`). That is exactly #127's finding, and its link map is what
+ *    recovers the position — which lives inside `packageForPath`.
+ *
+ * So: literally under a `node_modules/<pkg>/`, OR resolving to a package chain once #127's link
+ * map has undone the realpath. Both directions only WIDEN the exemption, and neither widens it
+ * past "a file inside some installed package", which is the property the graph exemption is about.
+ */
+function isDependencyGraphFile(resolvedPath: string, projectRoot: string | undefined): boolean {
+  if (isUnderNodeModules(resolvedPath)) return true;
+  const owner = packageForPath(resolvedPath, projectRoot);
+  return owner !== APP_ROOT && owner !== UNATTRIBUTED;
+}
+
+/**
+ * Does loading `resolvedPath` need an `fs.read` decision at all, on the FILE's side of the
+ * question? (The loader's side — is this the application? — is answered separately, because it
+ * costs a stack walk on the CJS path and a URL parse on the ESM one.)
+ *
+ * Ordered cheapest-first: the overwhelmingly common answer is "no, it is under `node_modules`",
+ * and this runs once per module the process loads.
+ */
+export function moduleLoadNeedsDecision(
+  resolvedPath: string,
+  projectRoot: string | undefined,
+): boolean {
+  // A bare builtin name (`Module._resolveFilename("path")` returns `"path"`), or anything else
+  // that is not a filesystem location. Nothing to read.
+  if (!path.isAbsolute(resolvedPath)) return false;
+  if (GATED_BY_ANOTHER_CAPABILITY.has(path.extname(resolvedPath).toLowerCase())) return false;
+  if (resolvedPath === CAPWALL_ROOT || resolvedPath.startsWith(CAPWALL_ROOT + path.sep)) {
+    return false;
+  }
+  return !isDependencyGraphFile(resolvedPath, projectRoot);
+}
+
+/** The capability request a module read raises. Identical in shape to a `readFileSync`. */
+function moduleReadRequest(resolvedPath: string): {
+  kind: "fs";
+  access: "read";
+  path: string;
+} {
+  return { kind: "fs", access: "read", path: toPolicyPath(resolvedPath) };
+}
+
+/**
+ * CJS half: decide whether the calling package may load `resolvedPath`. Returns normally when
+ * the load may proceed; throws {@link CapabilityError} on an enforce-mode denial.
+ *
+ * The subject is the ATTRIBUTED CALLER — capwall's ordinary stack walk — and deliberately not the
+ * `parent` module the loader hands us. `parent.filename` is caller-controlled: `createRequire()`
+ * builds a module record whose filename is whatever string it was given, so
+ * `createRequire("/proj/node_modules/granted/index.js")("./x.json")` would present itself as
+ * `granted` and inherit its grants. The stack walk cannot be spoofed that way (and where it CAN
+ * be defeated — an `eval` frame, a `data:` module — it answers `<unknown>`, which holds nothing).
+ *
+ * The walk only runs for loads that survived {@link moduleLoadNeedsDecision}, so in a normal
+ * process it runs for the application's own requires and nothing else.
+ */
+export function guardCjsModuleRead(ctx: ShimContext, resolvedPath: string): void {
+  if (!moduleLoadNeedsDecision(resolvedPath, ctx.projectRoot)) return;
+  const attribution = attributeCallerDetailed(attributionOptionsFor(ctx));
+  if (attribution.pkg === APP_ROOT) return; // the trust root, as everywhere else
+  guardAttributed(ctx, attribution, moduleReadRequest(resolvedPath));
+}
+
+/**
+ * The policy snapshot the ESM loader hook evaluates against — see `loader/esm-hooks.ts` for why
+ * the decision has to be taken on that thread rather than on the main one.
+ *
+ * Every field is structured-cloneable: `Policy` is the parsed `capabilities.json` document, i.e.
+ * plain data, so the snapshot crosses the thread boundary without any custom serialization.
+ */
+export interface EsmGateSnapshot {
+  /** False while no install is active; the gate is then inert. See {@link decideEsmModuleRead}. */
+  installed: boolean;
+  policy: Policy;
+  mode: Mode;
+  projectRoot: string | undefined;
+}
+
+/** What the ESM hook must do about one resolution, or `null` when there is nothing to decide. */
+export interface EsmGateOutcome {
+  pkg: string;
+  decision: Decision;
+}
+
+/**
+ * ESM half: decide whether the module at `importerUrl` may load `resolvedUrl`.
+ *
+ * WHY THE IMPORTER'S URL IS THE SUBJECT HERE, when the CJS half insists on a stack walk. The
+ * loader thread has no JavaScript stack belonging to the importing package — there is nothing to
+ * walk. What it does have is `context.parentURL`, which the HOST sets from the module record that
+ * actually contains the `import`, and which no in-process code can choose the way it can choose a
+ * `createRequire` filename. The two spellings a dependency CAN reach — a `data:` URL module and a
+ * synthetic/`vm` module — are not `file:` URLs, and this function charges those to `<unknown>`
+ * rather than inferring the trust root from them, which is #60's rule applied on this path.
+ *
+ * `installed: false` makes this inert, and that is deliberate rather than an oversight. Node
+ * cannot fully unregister a module-customization hook, so this code outlives `uninstall()`; the
+ * fail-closed `TORN_DOWN_POLICY` that a captured shim correctly falls back to would here mean
+ * "capwall was uninstalled, so the host process may no longer import its own files". Restoring
+ * the un-mediated behaviour is the only honest answer for a hook that cannot be removed, and it
+ * matches the CJS side, where `uninstall()` genuinely does restore `Module._load`.
+ */
+export function decideEsmModuleRead(
+  snapshot: EsmGateSnapshot,
+  importerUrl: string | undefined,
+  resolvedUrl: string,
+): EsmGateOutcome | null {
+  if (!snapshot.installed) return null;
+  // A `node:`/`data:`/`https:`/`capwall-esm:` target reads no file. (Network imports are a
+  // separate, currently un-mediated surface — see docs/threat-model.md.)
+  if (!resolvedUrl.startsWith("file:")) return null;
+  let resolvedPath: string;
+  try {
+    resolvedPath = fileURLToPath(resolvedUrl.split("?")[0] ?? resolvedUrl);
+  } catch {
+    return null; // not a convertible file: URL — Node will fail on it too
+  }
+  if (!moduleLoadNeedsDecision(resolvedPath, snapshot.projectRoot)) return null;
+
+  // No importer at all: Node loading the process entry point. There is nobody to charge, and the
+  // entry IS the application — the ESM counterpart of `isMain` on the CJS side.
+  if (importerUrl === undefined) return null;
+  let pkg: string;
+  if (importerUrl.startsWith("file:")) {
+    try {
+      pkg = packageForPath(fileURLToPath(importerUrl.split("?")[0] ?? importerUrl), snapshot.projectRoot);
+    } catch {
+      pkg = UNATTRIBUTED;
+    }
+  } else {
+    // A `data:` module, a `capwall-esm:` synthetic module, anything without a filesystem
+    // identity. Never the trust root — that inference is exactly what #60 closed.
+    pkg = UNATTRIBUTED;
+  }
+  if (pkg === APP_ROOT) return null;
+
+  const decision = evaluate(snapshot.policy, snapshot.mode, pkg, moduleReadRequest(resolvedPath));
+  return { pkg, decision };
+}

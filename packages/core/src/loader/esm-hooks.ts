@@ -1,16 +1,26 @@
 /**
  * ESM module customization hooks (roadmap M5) — the LOADER-THREAD half of ESM interception.
  *
- * Registered via `module.register()` from `esm-hook.ts`. Runs on Node's separate loader
- * thread, so it holds NO policy/attribution state — it only rewrites mediated builtin
- * specifiers to a synthetic `capwall-esm:` URL and, for that URL, returns generated module
- * source that re-exports capwall's shim members from the main-thread bridge (`esm-runtime.ts`).
+ * Registered via `module.register()` from `esm-hook.ts`. Runs on Node's separate loader thread.
  *
- * The synthetic source is evaluated on the MAIN thread, where the re-exported shim functions
- * attribute the caller and evaluate policy exactly as the CJS shims do. This covers BOTH
- * `import()` (dynamic) and static `import { x } from 'node:fs'` — the load hook intercepts the
- * module graph before evaluation, so the static binding is to our shim from the start (there
- * is no "immutable binding" problem because we never swap after the fact).
+ * TWO JOBS, and they take opposite approaches to that thread for reasons worth reading before
+ * changing either:
+ *
+ *  1. BUILTIN MEDIATION (M5). No policy state is needed here at all: the hook rewrites mediated
+ *     builtin specifiers to a synthetic `capwall-esm:` URL and, for that URL, returns generated
+ *     module source that re-exports capwall's shim members from the main-thread bridge
+ *     (`esm-runtime.ts`). The synthetic source is evaluated on the MAIN thread, where the
+ *     re-exported shim functions attribute the caller and evaluate policy exactly as the CJS
+ *     shims do — so the decision never happens on this thread.
+ *  2. THE MODULE-READ GATE (#123). This one cannot be deferred to the main thread: the decision
+ *     has to be taken at RESOLUTION time, which is here, and a round trip back to main deadlocks
+ *     (main blocks on hook results during synchronous module loads). So this thread holds a
+ *     policy SNAPSHOT, refreshed synchronously from a `MessagePort` on every invocation. See the
+ *     block comment above {@link refreshSnapshot}.
+ *
+ * Job 1 covers BOTH `import()` (dynamic) and static `import { x } from 'node:fs'` — the load hook
+ * intercepts the module graph before evaluation, so the static binding is to our shim from the
+ * start (there is no "immutable binding" problem because we never swap after the fact).
  *
  * Export names are supplied by the main thread at registration (it can enumerate the real
  * builtins without triggering this hook), so the load hook never imports the real module
@@ -27,6 +37,14 @@
  * whether it is mediated. See `mediatedSpecifierForUrl`.
  */
 
+// `node:worker_threads` is mediated, so it comes out of the CJS capture rather than a static ESM
+// import: this module IS the load hook, and caching a mediated specifier's node: URL in an ESM
+// registry is precisely what left the #78 backstop dead. `test/real-builtins.test.ts`'s source
+// scan enforces the rule across `src`.
+import { realWorkerThreads } from "../real-builtins.cjs";
+import { CapabilityError } from "../errors.js";
+import { decideEsmModuleRead, type EsmGateOutcome, type EsmGateSnapshot } from "./module-read.js";
+
 const PREFIX = "capwall-esm:";
 
 /** `Object.prototype.hasOwnProperty` bound once — never reached through a polluted prototype. */
@@ -37,6 +55,13 @@ interface InitData {
   bridgeUrl: string;
   /** specifier → its ESM named-export identifiers (default handled separately). */
   exports: Record<string, string[]>;
+  /**
+   * Two-way channel to the main thread, for the module-read gate (#123). Main → here carries
+   * policy snapshots; here → main carries decisions to record. See {@link refreshSnapshot}.
+   */
+  gatePort: GatePort;
+  /** The policy in force at registration time; later ones arrive over `gatePort`. */
+  gateSnapshot: EsmGateSnapshot;
 }
 
 let bridgeUrl = "";
@@ -44,9 +69,114 @@ let exportsBySpecifier: Record<string, string[]> = {};
 /** Specifiers already warned about in `load`'s re-mediation path — one line each, not per import. */
 const reMediationWarned = new Set<string>();
 
+/*
+ * ═════════════════════════════════════════════════════════════════════════════════════════════
+ * THE MODULE-READ GATE ON THIS THREAD (issue #123)
+ * ═════════════════════════════════════════════════════════════════════════════════════════════
+ * `import("/home/u/.aws/x.json", { with: { type: "json" } })` returns a file's contents as a
+ * value, through Node's JSON translator, without ever touching capwall's `fs` shim. Closing that
+ * needs a policy decision at resolution time — and resolution happens HERE, on a thread that by
+ * design holds no capwall state.
+ *
+ * WHY THE DECISION IS TAKEN ON THIS THREAD RATHER THAN DELEGATED TO THE MAIN ONE. It cannot be
+ * delegated. The loader hooks are asynchronous, but the main thread BLOCKS on their result for
+ * synchronous module resolution (`require(esm)`, the initial graph), so any round trip from here
+ * back to main deadlocks the process the moment it happens during a blocking load. Handing the
+ * hook a policy COPY and evaluating locally is the only shape that cannot deadlock.
+ *
+ * WHAT THAT COSTS, AND WHY IT IS NOT A SECOND IMPLEMENTATION. The copy is evaluated by the SAME
+ * `evaluate()` / `packageForPath()` / `matchesGlob()` functions the main thread uses — imported,
+ * not reimplemented — so there is one decision procedure, not two that can drift. What is
+ * genuinely duplicated is the policy DATA, and the risk that carries is staleness, which
+ * {@link refreshSnapshot} closes: `receiveMessageOnPort` drains the port SYNCHRONOUSLY, with no
+ * event-loop turn, at the top of every hook invocation. `install()` posts the new snapshot
+ * synchronously before it returns, so by the time any subsequent import reaches this thread the
+ * message is already queued and the very next drain sees it. There is no window in which an
+ * import is evaluated against a policy the main thread has already replaced.
+ *
+ * DECISIONS TRAVEL THE OTHER WAY over the same port, fire-and-forget. They are RECORDING, not
+ * enforcement — enforcement is the throw below, which happens here and now — so the main thread
+ * delivering them on its next event-loop turn is fine, and waiting for an acknowledgement would
+ * reintroduce exactly the deadlock this design avoids.
+ */
+
+/**
+ * The `MessagePort` type, DERIVED from the captured `node:worker_threads` rather than imported
+ * from it. A `import("node:worker_threads").MessagePort` annotation would be erased at build
+ * time and is harmless at runtime, but `test/real-builtins.test.ts`'s source scan cannot tell an
+ * erased type reference in that form from a live one — and the rule it enforces (#78: nothing in
+ * `src` names a mediated builtin except `real-builtins.cts`) is worth more than the convenience.
+ */
+type GatePort = Parameters<typeof realWorkerThreads.receiveMessageOnPort>[0];
+
+/** The channel to the main thread; `null` until {@link initialize}, and on a Node without it. */
+let gatePort: GatePort | null = null;
+
+/**
+ * The policy the gate evaluates against. Starts INERT (`installed: false`) so a hook that somehow
+ * runs before `initialize` gates nothing rather than denying everything — the host process's own
+ * imports must not become collateral damage of capwall's bootstrap.
+ */
+let gateSnapshot: EsmGateSnapshot = {
+  installed: false,
+  policy: { version: 1, mode: "enforce", default: {}, packages: {} },
+  mode: "enforce",
+  projectRoot: undefined,
+};
+
 export async function initialize(data: InitData): Promise<void> {
   bridgeUrl = data.bridgeUrl;
   exportsBySpecifier = data.exports;
+  gatePort = data.gatePort ?? null;
+  if (data.gateSnapshot) gateSnapshot = data.gateSnapshot;
+}
+
+/**
+ * Adopt the newest policy snapshot the main thread has posted, synchronously.
+ *
+ * `receiveMessageOnPort` pops from the port's queue WITHOUT an event-loop turn, which is what
+ * makes this race-free: a `postMessage` from `install()` is queued the instant it is called, so
+ * the next hook invocation sees it even though the port's `"message"` event has not fired. The
+ * loop drains to the END of the queue rather than taking one message, so a burst of
+ * install/uninstall transitions leaves the LAST one in force, not the oldest unread one.
+ */
+function refreshSnapshot(): void {
+  if (gatePort === null) return;
+  let message = realWorkerThreads.receiveMessageOnPort(gatePort);
+  while (message !== undefined) {
+    gateSnapshot = message.message as EsmGateSnapshot;
+    message = realWorkerThreads.receiveMessageOnPort(gatePort);
+  }
+}
+
+/** Report a decision to the main thread's `onDecision` sink. Never throws, never waits. */
+function reportDecision(outcome: EsmGateOutcome): void {
+  if (gatePort === null) return;
+  try {
+    // This is a `worker_threads` MessagePort, not `window.postMessage` — there is no target
+    // origin to pass, and adding one would be a TypeError.
+    // eslint-disable-next-line unicorn/require-post-message-target-origin
+    gatePort.postMessage(outcome);
+  } catch {
+    // A closed port (teardown raced with an in-flight import). The enforcement half below has
+    // already happened; losing the trace line is the lesser failure and must not break the load.
+  }
+}
+
+/**
+ * Take the module-read decision for one resolution, throwing on an enforce-mode denial.
+ *
+ * Throwing from `resolve` — rather than from `load` — is deliberate: it is the earliest point at
+ * which the target is known, and it happens BEFORE `defaultLoad` opens the file, so a denied
+ * import never reads the bytes at all. Node surfaces the throw to the importer as a failed
+ * import, which is what a caller already has to handle for a missing module.
+ */
+function gateModuleRead(parentURL: string | undefined, url: string): void {
+  refreshSnapshot();
+  const outcome = decideEsmModuleRead(gateSnapshot, parentURL, url);
+  if (outcome === null) return;
+  reportDecision(outcome);
+  if (!outcome.decision.allowed) throw new CapabilityError(outcome.decision.reason, outcome.pkg);
 }
 
 interface ResolveContext {
@@ -99,6 +229,10 @@ export async function resolve(
   const result = await nextResolve(specifier, context);
   const mediated = mediatedSpecifierForUrl(result.url);
   if (mediated !== null) return { url: PREFIX + mediated, shortCircuit: true };
+  // Not a builtin, so it is a file (or a `data:`/`https:` target the gate ignores). This is the
+  // ESM half of #123 — see `gateModuleRead`. It runs AFTER `nextResolve` because the decision is
+  // about the resolved target, never about the specifier text.
+  gateModuleRead(context.parentURL, result.url);
   return result;
 }
 
