@@ -70,8 +70,8 @@ const GUARDED_EGRESS_GLOBALS: readonly string[] = ["fetch", "WebSocket", "EventS
  *    Node 26 process started with that flag, a dependency could read and write that one file
  *    without an `fs` grant. It is narrow (opt-in flag, one path, no path control) and it is a
  *    FILESYSTEM question, not an egress one, so it does not belong in either list here — see
- *    docs/threat-model.md § Web Storage for the writeup. `sessionStorage` is in-memory and has
- *    no such angle.
+ *    docs/threat-model.md § Web Storage for the writeup and #156 for the tracking issue.
+ *    `sessionStorage` is in-memory and has no such angle.
  */
 const REVIEWED_INERT_GLOBALS: readonly string[] = [
   "AbortController", "AbortSignal", "AggregateError", "Array", "ArrayBuffer",
@@ -80,27 +80,25 @@ const REVIEWED_INERT_GLOBALS: readonly string[] = [
   "CompressionStream", "CountQueuingStrategy", "Crypto", "CryptoKey", "CustomEvent",
   "DOMException", "DataView", "Date", "DecompressionStream", "DisposableStack", "Error",
   "ErrorEvent", "EvalError", "Event", "EventTarget", "File", "FinalizationRegistry",
-  "Float16Array", "Float32Array", "Float64Array", "FormData", "Function", "Headers",
-  "Infinity", "Int16Array", "Int32Array", "Int8Array", "Intl", "Iterator", "JSON", "Map",
-  "Math", "MessageChannel", "MessageEvent", "MessagePort", "NaN", "Navigator", "Number",
-  "Object", "Performance", "PerformanceEntry", "PerformanceMark", "PerformanceMeasure",
-  "PerformanceObserver",
-  "PerformanceObserverEntryList", "PerformanceResourceTiming", "Promise", "Proxy",
-  "QuotaExceededError", "RangeError", "ReadableByteStreamController", "ReadableStream",
-  "ReadableStreamBYOBReader", "ReadableStreamBYOBRequest",
-  "ReadableStreamDefaultController", "ReadableStreamDefaultReader",
-  "ReferenceError", "Reflect", "RegExp", "Request", "Response", "Set", "SharedArrayBuffer",
-  "Storage", "String", "SubtleCrypto", "SuppressedError", "Symbol", "SyntaxError", "Temporal",
-  "TextDecoder", "TextDecoderStream", "TextEncoder", "TextEncoderStream", "TransformStream",
-  "TransformStreamDefaultController", "TypeError", "URIError", "URL", "URLPattern",
-  "URLSearchParams", "Uint16Array", "Uint32Array", "Uint8Array", "Uint8ClampedArray", "WeakMap",
-  "WeakRef", "WeakSet", "WebAssembly", "WritableStream", "WritableStreamDefaultController",
-  "WritableStreamDefaultWriter", "atob", "btoa", "clearImmediate", "clearInterval",
-  "clearTimeout", "console", "crypto", "decodeURI", "decodeURIComponent", "encodeURI",
-  "encodeURIComponent", "escape", "eval", "global", "globalThis", "isFinite", "isNaN",
-  "localStorage", "navigator", "parseFloat", "parseInt", "performance", "process",
-  "queueMicrotask", "sessionStorage", "setImmediate", "setInterval", "setTimeout",
-  "structuredClone", "undefined", "unescape",
+  "Float16Array", "Float32Array", "Float64Array", "FormData", "Function", "Headers", "Infinity",
+  "Int16Array", "Int32Array", "Int8Array", "Intl", "Iterator", "JSON", "Map", "Math",
+  "MessageChannel", "MessageEvent", "MessagePort", "NaN", "Navigator", "Number", "Object",
+  "Performance", "PerformanceEntry", "PerformanceMark", "PerformanceMeasure",
+  "PerformanceObserver", "PerformanceObserverEntryList", "PerformanceResourceTiming", "Promise",
+  "Proxy", "QuotaExceededError", "RangeError", "ReadableByteStreamController", "ReadableStream",
+  "ReadableStreamBYOBReader", "ReadableStreamBYOBRequest", "ReadableStreamDefaultController",
+  "ReadableStreamDefaultReader", "ReferenceError", "Reflect", "RegExp", "Request", "Response",
+  "Set", "SharedArrayBuffer", "Storage", "String", "SubtleCrypto", "SuppressedError", "Symbol",
+  "SyntaxError", "Temporal", "TextDecoder", "TextDecoderStream", "TextEncoder",
+  "TextEncoderStream", "TransformStream", "TransformStreamDefaultController", "TypeError",
+  "URIError", "URL", "URLPattern", "URLSearchParams", "Uint16Array", "Uint32Array", "Uint8Array",
+  "Uint8ClampedArray", "WeakMap", "WeakRef", "WeakSet", "WebAssembly", "WritableStream",
+  "WritableStreamDefaultController", "WritableStreamDefaultWriter", "atob", "btoa",
+  "clearImmediate", "clearInterval", "clearTimeout", "console", "crypto", "decodeURI",
+  "decodeURIComponent", "encodeURI", "encodeURIComponent", "escape", "eval", "global",
+  "globalThis", "isFinite", "isNaN", "localStorage", "navigator", "parseFloat", "parseInt",
+  "performance", "process", "queueMicrotask", "sessionStorage", "setImmediate", "setInterval",
+  "setTimeout", "structuredClone", "undefined", "unescape",
 ];
 
 /**

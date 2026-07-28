@@ -1654,8 +1654,8 @@ grant from `observe` and change no outcome, so `.node` skips this gate and keeps
 
 ## Web Storage (`localStorage`) — a file read/write below the `fs` shim, Node ≥26
 
-**Status: known, un-mediated, flag-gated. Narrow enough not to be alarming, real enough to write
-down rather than leave implied.**
+**Status: known, un-mediated, flag-gated — tracked as #156. Narrow enough not to be alarming,
+real enough to write down rather than leave implied.**
 
 Node 26 added Web Storage — `Storage`, `localStorage`, `sessionStorage` — to the globals. They
 were found by the global-egress inventory canary (`test/global-egress-inventory.test.ts`) when 26
@@ -1683,7 +1683,8 @@ arbitrary files.
 
 **What would change that.** Node making `localStorage` available without a flag, or allowing the
 path to be selected at runtime. Either would move this into the same class as #123 and it should
-be gated as an `fs` read/write on the backing file at that point.
+be gated as an `fs` read/write on the backing file at that point. #156 carries the reproduction
+and the design notes for whoever picks that up.
 
 ## Native `.node` addons
 

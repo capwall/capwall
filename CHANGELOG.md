@@ -40,7 +40,7 @@ has to be findable without reading the diff.
   **inert for egress** — none can originate a network request. `localStorage` is separately
   documented as a **known, un-mediated, flag-gated file channel**: with `--localstorage-file`,
   Node's internal read/write of that one file happens below the `fs` shim. See
-  `docs/threat-model.md` § Web Storage.
+  `docs/threat-model.md` § Web Storage, tracked as #156.
 
 ### Changed
 
