@@ -2,9 +2,10 @@
  * `node:module` — two gates on the module system.
  *
  *   1. The module-customization-hook registration API (`register`/`registerHooks`, issue #61),
- *      via a `Proxy` over the module object handed to `require("node:module")`.
+ *      via a patch on `Module.register` / `Module.registerHooks` THEMSELVES — see
+ *      {@link installLoaderHookGate} for why the shim's `get` trap could not hold this one.
  *   2. Direct calls to `Module.prototype._compile` (issue #93), via a patch on the PROTOTYPE
- *      itself — see {@link installCompileGate} for why the shim cannot do this one.
+ *      itself — see {@link installCompileGate} for the same reasoning one level down.
  *
  * ---------------------------------------------------------------------------------------------
  * Gate 1 — loader-hook registration (#61).
@@ -40,11 +41,37 @@
  * blocks). The application is the trust root, so its own tooling (`tsx`, `ts-node`, a custom
  * loader) is untouched; the same app-vs-dependency rule the `process.env` guard uses.
  *
- * WHAT THIS DOES NOT DO. It is a gate on *reaching* the API through a mediated module, not a
- * lock on the API itself:
- *  - `process.getBuiltinModule("node:module")` returns the real, un-shimmed module (Node ≥22).
- *    That is the pre-existing, path-independent residual `docs/threat-model.md` already names,
- *    and it defeats this gate exactly as it defeats every other shim.
+ * WHERE THE GATE LIVES, AND WHY IT MOVED (#181). It used to be a wrapper the shim's `get` trap
+ * returned for the two keys `register` and `registerHooks`. That gated the PROPERTY READ, not the
+ * capability, and `node:module` hands out several other own keys that reach the same two
+ * functions — starting with `Module`, Node's legacy self-reference, which the trap passed through
+ * as the raw class. `import { Module, registerHooks } from "node:module"` therefore refused one
+ * identifier and handed back the other in the same statement, and `module.constructor` gave every
+ * CJS module the same class for free with no `require` at all. The gate's whole value was one
+ * un-shimmed own key away.
+ *
+ * So the gate is on the two FUNCTION OBJECTS every route converges on, exactly as #93 put the
+ * `_compile` gate on the prototype every spelling of it converges on. `Module.registerHooks`,
+ * `require("node:module").registerHooks`, `module.constructor.registerHooks`,
+ * `Object.getPrototypeOf(module).constructor.registerHooks`,
+ * `process.getBuiltinModule("node:module").registerHooks` and the ESM named export are all reads
+ * of the same patched property. There is nothing left for a denylist of key names to miss,
+ * because the gate no longer depends on which key the caller used.
+ *
+ * The shim keeps ONE structural rule of its own, and it is a CATEGORY rather than a name: no own
+ * key may hand back an un-shimmed route to the shimmed surface, so any value that IS the module
+ * object is returned as the proxy instead (today that is `Module`; a future Node alias is covered
+ * the day it is added). Everything else — `createRequire`, `builtinModules`, `isBuiltin`,
+ * `_load`, `_resolveFilename`, `_extensions`, `runMain`, `syncBuiltinESMExports`, `SourceMap`, …
+ * — is passed through untouched, because none of them is a second route to a GATED capability:
+ * `_load` and `Module.prototype.load` are patched objects in their own right (loader/require.ts),
+ * so a caller holding the raw class reaches capwall's module-read gate (#177/#189) exactly as one
+ * holding the shim does; `createRequire` is ordinary tooling and capwall's own bootstrap uses it;
+ * `builtinModules` is a list of strings.
+ *
+ * WHAT THIS DOES NOT DO. It is a gate on CALLING the API, not a lock on the function object:
+ *  - A reference captured BEFORE `install()` is the un-patched function, exactly as a captured
+ *    `fs.readFileSync` is. Same residual as un-patching any shim.
  *  - A hook registered BEFORE capwall installs is already ahead of it.
  *  - The gate allows `<app>` because the application is the trust root, so it inherits whatever
  *    `attributeCaller` resolves to. That used to be a fail-open: issue #60 (a `data:` URL ES
@@ -69,7 +96,6 @@ import * as path from "node:path";
 import { realModule } from "../real-builtins.cjs"; // never `import … from "node:module"` — see #78
 import {
   APP_ROOT,
-  attributeCaller,
   attributeCallerDetailedVia,
   packageForPath,
   type StackBoundary,
@@ -88,17 +114,25 @@ type AnyFn = (...args: unknown[]) => unknown;
 /**
  * The registration entry points. `register` (async chain, Node ≥20.6) and `registerHooks`
  * (synchronous chain, Node ≥22.15) are both live routes to the same capability; the sync one
- * is strictly stronger for an attacker, since its chain runs ahead of capwall's. Anything else
- * on `node:module` (`createRequire`, `builtinModules`, `isBuiltin`, `SourceMap`, the `_`
- * internals, …) is passed through untouched — this shim gates hook registration, nothing more.
+ * is strictly stronger for an attacker, since its chain runs ahead of capwall's.
+ *
+ * These are PROPERTY NAMES ON THE REAL `Module` CLASS, not keys the shim inspects. Since #181 the
+ * gate is a patch on the two functions those names hold, so which name a caller reached them
+ * through — a shim read, `module.constructor`, `process.getBuiltinModule` — is not part of the
+ * mechanism any more.
  */
-const GUARDED_APIS = new Set(["register", "registerHooks"]);
+const GUARDED_APIS = ["register", "registerHooks"] as const;
 
 /** Decide and report. Returns normally when the registration may proceed. */
-function guardRegistration(ctx: ShimContext, api: string): void {
+function guardRegistration(ctx: ShimContext, api: string, hideAbove: AnyFn): void {
   // Same frame budget as every other attribution site (#15) — a gate that walked a different
-  // depth could attribute the same call to a different package than `guard` would.
-  const pkg = attributeCaller(attributionOptionsFor(ctx));
+  // depth could attribute the same call to a different package than `guard` would. `hideAbove`
+  // is the patched function, so the caller sits directly below it: the same boundary trick the
+  // `_compile` gate uses (#143), for the same reason — no walk through capwall's own frames.
+  const pkg = attributeCallerDetailedVia(
+    hideAbove as unknown as StackBoundary,
+    attributionOptionsFor(ctx),
+  ).pkg;
   // The application is the trust root — same rule as the env guard, where `<app>` reads pass
   // through. Since #60 this is a POSITIVE identification (a real application source file on the
   // stack), so a registration capwall cannot attribute is `<unknown>` and falls through to the
@@ -138,35 +172,31 @@ function guardRegistration(ctx: ShimContext, api: string): void {
  * identity, callability, prototype chain and own-key enumeration exact — verified that
  * `Object.keys(proxy)` equals `Object.keys(real)` and that it matches `node:module`'s ESM
  * named-export set exactly, which is what the ESM load hook generates re-exports from.
+ *
+ * THE ONE THING THE TRAP CHANGES, and it is a CATEGORY rather than a list of names (#181).
+ * `node:module` exposes itself under its own key — `Module.Module === Module`, Node's legacy
+ * self-reference — so a trap that forwards every value verbatim hands a caller the raw,
+ * un-shimmed module object through the shim. That is not "one more key to deny": it is the
+ * general shape of a shim that mediates a namespace by wrapping selected members, and any own
+ * key a future Node adds pointing back at the module has it too. So the rule is stated over the
+ * VALUE: **a value that is the module object is returned as the proxy.** `Module.Module === m`
+ * still holds for whatever `m` the caller is holding, which is the invariant real Node has.
+ *
+ * It is defense in depth rather than the gate. The capability #61 is about — registering a loader
+ * hook — is gated on the function objects themselves by {@link installLoaderHookGate}, so handing
+ * back the raw class would no longer bypass anything. This keeps the shim from being the thing
+ * that undoes a FUTURE member gate, which is precisely how #181 happened.
  */
-export function createModuleShim(ctx: ShimContext): typeof import("node:module") {
-  // Wrappers are memoised so `m.register === m.register` holds, as it does on the real module
-  // (code that compares or caches the reference must not see a fresh function each read).
-  const wrappers = new Map<string, AnyFn>();
-
-  return new Proxy(realModule, {
+export function createModuleShim(_ctx: ShimContext): typeof import("node:module") {
+  const proxy: object = new Proxy(realModule, {
     get(target, prop) {
       // `Reflect.get(target, prop)` WITHOUT forwarding the proxy as the receiver: any accessor
       // on a Node builtin that touches an internal slot would throw if handed the proxy.
       const value: unknown = Reflect.get(target, prop);
-      if (typeof prop !== "string" || !GUARDED_APIS.has(prop) || typeof value !== "function") {
-        return value;
-      }
-      let wrapper = wrappers.get(prop);
-      if (wrapper === undefined) {
-        const real = value as AnyFn;
-        wrapper = function (this: unknown, ...args: unknown[]): unknown {
-          guardRegistration(ctx, prop);
-          return Reflect.apply(real, this === wrapper ? target : this, args);
-        };
-        // Keep `.name`/`.length` faithful so feature-detection and error messages read right.
-        Object.defineProperty(wrapper, "name", { value: prop, configurable: true });
-        Object.defineProperty(wrapper, "length", { value: real.length, configurable: true });
-        wrappers.set(prop, wrapper);
-      }
-      return wrapper;
+      return value === target ? proxy : value;
     },
-  }) as unknown as typeof import("node:module");
+  });
+  return proxy as unknown as typeof import("node:module");
 }
 
 /** Register the `node:module` shim under both spellings (bare and `node:`-prefixed). */
@@ -174,6 +204,85 @@ export function registerModuleShim(reg: ShimRegistry, ctx: ShimContext): void {
   const shim = createModuleShim(ctx);
   reg.set("module", shim);
   reg.set("node:module", shim);
+}
+
+/** Handle for {@link installLoaderHookGate}; mirrors the other install-time guards. */
+export interface LoaderHookGateHandle {
+  uninstall(): void;
+}
+
+/**
+ * `Module.register` / `Module.registerHooks`, patched — issue #61's gate at the object every
+ * route to it converges on (issue #181).
+ *
+ * WHY NOT THE SHIM'S `get` TRAP, which is where this lived until #181. The trap fires for reads on
+ * the module object capwall hands out, and the module object is not the only way to the two
+ * functions. It is not even the shortest one: `node:module`'s CJS export IS the `Module` class, so
+ * every CJS module in the process already holds it as `module.constructor`, with no `require` and
+ * no import; the module object hands it back a second time under its own `Module` key; and
+ * `process.getBuiltinModule("node:module")` (Node ≥22) returns the un-shimmed module outright. All
+ * three read `registerHooks` off the same class. Gating the READ therefore gated one spelling of
+ * four, and #181's PoC used the one that sits in the SAME import statement as the gated one.
+ *
+ * This is #93's argument applied one level up, and #93's own words are the test: "there is one
+ * object both routes converge on". For `_compile` that object is `Module.prototype`; for the
+ * registration APIs it is the `Module` class's own `register`/`registerHooks` properties. A patch
+ * there survives `getBuiltinModule`, survives `module.constructor`, survives any own key of
+ * `node:module` that hands back the class, and — because the shim reads through to the real
+ * property — is what the ESM named export and `require("node:module").registerHooks` get too.
+ * One gate, not a denylist that has to keep pace with Node's own aliases.
+ *
+ * SINGLE PATCH PER PROCESS, REFERENCE-COUNTED (`definePropertyPatch`), for the reason
+ * `Module.prototype.load` is: this gate EVALUATES A POLICY and reports through `onDecision`, so a
+ * stacked second link would take a second decision about one registration — two `DENY` lines, two
+ * trace entries, two grants out of `observe`. Since #87 the single patch reads `liveCtx`, so it
+ * already tracks whichever install is in force.
+ *
+ * CAPWALL'S OWN REGISTRATION DOES NOT REACH THIS. `loader/esm-hook.ts` captures `registerHooks`
+ * off the real module at MODULE EVALUATION time — before any `install()` exists, by the same
+ * static-graph argument `real-builtins.cts` makes — and calls that captured function. Routing
+ * capwall's own hook registration through its own gate would attribute capwall and, in a checkout
+ * layout, decide it against the application's policy.
+ *
+ * A Node with no `register`/`registerHooks` (a future Node that removed the deprecated
+ * `register`) is "nothing to gate" rather than an install-time crash: the slot reads `undefined`
+ * and `definePropertyPatch` declines.
+ */
+const loaderHookPatches = GUARDED_APIS.map((api) =>
+  definePropertyPatch<AnyFn>(`Module.${api}`, {
+    slot: valueSlot<AnyFn>(`Module.${api}`, () => realModule as unknown as object, api),
+    build(ctx, real) {
+      const patched: AnyFn = function (this: unknown, ...args: unknown[]): unknown {
+        guardRegistration(ctx, api, patched);
+        // Forward VERBATIM — never re-state a Node primitive's parameter list (#128). `this` is
+        // whatever the caller reached the function through, which for every spelling above is
+        // the `Module` class or capwall's proxy over it.
+        return Reflect.apply(real, this, args);
+      };
+      // Keep `.name`/`.length` faithful so feature-detection and error messages read right.
+      Object.defineProperty(patched, "name", { value: api, configurable: true });
+      Object.defineProperty(patched, "length", { value: real.length, configurable: true });
+      return patched;
+    },
+  }),
+);
+
+/**
+ * Install the loader-hook registration gate. Installed eagerly by `install()` rather than through
+ * the shim registry — the registry is built lazily on the first mediated require, and
+ * `module.constructor` needs no require at all, so a gate that only existed once somebody
+ * required `node:module` would not be a gate.
+ */
+export function installLoaderHookGate(ctx: ShimContext): LoaderHookGateHandle {
+  const handles = loaderHookPatches.map((patch) => patch.install(ctx));
+  let uninstalled = false;
+  return {
+    uninstall() {
+      if (uninstalled) return; // idempotent — one call releases one activation, never two
+      uninstalled = true;
+      for (const handle of handles) handle.uninstall();
+    },
+  };
 }
 
 /* ============================================================================================

@@ -74,6 +74,28 @@ interface RegisteredHooks {
 let hooks: RegisteredHooks | null = null;
 let activations = 0;
 
+/**
+ * The PRISTINE `registerHooks`, read at module evaluation (#181).
+ *
+ * Since #181 the loader-hook gate is a patch on `Module.registerHooks` itself, not a wrapper the
+ * `node:module` shim's `get` trap returns — that is what closed the `Module`/`module.constructor`
+ * routes. It also means the ordinary property read below WOULD now reach capwall's own gate, and
+ * a gate capwall trips on its own hook registration is an attribution question capwall should not
+ * have to answer (in a checkout layout its own frames sit under the project root, so the answer
+ * would be the application's policy applied to capwall).
+ *
+ * Reading it here is enough, and provably so, by the argument `real-builtins.cts` makes for its
+ * own captures: this module sits in `index.js`'s STATIC import graph, ES module evaluation
+ * completes the graph before the entry module's body runs, and the patch is only ever applied
+ * from `install()`. There is no ordering in which a patch precedes this line.
+ *
+ * Destructured rather than written `const x: typeof realModule.registerHooks = …`, because
+ * `test/process-patch-sites.test.ts`'s source scan reads that annotation as a WRITE to a
+ * process-level location and would refuse the file. The scan is deliberately generous (its own
+ * header says over-capturing only makes it stricter); this is what "stricter" costs here.
+ */
+const { registerHooks: pristineRegisterHooks } = realModule;
+
 export function registerEsmHook(ctx: ShimContext): EsmHookHandle {
   // Make the shims resolvable in this realm for the synthetic modules to import. This pushes
   // onto an install STACK whose top drives a long-lived context box, so a later install's policy
@@ -94,9 +116,10 @@ export function registerEsmHook(ctx: ShimContext): EsmHookHandle {
       bridgeUrl: pathToFileURL(path.join(here, "esm-runtime.js")).href,
       exports: esmExportNames(),
     });
-    // The REAL `registerHooks`, never the `node:module` shim — capwall's own hook registration
-    // must not be attributed and gated by #61's own gate.
-    hooks = realModule.registerHooks({ resolve, load }) as RegisteredHooks;
+    // The PRISTINE `registerHooks`, never the `node:module` shim and (since #181) never the
+    // patched property either — capwall's own hook registration must not be attributed and gated
+    // by #61's own gate. See {@link pristineRegisterHooks}.
+    hooks = pristineRegisterHooks.call(realModule, { resolve, load }) as RegisteredHooks;
   }
 
   let uninstalled = false;

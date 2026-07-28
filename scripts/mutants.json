@@ -208,8 +208,8 @@
       "id": "esm-no-loader-thread",
       "mechanism": "#152/#153 \u2014 capwall's ESM interception uses the SYNCHRONOUS module.registerHooks(), so no module-customization thread is started (~53 ms) and no DEP0205 deprecation warning is printed. module.register() is Stability 0 with removal announced",
       "file": "packages/core/src/loader/esm-hook.ts",
-      "anchor": "    hooks = realModule.registerHooks({ resolve, load }) as RegisteredHooks;",
-      "mutation": "    hooks = realModule.registerHooks({ resolve, load }) as RegisteredHooks;\n    realModule.register(\"data:text/javascript,export function resolve(s,c,n){return n(s,c)}\", import.meta.url);",
+      "anchor": "    hooks = pristineRegisterHooks.call(realModule, { resolve, load }) as RegisteredHooks;",
+      "mutation": "    hooks = pristineRegisterHooks.call(realModule, { resolve, load }) as RegisteredHooks;\n    realModule.register(\"data:text/javascript,export function resolve(s,c,n){return n(s,c)}\", import.meta.url);",
       "tests": [
         "packages/core/test/esm-hook-graph.test.ts"
       ],
@@ -336,6 +336,30 @@
       ],
       "needsBuild": true,
       "note": "The mutation is the plausible over-reach \u2014 'record every resolved target, the CJS half will only match the real entry anyway' \u2014 and it converts the entry-point exemption from a host fact back into something a dependency writes: one denied `import(secret)` makes the subsequent `require(secret)` free. Caught by the unit rows that assert a load WITH an importer records nothing."
+    },
+    {
+      "id": "loader-hook-gate-on-the-real-registration-functions",
+      "mechanism": "#61/#181 \u2014 the loader-hook gate is a patch on `Module.register`/`Module.registerHooks` THEMSELVES, so every route to the capability converges on it: the named ESM export, `require('node:module').registerHooks`, `Module.registerHooks` reached through node:module's own self-reference, `module.constructor.registerHooks` (which needs no require at all) and `process.getBuiltinModule('node:module')`",
+      "file": "packages/core/src/shims/module.ts",
+      "anchor": "        guardRegistration(ctx, api, patched);",
+      "mutation": "        if (false) guardRegistration(ctx, api, patched);",
+      "tests": [
+        "packages/core/test/esm.test.ts"
+      ],
+      "needsBuild": true,
+      "note": "The mutation leaves the patch installed, the site registered and the shim intact \u2014 so `process-patch-sites.test.ts`'s inventory and the shim's own structural test both still pass. It is the whole of #61 at its new home: with it applied, any dependency registers a resolve+load hook that de-mediates node:fs process-wide, and an innocent third package reads a secret with no capwall line at all."
+    },
+    {
+      "id": "module-shim-returns-no-self-reference",
+      "mechanism": "#181 \u2014 the node:module shim's `get` trap never hands back the raw module object. Node keeps a legacy self-reference (`Module.Module === Module`), so a trap that forwards every value verbatim hands a caller an un-shimmed route to the surface it is shimming, through the shim",
+      "file": "packages/core/src/shims/module.ts",
+      "anchor": "      return value === target ? proxy : value;",
+      "mutation": "      return value;",
+      "tests": [
+        "packages/core/test/class-escapes.test.ts"
+      ],
+      "needsBuild": false,
+      "note": "Deliberately claimed by a STRUCTURAL test, not a behavioural one. Since #181 moved the capability gate onto the two function objects, the raw class no longer behaves differently from the proxy \u2014 so no end-to-end fixture can catch this, and the property is worth keeping anyway: it is what stops the shim being the thing that undoes the NEXT member gate, which is exactly how #181 happened."
     }
   ]
 }
