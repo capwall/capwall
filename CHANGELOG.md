@@ -21,6 +21,43 @@ has to be findable without reading the diff.
 
 ## [Unreleased]
 
+### Changed
+
+- **The ESM path no longer uses `module.register()`** (issues #152, #153). capwall's `resolve` and
+  `load` hooks are now registered with **`module.registerHooks()`** — synchronous, and running in
+  capwall's own realm rather than on Node's separate module-customization thread. Four things
+  change for anyone running capwall:
+
+  - **Node 26 no longer prints a deprecation warning on every mediated run, and
+    `--throw-deprecation` no longer stops the application starting.** `module.register()` is
+    Stability 0 and runtime-deprecated as **DEP0205** since Node 26.0.0, with removal announced;
+    under `NODE_OPTIONS=--throw-deprecation` `install()` threw and the mediated app never ran at
+    all. Both are fixed, verified on a real 26.5.0 binary.
+  - **A mediated process starts ~70–95 ms faster.** Measured with `pnpm bench:startup` on
+    22.22.3 / 24.18.0 / 26.5.0, ABBA-interleaved with the two builds' `dist` trees swapped between
+    runs: **−94.6 / −79.6 / −83.2 ms** idle and **−89.6 / −72.7 / −69.0 ms** at two cores, with
+    `bare node` and `CAPWALL_ESM=0` moving ≤10 ms as controls. Turning the ESM perimeter on now
+    costs 4–8 ms, where it cost 84–112 ms. Full tables in
+    [`scripts/bench/README.md`](scripts/bench/README.md) § After #152.
+  - **ESM teardown is real.** `registerHooks()` returns a `deregister()`, which the last
+    `uninstall()` calls. A mediated builtin that was **never imported** before teardown now
+    reaches the real builtin on a fresh `import`, exactly as a fresh `require` does on the CJS
+    path, instead of throwing "capwall is no longer installed". A specifier a module had **already
+    imported** still denies under the deny-all torn-down policy — that is the property that
+    matters and it is unchanged. This removes the last place `docs/threat-model.md` documented the
+    two module systems behaving differently on `uninstall()`.
+  - **A dependency's `module.register()` can no longer get ahead of capwall in the hook chain**
+    (#61). Node runs the synchronous hook chain entirely before the asynchronous one, and capwall
+    is now in the synchronous one. A dependency using `module.registerHooks()` still can — that
+    remains the named residual, and the `load`-level re-mediation backstop still catches it for all
+    twelve mediated builtins.
+
+  **One thing costs more.** `registerHooks` hooks are consulted for `require()` as well as
+  `import()`, which `module.register()` hooks were not. With ESM on, module loading over a large
+  CJS tree now costs ~0.1–0.2 ms per module more than with `CAPWALL_ESM=0` — about 11 ms (Node 22)
+  to 24 ms (Node 26) over `require("express")`'s 123 modules, against ~130 ms before. Net still a
+  large win; it is module-load work, not per-request work.
+
 ### Removed
 
 - **Node 20 support.** It went end-of-life on 2026-04-30. `engines` is now `>=22.15.0` in all

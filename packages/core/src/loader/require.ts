@@ -35,7 +35,7 @@
 import { realModule } from "../real-builtins.cjs"; // never `import … from "node:module"` — see #78
 import { liveRegistry, popInstall, pushInstall } from "./live-context.js";
 import { defineRelinkedPatch, valueSlot } from "../lifecycle/process-patch.js";
-import { guardCjsModuleRead } from "./module-read.js";
+import { beginGatedCjsLoad, endGatedCjsLoad, guardCjsModuleRead } from "./module-read.js";
 import type { ShimContext } from "../shims/runtime.js";
 
 /** Core modules capwall mediates; requiring any of these returns a shim once installed. */
@@ -246,11 +246,26 @@ const loadPatch = defineRelinkedPatch<ModuleLoad>("Module._load", {
       //
       // `args[2]` is `isMain`: Node loading the process ENTRY POINT, which has no requiring
       // package to charge and is the application by definition.
+      let decided = false;
       if (args[2] !== true && typeof request === "string" && !realModule.isBuiltin(request)) {
         const resolved = resolveQuietly(args);
-        if (resolved !== null) guardCjsModuleRead(ctx, resolved);
+        if (resolved !== null) {
+          guardCjsModuleRead(ctx, resolved);
+          decided = true;
+        }
       }
-      return Reflect.apply(link.next, this, args);
+      // Since #152 the ESM `resolve` hook is consulted for `require()` too, so it would take a
+      // SECOND decision about this same load unless it is told not to. Marked only when the
+      // decision above actually happened, so a load this gate could not resolve leaves the hook
+      // armed — see loader/module-read.ts § WHICH OF THE GATES DECIDES A GIVEN LOAD. The
+      // `guardCjsModuleRead` throw path deliberately marks nothing: nothing is delegated.
+      if (!decided) return Reflect.apply(link.next, this, args);
+      beginGatedCjsLoad();
+      try {
+        return Reflect.apply(link.next, this, args);
+      } finally {
+        endGatedCjsLoad();
+      }
     },
 });
 

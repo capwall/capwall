@@ -22,9 +22,9 @@
  * `examples/express-app` running clean under its unchanged committed policy (see
  * `packages/cli/test/express-app-policy.test.ts`) is the end-to-end proof that it does not.
  *
- * Subprocess per case: the gate is on the LOADER, decisions are cached per process
- * (`Module._cache`, the ESM registry), and the ESM half lives on Node's loader thread — none of
- * which is isolatable in-process. Requires `pnpm build` (CI does build → test).
+ * Subprocess per case: the gate is on the LOADER and decisions are cached per process
+ * (`Module._cache`, the ESM registry), neither of which is isolatable in-process. Requires
+ * `pnpm build` (CI does build → test).
  */
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import Module from "node:module";
@@ -200,6 +200,56 @@ export default async function probe() {
   }
 }
 `,
+  );
+
+  // THE `require(esm)` LAUNDERING ROUTE (#152). `require("./inner.mjs")` loads an ES module
+  // SYNCHRONOUSLY, so the whole ESM subgraph below it — including this JSON import of a file
+  // outside every package — is resolved inside ONE `Module._load` call. That matters because
+  // `loader/require.ts` marks the extent of a load it has already decided, so the ESM `resolve`
+  // hook does not decide it twice; a mark that covered the nested imports too would silently
+  // disarm the gate for exactly this shape. `inner.mjs` lives inside `evil`, so the require of
+  // it is free and the JSON import is the only decision in play.
+  //
+  // A STATIC import, not a dynamic one: `require(esm)` refuses a module with top-level `await`
+  // (`ERR_REQUIRE_ASYNC_MODULE`), so a `try`/`await import()` inside `inner.mjs` would never get
+  // as far as the gate. The denial therefore surfaces on the OUTER `require`, which is also the
+  // more adversarial shape — the JSON is a static dependency of the module being required.
+  await writeFile(
+    path.join(evil, "inner.mjs"),
+    `import data from ${JSON.stringify(pathToFileURL(path.join(vault, "secrets.json")).href)} with { type: "json" };
+export default "OK:" + JSON.stringify(data);
+`,
+  );
+  await writeFile(
+    path.join(evil, "require-esm.js"),
+    `module.exports = function run() {
+  try {
+    console.log("REQESM:inner:" + require("./inner.mjs").default);
+  } catch (err) {
+    console.log("REQESM:inner:OUTER-ERR:" + err.name);
+  }
+};
+`,
+  );
+  await writeFile(path.join(proj, "app-require-esm.js"), `require("evil/require-esm.js")();\n`);
+
+  // `require()` of a MEDIATED BUILTIN, from a dependency. Since #152 the hooks see `require` too,
+  // so this is the assertion that they do not intercept it: `Module._load` gets there first and
+  // hands back the CJS shim OBJECT, not the ESM synthetic module's namespace.
+  await writeFile(
+    path.join(evil, "builtin-require.js"),
+    `module.exports = function run() {
+  const a = require("node:fs");
+  const b = require("fs");
+  console.log("BUILTIN:same-object:" + (a === b));
+  console.log("BUILTIN:has-readFileSync:" + (typeof a.readFileSync === "function"));
+  console.log("BUILTIN:is-namespace:" + (a[Symbol.toStringTag] === "Module"));
+};
+`,
+  );
+  await writeFile(
+    path.join(proj, "app-builtin-require.js"),
+    `require("evil/builtin-require.js")();\n`,
   );
 
   // Entry points. The application is the trust root, so its OWN loads of the very same files must
@@ -461,6 +511,60 @@ describe("#123 ESM — import() is not a way around fs.read either", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════
+// WHICH GATE DECIDES (#152). `module.registerHooks()` is consulted for `require()` as well as
+// `import()`, so from the moment the ESM path moved onto it there are TWO gates that can see the
+// same load — and both failure modes are real. Deciding twice is noisy and would double every
+// grant `observe` emits; declining twice is a silent bypass. `loader/require.ts` wins, and it
+// hands the hook the exact extent of what it decided.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+describe("#152 — the CJS gate and the ESM hook decide each load exactly once, between them", () => {
+  it("still gates an out-of-graph import reached through require(esm)", async () => {
+    // THE LAUNDERING VECTOR the arbitration creates, and the reason the hook's stand-down test
+    // is a conjunction rather than "am I inside a Module._load". `require("./inner.mjs")` pulls
+    // the whole ES subgraph in synchronously, so the vault JSON three lines down resolves inside
+    // that one `Module._load` — which `loader/require.ts` has already marked. The `require`
+    // EXPORT CONDITION is what separates them: measured on 22/24/26, the direct
+    // `require("./inner.mjs")` resolves with `["require", …]` and the nested `import` with
+    // `["node", "import", …]`.
+    const r = await deny(path.join(proj, "app-require-esm.js"));
+    expect(r.stdout).toContain("REQESM:inner:OUTER-ERR:CapabilityError");
+    expect(r.stdout).not.toContain(SECRET);
+    expect(r.stderr).toMatch(/DENY 'evil' fs:read .*secrets\.json/);
+  }, 30_000);
+
+  it("records ONE decision for one require, not one per gate", async () => {
+    // The other direction, and the one that would have shipped quietly: a duplicate decision is
+    // not a security defect, it is an AUDIT defect — two `DENY` lines for one read, two entries
+    // in the trace `capwall gen-policy` reads, and a `capwall diff` that reports drift that is
+    // not there. Counted rather than matched, because `toMatch` is satisfied by either count.
+    const trace = path.join(root, "trace-once.jsonl");
+    const r = await runEntry(path.join(proj, "app.js"), {
+      CAPWALL_MODE: "observe",
+      CAPWALL_TRACE_FILE: trace,
+    });
+    const recorded = r.stderr
+      .split("\n")
+      .filter((l) => /observe: recorded fs:read .*[/\\]secrets\.json/.test(l));
+    expect(recorded, `one require, ${recorded.length} decisions:\n${recorded.join("\n")}`).toHaveLength(1);
+  }, 30_000);
+
+  it("leaves require() of a mediated builtin on the CJS path — the hook does not steal it", async () => {
+    // `Module._load` intercepts every mediated builtin before Node's loader is reached, so the
+    // ESM hook's `capwall-esm:` rewrite must never be what a `require` gets. If it ever were, the
+    // caller would receive an ES module NAMESPACE where it asked for the CJS shim object — a
+    // whole-ecosystem break, and one that would not look like a security failure. Asserted by
+    // identity against a second `require` of the other spelling, which only holds for the shim.
+    const r = await runEntry(path.join(proj, "app-builtin-require.js"), {
+      CAPWALL_MODE: "enforce",
+      CAPWALL_POLICY_FILE: denyPolicy,
+    });
+    expect(r.stdout).toContain("BUILTIN:same-object:true");
+    expect(r.stdout).toContain("BUILTIN:has-readFileSync:true");
+    expect(r.stdout).toContain("BUILTIN:is-namespace:false");
+  }, 30_000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
 // OBSERVE. "observe cannot record what it never sees" was half of #123's cost: a generated
 // policy under-reported the package's real filesystem reach, on both module systems.
 // ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -480,7 +584,7 @@ describe("#123 observe — the reach is now recorded, on both module systems", (
     expect(traced).toContain("secrets.json");
   }, 30_000);
 
-  it("records the ESM module read too — the loader thread reports back to onDecision", async () => {
+  it("records the ESM module read too — the resolve hook reports to onDecision", async () => {
     const trace = path.join(root, "trace-esm.jsonl");
     const r = await runEntry(path.join(proj, "app-esm.mjs"), {
       CAPWALL_MODE: "observe",

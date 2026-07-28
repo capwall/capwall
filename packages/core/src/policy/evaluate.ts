@@ -15,13 +15,16 @@
 // The two grammar modules are imported by their OWN subpaths rather than through
 // `@capwall/policy-schema`'s barrel, and that is a startup-cost decision rather than a style one
 // (#150). The barrel builds the whole Zod schema tree at module scope, so importing `ANY_HOST`
-// through it drags `zod` into every realm that evaluates a decision — including Node's ESM LOADER
-// THREAD, which reaches this file through `loader/esm-hooks.ts` → `loader/module-read.ts` and
-// needs no schema at all (it is handed an already-parsed policy). `module.register()` BLOCKS the
-// main thread while that thread resolves and compiles its graph, so every module on it is paid for
-// serially at startup. `parsePolicy` — the one consumer that genuinely needs Zod — still imports
-// the barrel from `policy/load.ts`, on the main thread only, where a policy is actually parsed.
-// `test/esm-hook-graph.test.ts` holds this shape in place from both ends.
+// through it drags `zod` into every graph that evaluates a decision — and evaluating a decision
+// needs no schema at all, since this module is handed an already-parsed policy. `parsePolicy` —
+// the one consumer that genuinely needs Zod — imports the barrel from `policy/load.ts`.
+//
+// #150 wrote this rule about Node's ESM loader thread, which reached this file through
+// `loader/esm-hooks.ts` and paid for its whole graph serially at startup. #152 removed that
+// thread, and with it the guard that used to hold this line in place: `src/index.ts` re-exports
+// `loadPolicyFromObject`, so zod is on `@capwall/core`'s entry graph regardless and there is no
+// honest scan left to write. The subpath import is still right and still free; it is simply no
+// longer load-bearing enough to test.
 import { ANY_HOST, matchesHostPattern } from "@capwall/policy-schema/host";
 import { widenedPackageKeys } from "@capwall/policy-schema/package-key";
 import type { Mode, PackagePolicy, Policy } from "@capwall/policy-schema";

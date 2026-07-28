@@ -19,7 +19,7 @@ The five gates are genuinely five different checks:
 |---|---|---|
 | `build` | `tsc` emit, per package | Type errors in `src/`; produces `dist/`, which the CLI and ESM tests run against. |
 | `typecheck` | `tsc --noEmit` over src **and** tests | Type errors the build never sees — `build` does not compile `test/`. |
-| `test` | vitest, per package | Behaviour. ~190 of its assertions run in a child `node` process (122 in `@capwall/core`, 69 in `@capwall/cli`), because hardened mode, ESM module caching and `module.register()` are process-sticky. Those children go through `packages/core/test/helpers/subprocess.ts`, which owns the per-child wall-clock budget, the measurements it is derived from, and the failure message you get when one overruns (issue #145). |
+| `test` | vitest, per package | Behaviour. ~190 of its assertions run in a child `node` process (122 in `@capwall/core`, 69 in `@capwall/cli`), because hardened mode, ESM module caching and loader-hook registration are process-sticky. Those children go through `packages/core/test/helpers/subprocess.ts`, which owns the per-child wall-clock budget, the measurements it is derived from, and the failure message you get when one overruns (issue #145). |
 | `lint` | [oxlint](https://oxc.rs) once over the whole repo, config in `.oxlintrc.json` | Defects `tsc` does not check — unused bindings, unreachable/duplicate code, `no-explicit-any`, misuse patterns. It is **not** a style gate; see the config's comments for why the pedantic rules are off. |
 | `bench:gate` | `scripts/bench/bench.mjs --quick`, ~10s | Performance regressions on the mediated hot path. Gates on a **ratio** against a CPU calibration co-sampled in the same loop, not on absolute microseconds, so it is portable and not flaky on a busy machine — see `scripts/bench/README.md` § The regression gate for the derivation. Needs `pnpm build` first (it runs against `dist/`). `CI_BENCH=0 pnpm ci:local` skips it. |
 
@@ -57,7 +57,7 @@ CI_CPUSET=0,1 pnpm ci:local                       # pin to 2 cores — a GitHub 
 
 | version | why it is in the matrix |
 |---|---|
-| **22** | The **floor**, and `engines` says `>=22.15.0`. 22.15 is where `module.registerHooks()` landed; capwall wants that API without a version gate (issue #152). The floor leg is where code that reaches for a newer API breaks. |
+| **22** | The **floor**, and `engines` says `>=22.15.0`. 22.15 is where `module.registerHooks()` landed, which since #152 is capwall's entire ESM path — the floor is chosen for that API, not rounded to it. The floor leg is where code that reaches for a newer API breaks. |
 | **24** | The **active LTS** (until 2028-04-30) — what most users upgrading off 20 land on. It is also the version the release workflow packs on. |
 | **26** | `current`, and **LTS from 2026-10-28**. Carried now so breakage lands as a CI failure months before it becomes the version everyone runs. It has already paid for itself twice — see below. |
 

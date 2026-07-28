@@ -9,7 +9,7 @@ pnpm build            # bench.mjs imports the BUILT packages/core/dist, not src
 pnpm bench            # the full run, ~20s
 pnpm bench:gate       # the reduced run CI uses, ~10s
 node scripts/bench/bench.mjs --json    # machine-readable
-node scripts/bench/bench.mjs --no-esm  # skip the ESM arm and its loader thread
+node scripts/bench/bench.mjs --no-esm  # skip the ESM arm
 ```
 
 Exits `0` on PASS, non-zero on FAIL. Deliberately dependency-free — timing is
@@ -310,13 +310,13 @@ and fails nothing.
 
 | cost | ms | why it stays |
 |---|---|---|
-| Node's loader-thread bootstrap | ~53 | Node's, and `register()` blocks until it is done. `module.registerHooks()` (synchronous, no thread) would remove it. **The version objection is gone**: it is Node ≥22.15, which is exactly the supported floor, so it needs no gate and no second version-conditional implementation of a security-critical hook. Node 26 additionally DEPRECATED `module.register()` (DEP0205) in its favour. Tracked as #152 — still a follow-up with a real design question in it (the ESM perimeter is where #59/#61/#62 lived), not a tweak. |
+| ~~Node's loader-thread bootstrap~~ | ~~53~~ | **Gone — #152 moved the hooks to `module.registerHooks()`.** See § After #152 below; it took considerably more than the 53 ms with it. |
 | `real-builtins.cts`'s twelve `require`s on the MAIN thread | 13 | #78. They must be eager and inside `index.js`'s static graph: that is the whole proof that they run against a pristine `Module._load` rather than capturing capwall's own shims. Narrowing helps a realm that needs two of them; it cannot help the realm that needs all twelve. |
 | `globalThis.Request` → undici | 21 | `global-egress.ts` captures the real `Request.prototype.url` getter at module scope, and V8 materializes undici on the first *observation* of that global (even `getOwnPropertyDescriptor` triggers it — verified). The capture is load-bearing: it is what stops a `Request` with a shadowed own `url` accessor reporting a granted destination while undici dials another (#26/#56). Deferring it to first `fetch()` would put that capture *after* dependencies have run, which is the window it exists to close. Note the guard itself is nearly free once undici is resident — `installGlobalEgressGuard` is ~1 ms — so this is the price of the TOCTOU capture, not of the guard. |
 | zod on the MAIN thread | 4 (zod 3) / **~62** (zod 4) | `parsePolicy` is real validation of a real document, and the preload always parses one. See § zod 4 below for the measured breakdown of the increase and why none of it is recoverable without giving that sentence up. |
-| the ESM shim registry being built eagerly | 3 | #150 opened by asking whether lazy shim construction was the win. **It is worth 3 ms.** `registerEsmHook` needs every specifier's export names to ship to the loader thread, so the registry cannot be lazy there — and it turns out not to matter. Recorded because "we checked and it was small" is a result. |
+| the ESM shim registry being built eagerly | 3 | #150 opened by asking whether lazy shim construction was the win. **It is worth 3 ms.** `registerEsmHook` needs every specifier's export names before the hooks go live, so the registry cannot be lazy — and it turns out not to matter. Recorded because "we checked and it was small" is a result. |
 
-### Before / after
+### Before / after — #150 (narrowing the loader thread's graph)
 
 ABBA-interleaved: the two builds' `dist` trees are swapped on disk between **every** sample, so both
 arms share the machine's mood — the same discipline the block estimator applies one level down.
@@ -595,6 +595,94 @@ unlike those two it is not bought by a guarantee — it is bought by the source 
 separate CJS module for #78's proof to mean anything, and `test/esm-hook-graph.test.ts` holds the
 loader thread's graph in place with a *static scan of the import graph* that a bundle would
 invalidate. Filed as **#171** with these numbers rather than attempted.
+## After #152 — `module.registerHooks()`, and the loader thread is gone
+
+#150 shaved capwall's own graph off the loader thread. **#152 removed the thread.** The ESM path
+now registers **synchronous, same-realm** `resolve`/`load` hooks with `module.registerHooks()`,
+which Node ≥22.15 has and which is Node's named replacement for the DEP0205-deprecated
+`module.register()` (see [`docs/node-api-dependencies.md`](../../docs/node-api-dependencies.md)).
+
+Measured with **`pnpm bench:startup`** — the harness committed one PR earlier, for this — with the
+two builds' `dist` trees swapped on disk between runs and the build order itself ABBA'd
+(before / after / after / before), min-over-runs of the harness's own min-over-rounds. `wall` is
+`performance.now()` on the first line of the child's entry point; `cpu` is the same instant's
+`process.cpuUsage()`, which **counts the loader thread**, so the `cpu` column is where the thread
+itself shows up.
+
+**Idle 16-core, 20 rounds per build.**
+
+| Node | arm | wall before | wall after | | cpu before | cpu after |
+|---|---|---|---|---|---|---|
+| 22.22.3 | mediated, esm ON | 273.4 ms | **178.8 ms** | **−94.6** | 337.7 ms | **227.0 ms** (−110.7) |
+| | `CAPWALL_ESM=0` (control) | 161.3 | 171.0 | +9.7 | 200.3 | 216.2 |
+| | bare node (control) | 42.7 | 44.7 | +2.0 | 39.8 | 41.1 |
+| 24.18.0 | mediated, esm ON | 241.5 ms | **161.9 ms** | **−79.6** | 303.7 ms | **211.2 ms** (−92.5) |
+| | `CAPWALL_ESM=0` (control) | 153.2 | 155.0 | +1.8 | 205.1 | 200.9 |
+| | bare node (control) | 42.4 | 42.5 | +0.1 | 41.0 | 41.4 |
+| 26.5.0 | mediated, esm ON | 224.2 ms | **141.0 ms** | **−83.2** | 280.9 ms | **182.6 ms** (−98.3) |
+| | `CAPWALL_ESM=0` (control) | 140.0 | 137.3 | −2.7 | 183.2 | 177.9 |
+| | bare node (control) | 37.7 | 36.8 | −0.9 | 38.1 | 38.0 |
+
+**2 cores (`taskset -c 0,1`) — a GitHub hosted runner, 16 rounds per build.**
+
+| Node | mediated esm ON, wall | | `CAPWALL_ESM=0` control | bare control |
+|---|---|---|---|---|
+| 22.22.3 | 227.4 → **137.8 ms** | **−89.6** | 138.7 → 136.0 (−2.7) | 30.0 → 36.1 (+6.1) |
+| 24.18.0 | 211.7 → **139.0 ms** | **−72.7** | 129.7 → 138.8 (+9.1) | 32.8 → 35.5 (+2.7) |
+| 26.5.0 | 211.9 → **142.9 ms** | **−69.0** | 137.1 → 138.8 (+1.7) | 33.5 → 33.1 (−0.4) |
+
+**Under load (16 cores, 24 spinners, loadavg 15→47)** the direction is the same and the magnitudes
+are not measurements: an earlier spawn-clocked run put mediated p50 at 1444 → 1051 (22),
+1490 → 968 (24) and 1641 → 710 (26), but the `CAPWALL_ESM=0` control moved by +234 ms and +426 ms
+on 24 and 26 — which by this document's own rule means the two arms differed in something other
+than the change. Quoted only so the row is not silently omitted.
+
+**The controls hold** in every clean row: `bare node` within ±6 ms and `CAPWALL_ESM=0` within
+±10 ms, against an ~80–95 ms move on the arm under test. The two rows where a control drifts most
+(Node 22 idle, Node 24 at two cores) drift *upward*, i.e. against the change, so they do not
+manufacture the result.
+
+### The number that matters most: esm ON now costs about what esm OFF costs
+
+The gap between `mediated, esm ON` and `CAPWALL_ESM=0` — everything the ESM perimeter costs a
+process — collapses:
+
+| Node | before #152 | after #152 |
+|---|---|---|
+| 22.22.3 | 112.1 ms | **7.8 ms** |
+| 24.18.0 | 88.3 ms | **6.9 ms** |
+| 26.5.0 | 84.2 ms | **3.7 ms** |
+
+The single largest item in the startup breakdown at the top of this section is gone, not reduced.
+The `cpu` column says the same thing from the other side: a mediated child used to burn 60–65 ms
+more CPU than wall-clock, which was the loader thread; it now burns ~40 ms more, the same as the
+`CAPWALL_ESM=0` control.
+
+### What got WORSE, and it is not nothing
+
+**`registerHooks` hooks are consulted for `require()` as well as `import()`.**
+`module.register()` hooks were not. So with ESM on, every CJS module load in the process now goes
+through capwall's `resolve` and `load`. On the harness's tiny entry point that is unmeasurable;
+on a large CJS tree it is not. Measured separately (not by `bench:startup`, whose target is fixed)
+at two cores over `require("express")` — 123 modules — comparing `esm ON` against `CAPWALL_ESM=0`
+in the same build:
+
+| Node | esm ON − esm OFF, before #152 | after #152 |
+|---|---|---|
+| 22.22.3 | ~131 ms | **~11 ms** |
+| 24.18.0 | ~130 ms | **~18 ms** |
+| 26.5.0 | ~102 ms | **~24 ms** |
+
+So roughly **0.1–0.2 ms per CJS module**, where before it was zero: a fixed per-process thread
+cost has been traded for a per-module one. On that tree the trade is still strongly positive
+(net −120 / −100 / −63 ms end to end), and it is module-load work rather than per-request work,
+so the budget in AGENTS.md § 5 is untouched. But it scales with the size of the `require` graph
+and it is largest on Node 26, which is where the smallest share of the win survives. An
+application large enough for that to matter can turn the ESM perimeter off with `CAPWALL_ESM=0`,
+at the price of un-mediated `import`.
+
+**Every row of the per-call table above is unchanged**, as expected for a change that only moves
+module loading: `pnpm bench:gate` PASS, ratio 1.04 (limit 7), 21/21 self-checks green.
 
 ### zod 4 — the +58 ms is module load, and it is not recoverable (#161)
 

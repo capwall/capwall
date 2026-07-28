@@ -227,7 +227,7 @@ module.exports = function () {
     write(path.join(app, "main.mjs"), `(await import("@ws/lib/esm.mjs")).run();\n`);
 
     expect(principal((await runUnderCapwall(app, path.join(app, "main.cjs"))).stdout, "lib", "cjs")).toBe("@ws/lib");
-    // ESM too: `module.register()` hooks run on Node's loader thread and cannot write the map, so
+    // ESM too: capwall's `resolve` hook does not write the map (see link-map.ts § discovery), so
     // this one is recovered by `link-map.ts`'s verified discovery rather than observed.
     expect(principal((await runUnderCapwall(app, path.join(app, "main.mjs"))).stdout, "lib", "esm")).toBe("@ws/lib");
   });

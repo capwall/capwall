@@ -80,8 +80,8 @@ lands; capwall assumes one got through and *contains what it can do at runtime*.
 
 ## MVP scope (build order)
 
-1. **Module-load interception** — patch CJS `require`/loader; ESM via `module.register`
-   loader hooks. Attribute every capability-sensitive call to the **owning package** via
+1. **Module-load interception** — patch CJS `require`/loader; ESM via synchronous
+   `module.registerHooks()` loader hooks. Attribute every capability-sensitive call to the **owning package** via
    call-stack / module path.
 2. **Declarative per-package capability policy** — `capabilities.json` mapping each package
    to allowed `fs` (read/write path globs), `net` (host patterns/ports), `ipc` (unix-socket /

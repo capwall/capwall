@@ -149,12 +149,18 @@ let hardenedRatchet = false;
 /**
  * Subscribers notified whenever {@link liveCtx} is re-pointed (issue #123).
  *
- * WHY THIS EXISTS, given that the whole design is "everyone reads the same live box". Because
- * one consumer cannot: the ESM module-customization hook runs on Node's separate LOADER THREAD
- * and therefore holds a COPY of the policy, not a reference to this box (see
- * `loader/esm-hooks.ts`). A copy has to be re-sent when the original changes, and this is the one
- * place that knows when it did. Nothing else may use this to cache policy state — an in-process
- * consumer that reads `liveCtx` directly is always correct and never needs a notification.
+ * WHY THIS EXISTS, given that the whole design is "everyone reads the same live box". It existed
+ * for ONE consumer that could not read the box: while capwall's module-customization hooks ran on
+ * Node's separate loader thread (`module.register()`), they held a COPY of the policy and it had
+ * to be re-sent whenever the original changed. #152 moved them to `module.registerHooks()`, which
+ * runs them in this realm reading `liveCtx` directly, so that consumer is gone and this has no
+ * subscribers in `src` today.
+ *
+ * KEPT RATHER THAN DELETED, and the reason is the rule rather than the API: an out-of-realm or
+ * out-of-process mediator is a shape capwall may need again (a permission-model sandbox, a second
+ * realm), and this is the only place that knows when the live context was re-pointed. Nothing
+ * IN-realm may use it to cache policy state — a consumer that reads `liveCtx` directly is always
+ * correct and never needs a notification, and a cache here is how #62/#87 came back.
  */
 type LiveContextListener = (ctx: ShimContext, installed: boolean) => void;
 const contextListeners = new Set<LiveContextListener>();
