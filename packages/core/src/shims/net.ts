@@ -946,6 +946,118 @@ function agentConnectionResolver(defaultPort: number): (args: unknown[]) => Reso
   return (args) => resolveNetCall(args, defaultPort);
 }
 
+/** The member of `http` that is both lazy AND egress-bearing. See {@link defineGuardedWebSocket}. */
+const LAZY_WEBSOCKET = "WebSocket";
+
+/**
+ * Copy `real`'s own enumerable properties onto `shim`, PRESERVING LAZINESS (issue #170).
+ *
+ * A flat `shim[key] = real[key]` loop READS every property, which is fine for the ordinary data
+ * properties a builtin namespace is mostly made of and expensive for the ones Node deliberately
+ * made lazy. On `node:http` three of them — `WebSocket`, `CloseEvent`, `MessageEvent` — are the
+ * SAME lazy binding, and touching any one materializes undici: ~21 ms, the largest single line
+ * in `scripts/bench/README.md` § Startup. Building the `http` shim therefore charged that to
+ * every process that required `http`, and on the ESM path — which builds the whole registry
+ * eagerly inside `install()` — to every mediated process, whether or not anything ever mentioned
+ * a WebSocket. That is how `CAPWALL_GLOBAL_EGRESS=0` could skip capwall's other undici read (the
+ * `Request.prototype.url` capture) and still pay the price.
+ *
+ * So a GETTER-ONLY accessor is mirrored as a getter that forwards to the real one on each read,
+ * and everything else is copied by value. Three properties of that rule are load-bearing:
+ *
+ *  - It is a SHAPE test, not a name list. A future Node that makes another member lazy is
+ *    covered on arrival, which a hardcoded `["WebSocket", "CloseEvent", "MessageEvent"]` would
+ *    not be — and AGENTS.md § 8 is explicit that a version table in code is the thing to avoid.
+ *  - `getter-only` deliberately excludes accessors that also have a SETTER. `http.globalAgent`
+ *    is one, and it is REPLACED further down by the guarded view (#65) with a plain assignment,
+ *    which would throw against a setter-less accessor. Copying it by value keeps that working.
+ *  - Reading the descriptor does NOT trigger the lazy binding —
+ *    `Object.getOwnPropertyDescriptor(http, "WebSocket")` leaves `internal/deps/undici/undici`
+ *    out of `process.moduleLoadList` where reading the property puts it in. Measured on
+ *    22.22.3 / 24.18.0 / 26.5.0. (That is NOT true of `globalThis`, where the descriptor read
+ *    materializes — which is why `shims/global-egress.ts` cannot probe its way out of the same
+ *    cost and had to condition on the environment instead.)
+ *
+ * Deliberately applied here and not to the `net`/`tls`/`http2`/`dgram` builders. Their lazy
+ * members (`net.BlockList`, `net.SocketAddress`, `tls.rootCertificates`) are cheaper and none of
+ * them reaches undici; widening this without a measurement behind it is how a targeted fix turns
+ * into a refactor nobody can review.
+ */
+function isLazyAccessor(
+  desc: PropertyDescriptor | undefined,
+): desc is PropertyDescriptor & { get: () => unknown } {
+  return desc !== undefined && desc.get !== undefined && desc.set === undefined;
+}
+
+function copyPreservingLaziness(real: object, shim: Record<string, unknown>): void {
+  const realRecord = real as Record<string, unknown>;
+  for (const key of Object.keys(real)) {
+    const desc = Object.getOwnPropertyDescriptor(real, key);
+    if (isLazyAccessor(desc)) {
+      const get = desc.get;
+      Object.defineProperty(shim, key, {
+        configurable: true,
+        enumerable: true,
+        get: () => get.call(real),
+      });
+      continue;
+    }
+    shim[key] = realRecord[key];
+  }
+}
+
+/**
+ * Mirror `http.WebSocket` onto the shim as a GUARDED, and still LAZY, accessor.
+ *
+ * ISSUE #80 — Node ≥22 re-exports the GLOBAL `WebSocket` class onto the `http` namespace, and a
+ * verbatim copy would land on the shim unguarded. While `globalThis.WebSocket` was itself
+ * un-mediated, shimming this copy bought nothing (the global was right there). Now that the
+ * global IS guarded, `require("http").WebSocket` is the remaining one-liner, so it gets the same
+ * guarded subclass — built through the shared factory so repeated shim builds do not mint new
+ * classes. Present on every supported Node (the re-export is ≥22, unflagged since 22.4, and the
+ * floor is ≥22.15); the presence check is kept because this shim mirrors the real module rather
+ * than a version table — if Node ever drops the re-export, capwall must not invent one.
+ * `test/composition-matrix.test.ts` asserts both directions of that.
+ *
+ * ISSUE #170 — IT STAYS LAZY. {@link copyPreservingLaziness} has already mirrored the real
+ * getter onto the shim; this replaces that mirror with one that guards what it returns, and it
+ * still does not read the underlying property until a caller does. Consequences, all deliberate:
+ *  - `Object.keys()` still lists it, so `esmExportNames()` (which reads NAMES, never values)
+ *    still gives the synthetic ES module a `WebSocket` export. Laziness survives the ESM path.
+ *  - It stays getter-only, exactly like Node's own descriptor (`set` is `undefined` there). The
+ *    old data property was assignable where the real namespace is not, so this is *more*
+ *    faithful, not less.
+ *  - The guarded subclass is minted on first read and memoized in this closure rather than by
+ *    self-replacing the property, because hardened mode freezes the shim namespace and a
+ *    self-replacing accessor would then throw on the first read instead of returning the class.
+ */
+function defineGuardedWebSocket(
+  shim: Record<string, unknown>,
+  real: Record<string, unknown>,
+  ctx: ShimContext,
+): void {
+  const desc = Object.getOwnPropertyDescriptor(real, LAZY_WEBSOCKET);
+  if (desc === undefined) return; // a Node without the re-export — invent nothing
+  let guarded: unknown;
+  let taken = false;
+  Object.defineProperty(shim, LAZY_WEBSOCKET, {
+    configurable: true,
+    enumerable: desc.enumerable === true,
+    get(): unknown {
+      if (!taken) {
+        taken = true;
+        // THE read that materializes undici, now deferred to a caller that actually wants it.
+        const realWebSocket: unknown = desc.get ? desc.get.call(real) : desc.value;
+        guarded =
+          typeof realWebSocket === "function"
+            ? guardedWebSocketClass(ctx, realWebSocket as AnyCtor)
+            : realWebSocket;
+      }
+      return guarded;
+    },
+  });
+}
+
 /**
  * Build a shimmed `http`/`https` module: `request`/`get`, `new ClientRequest()`,
  * `Agent.createConnection`, and the `globalAgent` INSTANCE are guarded. `server.listen` is
@@ -953,9 +1065,7 @@ function agentConnectionResolver(defaultPort: number): (args: unknown[]) => Reso
  */
 function wrapHttpModule<T extends object>(real: T, ctx: ShimContext, defaultPort: number): T {
   const shim: Record<string, unknown> = {};
-  for (const key of Object.keys(real)) {
-    shim[key] = (real as unknown as Record<string, unknown>)[key];
-  }
+  copyPreservingLaziness(real, shim);
   const realRecord = real as unknown as Record<string, unknown>;
   for (const name of ["request", "get"]) {
     const orig = realRecord[name];
@@ -981,19 +1091,9 @@ function wrapHttpModule<T extends object>(real: T, ctx: ShimContext, defaultPort
   // line, under a deny-all enforce policy, from any dependency. Guard the exposed instance;
   // never the process-global one it wraps (see `guardedInstanceMethods` for why a Proxy, and
   // why patching the real agent is off the table).
-  // ISSUE #80 — Node ≥22 re-exports the GLOBAL `WebSocket` class onto the `http` namespace, and
-  // the copy loop above duplicates it through unguarded. While `globalThis.WebSocket` was itself
-  // un-mediated, shimming this copy bought nothing (the global was right there). Now that the
-  // global IS guarded, `require("http").WebSocket` is the remaining one-liner, so it gets the
-  // same guarded subclass — built through the shared factory so repeated shim builds do not mint
-  // new classes. Present on every supported Node (the re-export is ≥22, unflagged since 22.4,
-  // and the floor is ≥22.15); the presence check is kept because this shim mirrors the real
-  // module rather than a version table — if Node ever drops the re-export, capwall must not
-  // invent one. `test/composition-matrix.test.ts` asserts both directions of that.
-  const realWebSocket = realRecord["WebSocket"];
-  if (typeof realWebSocket === "function") {
-    shim["WebSocket"] = guardedWebSocketClass(ctx, realWebSocket as AnyCtor);
-  }
+  // ISSUE #80 / #170 — the `http.WebSocket` re-export, guarded and still lazy. See
+  // `defineGuardedWebSocket` for both halves of why.
+  defineGuardedWebSocket(shim, realRecord, ctx);
   const realGlobalAgent = realRecord["globalAgent"];
   if (typeof realGlobalAgent === "object" && realGlobalAgent !== null) {
     shim["globalAgent"] = guardedInstanceMethods(

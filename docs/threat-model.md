@@ -789,7 +789,11 @@ globals with guarded equivalents for the life of the install. What it covers and
   too. While the global was un-mediated, shimming that copy bought nothing; now that the global is
   guarded, the module copy would be the remaining one-liner. Note the one deviation: the two
   guarded copies are not `===` to each other the way the real ones are. `instanceof` still answers
-  correctly for both.
+  correctly for both. It is exposed on the shim as a **getter, not a value** (#170): it is
+  getter-only on the real namespace, and reading it materializes undici — flattening it charged
+  ~21 ms of startup to every process that required `http`, and to every mediated process at all on
+  the ESM path, which builds the shim registry eagerly. The guarded subclass is still built before
+  anything can use it; only the read that produces it is deferred to a caller that wants it.
 - **Policy shape: the existing `net` grant**, not a new capability. A dependency dialing
   `example.com:443` holds the same authority whether it got there through `http.request`,
   `net.connect` or `fetch`; splitting them would let a policy grant one and not the other by
@@ -801,9 +805,27 @@ globals with guarded equivalents for the life of the install. What it covers and
   read sends the request to the **second** value; and a `Request` with an OWN shadowed `url`
   accessor reports whatever the attacker chose while undici dials the real internal URL — so the
   guard reads a `Request`'s destination through the **real `Request.prototype.url` getter**, which
-  reaches the same state undici dials from and steps over the shadow. For strings and `URL`s,
-  capwall performs exactly one `String(input)` — the same conversion undici performs — and forwards
-  that immutable string, so there is no second read left to diverge.
+  reaches the same state undici dials from and steps over the shadow. The same is true one level
+  up: replacing `Request.prototype.url` itself makes every later `Request` lie, and a getter
+  captured beforehand still returns the true URL (verified on 22.22.3 and 26.5.0). For strings and
+  `URL`s, capwall performs exactly one `String(input)` — the same conversion undici performs — and
+  forwards that immutable string, so there is no second read left to diverge.
+- **WHEN that getter is captured, and the one configuration where it is late (#170).** The capture
+  happens at `shims/global-egress.ts`'s **module evaluation** — as early as capwall itself loads,
+  before any dependency has run — because a capture taken at `install()` would be behind anything
+  an embedder required in between. It is skipped only when `CAPWALL_GLOBAL_EGRESS=0` is already in
+  the environment, i.e. when this process has said it does not want the guard; that variable is
+  read at module evaluation too, so the condition is exactly as early as the capture it replaces,
+  and reading `globalThis.Request` costs ~21 ms of startup that a process which switched the guard
+  off should not pay. An embedder can nevertheless set that variable and still pass
+  `globalEgress: true` (the option is a code-level default the variable does not reach); capwall
+  takes the capture at install time there, and **warns on stderr** if undici had already been
+  materialized in between, because it then cannot prove the getter is Node's own. The residual it
+  cannot detect is a dependency that replaces `globalThis.Request` **without** materializing
+  undici: the only route to Node's `Request` class is that property, so there is nothing left to
+  compare against. It is reachable only by code running before `install()` — which has already
+  captured raw `fs`, `net` and `child_process` — and only in that self-contradictory
+  configuration.
 - **Attribution is unchanged and lands on the dependency.** The guard runs synchronously, on the
   caller's own stack, before the first `await`, so a dependency's `fetch` is charged to that
   dependency — not `<app>`, and not `<unknown>` (which would have forced every real app to grant
@@ -1705,10 +1727,11 @@ grant from `observe` and change no outcome, so `.node` skips this gate and keeps
   `<project>/app.config.js`) now needs an `fs.read` grant covering them. That is a true statement
   about what those tools do, and `capwall observe` generates the grant from the trace.
 
-## Web Storage (`localStorage`) — a file read/write below the `fs` shim, Node ≥26
+## Web Storage (`localStorage`) — an `fs` read/write on its backing file, Node ≥26
 
-**Status: known, un-mediated, flag-gated — tracked as #156. Narrow enough not to be alarming,
-real enough to write down rather than leave implied.**
+**Status: MEDIATED as of #156.** `localStorage`'s six members take an ordinary `fs` decision on
+the file `--localstorage-file` names. This section used to say "known, un-mediated, flag-gated";
+it does not any more, and the paragraphs below say what the gate does and what it still does not.
 
 Node 26 added Web Storage — `Storage`, `localStorage`, `sessionStorage` — to the globals. They
 were found by the global-egress inventory canary (`test/global-egress-inventory.test.ts`) when 26
@@ -1718,26 +1741,67 @@ classification is asserted, not asserted-in-a-comment — the prototype's full m
 pinned, so a future Node that grows it a sync- or fetch-shaped method fails the test and forces a
 re-review.
 
-Egress is not the only question, and the other answer is less comfortable:
+Egress was not the only question, and the other answer was the one that needed work:
 
-- **`sessionStorage` is in-memory.** No persistence, no file, nothing to mediate.
-- **`localStorage` is file-backed, and capwall does not see the I/O.** It materializes only when
-  the user starts Node with `--localstorage-file=<path>`; without that flag the global is present
-  but throws on use. When it *is* on, Node performs the read and write internally, below the
-  `fs` shim, so a dependency can `localStorage.setItem`/`getItem` against that one file **with no
-  `fs` grant and no recorded decision** — the same shape as the module-system read channel #123
-  closed, on a different Node internal.
+- **`sessionStorage` is in-memory.** No persistence, no file, nothing to mediate — and it is
+  deliberately left alone. Gating it would deny-by-default a store that touches no disk.
+- **`localStorage` is file-backed, and Node does that file's I/O internally, below the `fs`
+  shim.** It materializes only when the process is started with `--localstorage-file=<path>`.
+  Before #156 a dependency could `setItem`/`getItem` against that file **with no `fs` grant and
+  no recorded decision** — the same shape as the module-system read channel #123 closed, on a
+  different Node internal.
 
-**Why it is not treated as urgent.** The flag is opt-in and set by the operator, never by a
-dependency; there is exactly one path, chosen by the operator, and a dependency has no control
-over which file is touched; and the contents are a key-value store the dependency could equally
-have kept in memory. It is a persistence and cross-run-signalling channel, not a route to
-arbitrary files.
+### What the gate does
 
-**What would change that.** Node making `localStorage` available without a flag, or allowing the
-path to be selected at runtime. Either would move this into the same class as #123 and it should
-be gated as an `fs` read/write on the backing file at that point. #156 carries the reproduction
-and the design notes for whoever picks that up.
+`shims/web-storage.ts` replaces `globalThis.localStorage` with capwall's own view, for the life
+of the install, and each member takes a decision on the **resolved backing path**:
+
+| member | decision |
+|---|---|
+| `getItem`, `key`, `length` | `fs` **read** |
+| `setItem`, `removeItem`, `clear` | `fs` **write** |
+
+It is an **`fs`** capability, not a new kind and not `net` — the surface was discovered by the
+egress canary but the authority it confers is filesystem authority. So every existing policy,
+`observe` trace, `gen-policy` output and `capwall diff` covers it with no schema change, and the
+grant is written the way any other file grant is.
+
+Four properties are worth stating precisely:
+
+- **It replaces the object, not `Storage.prototype`.** `Storage.prototype.length` is a
+  **non-configurable** getter on 26.5.0 (measured), so a prototype patch could never gate `length`
+  — a read of the file's state. Replacing the global covers all six members, leaves
+  `sessionStorage` and `Storage.prototype` untouched, and needs no per-call discrimination between
+  the two stores.
+- **The view is still a `Storage` to ordinary code.** Its prototype is `Storage.prototype`, so
+  `localStorage instanceof Storage` answers true, and every member forwards with
+  `Reflect.apply(realMethod, realStorage, args)` — invoked on the real object, so Node's brand
+  checks pass and the arity and coercion behaviour are Node's.
+- **One deviation, and it fails closed.** `Storage.prototype.getItem.call(localStorage, k)` throws
+  `TypeError: Illegal invocation` against the view, because the view is capwall's object rather
+  than a branded `Storage`. Same class as the guarded `http.globalAgent` view (#65). It cannot be
+  used to reach the file un-gated; reaching the raw object at all needs a capture taken before
+  `install()`, which is the pre-install residual every capwall surface carries.
+- **It is a clean no-op everywhere else.** On Node 22 and 24 the global does not exist; on Node 26
+  without the flag it is present-but-unavailable. capwall detects that with
+  `Object.keys(globalThis)` and never by READING the property — reading it on 26 without the flag
+  prints `ExperimentalWarning: localStorage is not available…` on the same stderr capwall's DENY
+  lines use, which would put a warning in every mediated process on the next LTS. No patch site is
+  even registered.
+
+### What it still does not do
+
+- **The backing path is recovered from `--localstorage-file` in `process.execArgv` and
+  `NODE_OPTIONS`**, resolved against the process's cwd the way Node resolves it (verified on
+  26.5.0, including that the command line wins over `NODE_OPTIONS`). If a future Node grows a
+  third channel for that flag, capwall would not find the path — so it gates on the sentinel
+  `<localstorage>` rather than declining to decide. A decision is always taken; deny-by-default
+  still holds; the sentinel shows up in an `observe` trace as a legible prompt.
+- **The narrowness that made #156 non-urgent has not changed, and is not what the gate rests on.**
+  The flag is opt-in and set by the operator, never by a dependency; there is exactly one path;
+  a dependency has no path control. It remains a persistence and cross-run-signalling channel
+  rather than a route to arbitrary files. The gate exists because Node 26 becomes LTS on
+  2026-10-28 and "flag-gated on a version nobody runs" stops being a mitigation.
 
 ## Native `.node` addons
 

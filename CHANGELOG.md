@@ -23,6 +23,30 @@ has to be findable without reading the diff.
 
 ### Changed
 
+- **`CAPWALL_GLOBAL_EGRESS=0` now refunds the startup cost it was supposed to avoid** (#170).
+  The switch turned the global egress guard off and kept its dominant price: the real
+  `Request.prototype.url` capture — ~21 ms of undici materialization, the largest single line in
+  `scripts/bench/README.md` § Startup — was an IIFE at module scope, so it ran whether or not the
+  guard installed. Measured 188.98 vs 187.78 ms on Node 22 and 148.76 vs 159.36 on 26: no
+  difference at all.
+
+  The capture is **not** deferred to `install()`, which is the obvious fix and reopens #26/#56 for
+  an embedder who imports `@capwall/core` early and installs late — a dependency in between can
+  replace `Request.prototype.url` and capwall would guard the URL it claims while undici dials the
+  real one. It is conditional on `CAPWALL_GLOBAL_EGRESS`, which is read at module evaluation, so
+  the condition is exactly as early as the capture it replaces and every configuration that does
+  not contradict itself is unchanged. The one that does — the variable set AND `globalEgress: true`
+  passed to `install()` — takes the capture late and warns on stderr if it cannot prove the getter
+  is Node's own.
+
+  A second undici materialization had to go with it: `node:http` carries three members that are the
+  same lazy binding (`WebSocket`, `CloseEvent`, `MessageEvent`), and building the `http` shim read
+  them, so the ESM path — which builds the whole registry inside `install()` — paid the 21 ms on
+  **every** mediated process regardless of the switch. Getter-only members of the real namespace
+  are now mirrored as getters rather than flattened to values, which is also a more faithful shim:
+  `http.WebSocket` is getter-only on Node and capwall's copy was assignable. Measured delta between
+  the guard on and off, previously 0: **19–29 ms**.
+
 - **The ESM path no longer uses `module.register()`** (issues #152, #153). capwall's `resolve` and
   `load` hooks are now registered with **`module.registerHooks()`** — synchronous, and running in
   capwall's own realm rather than on Node's separate module-customization thread. Four things
@@ -68,8 +92,45 @@ has to be findable without reading the diff.
   deprecated `module.register()` in its favour, DEP0205). If you are on Node 20, upgrade to 24
   (the active LTS, supported to 2028-04-30).
 
+### Security
+
+- **`localStorage` is mediated as an `fs` read/write on its backing file** (#156). Node 26 ships
+  Web Storage, and with `--localstorage-file=<path>` Node performs that file's I/O internally,
+  **below capwall's `fs` shim** — so a dependency read and wrote it with no `fs` grant and no
+  recorded decision: nothing denied in `enforce`, nothing in the `observe` trace, nothing for
+  `capwall diff`. Same shape as the module-system read channel #123 closed, on a different Node
+  internal.
+
+  `getItem`/`key`/`length` are now an `fs` **read** on the resolved backing path and
+  `setItem`/`removeItem`/`clear` an `fs` **write**, charged to the calling package. It is an `fs`
+  capability, not a new kind and not `net` — it was found by the egress inventory canary, but the
+  authority it confers is filesystem authority — so every existing policy, trace, `gen-policy`
+  output and `capwall diff` covers it with no schema change.
+
+  `sessionStorage` is in-memory and is deliberately **not** gated. The guard is a clean no-op on
+  Node 22 and 24 (no such global) and on Node 26 without the flag: capwall detects availability
+  with `Object.keys(globalThis)` and never by reading the property, which would print
+  `ExperimentalWarning: localStorage is not available…` on the same stderr its `DENY` lines use.
+  No process-patch site is registered in that case at all. One deviation, and it fails closed:
+  `Storage.prototype.getItem.call(localStorage, k)` throws `Illegal invocation` against capwall's
+  view — the same class as the guarded `http.globalAgent` view (#65). See
+  `docs/threat-model.md` § Web Storage.
+
 ### Added
 
+- **The `malicious-dep-demo` definition-of-done demo is now gated by a test** (#164), and the
+  committed `examples/malicious-dep-demo/node_modules/sneaky-dep` fixture it needs — deleted by
+  accident for the third time, most recently in the merge of #173 — is restored.
+
+  AGENTS.md § 6 names "blocked in `enforce`, only logged in `observe`" as part of the definition
+  of done, and nothing mechanical checked it. With the fixture gone, `pnpm test`,
+  `pnpm mutation:gate`, `pnpm bench:gate` and `pnpm ci:local` were **green on all three Node
+  versions**. `packages/cli/test/malicious-dep-demo.test.ts` runs the demo end to end and asserts
+  the observable outcome — the env read soft-denies to `undefined`, the fs read is denied before
+  any bytes are read, both `DENY` lines are printed, and the `observe` policy lists exactly the
+  two capabilities the dependency attempted and no `net` grant (AGENTS.md § 8's "stays obviously
+  inert", mechanically). A third test runs the demo with the fixture absent and asserts the
+  enforce assertions genuinely stop holding, so the gate cannot pass for the wrong reason.
 - **Node 24 and Node 26 are tested.** 24 is the active LTS; 26 becomes LTS on 2026-10-28 and is
   carried early so breakage surfaces before it is everyone's runtime.
 - **Web Storage is classified.** Node 26 introduced `Storage`/`localStorage`/`sessionStorage`,

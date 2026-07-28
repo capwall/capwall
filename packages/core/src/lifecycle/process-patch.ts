@@ -224,7 +224,11 @@ export function globalPropertySlot(name: string): GlobalPropertySlot {
       // lazy accessors that materialize into a data property on first access, and the descriptor
       // worth restoring is the post-materialization one.
       const real: unknown = globals[name];
-      if (typeof real !== "function") return null; // absent on this Node / behind an unset flag
+      // Absent on this Node, or behind an unset flag. Functions and classes cover the egress
+      // globals; a non-null OBJECT is here for `localStorage` (#156), which is an instance rather
+      // than a constructor. Everything else — `undefined`, `null`, a primitive — means there is
+      // nothing to guard, and capwall never ADDS a global.
+      if (typeof real !== "function" && (typeof real !== "object" || real === null)) return null;
       const saved = Object.getOwnPropertyDescriptor(globals, name);
       // `configurable !== true` means capwall could never put the original back — so it does not
       // take the global at all, rather than taking it irreversibly.

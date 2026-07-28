@@ -100,6 +100,15 @@
  * Forwarding the pinned string makes Node fail on the identical garbage — the error message is
  * byte-identical to un-shimmed Node (`Failed to parse URL from …`), verified.
  *
+ * ── STARTUP COST, AND WHAT THE OFF SWITCH ACTUALLY BUYS (issue #170) ────────────────────────
+ * Capturing the real `Request.prototype.url` getter means reading `globalThis.Request`, which
+ * materializes undici: ~21 ms on every mediated process, the largest single line in
+ * `scripts/bench/README.md` § Startup. That capture is conditional — see
+ * {@link realRequestUrlGetter} for the full table of which configurations pay it, why the
+ * condition is `CAPWALL_GLOBAL_EGRESS` rather than the `globalEgress` install option, and why
+ * moving the capture into {@link installGlobalEgressGuard} unconditionally would buy the 21 ms
+ * with a TOCTOU window on the embedder path.
+ *
  * ── POLICY SHAPE ────────────────────────────────────────────────────────────────────────────
  * A global egress call is evaluated as an ordinary **`net`** capability (`hosts` / `ports`), not
  * a new capability kind. A dependency dialing `example.com:443` is the same authority whether it
@@ -240,19 +249,28 @@ function pinUrlArgument(args: unknown[]): ResolvedGlobalCall {
 }
 
 /**
- * The REAL `Request.prototype.url` getter, captured once at module evaluation — i.e. as early
- * as capwall itself loads, before any dependency has run.
+ * Read the REAL `Request.prototype.url` getter off `globalThis.Request`.
  *
  * Calling this getter ON the caller's object is the only trustworthy way to learn where a
- * `Request` will actually go. `req.url` is not: an own accessor installed with
- * `Object.defineProperty(req, "url", { get })` shadows the prototype getter for ordinary reads
- * while undici keeps dialing the real internal URL. Measured — a `Request` built for
- * `http://127.0.0.1:P/real` and shadowed to report `http://granted.example/` fetched `/real`.
+ * `Request` will actually go. `req.url` is not, and neither is `Request.prototype.url` at call
+ * time. Both are replaceable, and undici reads neither — it dials its own internal state.
+ * Measured on 22.22.3 and 26.5.0, in both flavours:
+ *   - an OWN accessor (`Object.defineProperty(req, "url", { get })`) reports the attacker's
+ *     granted-looking URL while the request goes to the real one;
+ *   - the same via `Object.defineProperty(Request.prototype, "url", { get })`, which a
+ *     dependency can do once and have every later `Request` lie — while a getter captured
+ *     BEFOREHAND still returns the true URL off the instance's internal slots.
+ * The second is why the capture has to happen before anything else runs, and it is what
+ * `test/global-egress-capture.test.ts` and the `#170` mutant pin.
  *
  * `undefined` when the runtime has no `Request` (it exists on every supported Node, but the
  * guard must not assume a global into existence).
+ *
+ * COST: reading `globalThis.Request` MATERIALIZES undici — ~21 ms of every mediated process's
+ * startup, the single largest line in `scripts/bench/README.md` § Startup. See
+ * {@link realRequestUrlGetter} for when capwall pays it and when it does not.
  */
-const realRequestUrlGetter: (() => unknown) | undefined = (() => {
+function captureRequestUrlGetter(): (() => unknown) | undefined {
   const RequestCtor: unknown = (globalThis as unknown as Record<string, unknown>)["Request"];
   if (typeof RequestCtor !== "function") return undefined;
   const desc = Object.getOwnPropertyDescriptor(
@@ -260,7 +278,129 @@ const realRequestUrlGetter: (() => unknown) | undefined = (() => {
     "url",
   );
   return typeof desc?.get === "function" ? (desc.get as () => unknown) : undefined;
-})();
+}
+
+/**
+ * `true` when this process was started with the documented switch that turns the whole global
+ * egress guard OFF — `CAPWALL_GLOBAL_EGRESS=0`, read here at module evaluation, which is the
+ * earliest moment in the process and therefore not something a dependency can influence.
+ *
+ * THE POINT OF READING IT HERE RATHER THAN AT INSTALL TIME (issue #170). The capture below used
+ * to be an unconditional module-scope IIFE, so `CAPWALL_GLOBAL_EGRESS=0` removed the control and
+ * kept its dominant cost: measured 188.98 vs 187.78 ms on Node 22 and 148.76 vs 159.36 on 26 —
+ * no difference at all. An escape hatch that disables a security control without refunding its
+ * price is the opposite of an escape hatch.
+ */
+const GLOBAL_EGRESS_OFF_BY_ENV = process.env["CAPWALL_GLOBAL_EGRESS"] === "0";
+
+/**
+ * The REAL `Request.prototype.url` getter, captured at module evaluation — i.e. as early as
+ * capwall itself loads, before any dependency has run — UNLESS this process has already said it
+ * does not want the guard at all.
+ *
+ * ── WHY THE CONDITION IS THE ENVIRONMENT VARIABLE AND NOT THE `globalEgress` OPTION ──────────
+ *
+ * The obvious fix for #170 is to move the capture into {@link installGlobalEgressGuard}, where
+ * `ctx` is known and it can be skipped whenever the guard is off. That is NOT what this does,
+ * because it is only window-free on one of capwall's two entry paths:
+ *
+ *  - **Preload.** `install()` runs from the preload body, the first thing in the process. No
+ *    dependency executes between this module's evaluation and that call, so deferring is free.
+ *  - **Embedder.** `import { install } from "@capwall/core"` evaluates this graph at import
+ *    time and `install()` may be called much later. A dependency `require`d in between can
+ *    replace `Request.prototype.url` (verified above) — and capwall would then read a tampered
+ *    getter while undici dials the real internal URL, which is #26/#56 reopened. Deferring by
+ *    default buys 21 ms with a TOCTOU window, which is not a trade this file is allowed to make.
+ *
+ * `CAPWALL_GLOBAL_EGRESS` is knowable at module evaluation, and it is knowable *safely*: the
+ * environment is read before any dependency exists, and it is the preload's ONLY configuration
+ * channel (`preload.ts` is the only reader of it). So the condition is exactly as early as the
+ * capture it replaces, and every configuration that does not contradict itself behaves precisely
+ * as it did before:
+ *
+ *  | configuration                                    | capture       | guard | vs. before |
+ *  |--------------------------------------------------|---------------|-------|------------|
+ *  | preload / embedder, variable unset               | eager, here   | on    | identical  |
+ *  | preload, `CAPWALL_GLOBAL_EGRESS=0`               | never taken   | off   | −21 ms     |
+ *  | embedder, `globalEgress: false`, variable unset   | eager, here   | off   | identical  |
+ *  | embedder, `CAPWALL_GLOBAL_EGRESS=0` + `true`      | late, warned  | on    | see below  |
+ *
+ * The `globalEgress: false` option deliberately does NOT skip the capture. It is not knowable
+ * until `install()`, and skipping on it is the deferral described above — the 21 ms stays, and
+ * the reason is written here rather than left to be rediscovered.
+ *
+ * ── THE ONE ROW THAT IS NOT IDENTICAL ────────────────────────────────────────────────────────
+ * An embedder can set `CAPWALL_GLOBAL_EGRESS=0` in the environment and still ask `install()` for
+ * the guard, since that option is a code-level default the variable does not reach. That
+ * configuration contradicts itself, and capwall does not silently pick a side: it takes the
+ * capture late (a working guard beats no guard) and, if it cannot prove the getter is still
+ * Node's own, says so on stderr. See {@link ensureRequestUrlCapture}.
+ */
+let realRequestUrlGetter: (() => unknown) | undefined = GLOBAL_EGRESS_OFF_BY_ENV
+  ? undefined
+  : captureRequestUrlGetter();
+
+/** Whether {@link realRequestUrlGetter} is still owed — see {@link ensureRequestUrlCapture}. */
+let requestUrlCaptureDeferred = GLOBAL_EGRESS_OFF_BY_ENV;
+
+/**
+ * Has anything in this realm materialized undici — i.e. can a `Request` object exist yet?
+ *
+ * `process.moduleLoadList` is an undocumented Node internal (inventoried in
+ * `docs/node-api-dependencies.md`), and it is used here for exactly one narrow question, on the
+ * fail-safe side: `internal/deps/undici/undici` appears in it at the instant `globalThis.Request`
+ * is first read, and not before. Verified on 22.22.3 / 24.18.0 / 26.5.0 — including that merely
+ * reading `globalThis.fetch` does NOT load it, so the entry tracks the `Request` class
+ * specifically. If the class has not been created, no code can have replaced a getter on its
+ * prototype, so a capture taken now is Node's own.
+ *
+ * Anything unrecognizable — a Node that drops the array, a dependency that replaced it — reads
+ * as "already materialized", i.e. as doubt. This decides whether capwall WARNS, never whether it
+ * guards, so the conservative answer is the harmless one.
+ */
+function undiciMaterialized(): boolean {
+  const list: unknown = (process as unknown as { moduleLoadList?: unknown }).moduleLoadList;
+  if (!Array.isArray(list)) return true;
+  return list.some((m) => typeof m === "string" && m.endsWith("internal/deps/undici/undici"));
+}
+
+/**
+ * Take the capture that {@link realRequestUrlGetter} skipped, on the one self-contradictory
+ * configuration that can reach it: `CAPWALL_GLOBAL_EGRESS=0` in the environment AND an
+ * `install()` that asked for the global egress guard anyway.
+ *
+ * Called from {@link installGlobalEgressGuard} before the guard is built, so no `fetch` can be
+ * mediated with the getter still missing (a missing getter is not a soft failure — it would send
+ * every `Request` input down the `String(input)` path, where `"[object Request]"` parses as
+ * nothing and the call is forwarded UNGUARDED).
+ *
+ * The warning is conditional on {@link undiciMaterialized} rather than unconditional, because
+ * the common shape of this contradiction — a process with the variable exported globally, an
+ * embedder that installs at startup — has provably lost nothing: no `Request` class existed
+ * between this module's evaluation and now, so nobody could have tampered with one. Warning
+ * there would be crying wolf, and a warning nobody believes is worse than none.
+ *
+ * The residual it does NOT detect is a dependency that replaces `globalThis.Request` itself
+ * without ever materializing undici. That is unfalsifiable from inside the process — the only
+ * route to Node's `Request` class IS that property — and it is reachable only by code running
+ * before `install()`, which has already captured raw `fs`, `net` and `child_process`. Named in
+ * docs/threat-model.md § Global egress surfaces rather than left implied.
+ */
+function ensureRequestUrlCapture(): void {
+  if (!requestUrlCaptureDeferred) return;
+  requestUrlCaptureDeferred = false;
+  const provablyPristine = !undiciMaterialized();
+  realRequestUrlGetter = captureRequestUrlGetter();
+  if (provablyPristine) return;
+  process.stderr.write(
+    "[capwall] WARN CAPWALL_GLOBAL_EGRESS=0 is set, but install() was asked for the global " +
+      "egress guard anyway. The Request.prototype.url capture that closes #26/#56 is skipped " +
+      "at load when that variable is set (skipping it is what the variable buys, issue #170), " +
+      "so it had to be taken now — after undici was already materialized. capwall cannot prove " +
+      "the getter it captured is Node's own. Unset CAPWALL_GLOBAL_EGRESS, or pass " +
+      "globalEgress: false.\n",
+  );
+}
 
 /**
  * The true URL of `input` if it is a genuine `Request`, else `undefined`.
@@ -627,7 +767,12 @@ const egressPatch = defineSharedPatch<EgressState>("globalThis egress (fetch/Web
 /**
  * Install the global egress guard: replace `fetch` / `WebSocket` / `EventSource` on
  * `globalThis` with guarded equivalents, for as long as ANY install is active.
+ *
+ * The capture check runs BEFORE the patch, so the `fetch` wrapper is never reachable with
+ * {@link realRequestUrlGetter} still owed (#170). On every ordinary configuration it is a
+ * boolean read — the getter was captured at module evaluation.
  */
 export function installGlobalEgressGuard(ctx: ShimContext): GlobalEgressGuardHandle {
+  ensureRequestUrlCapture();
   return egressPatch.install(ctx);
 }
