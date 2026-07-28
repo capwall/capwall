@@ -224,9 +224,39 @@ Do not start step *n+1* until step *n* has passing tests and a clean typecheck.
   *and* on a clock — it is the deprecation path, not just a ~53 ms startup win. It is deliberately
   NOT a drive-by change: the ESM perimeter is where #59, #61 and #62 lived, so it gets its own PR
   with the full laundering-vector suite run against it.
-- **License hygiene.** capwall is MIT. **Do NOT** pull in non-compete / source-available
-  code (e.g. PolyForm-licensed Socket code). Prefer permissive (MIT/BSD/Apache-2.0) deps
-  only.
+- **License hygiene.** capwall is MIT, and the gate is **scoped by whether the dependency
+  ships**. An earlier revision of this bullet said "permissive only" without saying *where*,
+  which read as one blanket rule and blocked a devDep major over a licence that never reaches
+  a user (#158/#159). Three rules, in decreasing severity:
+  - **Non-compete / source-available code is refused at ANY depth, dev or runtime.** PolyForm
+    (e.g. Socket's), BUSL, SSPL, Elastic, anything "free for non-commercial use". No dev-only
+    carve-out and no exceptions — this is the prohibition the section was written for, and it
+    is about what capwall is allowed to be built from, not about what it distributes.
+  - **Runtime dependencies: MIT / BSD / Apache-2.0 only.** That gate does not move. Weak
+    copyleft is *not* acceptable here. Runtime deps are shipped inside the published tarballs,
+    so their licences become every consumer's problem as well as ours. Today the entire
+    runtime closure of all four publishable packages is one package — `zod`, MIT — and
+    `pnpm --filter '@capwall/*' licenses list --prod` is how you confirm that in one command.
+  - **Weak copyleft (MPL-2.0 and similar) is acceptable in devDependencies.** npm does not
+    bundle devDeps, and capwall's `files` fields are narrow: a packed `@capwall/core` is
+    `dist/`, `src/`, `LICENSE`, `README.md`, `package.json` — nothing else, no `node_modules`.
+    An MPL-2.0 build tool is therefore never distributed by capwall and never reaches a user.
+    This is what unblocked vitest 4, whose vite 8 hard-depends on MPL-2.0 `lightningcss`, a
+    CSS transformer this project never calls.
+
+  **The known trade-off, accepted deliberately rather than missed.** Some enterprise licence
+  scanners flag copyleft anywhere in a dependency tree, devDeps included, and report on the
+  lockfile rather than on the tarball. So capwall can be legally clean and still surface as a
+  finding — in precisely the procurement review a security tool has to survive to get adopted.
+  That was weighed against permanently freezing dev tooling one major behind, and the tooling
+  won. If it ever bites a real adopter, the lever is a `pnpm.overrides` pin **with the reason
+  written next to it**; #158 removed two overrides that had no reason attached and had quietly
+  aged into version caps, so an unexplained pin is worse than none.
+
+  Nothing in `scripts/` enforces any of this — it is a review gate, and `pnpm licenses list`
+  is the command. If that ever changes, the check has to encode these three rules and not the
+  blanket one, because a policy stated in prose and enforced more strictly in code is the
+  drift this project keeps finding.
 
 ## 6. Definition of done (per feature)
 
