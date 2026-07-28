@@ -222,6 +222,15 @@ const NODE_LOADER_FRAME_PREFIX = "node:internal/modules/";
  * foreign filename and is denied by default. The bootstrap is closed before the first frame
  * exists. (Compiling under a `node:` name is also, separately, not something any real tool does.)
  *
+ * THAT ARGUMENT IS ABOUT ACQUIRING A FRAME, AND SAYS NOTHING ABOUT THE FRAMES THIS FUNCTION IS
+ * HANDED. `Error.captureStackTrace` is a writable property of a primordial: one assignment
+ * replaces it with a function that writes a fabricated CallSite reporting any file name at all,
+ * which defeats this check and the attribution walk together, needs no real frame, and restores
+ * itself on the next statement. It is out of scope for an in-process mechanism — capwall cannot
+ * freeze `Error`, and a detector would run in the process the attacker controls — so it is NAMED
+ * rather than defended: docs/threat-model.md § The one assumption every control rests on, and the
+ * *Shared mutable primordials* residual it points at. Hardened mode does not mitigate it either.
+ *
  * FAILS CLOSED. No caller frame at all — a `_compile` invoked from native code or through a
  * detached callback — is not the loader, so it is gated. The loader always has a frame.
  */

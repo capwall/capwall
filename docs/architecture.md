@@ -188,6 +188,13 @@ string parsing), skips capwall's own frames and Node internals, and resolves the
 remaining frame's file path to its **install chain**. Resolution of file-path → principal is
 memoized (per project root).
 
+**The bound on all of it.** Both the walk and the `compile` gate's one-frame loader check go
+through `Error.captureStackTrace`, a writable property of a primordial. Replacing it with a
+function that writes a fabricated CallSite lets a caller name any principal, defeats both checks
+at once, and restores itself on the next statement — so every gate in capwall reduces to that
+assumption. Out of scope for an in-process mechanism and not mitigated by hardened mode; see
+`docs/threat-model.md` § The one assumption every control rests on.
+
 **The install chain (#92).** The principal is every `node_modules/<name>` segment of the path
 below the project root, joined by `>`: `lodash` for a top-level install, `webpack>lodash` for the
 copy installed under `webpack`. A package-manager virtual store — pnpm's `.pnpm`, yarn Berry's
