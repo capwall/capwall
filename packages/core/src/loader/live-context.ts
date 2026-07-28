@@ -32,10 +32,37 @@
  *
  * WHAT IS *NOT* LIVE, and why: `hardened` (#17) is consumed at shim-BUILD time — it freezes the
  * objects as they are created, and a frozen object cannot be un-frozen. A capture therefore keeps
- * the hardening of the install that first built it. {@link liveRegistry} still honours a later
- * install's `hardened` for FRESHLY handed-out shims by memoizing one registry per hardened-ness,
- * so `install({hardened: true})` is never silently downgraded to unhardened shims. Enforcement is
- * identical either way — only the freezing differs.
+ * the hardening of the install that first built it. {@link liveRegistry} honours the live
+ * hardened-ness for FRESHLY handed-out shims by memoizing one registry per hardened-ness.
+ *
+ * HARDENED IS A RATCHET, NOT A PER-INSTALL SETTING (issue #129). This is the precedence rule the
+ * memoization note used to leave unstated, and getting it wrong was a real downgrade: `hardened`
+ * was taken from whichever install was NEWEST, so with a `hardened: true` install still active, a
+ * later `install({ hardened: false })` made every subsequent `require("node:fs")` hand back an
+ * UNFROZEN shim — which a dependency can then monkey-patch, process-wide and unlogged, which is
+ * the exact one-liner hardened mode exists to close. `install({ hardened: true })` had verified
+ * its post-condition (#103) and returned a handle; nothing revoked or re-checked that promise,
+ * and nothing warned.
+ *
+ * It was also inconsistent with the OTHER HALF OF THE SAME OPTION. The egress globals are already
+ * a ratchet: `GlobalPropertySlot.pin` is applied by `refresh` on every install and nothing
+ * un-pins until the last install restores the saved descriptors (`shims/global-egress.ts` §
+ * `pinGlobalEgress`). One `install({ hardened: false })` therefore left the process HALF-hardened,
+ * and which half you saw depended on which surface you looked at — so a reader could not tell
+ * which of the two behaviours was the bug.
+ *
+ * THE RULE, now uniform across every surface: **hardened engages when any install asks for it and
+ * lifts only when capwall fully uninstalls.** Deliberately matching the egress ratchet rather than
+ * the narrower "while the hardened install is active", because the whole complaint in #129 is the
+ * asymmetry, and because un-hardening while capwall is still mediating would hand a dependency a
+ * window in which a still-mediated surface became patchable again. #97's principle drives the
+ * direction: a security option accepted and then silently revoked is worse than one refused.
+ *
+ * WHAT IT STILL DOES NOT DO, and this is a property of freezing rather than of precedence: a
+ * reference captured BEFORE the hardened install arrived stays unfrozen forever. `install({
+ * hardened: true })` freezes what it hands out from then on; it cannot reach back into a `const fs
+ * = require("node:fs")` some module already holds. Install capwall early — that is what the
+ * `--import` preload is for.
  */
 import { buildShimRegistry } from "../shims/index.js";
 import type { ShimContext, ShimRegistry } from "../shims/runtime.js";
@@ -110,7 +137,22 @@ export const liveCtx = liveBox as ShimContext;
 let installed = false;
 
 /**
+ * Hardened mode's ratchet state (#129): has any install in the CURRENT install era asked for it?
+ *
+ * Reset only when the stack empties, which is the same moment `shims/global-egress.ts` lets the
+ * egress pin go — that alignment is the point. Not derived from `installs.some(…)` on each call,
+ * because that would silently un-harden the moment the hardened install unwound while another was
+ * still mediating, re-opening the downgrade one step later.
+ */
+let hardenedRatchet = false;
+
+/**
  * Re-point {@link liveCtx} at the newest install, or at the torn-down policy if there is none.
+ *
+ * ONE FIELD IS NOT THE NEWEST INSTALL'S: `hardened` is a ratchet over every install in the current
+ * era (#129), not last-writer-wins. Everything else is the top of the stack. Adding a field means
+ * deciding which of those two it is — "newest wins" is right for a POLICY (that is #62/#87's whole
+ * point) and wrong for a SECURITY FLOOR, which is what #129 was.
  *
  * EVERY field of {@link LiveContext} must be assigned on BOTH branches. A field added to
  * `ShimContext` and not mirrored here would silently keep the PREVIOUS install's value — which is
@@ -131,6 +173,9 @@ function applyTopOfStack(): void {
     liveBox.projectRoot = undefined;
     liveBox.maxFrames = undefined;
     liveBox.hardened = undefined;
+    // The last install is gone and everything it patched is restored, so the ratchet releases
+    // here and only here — the same boundary the egress pin uses.
+    hardenedRatchet = false;
     installed = false;
     return;
   }
@@ -139,7 +184,10 @@ function applyTopOfStack(): void {
   liveBox.onDecision = top.onDecision;
   liveBox.projectRoot = top.projectRoot;
   liveBox.maxFrames = top.maxFrames;
-  liveBox.hardened = top.hardened;
+  // `hardened` is the ONE field that is not taken from the top of the stack (#129). It is a
+  // ratchet over every active install, not the newest install's opinion; see the header.
+  if (!hardenedRatchet && installs.some((ctx) => ctx.hardened === true)) hardenedRatchet = true;
+  liveBox.hardened = hardenedRatchet;
   installed = true;
 }
 
@@ -180,7 +228,14 @@ export function isInstalled(): boolean {
  */
 const registries = new Map<string, ShimRegistry>();
 
-/** The shim registry for one interception path, built against {@link liveCtx} (see above). */
+/**
+ * The shim registry for one interception path, built against {@link liveCtx} (see above).
+ *
+ * Keyed by hardened-ness because a frozen shim cannot be un-frozen, so the two populations have to
+ * be separate objects. Which key is live is decided by the RATCHET, not by the newest install
+ * (#129): with a hardened install active this returns the frozen registry no matter what options
+ * a later install passed.
+ */
 export function liveRegistry(path: "cjs" | "esm"): ShimRegistry {
   const key = `${path}:${liveBox.hardened === true ? "hardened" : "plain"}`;
   let reg = registries.get(key);

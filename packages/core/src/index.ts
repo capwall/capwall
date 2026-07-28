@@ -130,6 +130,19 @@ export interface InstallOptions {
    * accepted and silently inert on the ESM path; a security option that is accepted and not
    * applied is worse than one that is refused. See `hardeningGaps` for why the check cannot
    * produce a false positive.
+   *
+   * A RATCHET FOR THE PROCESS, NOT A PER-INSTALL SETTING (#129). Installs nest, and `hardened`
+   * does NOT follow the newest one the way `policy` and `mode` do. Once ANY install has asked for
+   * it, every freshly handed-out shim is frozen and the egress globals stay pinned until the LAST
+   * install is released — so a later `install({ hardened: false })` cannot silently downgrade a
+   * hardened install that is still active, and `hardened: false` is "I am not asking for it",
+   * never "turn it off". Both halves of the option behave this way; before #129 the egress globals
+   * ratcheted and the shim registries were last-writer-wins, which left the process half-hardened.
+   * The corollary is that passing `hardened: false` guarantees nothing about the surfaces you get
+   * if something else in the process asked for hardening.
+   *
+   * What it still cannot do is reach BACKWARDS: a reference captured before the hardened install
+   * arrived stays unfrozen, because a frozen object is made frozen when it is built. Install early.
    */
   hardened?: boolean;
 }

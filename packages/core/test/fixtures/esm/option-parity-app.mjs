@@ -41,17 +41,31 @@ const policy = loadPolicyFromObject(
 );
 
 const decisions = [];
+// `downgradeAfter` is a probe directive, not an InstallOption — see below.
+const { downgradeAfter, ...installOptions } = config.options ?? {};
 const options = {
   projectRoot: config.projectRoot === "node_modules" ? path.join(ROOT, "node_modules") : ROOT,
   onDecision: (pkg, decision) =>
     decisions.push({ pkg, kind: decision.observed.kind, allowed: decision.allowed }),
-  ...config.options,
+  ...installOptions,
 };
 
 let installError = null;
 let handle = null;
+/**
+ * #129: nest a NON-hardened install on top, BEFORE any probe requires a mediated builtin.
+ *
+ * The downgrade this reproduces is not about the install call — it is about what the NEXT
+ * `require("node:fs")` / `import "node:net"` hands back. Both probe sets below load their
+ * dependency (and therefore capture their shims) after this point, so a registry that followed
+ * the newest install rather than the ratchet shows up as `frozen: false`.
+ */
+let downgrade = null;
 try {
   handle = install(policy, config.mode ?? "enforce", options);
+  if (downgradeAfter === true) {
+    downgrade = install(policy, config.mode ?? "enforce", { ...options, hardened: false });
+  }
 } catch (err) {
   installError = String(err && err.message);
 }
@@ -79,6 +93,7 @@ if (installError === null) {
   // Which principal each path's read was charged to — the `projectRoot` observable, and the
   // `attribution.maxFrames` one.
   report.decisions = decisions;
+  if (downgrade !== null) downgrade.uninstall();
   handle.uninstall();
 }
 

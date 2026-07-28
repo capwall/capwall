@@ -46,6 +46,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { install, loadPolicyFromObject, type InstallHandle, type Policy } from "../src/index.js";
+import { liveRegistry } from "../src/loader/live-context.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const APP_DIR = path.join(here, "fixtures", "esm");
@@ -304,5 +305,102 @@ describe("#97 — a security option accepted but not applied is a startup error"
     plain.uninstall();
     open.pop();
     expect(Object.getOwnPropertyDescriptor(globalThis, "fetch")?.writable).toBe(true);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════════════════════
+ * #129 — hardened is a RATCHET, on every surface, not last-writer-wins on some of them.
+ * ═════════════════════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * #97's principle ("a security option accepted and not applied is worse than one refused") held at
+ * install time and was then silently reversible by the multi-install path #107 made a supported
+ * shape. `liveRegistry` memoized one registry per hardened-ness and took the hardened-ness from
+ * whichever install was NEWEST, so with a `hardened: true` install still active a later
+ * `install({ hardened: false })` handed every subsequent `require("node:fs")` an UNFROZEN shim —
+ * which the caller can monkey-patch, process-wide and unlogged, which is the one-liner hardened
+ * mode exists to close. Meanwhile the egress globals stayed pinned, because `pin` is a ratchet. One
+ * `install()` left the process half-hardened and NEITHER behaviour was documented, so a reader
+ * could not tell which one was the bug.
+ *
+ * The semantics chosen, and now uniform: **hardened engages when any install asks for it and lifts
+ * only when capwall fully uninstalls** — the egress half's behaviour, applied to the shim
+ * registries too. The rows below assert it on both axes at once (`{cjs, esm}` × the downgrade
+ * attempt), which is the cross that #97 survived many merges by not having.
+ */
+describe("#129 — a later non-hardened install cannot downgrade an active hardened one", () => {
+  const open: InstallHandle[] = [];
+  afterEach(() => {
+    while (open.length > 0) open.pop()?.uninstall();
+  });
+  const anyPolicy = (): Policy =>
+    loadPolicyFromObject({ version: 1, mode: "enforce", packages: {} }, { projectRoot: here });
+
+  it("a fresh require after install({hardened:false}) still gets a FROZEN shim", async () => {
+    // A subprocess: the registries are memoized per hardened-ness for the life of the process, and
+    // the ESM half registers a loader hook that cannot be unregistered. Both halves are probed in
+    // one run so the two axes actually cross.
+    const r = await parity({ ...BASE, options: { esm: true, hardened: true, downgradeAfter: true } });
+    expect(r.installError).toBeNull();
+    // Measured against the unfixed source, both halves reported `false`: same policy, same
+    // process, `hardened: true` install still active and its post-condition already verified —
+    // and every shim handed out afterwards patchable. Meanwhile `globalThis.fetch` stayed pinned,
+    // which is the half-hardened process #129 is about.
+    expect([r.cjs.frozen, r.esm.frozen]).toEqual([true, true]);
+  }, 60_000);
+
+  it("the shim ratchet releases on the same boundary the egress pin does — the LAST uninstall", () => {
+    // In-process, because the boundary under test is the transition itself. Asserting the two
+    // surfaces together is the point: #129 is not "the registries were wrong", it is "the two
+    // halves of one option disagreed", and a test that checked only one half would not notice
+    // them diverging again.
+    const hardened = install(anyPolicy(), "enforce", { projectRoot: here, hardened: true });
+    open.push(hardened);
+    const fetchWritable = (): boolean | undefined =>
+      Object.getOwnPropertyDescriptor(globalThis, "fetch")?.writable;
+    expect([Object.isFrozen(liveRegistry("cjs").get("node:fs")), fetchWritable()]).toEqual([
+      true,
+      false,
+    ]);
+
+    // The downgrade attempt. Both surfaces must ignore it.
+    const plain = install(anyPolicy(), "enforce", { projectRoot: here });
+    open.push(plain);
+    expect([Object.isFrozen(liveRegistry("cjs").get("node:fs")), fetchWritable()]).toEqual([
+      true,
+      false,
+    ]);
+
+    // The hardened install unwinds but capwall is still mediating: still hardened, on both.
+    hardened.uninstall();
+    open.pop();
+    expect([Object.isFrozen(liveRegistry("cjs").get("node:fs")), fetchWritable()]).toEqual([
+      true,
+      false,
+    ]);
+
+    // The last install goes: the ratchet releases, on both, together.
+    plain.uninstall();
+    open.pop();
+    expect(fetchWritable()).toBe(true);
+    const after = install(anyPolicy(), "enforce", { projectRoot: here });
+    open.push(after);
+    expect([Object.isFrozen(liveRegistry("cjs").get("node:fs")), fetchWritable()]).toEqual([
+      false,
+      true,
+    ]);
+  });
+
+  it("install({hardened:true}) on top of a plain install still satisfies its own post-condition", () => {
+    // The other order, which #103's install-time check must keep agreeing with: the ratchet has to
+    // make `liveRegistry` hand back the FROZEN registry by the time `hardeningGaps` inspects it,
+    // or `install()` would refuse an install it is perfectly able to honour.
+    const plain = install(anyPolicy(), "enforce", { projectRoot: here });
+    open.push(plain);
+    expect(Object.isFrozen(liveRegistry("cjs").get("node:fs"))).toBe(false);
+    expect(() => {
+      open.push(install(anyPolicy(), "enforce", { projectRoot: here, hardened: true }));
+    }).not.toThrow();
+    expect(Object.isFrozen(liveRegistry("cjs").get("node:fs"))).toBe(true);
   });
 });

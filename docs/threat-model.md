@@ -1181,11 +1181,34 @@ realistic way to trip it is code outside capwall pinning an egress global non-co
 a hardened install, after which nobody can harden or restore it; capwall refuses rather than
 running with the option quietly absent.
 
-One consequence of `hardened` is worth stating plainly, because `Object.freeze` is irreversible
-and everything else about an install IS live: a shim reference a module already captured keeps
-the hardening of the install that first built it. A later install with a different `hardened`
-gets correctly-hardened shims for anything freshly handed out — the registry is memoized per
-hardened-ness — but it cannot un-freeze, or retroactively freeze, what is already held.
+**`hardened` is a RATCHET for the process, not a per-install setting (#129).** Installs nest, and
+this is the one option that does **not** follow the newest one the way `policy` and `mode` do.
+Once any install has asked for hardening, every freshly handed-out shim is frozen and the egress
+globals stay pinned **until the last install is released**; `hardened: false` means "I am not
+asking for it", never "turn it off". So a later `install({ hardened: false })` cannot downgrade a
+hardened install that is still active, and passing `hardened: false` guarantees nothing about the
+surfaces you get if something else in the process asked for hardening.
+
+Before #129 only *half* the option behaved this way. The egress globals ratcheted
+(`GlobalPropertySlot.pin` is re-applied on every install and nothing un-pins until the last one
+restores), while the shim registries were last-writer-wins: with a `hardened: true` install still
+active, a later `install({ hardened: false })` made every subsequent `require("node:fs")` return
+an **unfrozen** shim, which a dependency can then monkey-patch — process-wide, unlogged, the exact
+one-liner hardened mode exists to close. The `hardened: true` install had verified its
+post-condition (above) and returned a handle; nothing revoked or re-checked that promise, and
+nothing warned. One `install()` therefore left the process half-hardened, and which half you saw
+depended on which surface you looked at, so neither behaviour was documented as intended. The
+ratchet is the safer of the two and the one already in force on the egress side, so it is now the
+rule on both. It is not a dependency-reachable bypass — reaching it means calling `install()`,
+which is the "reach capwall's own machinery" class this document already declines to defend — but
+it is a real hazard for embedders, who are told installs nest and teardown is order-independent.
+
+One further consequence is worth stating plainly, because `Object.freeze` is irreversible and
+everything else about an install IS live: a shim reference a module already captured keeps the
+hardening of the install that first built it. A later hardened install gets frozen shims for
+anything freshly handed out — the registry is memoized per hardened-ness — but it cannot
+retroactively freeze what is already held. Install capwall early; that is what the `--import`
+preload is for.
 
 Note the dependency on issue #64: while `fs.ReadStream`, `vm.Script` and
 `worker_threads.Worker` were construct-trap Proxies, hardened mode could not freeze them at
