@@ -192,10 +192,15 @@ that capwall blocks in `enforce` mode.
 capwall is **pragmatic defense-in-depth, not a formal sandbox.** Without SES's frozen
 primordials, a *determined in-process attacker* (prototype pollution, shared mutable
 primordials, fd/symlink escapes, un-patching the shims, `node:sqlite`/`vm`/`eval`, native
-`.node` addons, spawned-subprocess internals) can defeat it. Its job is to stop
-**opportunistic, worm-style supply-chain malware** — the Shai-Hulud / Glassworm class that
-runs at application-runtime and does not go out of its way to break out of a capability
-shim.
+`.node` addons, spawned-subprocess internals) can defeat it. The sharpest form of that, worth
+knowing before you rely on any of it: capwall decides **who is calling** by asking V8 for the
+stack, so replacing `Error.captureStackTrace` — one line, self-restoring, and **not** mitigated
+by hardened mode — lets a caller mint any principal in the policy. Every gate is a decision
+about a principal, so that assumption bounds all of them; see
+[`docs/threat-model.md`](./docs/threat-model.md) § The one assumption every control rests on.
+capwall's job is to stop **opportunistic, worm-style supply-chain malware** — the Shai-Hulud /
+Glassworm class that runs at application-runtime and does not go out of its way to break out of
+a capability shim.
 
 Native addons and subprocesses can be **gated** (whether they run) but not **confined**
 (what they do once running). A `"native": true` grant in particular is a load-time decision

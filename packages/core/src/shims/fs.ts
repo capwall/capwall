@@ -69,8 +69,6 @@ import {
 import { harden } from "./harden.js";
 import { CapabilityError } from "../errors.js";
 
-export type { DecisionSink, ShimContext } from "./runtime.js";
-
 type Access = "read" | "write";
 /** Which positional args of a method are paths, and what access each implies. */
 interface PathSpec {

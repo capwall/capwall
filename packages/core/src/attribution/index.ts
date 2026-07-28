@@ -191,7 +191,10 @@ export interface Attribution {
    * attacker who detaches from their own stack gets recorded, not suppressed. A frame reporting
    * a `node:` name cannot be forged for the same reason `calledByNodeLoader` may trust one
    * (`shims/module.ts`): acquiring it means having compiled under that name, which the compile
-   * gate denies before the first such frame can exist.
+   * gate denies before the first such frame can exist. That argument covers acquiring a real
+   * frame and not the CallSites this module is handed — replacing `Error.captureStackTrace`
+   * fabricates them outright, which is the documented primordials bound on all of attribution
+   * (docs/threat-model.md § The one assumption every control rests on).
    */
   initiatedByNode: boolean;
 }

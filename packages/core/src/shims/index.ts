@@ -39,5 +39,3 @@ export function buildShimRegistry(ctx: ShimContext): ShimRegistry {
   // separately via installEnvGuard() in index.ts install().
   return reg;
 }
-
-export type { ShimContext, ShimRegistry, DecisionSink } from "./runtime.js";

@@ -34,8 +34,6 @@ import {
 } from "./runtime.js";
 import { harden } from "./harden.js";
 
-export type { DecisionSink, ShimContext, ShimRegistry } from "./runtime.js";
-
 type AnyFn = (...args: unknown[]) => unknown;
 
 /** Function-kind entry points gated as plain calls (guard, then delegate). */

@@ -76,6 +76,12 @@ export interface InstallOptions {
    * Gate `process.env` reads by dependencies against the `env` allowlist (the
    * anti-exfiltration control). On by default. Set `false` to leave `process.env` untouched
    * (e.g. if the Proxy overhead is a concern for a workload that reads env in a hot loop).
+   *
+   * The CLI preload reaches this through `CAPWALL_ENV=0`, and WARNS when it does — until #125
+   * this was the one install option with no preload channel, so the hatch documented here was
+   * unreachable from the CLI. See `preload.ts`'s header for why an environment switch for the
+   * anti-exfiltration control is not the weakening it looks like (the whole configuration
+   * channel is the environment, and `CAPWALL_MODE=observe` is already strictly more powerful).
    */
   env?: boolean;
   /**
@@ -379,7 +385,10 @@ export {
   DEFAULT_MAX_FRAMES,
 } from "./attribution/index.js";
 export type { Attribution, AttributionOptions, StackBoundary } from "./attribution/index.js";
-export type { DecisionSink } from "./shims/fs.js";
+// `DecisionSink` is DECLARED in `shims/runtime.ts`; take it from there. It used to be exported
+// through `shims/fs.js`, which only mirrored it — a leftover from when the type lived in that
+// file, and the reason the mirror lines could not be deleted without breaking the published API.
+export type { DecisionSink } from "./shims/runtime.js";
 export type {
   Policy,
   PackagePolicy,

@@ -13,6 +13,13 @@
  *   CAPWALL_TRACE_FILE    where to append the JSONL decision trace (optional)
  *   CAPWALL_PROJECT_ROOT  project root for attribution/glob resolution (default: cwd)
  *   CAPWALL_ESM           "0" disables the ESM loader hook (default: on)
+ *   CAPWALL_ENV           "0" disables the process.env read guard — the anti-exfiltration
+ *                         control — leaving `process.env` un-proxied (default: on, issue #125).
+ *                         The escape hatch for a workload that reads env in a hot loop and
+ *                         cannot pay the Proxy. Setting it WARNS on stderr: every `env` grant
+ *                         in the policy stops being enforced or recorded while `enforce` keeps
+ *                         printing denials for every other capability, so the process looks
+ *                         guarded and is not. See below for why this is switchable at all.
  *   CAPWALL_GLOBAL_EGRESS "0" disables the global egress guard — globalThis.fetch/WebSocket/
  *                         EventSource (default: on, issue #80). Those are globals, not module
  *                         exports, so they are the one surface capwall reaches by writing to
@@ -30,6 +37,25 @@
  * That is the complete set — capwall reads no other CAPWALL_* variable. They are also never
  * gated or recorded by the env shim, being capwall's own plumbing rather than the target's
  * environment. The same table is in packages/core/README.md § Environment variables.
+ *
+ * WHY `CAPWALL_ENV` EXISTS AT ALL, given that the env guard is *the* anti-exfiltration control
+ * (issue #125). The argument against it is that an env-var switch hands anyone who can set
+ * `CAPWALL_*` a one-line disable of the control that protects secrets. That argument does not
+ * survive contact with this table: the whole configuration channel is the environment, so the
+ * same attacker already has `CAPWALL_MODE=observe` (denies nothing at all), a substituted
+ * `CAPWALL_POLICY_FILE`, or simply dropping capwall's `--import` from `NODE_OPTIONS`. Each is
+ * strictly more powerful than `CAPWALL_ENV=0`. Nor is it dependency-reachable: every variable
+ * here is read once, at install time, before the target's entry point — a dependency writing
+ * `process.env.CAPWALL_ENV` later (writes are not mediated, #66) changes nothing. So `env` was
+ * an OMISSION from this table, not a decision, and the fix is to add it rather than to document
+ * a hatch `install()` advertises and the CLI cannot reach.
+ *
+ * It warns, and `globalEgress` does not, because the failure modes differ in kind rather than
+ * degree: `globalEgress: false` leaves the `net` grant enforced on every module surface, so the
+ * policy still means something, whereas `env: false` makes every `env` grant in the document
+ * decorative and records no env decision at all — while `enforce` keeps printing `DENY` lines
+ * for the other capabilities. That is the "looks enforced, isn't" shape, which is what the
+ * `<unknown>`-broad-grant warning below also exists for.
  *
  * Trace format: one JSON object per line, `{ "pkg": string, "req": CapabilityRequest }`,
  * deduplicated per process. `capwall gen-policy` aggregates this into a capabilities.json.
@@ -135,10 +161,24 @@ if (active) {
     );
   }
 
+  // The one switch that turns off a control rather than narrowing one, so it is never silent.
+  const envGuard = process.env["CAPWALL_ENV"] !== "0";
+  if (!envGuard) {
+    process.stderr.write(
+      `[capwall] CAPWALL_ENV=0 — the process.env read guard is OFF. Every 'env' grant in the ` +
+        `policy is unenforced and no env read is recorded, while other capabilities keep being ` +
+        `enforced (see docs/threat-model.md § process.env)\n`,
+    );
+  }
+
   const seen = new Set<string>();
   install(policy, mode, {
     projectRoot,
     attribution: { maxFrames },
+    // The anti-exfiltration control, on by default. `CAPWALL_ENV=0` is the CLI channel for the
+    // `env: false` escape hatch `install()` has always documented (#125) — see the header for
+    // why an env-var switch for it is not the weakening it looks like.
+    env: envGuard,
     // Mediate ESM `import` of builtins too (roadmap M5), on by default. Set CAPWALL_ESM=0 to
     // disable (leaves the CJS `require` path unaffected). The preload is loaded via --import,
     // which runs before the target's entry point, so the ESM hook is registered in time.

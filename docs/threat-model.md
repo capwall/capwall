@@ -10,6 +10,25 @@ capwall is **pragmatic, runtime, per-package defense-in-depth against opportunis
 supply-chain malware.** It is **not** a formal sandbox and does not withstand a determined
 in-process attacker.
 
+## The one assumption every control rests on
+
+capwall answers exactly one question before every capability decision — *whose code is
+calling?* — and it answers it by asking V8 for the stack, through `Error.captureStackTrace`
+with a temporary `Error.prepareStackTrace` swap. That is the mechanism behind the attribution
+walk (`attribution/index.ts`), the `compile` gate's "did Node's own loader call this?" check
+(`shims/module.ts`), and the "was this read initiated by Node itself?" discriminator (#119).
+`Error` is an ordinary primordial with ordinary writable properties, shared with every package
+in the process.
+
+So, plainly: **capwall's attribution — and therefore every control in this document, because
+every gate is a decision about a principal — rests on V8 stack machinery that any code in the
+host process can replace with one assignment.** There is no in-process fix. capwall cannot
+freeze `Error` without breaking every library that formats or captures a stack trace, and a
+guard written in the same process would rest on the same assumption it was checking. The
+residual that names this is § What capwall does NOT stop → *Shared mutable primordials*, where
+it is worked through with the cheapest concrete instance; **hardened mode does not mitigate it**,
+and neither does anything else capwall ships.
+
 ## Implementation status (keep in sync with the roadmap)
 
 As of roadmap **M5**, all core capability surfaces are mediated on **both the CJS `require`
@@ -93,8 +112,11 @@ be revoked.
   an escaping `TypeError` there would abort teardown and strand every other patch.
   #90 found the bugs; **#107 made the rule structural.** All five patch sites now go through one
   reference-counted relink chain, `core/src/lifecycle/process-patch.ts`, which is the only file in
-  `core/src` permitted to write a process global — asserted by a source scan in
-  `test/process-patch-sites.test.ts`, so a sixth patch site cannot be added off to the side. See
+  the whole workspace permitted to write a process global — asserted by a source scan in
+  `test/process-patch-sites.test.ts`, so a sixth patch site cannot be added off to the side. The
+  scan covers **`packages/*​/src`** since #125, not core alone: the other three packages get the
+  stricter rule of *no* process-global write at all, because the lifecycle helper is not on
+  `@capwall/core`'s `exports` map and they could not use it even if they had a reason to. See
   `docs/architecture.md` § Process-patch lifecycle.
 - **`hardened` is the one setting that is not per-install: it is a process-wide RATCHET (#129).**
   Every other option follows the newest install. `hardened` engages the moment **any** install
@@ -573,6 +595,17 @@ Per-capability notes:
   compose with writes (a silently dropped write leaves the dependency believing it succeeded; a
   throwing write reintroduces the crash). Tracked as a policy-language question, not a bug.
 
+  **Switchable off**: `install(…, { env: false })` / `CAPWALL_ENV=0` (#125), for a workload that
+  reads env in a hot loop and cannot pay the Proxy. `install()` has always documented the option;
+  the preload channel is new, and its absence was an omission rather than a safeguard — the
+  entire preload configuration surface is the environment, so anyone who can set `CAPWALL_ENV`
+  already has `CAPWALL_MODE=observe` or a substituted `CAPWALL_POLICY_FILE`, both strictly more
+  powerful, and no dependency can reach any of them (every `CAPWALL_*` variable is read once,
+  before the target's entry point, so a runtime `process.env` write — which is not mediated, see
+  above — changes nothing). It is the one switch that **warns on stderr** when set, because
+  turning it off makes every `env` grant in the policy unenforced and unrecorded while `enforce`
+  keeps denying every other capability: a process that looks guarded and is not.
+
 **Capability-bearing classes are guarded subclasses, not Proxies.** Where a capability can be
 reached through a class rather than a module function, capwall replaces the class with a
 **subclass it owns**, whose constructor (or prototype method) runs the check before delegating,
@@ -960,11 +993,62 @@ emit a starter policy scoped to what each package *actually* did, tighten it, en
 capwall does **not** harden JavaScript primordials (that is SES's job — see below). Without
 frozen primordials, a **determined in-process attacker** can defeat it via, among others:
 
-- **Prototype pollution** and **shared mutable primordials** — mutating
-  `Object.prototype`/`Array.prototype`/etc. to influence code in other packages, or to
-  tamper with capwall's own bookkeeping.
+- **Shared mutable primordials** — and the one that matters is `Error`, because capwall's
+  bookkeeping lives there. The worked example for this class is deliberately **not** prototype
+  pollution and **not** un-patching a shim; it is this, which is the cheapest escape anywhere in
+  this document:
+
+  ```js
+  Error.captureStackTrace = (h) => {
+    h.stack = [{ isEval: () => false, getFileName: () => "node:internal/modules/cjs/loader" }];
+  };
+  ```
+
+  capwall asks V8 for the stack in exactly two places and that line defeats **both**:
+  `calledByNodeLoader` (`shims/module.ts`, the `compile` gate's "is this Node's own loader?"
+  check) answers yes for any caller, and the attribution walk (`attribution/index.ts`) returns
+  whatever principal the fabricated CallSite names. Verified against a deny-all `enforce`
+  policy: a dependency holding **no grant at all** called `Module.prototype._compile` with an
+  arbitrary filename and it was **ALLOWED with no decision recorded** — no `DENY`, no `ALLOW`,
+  nothing for `observe` or `capwall diff` — where the identical call one statement earlier was
+  denied and logged. Swapping the fake file name for a granted package's path mints that
+  package: the same dependency then read an `env` key granted only to `trusted`, got the value,
+  and the read was charged to `trusted`.
+
+  Three things make this, rather than shim un-patching, the honest characterization of the class:
+
+  - **One line, and it does not have to stay in place.** The real `Error.captureStackTrace` goes
+    back on the next statement, so the escape is **self-restoring**: no persistent artifact, no
+    surface left in a modified state, nothing for a later audit or a liveness check to notice.
+    Un-patching a shim is the opposite — the patch has to remain in place for the escape to keep
+    working, and it visibly mutates an object other packages hold references to.
+  - **Hardened mode does nothing about it.** Stated flatly because the adjacent bullets *do*
+    claim partial hardened-mode coverage, so the contrast is otherwise invisible and a reader who
+    enabled hardened mode will reasonably conclude this class is handled. It is not. `Error` is a
+    primordial capwall does not and cannot freeze: freezing it breaks every library that formats
+    a stack trace or calls `Error.captureStackTrace` on its own error classes, and — being a
+    process-global — the freeze would outlive `uninstall()`, the same constraint that keeps the
+    real builtins (#77), `process.env` and `Module.prototype._compile` unfrozen. Hardened mode
+    closes the reassignment half of the un-patching bullet below and none of this one.
+  - **It is strictly more powerful than un-patching.** Un-patching *disables* enforcement for
+    whoever un-patched (and, being a shared singleton, for everyone else). This *mints identity*:
+    the caller chooses which principal capwall believes is running. That composes with the two
+    facts elsewhere in this document that make identity the whole game — `compile` is
+    identity-granting, "a grant of every other grant", and `<app>` is exempt from five gates
+    outright (§ What the trust root is actually exempt from). Forging `<app>` costs the same one
+    line as forging Node's loader.
+
+  **Prototype pollution proper** — mutating `Object.prototype`/`Array.prototype`/etc. to
+  influence code in other packages — is the rest of this class and is equally out of scope.
+  Freezing the primordials is SES's job; see § vs SES / hardened primordials. capwall does not
+  attempt a detection heuristic here either: a check for a replaced `Error.captureStackTrace`
+  would itself run in the process the attacker controls, and a spoofable guard inside the
+  attribution layer is worse than a documented bound (the same reasoning that rejected the
+  `ownKeys` enumeration-epoch heuristic under § Name-level vs value-level).
 - **Un-patching the shims** — reaching for the original, un-wrapped core module reference and
-  calling it directly. This is **cheap, not exotic**: capwall returns a plain, mutable shim
+  calling it directly. This is **cheap, not exotic** (though not the cheapest escape in this
+  section — that is the bullet above, and hardened mode reaches this one and not that one):
+  capwall returns a plain, mutable shim
   object (deliberately un-frozen, so legitimate `fs` monkey-patchers such as `graceful-fs`
   keep working — the no-SES-tax tradeoff). A dependency can reassign the shim's methods, or
   reach the raw builtin through channels capwall does not mediate. Both the CJS `require` and
@@ -1397,6 +1481,14 @@ still installed and still enforcing afterwards.
 a sandbox and it closes none of the following, each re-verified against a hardened install
 with a deny-all `enforce` policy:
 
+- **Replacing `Error.captureStackTrace`** — the one line under § What capwall does NOT stop →
+  *Shared mutable primordials*, re-verified against a hardened install: the `compile` gate still
+  waves the forged call through with no decision recorded, and the attribution walk still returns
+  the principal the fake CallSite names. `Error` is a primordial, not a capwall-created object,
+  so there is nothing here for hardened mode to freeze — and freezing it is not available anyway
+  (it breaks every stack-formatting library and outlives `uninstall()`). This is listed first
+  because it is **cheaper than everything else in this list and defeats every gate at once**,
+  including the ones hardened mode does close: it does not need to touch a shim.
 - **`process.getBuiltinModule("node:fs")`** (Node ≥22) — a plain public API returning the
   real, un-shimmed module; the read succeeds. Also `process.binding`, internal module caches,
   and builtins loaded from a context capwall has not patched. These never touch a shim object,
@@ -1644,6 +1736,9 @@ runtime.** Complementary layers, not competitors.
 
 Deploying capwall in `enforce` mode meaningfully raises the cost of opportunistic
 supply-chain malware and gives you a per-package audit trail. It does **not** provide a
-security boundary against a determined, capwall-aware in-process attacker. Treat it as one
+security boundary against a determined, capwall-aware in-process attacker. The bound is the one
+stated at the top of this document: every gate here is a decision about a principal, and the
+principal comes from V8 stack machinery any code in the process can replace with one assignment
+— silently, without persisting, and with hardened mode on. Treat capwall as one
 layer of defense-in-depth, alongside dependency review, lockfile pinning, least-privilege
 process/OS sandboxing (containers, seccomp), and secret hygiene.
