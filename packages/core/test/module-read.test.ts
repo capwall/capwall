@@ -26,19 +26,21 @@
  * (`Module._cache`, the ESM registry), and the ESM half lives on Node's loader thread — none of
  * which is isolatable in-process. Requires `pnpm build` (CI does build → test).
  */
-import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { moduleLoadNeedsDecision, decideEsmModuleRead } from "../src/loader/module-read.js";
 import { parsePolicy } from "@capwall/policy-schema";
+import {
+  assertPreloadBuilt,
+  PRELOAD_IMPORT_FLAG,
+  runNode,
+  type NodeRunResult,
+} from "./helpers/subprocess.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const PRELOAD = createRequire(import.meta.url).resolve("../dist/preload.js");
 
 /** The string that must never reach stdout through any channel under a deny-all policy. */
 const SECRET = "AKIA-MODULE-READ-CHANNEL";
@@ -49,31 +51,23 @@ let vault: string;
 let denyPolicy: string;
 let vaultGrantPolicy: string;
 
-interface RunResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
-
-function runEntry(entry: string, env: Record<string, string>): Promise<RunResult> {
-  const nodeOptions = `--import ${pathToFileURL(PRELOAD).href}`;
-  return new Promise((resolve, reject) => {
-    execFile(
-      process.execPath,
-      [entry],
-      {
-        cwd: proj,
-        env: { ...process.env, NODE_OPTIONS: nodeOptions, CAPWALL_PROJECT_ROOT: proj, ...env },
-      },
-      (err, stdout, stderr) => {
-        if (err && typeof err.code !== "number") return reject(err);
-        resolve({ code: err ? (err.code as number) : 0, stdout, stderr });
-      },
-    );
+/**
+ * `NODE_OPTIONS` rather than an argv flag, because several entries below are themselves spawned
+ * as `node <entry>` by the fixture and must inherit the preload. Identical (entry, env) pairs run
+ * once and are shared (#145) — the CJS and ESM halves of a claim are separate `it`s asserting
+ * different things about the same run.
+ */
+function runEntry(entry: string, env: Record<string, string>): Promise<NodeRunResult> {
+  return runNode([entry], {
+    // Sound to share: the whole fixture tree and both policy files are built in `beforeAll` and
+    // are read-only for the rest of the file.
+    share: true,
+    cwd: proj,
+    env: { NODE_OPTIONS: PRELOAD_IMPORT_FLAG, CAPWALL_PROJECT_ROOT: proj, ...env },
   });
 }
 
-const deny = (entry: string): Promise<RunResult> =>
+const deny = (entry: string): Promise<NodeRunResult> =>
   runEntry(entry, { CAPWALL_MODE: "enforce", CAPWALL_POLICY_FILE: denyPolicy });
 
 /**
@@ -209,10 +203,7 @@ try {
 }
 
 beforeAll(async () => {
-  expect(
-    existsSync(PRELOAD),
-    `built preload not found at ${PRELOAD} — run 'pnpm build' first`,
-  ).toBe(true);
+  assertPreloadBuilt();
   root = await mkdtemp(path.join(os.tmpdir(), "capwall-modread-"));
   proj = path.join(root, "proj");
   vault = path.join(root, "vault");

@@ -224,6 +224,19 @@ as the gate.
 - Keep smoke tests trivial but real (`packages/core/test/core.test.ts` asserts the
   evaluator's deny-by-default semantics and observe-mode pass-through — extend, don't
   delete).
+- **Start child processes through `packages/core/test/helpers/subprocess.ts`, and no more than
+  two per test.** ~190 of the suite's children are a full `node` startup (122 in `core`, 69 in
+  `cli`), because hardened mode, ESM module caching and `module.register()` are
+  process-sticky. Each costs ~0.5s, and the per-test timeout is arithmetic on that count —
+  which a setup file enforces, so a third child fails by name rather than by quietly
+  invalidating a budget nobody re-derived. The helper owns the budget, the measurements behind
+  it, and the failure message. A test over budget usually wants splitting; two `it`s asserting
+  different things about ONE run want `share: true` (#145).
+- **Never gate on a wall-clock figure.** A per-call microsecond bound measures elapsed time,
+  and a descheduled process accumulates elapsed time it did not spend running, so it goes red
+  on a busy machine at any threshold that still catches a regression. Gate on a RATIO against
+  a reference co-sampled in the same interleaved loop — `scripts/bench/bench.mjs` against a
+  CPU calibration, `install-lifecycle.test.ts` against the same call unmediated.
 - **A security test must be able to FAIL.** `pnpm test` is the only gate that runs (#3), so a
   test that passes for the wrong reason is worse than a missing one — it is a green light
   nobody re-examines. Issue #112 found six, including a "ReDoS hardening" test that passed

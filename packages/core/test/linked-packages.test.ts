@@ -30,27 +30,23 @@
  * behaviour under test is Node's own resolution: an in-process `install()` cannot make vitest's
  * transformed module graph resolve through a symlink the way `require` does.
  */
-import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { APP_ROOT, UNATTRIBUTED, packageForPath } from "../src/attribution/index.js";
+import { assertPreloadBuilt, runPreloaded, type NodeRunResult } from "./helpers/subprocess.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const PRELOAD = createRequire(import.meta.url).resolve("../dist/preload.js");
 const ATTRIBUTION = createRequire(import.meta.url).resolve("../dist/attribution/index.js");
 
 let tmpDir: string;
 
 beforeAll(async () => {
-  expect(
-    existsSync(PRELOAD),
-    "built core not found — run 'pnpm build' before 'pnpm test'",
-  ).toBe(true);
+  assertPreloadBuilt();
   tmpDir = await mkdtemp(path.join(os.tmpdir(), "capwall-linked-"));
 });
 afterAll(async () => {
@@ -93,28 +89,14 @@ function writePolicy(dir: string): void {
 }
 
 /** `entry` is `.cjs` or `.mjs`; the layout decides which spelling reaches the package. */
-async function runUnderCapwall(
-  projectRoot: string,
-  entry: string,
-): Promise<{ code: number; stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    execFile(
-      process.execPath,
-      ["--import", pathToFileURL(PRELOAD).href, entry],
-      {
-        cwd: projectRoot,
-        env: {
-          ...process.env,
-          CAPWALL_MODE: "enforce",
-          CAPWALL_POLICY_FILE: path.join(projectRoot, "capabilities.json"),
-          CAPWALL_PROJECT_ROOT: projectRoot,
-        },
-      },
-      (err, stdout, stderr) => {
-        if (err && typeof err.code !== "number") return reject(err);
-        resolve({ code: err ? (err.code as number) : 0, stdout, stderr });
-      },
-    );
+function runUnderCapwall(projectRoot: string, entry: string): Promise<NodeRunResult> {
+  return runPreloaded([entry], {
+    cwd: projectRoot,
+    env: {
+      CAPWALL_MODE: "enforce",
+      CAPWALL_POLICY_FILE: path.join(projectRoot, "capabilities.json"),
+      CAPWALL_PROJECT_ROOT: projectRoot,
+    },
   });
 }
 

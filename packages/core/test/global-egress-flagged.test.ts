@@ -21,47 +21,43 @@
  * distinction the assertions rely on is `BLOCKED` (a `CapabilityError` from capwall's guard,
  * raised before any socket opens) vs `ALLOWED` (anything else).
  */
-import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+  assertPreloadBuilt,
+  PRELOAD_IMPORT_FLAG,
+  runNode,
+  type NodeRunResult,
+} from "./helpers/subprocess.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const APP = path.join(here, "fixtures", "global-egress-app.cjs");
 const APP_DIR = path.dirname(APP);
-const PRELOAD = createRequire(import.meta.url).resolve("../dist/preload.js");
 
-interface RunResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
-
-function runApp(env: Record<string, string>): Promise<RunResult> {
-  return new Promise((resolve, reject) => {
-    execFile(
-      process.execPath,
-      [
-        "--experimental-websocket",
-        "--experimental-eventsource",
-        "--import",
-        pathToFileURL(PRELOAD).href,
-        APP,
-        `127.0.0.1:${wsPort}`,
-        `127.0.0.1:${esPort}`,
-      ],
-      { cwd: APP_DIR, env: { ...process.env, CAPWALL_PROJECT_ROOT: APP_DIR, ...env } },
-      (err, stdout, stderr) => {
-        if (err && typeof err.code !== "number") return reject(err);
-        resolve({ code: err ? (err.code as number) : 0, stdout, stderr });
-      },
-    );
-  });
+/**
+ * Every case here is one run of the same app under a different environment, so the (env → run)
+ * mapping is total: `runNode` runs each distinct environment once and shares it (#145). The
+ * hardened-vs-plain comparison at the bottom re-states four environments the four cases above it
+ * already ran, and now costs nothing extra rather than four more ~0.5 s processes.
+ */
+function runApp(env: Record<string, string>): Promise<NodeRunResult> {
+  return runNode(
+    [
+      "--experimental-websocket",
+      "--experimental-eventsource",
+      PRELOAD_IMPORT_FLAG,
+      APP,
+      `127.0.0.1:${wsPort}`,
+      `127.0.0.1:${esPort}`,
+    ],
+    // Sound to share: both policy files are written once in `beforeAll` and never rewritten,
+    // so the environment is the only input that varies.
+    { share: true, cwd: APP_DIR, env: { CAPWALL_PROJECT_ROOT: APP_DIR, ...env } },
+  );
 }
 
 /** Bind an ephemeral port, then close it immediately — connecting to it afterwards reliably
@@ -87,7 +83,7 @@ let wsPort: number;
 let esPort: number;
 
 beforeAll(async () => {
-  expect(existsSync(PRELOAD), `built preload not found at ${PRELOAD} — run 'pnpm build' first`).toBe(true);
+  assertPreloadBuilt();
   wsPort = await closedLocalPort();
   esPort = await closedLocalPort();
   tmpDir = await mkdtemp(path.join(os.tmpdir(), "capwall-globals-"));

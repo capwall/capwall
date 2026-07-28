@@ -8,15 +8,18 @@
  *
  * Requires `pnpm build` first — the end-to-end cases run the built `dist/preload.js`.
  */
-import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resolveMode } from "../src/policy/mode.js";
+import {
+  assertPreloadBuilt,
+  PRELOAD_IMPORT_FLAG,
+  runNode,
+  type NodeRunResult,
+} from "./helpers/subprocess.js";
 
 describe("resolveMode — precedence", () => {
   it("CAPWALL_MODE wins over the policy's declared mode", () => {
@@ -48,36 +51,18 @@ describe("resolveMode — precedence", () => {
 const here = path.dirname(fileURLToPath(import.meta.url));
 const APP = path.join(here, "fixtures", "esm", "app.mjs");
 const APP_DIR = path.dirname(APP);
-const PRELOAD = createRequire(import.meta.url).resolve("../dist/preload.js");
-
-interface RunResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
-
 /** Spawn the fixture app under the built preload with exactly `env` (CAPWALL_* only). */
-function runApp(env: Record<string, string>): Promise<RunResult> {
-  const nodeOptions = `--import ${pathToFileURL(PRELOAD).href}`;
-  const childEnv: Record<string, string | undefined> = {
-    ...process.env,
-    NODE_OPTIONS: nodeOptions,
-    CAPWALL_PROJECT_ROOT: APP_DIR,
-    // The vitest runner's own environment must not leak a mode into these cases.
-    CAPWALL_MODE: undefined,
-    CAPWALL_POLICY_FILE: undefined,
-    ...env,
-  };
-  return new Promise((resolve, reject) => {
-    execFile(
-      process.execPath,
-      [APP],
-      { cwd: APP_DIR, env: childEnv },
-      (err, stdout, stderr) => {
-        if (err && typeof err.code !== "number") return reject(err);
-        resolve({ code: err ? (err.code as number) : 0, stdout, stderr });
-      },
-    );
+function runApp(env: Record<string, string>): Promise<NodeRunResult> {
+  return runNode([APP], {
+    cwd: APP_DIR,
+    env: {
+      NODE_OPTIONS: PRELOAD_IMPORT_FLAG,
+      CAPWALL_PROJECT_ROOT: APP_DIR,
+      // The vitest runner's own environment must not leak a mode into these cases.
+      CAPWALL_MODE: undefined,
+      CAPWALL_POLICY_FILE: undefined,
+      ...env,
+    },
   });
 }
 
@@ -90,10 +75,7 @@ let declaresObserve: string;
 let declaresNothing: string;
 
 beforeAll(async () => {
-  expect(
-    existsSync(PRELOAD),
-    `built preload not found at ${PRELOAD} — run 'pnpm build' first`,
-  ).toBe(true);
+  assertPreloadBuilt();
   tmpDir = await mkdtemp(path.join(os.tmpdir(), "capwall-mode-"));
   declaresEnforce = path.join(tmpDir, "declares-enforce.json");
   declaresObserve = path.join(tmpDir, "declares-observe.json");

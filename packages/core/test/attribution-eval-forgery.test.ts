@@ -25,57 +25,37 @@
  * These run the built `dist/preload.js` in a subprocess (`pnpm build` first — CI does build →
  * test), because the vectors depend on real CJS loading and real timer detachment.
  */
-import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { assertPreloadBuilt, runPreloaded, type NodeRunResult } from "./helpers/subprocess.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const APP_DIR = path.join(here, "fixtures", "eval-forge");
 const APP = path.join(APP_DIR, "app.cjs");
-const PRELOAD = createRequire(import.meta.url).resolve("../dist/preload.js");
 const SECRET_VALUE = "forge-fixture-placeholder-not-a-real-secret";
 const SECRET_FILE = path.join(APP_DIR, "secret.txt");
-
-interface RunResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
 
 /** `forge-dep` has NO entry at all, so every grant it appears to hold has been forged. */
 let policyFile: string;
 let tmpDir: string;
 
-function runVector(vector: string): Promise<RunResult> {
-  return new Promise((resolve, reject) => {
-    execFile(
-      process.execPath,
-      [`--import=${pathToFileURL(PRELOAD).href}`, APP, vector],
-      {
-        cwd: APP_DIR,
-        env: {
-          ...process.env,
-          CAPWALL_MODE: "enforce",
-          CAPWALL_POLICY_FILE: policyFile,
-          CAPWALL_PROJECT_ROOT: APP_DIR,
-          FORGE_FIXTURE_SECRET: SECRET_VALUE,
-        },
-      },
-      (err, stdout, stderr) => {
-        if (err && typeof err.code !== "number") return reject(err);
-        resolve({ code: err ? (err.code as number) : 0, stdout, stderr });
-      },
-    );
+function runVector(vector: string): Promise<NodeRunResult> {
+  return runPreloaded([APP, vector], {
+    cwd: APP_DIR,
+    env: {
+      CAPWALL_MODE: "enforce",
+      CAPWALL_POLICY_FILE: policyFile,
+      CAPWALL_PROJECT_ROOT: APP_DIR,
+      FORGE_FIXTURE_SECRET: SECRET_VALUE,
+    },
   });
 }
 
 /** Assert the vector obtained NEITHER capability, and that both denials were recorded. */
-function expectDenied(r: RunResult, pkg: string): void {
+function expectDenied(r: NodeRunResult, pkg: string): void {
   // The env read is soft (the value is hidden, the caller is not crashed) …
   expect(r.stdout).toContain("env=undefined");
   // … and the file read throws `CapabilityError`, which the fixture reports by principal.
@@ -89,10 +69,7 @@ function expectDenied(r: RunResult, pkg: string): void {
 }
 
 beforeAll(async () => {
-  expect(
-    existsSync(PRELOAD),
-    `built preload not found at ${PRELOAD} — run 'pnpm build' before 'pnpm test'`,
-  ).toBe(true);
+  assertPreloadBuilt();
   tmpDir = await mkdtemp(path.join(os.tmpdir(), "capwall-eval-forge-"));
   policyFile = path.join(tmpDir, "capabilities.json");
   await writeFile(

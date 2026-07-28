@@ -18,7 +18,6 @@
  * Nothing else in the suite nests an install AND compiles a module inside the nested window, so
  * without this file the failure would have surfaced in someone's application instead.
  */
-import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
@@ -26,6 +25,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { runNode, type NodeRunResult } from "./helpers/subprocess.js";
 
 const CORE_DIST = createRequire(import.meta.url).resolve("../dist/index.js");
 
@@ -38,20 +38,13 @@ let tmpDir: string;
  * (`Module.prototype`) and the assertion is about that global's state — a leaked patch would
  * otherwise contaminate every later test file in the same worker.
  */
-async function runScript(
-  source: string,
-): Promise<{ code: number; stdout: string; stderr: string }> {
+async function runScript(source: string): Promise<NodeRunResult> {
   // A fresh directory per run: each script builds its own `node_modules` fixture tree, and the
   // second test asserts on a module CACHE miss, which a shared cwd would quietly turn into a hit.
   const dir = await mkdtemp(path.join(tmpDir, "run-"));
   const file = path.join(dir, "script.mjs");
   await writeFile(file, source);
-  return new Promise((resolve, reject) => {
-    execFile(process.execPath, [file], { cwd: dir }, (err, stdout, stderr) => {
-      if (err && typeof err.code !== "number") return reject(err);
-      resolve({ code: err ? (err.code as number) : 0, stdout, stderr });
-    });
-  });
+  return runNode([file], { cwd: dir });
 }
 
 /**

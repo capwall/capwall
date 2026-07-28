@@ -5,16 +5,19 @@
  * process, so in-process policy switching wouldn't isolate). Requires `pnpm build` first —
  * it runs against the built `dist/preload.js` (CI does build → test).
  */
-import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import * as nodeModule from "node:module";
-import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MEDIATED_MODULES } from "../src/loader/require.js";
+import {
+  assertPreloadBuilt,
+  PRELOAD_IMPORT_FLAG,
+  runNode,
+  type NodeRunResult,
+} from "./helpers/subprocess.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const APP = path.join(here, "fixtures", "esm", "app.mjs");
@@ -27,7 +30,6 @@ const HOOKJACK_APP = path.join(APP_DIR, "hookjack-app.mjs");
 const POLICY_SWAP_APP = path.join(APP_DIR, "policy-swap-app.mjs");
 /** #78 regression entry: a loader hook ahead of capwall's, caught by the load()-level backstop. */
 const BACKSTOP_APP = path.join(APP_DIR, "backstop-app.mjs");
-const PRELOAD = createRequire(import.meta.url).resolve("../dist/preload.js");
 
 /**
  * `module.registerHooks()` is Node ≥22.15 — absent on the Node 20 leg of the CI matrix.
@@ -43,27 +45,14 @@ const PRELOAD = createRequire(import.meta.url).resolve("../dist/preload.js");
 const HAS_REGISTER_HOOKS =
   typeof (nodeModule as { registerHooks?: unknown }).registerHooks === "function";
 
-interface RunResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
-
-function runApp(env: Record<string, string>, entry: string = APP): Promise<RunResult> {
-  const nodeOptions = `--import ${pathToFileURL(PRELOAD).href}`;
-  return new Promise((resolve, reject) => {
-    execFile(
-      process.execPath,
-      [entry],
-      {
-        cwd: APP_DIR,
-        env: { ...process.env, NODE_OPTIONS: nodeOptions, CAPWALL_PROJECT_ROOT: APP_DIR, ...env },
-      },
-      (err, stdout, stderr) => {
-        if (err && typeof err.code !== "number") return reject(err);
-        resolve({ code: err ? (err.code as number) : 0, stdout, stderr });
-      },
-    );
+/** Identical (entry, env) pairs run once and are shared — see test/helpers/subprocess.ts (#145). */
+function runApp(env: Record<string, string>, entry: string = APP): Promise<NodeRunResult> {
+  return runNode([entry], {
+    // Sound to share: the vendored ESM fixture is committed and both policy files are written
+    // once in `beforeAll`; nothing here rewrites an input between two identical calls.
+    share: true,
+    cwd: APP_DIR,
+    env: { NODE_OPTIONS: PRELOAD_IMPORT_FLAG, CAPWALL_PROJECT_ROOT: APP_DIR, ...env },
   });
 }
 
@@ -72,7 +61,7 @@ let denyPolicy: string;
 let grantPolicy: string;
 
 beforeAll(async () => {
-  expect(existsSync(PRELOAD), `built preload not found at ${PRELOAD} — run 'pnpm build' first`).toBe(true);
+  assertPreloadBuilt();
   tmpDir = await mkdtemp(path.join(os.tmpdir(), "capwall-esm-"));
   denyPolicy = path.join(tmpDir, "deny.json");
   grantPolicy = path.join(tmpDir, "grant.json");
@@ -248,7 +237,7 @@ describe("#78 — the load()-level re-mediation backstop actually fires", () => 
     "module",
   ] as const;
 
-  let out: RunResult;
+  let out: NodeRunResult;
 
   beforeAll(async () => {
     out = await runApp(
@@ -335,19 +324,12 @@ describe("#62 — a runtime policy swap reaches already-imported ESM specifiers"
   // The subprocess is load-bearing, not incidental: synthetic ESM modules are cached per
   // process and never re-evaluated, so an in-process test would be asserting against whatever
   // policy the FIRST install in the worker happened to leave behind — which is the bug.
-  let out: RunResult;
+  let out: NodeRunResult;
 
   beforeAll(async () => {
-    out = await new Promise<RunResult>((resolve, reject) => {
-      execFile(
-        process.execPath,
-        [POLICY_SWAP_APP],
-        { cwd: APP_DIR, env: { ...process.env, CAPWALL_MODE: "", CAPWALL_POLICY_FILE: "" } },
-        (err, stdout, stderr) => {
-          if (err && typeof err.code !== "number") return reject(err);
-          resolve({ code: err ? (err.code as number) : 0, stdout, stderr });
-        },
-      );
+    out = await runNode([POLICY_SWAP_APP], {
+      cwd: APP_DIR,
+      env: { CAPWALL_MODE: "", CAPWALL_POLICY_FILE: "" },
     });
   });
 

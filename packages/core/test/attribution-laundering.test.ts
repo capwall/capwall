@@ -14,53 +14,43 @@
  * These run the built `dist/preload.js` in a subprocess (`pnpm build` first — CI does build →
  * test), because the vectors depend on real ESM loading and real timer detachment.
  */
-import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { assertPreloadBuilt, runPreloaded, type NodeRunResult } from "./helpers/subprocess.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const APP_DIR = path.join(here, "fixtures", "launder");
 const APP = path.join(APP_DIR, "app.mjs");
-const PRELOAD = createRequire(import.meta.url).resolve("../dist/preload.js");
 const SECRET_VALUE = "fixture-placeholder-not-a-real-secret";
 
-interface RunResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
-
-/** Run one fixture vector under the built preload with `policyFile` in enforce mode. */
+/**
+ * Run one fixture vector under the built preload with `policyFile` in enforce mode.
+ *
+ * Two `it`s below assert different things about the SAME invocation — the env read and the UDP
+ * send are separate claims about one run of one vector. `runPreloaded` runs each distinct
+ * (argv, cwd, env) once and shares it (#145), so stating them separately no longer costs a
+ * second ~0.5 s process.
+ */
 function runVector(
   vector: string,
   policyFile: string,
   extraEnv: Record<string, string> = {},
-): Promise<RunResult> {
-  return new Promise((resolve, reject) => {
-    execFile(
-      process.execPath,
-      [`--import=${pathToFileURL(PRELOAD).href}`, APP, vector],
-      {
-        cwd: APP_DIR,
-        env: {
-          ...process.env,
-          CAPWALL_MODE: "enforce",
-          CAPWALL_POLICY_FILE: policyFile,
-          CAPWALL_PROJECT_ROOT: APP_DIR,
-          LAUNDER_FIXTURE_SECRET: SECRET_VALUE,
-          ...extraEnv,
-        },
-      },
-      (err, stdout, stderr) => {
-        if (err && typeof err.code !== "number") return reject(err);
-        resolve({ code: err ? (err.code as number) : 0, stdout, stderr });
-      },
-    );
+): Promise<NodeRunResult> {
+  return runPreloaded([APP, vector], {
+    // Sound to share: the fixture reads the policy file and the environment and nothing else,
+    // and no test here rewrites either between two identical calls.
+    share: true,
+    cwd: APP_DIR,
+    env: {
+      CAPWALL_MODE: "enforce",
+      CAPWALL_POLICY_FILE: policyFile,
+      CAPWALL_PROJECT_ROOT: APP_DIR,
+      LAUNDER_FIXTURE_SECRET: SECRET_VALUE,
+      ...extraEnv,
+    },
   });
 }
 
@@ -71,10 +61,7 @@ let denyAll: string;
 let grantApp: string;
 
 beforeAll(async () => {
-  expect(
-    existsSync(PRELOAD),
-    `built preload not found at ${PRELOAD} — run 'pnpm build' before 'pnpm test'`,
-  ).toBe(true);
+  assertPreloadBuilt();
   tmpDir = await mkdtemp(path.join(os.tmpdir(), "capwall-launder-"));
   denyAll = path.join(tmpDir, "deny.json");
   grantApp = path.join(tmpDir, "grant-app.json");

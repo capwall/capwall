@@ -33,19 +33,17 @@
  * These run the built `dist/preload.js` in a subprocess (`pnpm build` first — CI does build →
  * test), because the vectors depend on real CJS loading.
  */
-import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { assertPreloadBuilt, runPreloaded, type NodeRunResult } from "./helpers/subprocess.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const APP_DIR = path.join(here, "fixtures", "pkg-identity");
 const APP = path.join(APP_DIR, "app.cjs");
-const PRELOAD = createRequire(import.meta.url).resolve("../dist/preload.js");
 const SECRET_VALUE = "forge-fixture-placeholder-not-a-real-secret";
 const SECRET_FILE = path.join(APP_DIR, "secret.txt");
 
@@ -63,49 +61,42 @@ const BASE_PACKAGES: Record<string, unknown> = {
   "transform-dep": { fs: { read: ["./**"] }, compile: true },
 };
 
-interface RunResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
-
 let tmpDir: string;
-let policySeq = 0;
 
-/** Write a one-off policy file and run `vector` against it under enforce. */
+/**
+ * Write a policy file and run `vector` against it under enforce.
+ *
+ * The file is NAMED for its content, so the same policy always lands on the same path — which
+ * is what lets `runPreloaded` recognise two calls as the same invocation and run one child
+ * instead of two (#145). A per-call sequence number would have made every run unique by
+ * accident and defeated that, without making any test more independent.
+ */
 async function runVector(
   vector: string,
   packages: Record<string, unknown> = BASE_PACKAGES,
-): Promise<RunResult> {
-  const policyFile = path.join(tmpDir, `capabilities-${policySeq++}.json`);
-  await writeFile(
-    policyFile,
-    JSON.stringify({ version: 1, mode: "enforce", default: {}, packages }),
+): Promise<NodeRunResult> {
+  const body = JSON.stringify({ version: 1, mode: "enforce", default: {}, packages });
+  const policyFile = path.join(
+    tmpDir,
+    `capabilities-${createHash("sha256").update(body).digest("hex").slice(0, 12)}.json`,
   );
-  return new Promise((resolve, reject) => {
-    execFile(
-      process.execPath,
-      [`--import=${pathToFileURL(PRELOAD).href}`, APP, vector],
-      {
-        cwd: APP_DIR,
-        env: {
-          ...process.env,
-          CAPWALL_MODE: "enforce",
-          CAPWALL_POLICY_FILE: policyFile,
-          CAPWALL_PROJECT_ROOT: APP_DIR,
-          FORGE_FIXTURE_SECRET: SECRET_VALUE,
-        },
-      },
-      (err, stdout, stderr) => {
-        if (err && typeof err.code !== "number") return reject(err);
-        resolve({ code: err ? (err.code as number) : 0, stdout, stderr });
-      },
-    );
+  await writeFile(policyFile, body);
+  return runPreloaded([APP, vector], {
+    // Sound to share BECAUSE the policy file is named for its content: two calls that agree on
+    // the path agree on the bytes, so they really are the same question.
+    share: true,
+    cwd: APP_DIR,
+    env: {
+      CAPWALL_MODE: "enforce",
+      CAPWALL_POLICY_FILE: policyFile,
+      CAPWALL_PROJECT_ROOT: APP_DIR,
+      FORGE_FIXTURE_SECRET: SECRET_VALUE,
+    },
   });
 }
 
 /** Assert the vector obtained NEITHER capability, and that both denials were recorded. */
-function expectDenied(r: RunResult, pkg: string): void {
+function expectDenied(r: NodeRunResult, pkg: string): void {
   // The env read is soft (the value is hidden, the caller is not crashed) …
   expect(r.stdout).toContain("env=undefined");
   // … and the file read throws `CapabilityError`, which the fixture reports by principal.
@@ -119,17 +110,14 @@ function expectDenied(r: RunResult, pkg: string): void {
 }
 
 /** Assert the vector got BOTH capabilities — the shape of a working legitimate use. */
-function expectAllowed(r: RunResult): void {
+function expectAllowed(r: NodeRunResult): void {
   expect(r.stdout).toContain(`env=${SECRET_VALUE}`);
   expect(r.stdout).toContain(`fs=${SECRET_VALUE}`);
   expect(r.stdout).toContain("done");
 }
 
 beforeAll(async () => {
-  expect(
-    existsSync(PRELOAD),
-    `built preload not found at ${PRELOAD} — run 'pnpm build' before 'pnpm test'`,
-  ).toBe(true);
+  assertPreloadBuilt();
   tmpDir = await mkdtemp(path.join(os.tmpdir(), "capwall-pkg-identity-"));
 });
 
@@ -177,25 +165,28 @@ describe("#92 — what it costs a LEGITIMATE nested install", () => {
     expectAllowed(await runVector("legit-toplevel", onlyBare));
   });
 
-  it("grants a nested install through the explicit `*>name` / `**>name` keys", async () => {
-    // The documented widening, in the same one-vs-many spelling `net.hosts` uses. It is
-    // deliberately not implicit: writing it says "any package in the tree may ship a directory
-    // called legit-nested and receive these grants", which is true, and is the #92 hole
-    // re-opened for that one name by choice.
-    //
-    // `legit-host>legit-nested` is one level deep, so BOTH forms cover it.
-    for (const key of ["*>legit-nested", "**>legit-nested"]) {
+  // The documented widening, in the same one-vs-many spelling `net.hosts` uses. It is
+  // deliberately not implicit: writing it says "any package in the tree may ship a directory
+  // called legit-nested and receive these grants", which is true, and is the #92 hole re-opened
+  // for that one name by choice.
+  //
+  // `legit-host>legit-nested` is one level deep, so BOTH forms cover it. One `it` per form
+  // rather than a loop inside one: each spelling is its own claim, a failure names which
+  // spelling broke, and no single test has to fit four ~0.5 s subprocesses inside its budget —
+  // which is what made this one of the two tests that lost the race under CPU contention (#145).
+  for (const key of ["*>legit-nested", "**>legit-nested"]) {
+    it(`grants a nested install through the explicit \`${key}\` key`, async () => {
       const wildcard = { [key]: FULL_GRANT };
       expectAllowed(await runVector("legit-nested", wildcard));
-      // And neither reaches the top-level install, which has no chain to widen.
+      // And it does not reach the top-level install, which has no chain to widen.
       expectDenied(await runVector("legit-toplevel", wildcard), "legit-nested");
-    }
-  });
+    });
+  }
 });
 
 describe("#93 — Module.prototype._compile cannot choose a frame's package", () => {
   /** Assert the compile itself was refused, and refused against the REAL caller. */
-  function expectCompileDenied(r: RunResult, pkg: string): void {
+  function expectCompileDenied(r: NodeRunResult, pkg: string): void {
     expect(r.stdout).toContain("env=undefined");
     expect(r.stdout).toContain(`fs=COMPILEDENIED:${pkg}`);
     expect(r.stdout).not.toContain(SECRET_VALUE);

@@ -22,11 +22,9 @@
  * class process-wide. #70 converted all three to guarded subclasses — objects capwall owns —
  * so they are now frozen like every other guarded class, and this file asserts that.
  */
-import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   install,
@@ -40,6 +38,12 @@ import { createHttpShim, createNetShim, createTlsShim, createDgramShim } from ".
 import { createVmShim } from "../src/shims/vm.js";
 import { createWorkerThreadsShim } from "../src/shims/worker_threads.js";
 import type { ShimContext } from "../src/shims/runtime.js";
+import {
+  assertPreloadBuilt,
+  PRELOAD_IMPORT_FLAG,
+  runNode,
+  type NodeRunResult,
+} from "./helpers/subprocess.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const requireCjs = createRequire(import.meta.url);
@@ -444,7 +448,20 @@ describe("hardened mode is orthogonal to policy decisions", () => {
 /* ------------------------------------------------------------------------------------- */
 /* CAPWALL_HARDENED=1 — the preload env override (runs against the built dist/preload.js). */
 
-const PRELOAD = requireCjs.resolve("../dist/preload.js");
+/**
+ * Both probes below print one JSON line and nothing else. A child that died instead prints
+ * nothing, and `JSON.parse("")` would report that as a syntax error naming neither the probe nor
+ * its stderr — so the failure is spelled out here instead.
+ */
+function reportFrom(r: NodeRunResult, code: string): unknown {
+  if (r.code !== 0 || r.stdout.trim() === "") {
+    throw new Error(
+      `hardened-mode probe exited ${String(r.code)} with stdout ${JSON.stringify(r.stdout)}\n` +
+        `  probe: ${code}\n  stderr: ${r.stderr.trim() || "(empty)"}`,
+    );
+  }
+  return JSON.parse(r.stdout.trim()) as unknown;
+}
 
 interface SubprocessReport {
   fs: boolean;
@@ -459,25 +476,10 @@ function frozenInSubprocess(env: Record<string, string>): Promise<SubprocessRepo
     "promises: Object.isFrozen(require('fs/promises'))," +
     "readStream: Object.isFrozen(require('fs').ReadStream)" +
     "}))";
-  return new Promise((resolve, reject) => {
-    execFile(
-      process.execPath,
-      ["-e", code],
-      {
-        cwd: here,
-        env: {
-          ...process.env,
-          NODE_OPTIONS: `--import ${pathToFileURL(PRELOAD).href}`,
-          CAPWALL_PROJECT_ROOT: here,
-          ...env,
-        },
-      },
-      (err, stdout) => {
-        if (err) return reject(err);
-        resolve(JSON.parse(stdout.trim()) as SubprocessReport);
-      },
-    );
-  });
+  return runNode(["-e", code], {
+    cwd: here,
+    env: { NODE_OPTIONS: PRELOAD_IMPORT_FLAG, CAPWALL_PROJECT_ROOT: here, ...env },
+  }).then((r) => reportFrom(r, code) as SubprocessReport);
 }
 
 /**
@@ -505,30 +507,15 @@ function esmFrozenInSubprocess(env: Record<string, string>): Promise<Record<stri
     "netSocketPrototype: Object.isFrozen(net.Socket.prototype)," +
     "dgramSocketPrototype: Object.isFrozen(dgram.Socket.prototype)" +
     "}));";
-  return new Promise((resolve, reject) => {
-    execFile(
-      process.execPath,
-      ["--input-type=module", "-e", code],
-      {
-        cwd: here,
-        env: {
-          ...process.env,
-          NODE_OPTIONS: `--import ${pathToFileURL(PRELOAD).href}`,
-          CAPWALL_PROJECT_ROOT: here,
-          ...env,
-        },
-      },
-      (err, stdout) => {
-        if (err) return reject(err);
-        resolve(JSON.parse(stdout.trim()) as Record<string, boolean>);
-      },
-    );
-  });
+  return runNode(["--input-type=module", "-e", code], {
+    cwd: here,
+    env: { NODE_OPTIONS: PRELOAD_IMPORT_FLAG, CAPWALL_PROJECT_ROOT: here, ...env },
+  }).then((r) => reportFrom(r, code) as Record<string, boolean>);
 }
 
 describe("CAPWALL_HARDENED env override (preload)", () => {
   it("CAPWALL_HARDENED=1 freezes the shims the preload installs", async () => {
-    expect(existsSync(PRELOAD), `built preload not found at ${PRELOAD} — run 'pnpm build'`).toBe(true);
+    assertPreloadBuilt();
     await expect(frozenInSubprocess({ CAPWALL_MODE: "observe", CAPWALL_HARDENED: "1" })).resolves.toEqual({
       fs: true,
       promises: true,

@@ -14,12 +14,16 @@
  * (b) garbage config falls back to the default instead of throwing or silently capturing zero
  * frames, and (c) the `CAPWALL_MAX_FRAMES` env path works through the real preload.
  */
-import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  assertPreloadBuilt,
+  PRELOAD_IMPORT_FLAG,
+  runNode,
+  type NodeRunResult,
+} from "./helpers/subprocess.js";
 import {
   DEFAULT_MAX_FRAMES,
   UNATTRIBUTED,
@@ -221,36 +225,23 @@ describe("attribution maxFrames — validation falls back to the default", () =>
 describe("CAPWALL_MAX_FRAMES env path (preload)", () => {
   // Runs the built preload the way the CLI does (NODE_OPTIONS=--import). Requires `pnpm build`
   // first, like esm.test.ts.
-  const PRELOAD = requireCjs.resolve("../dist/preload.js");
   const APP = path.join(FIXTURES, "deep-stack-app.cjs");
 
-  function runApp(env: Record<string, string>): Promise<{ code: number; stdout: string; stderr: string }> {
-    const nodeOptions = `--import ${pathToFileURL(PRELOAD).href}`;
-    return new Promise((resolve, reject) => {
-      execFile(
-        process.execPath,
-        [APP, String(DEEP)],
-        {
-          cwd: FIXTURES,
-          env: {
-            ...process.env,
-            NODE_OPTIONS: nodeOptions,
-            CAPWALL_MODE: "observe",
-            CAPWALL_PROJECT_ROOT: FIXTURES,
-            CAPWALL_MAX_FRAMES: "",
-            ...env,
-          },
-        },
-        (err, stdout, stderr) => {
-          if (err && typeof err.code !== "number") return reject(err);
-          resolve({ code: err ? (err.code as number) : 0, stdout, stderr });
-        },
-      );
+  function runApp(env: Record<string, string>): Promise<NodeRunResult> {
+    return runNode([APP, String(DEEP)], {
+      cwd: FIXTURES,
+      env: {
+        NODE_OPTIONS: PRELOAD_IMPORT_FLAG,
+        CAPWALL_MODE: "observe",
+        CAPWALL_PROJECT_ROOT: FIXTURES,
+        CAPWALL_MAX_FRAMES: "",
+        ...env,
+      },
     });
   }
 
   it("mis-attributes the deep read to <unknown> with no CAPWALL_MAX_FRAMES set", async () => {
-    expect(existsSync(PRELOAD), `built preload not found at ${PRELOAD} — run 'pnpm build' first`).toBe(true);
+    assertPreloadBuilt();
     const r = await runApp({});
     expect(r.stdout).toContain("READ_OK:fixture data");
     expect(r.stderr).toMatch(/observe: recorded fs:read .* for '<unknown>'/);
