@@ -285,11 +285,27 @@ export function guardCjsModuleRead(ctx: ShimContext, resolvedPath: string): void
 }
 
 /**
- * The policy snapshot the ESM loader hook evaluates against — see `loader/esm-hooks.ts` for why
- * the decision has to be taken on that thread rather than on the main one.
+ * The policy state ONE ESM resolution is decided against.
  *
- * Every field is structured-cloneable: `Policy` is the parsed `capabilities.json` document, i.e.
- * plain data, so the snapshot crosses the thread boundary without any custom serialization.
+ * NOT A MESSAGE ANY MORE, and the previous version of this comment said it was. Under
+ * `module.register()` the hook ran on Node's separate loader thread holding its own COPY of the
+ * policy, which the main thread posted over a `MessagePort` whenever the live context was
+ * re-pointed — hence the "every field is structured-cloneable, so the snapshot crosses the thread
+ * boundary" rule that used to be stated here. #152 deleted the thread, the port and the copy (see
+ * `loader/esm-hooks.ts`'s header for the full list of what went with it). Nothing is serialized,
+ * nothing crosses anything, and there is no longer any constraint on what a field may hold.
+ *
+ * WHY THE TYPE IS KEPT, since that reason is gone. It is what makes {@link decideEsmModuleRead} a
+ * PURE FUNCTION of (policy state, resolution) instead of a reader of process state.
+ * `loader/esm-hooks.ts` builds one from `liveCtx` per resolution (`currentSnapshot()`) and passes
+ * it in; the alternative — importing `liveCtx` here and reading it inside the decision — would
+ * make the gate's answer depend on a module-level singleton and untestable without a live
+ * install. The allocation is at MODULE-LOAD frequency, not per capability call, so it sits on no
+ * budget in AGENTS.md § 5.
+ *
+ * THE ONE RULE THAT STILL APPLIES: build a snapshot per resolution and never retain one across
+ * resolutions. A retained snapshot is a copy again, and a copy that can go stale is exactly the
+ * #62/#87 defect this shape used to have by construction.
  */
 export interface EsmGateSnapshot {
   /** False while no install is active; the gate is then inert. See {@link decideEsmModuleRead}. */

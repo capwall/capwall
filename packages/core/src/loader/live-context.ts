@@ -161,6 +161,14 @@ let hardenedRatchet = false;
  * realm), and this is the only place that knows when the live context was re-pointed. Nothing
  * IN-realm may use it to cache policy state — a consumer that reads `liveCtx` directly is always
  * correct and never needs a notification, and a cache here is how #62/#87 came back.
+ *
+ * KEPT MEANS TESTED (#175). Machinery with no callers has no way of being wrong until someone
+ * needs it, and `oxlint`'s `no-unused-vars` cannot see an exported symbol — so "kept for later"
+ * without coverage is a promise nobody has checked. `test/install-lifecycle.test.ts`
+ * § "#175 — the live-context subscription still works with no subscribers in `src`" pins the four
+ * things a re-user would rely on: the current state on subscribe, a notification on push, one on
+ * the pop that empties the stack, and unsubscribe actually unsubscribing. It also pins the
+ * failure isolation below, because a listener that throws must not strand a half-applied install.
  */
 type LiveContextListener = (ctx: ShimContext, installed: boolean) => void;
 const contextListeners = new Set<LiveContextListener>();

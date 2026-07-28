@@ -755,9 +755,11 @@ function installChainFor(filePath: string, projectRoot?: string): string {
   const insideProject = roots !== null && roots.some((r) => isUnder(normalized, r));
   if (roots !== null && !insideProject && !normalized.includes(marker)) {
     // Out of the project, under no `node_modules`, and no link recorded for it — the shape a
-    // linked dependency has when capwall never observed its resolution (an ESM import; see
-    // `link-map.ts` on why the loader-thread hook cannot record). Try to recover the entry that
-    // links here. This can only turn `<unknown>` into a package NAME; it is never consulted for a
+    // linked dependency has when capwall never observed its resolution (an ESM import). Since
+    // #152 the ESM `resolve` hook runs in this realm and COULD write to the map; it deliberately
+    // does not, so this is a recovery path for a choice rather than for an obstacle — see
+    // `link-map.ts` § `discoverPackageLink` for the choice and what it costs. Try to recover the
+    // entry that links here. This can only turn `<unknown>` into a package NAME; it is never consulted for a
     // path that would have been `<app>`, so the trust-root sentinel stays a positive
     // identification (#60).
     if (discoverPackageLink(normalized, roots[0] as string)) normalized = rewriteThroughLinks(raw);
