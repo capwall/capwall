@@ -57,11 +57,11 @@ has roughly doubled since the harness was written.
 | `Module._load` relink chain (#22) | yes | mediated and non-mediated specifiers |
 | ESM `import` path (M5, on by default) | yes | the same fixture file imported under two URLs, before and after install |
 | hardened mode (#17) | yes | a second, stacked hardened install; both arms mediated |
-| `Module.prototype._compile` gate (#93) | **no** | fires once per CJS module load, and the loader-called path is a 1-frame capture. Pairing it needs an install/uninstall per block — #134. |
-| `process.dlopen` native gate (S2) | **no** | once per `.node` addon load; no vendored addon in the bench tree — #134. |
+| `Module.prototype._compile` gate (#93) | yes (#134) | `[G]` — N generated CJS modules `require`d fresh, with the real and the patched `_compile` swapped into the prototype slot per arm |
+| `process.dlopen` native gate (S2) | yes (#134) | `[G]` — a placeholder `.node` inside the fixture package, so the gate's two subjects (#49) are one principal |
+| ESM cold resolution (loader-thread hooks) | yes (#134) | `[G]` — a fresh `?n=` URL per iteration; paired against the same import with a NON-mediated specifier |
 | `node:module` loader-hook registration gate (#61) | **no** | once per process. |
 | `vm` / `worker_threads` gates | **no** | one `guard()` each, identical in shape to the `child_process` deny row, and the allowed form is dominated by thread/context creation. |
-| ESM cold resolution (loader-thread hooks) | **no** | startup cost, not per-request — #134. |
 | observe mode | **no** | the sink here is a no-op; a real `observe` run writes a trace line per decision, and that cost is the embedder's, not capwall's. |
 | end-to-end request latency (express-app) | **no** | still the follow-up it always was: this harness measures the shim hot path in isolation. |
 
@@ -112,6 +112,13 @@ The named exception: `process.env` is a **process-global** surface. `install()` 
 object itself, so an "un-mediated" arm that reaches an env read through Node's own internals
 (`fs.glob` does; `spawnSync` reads `NODE_V8_COVERAGE` by name) still trips the gate. Those rows
 declare `["env"]` as an allowed baseline decision kind, and it cancels in the delta.
+
+The second named exception, added with the startup section (#134): the **`_compile` gate's own
+premise is the opposite one.** On a loader-driven compile the gate's job is to recognize Node's
+frame and charge *nobody*, so "the mediated arm produces a decision" would be a failure there.
+That row asserts the inverse — the patched implementation is in the path, and it stays silent —
+which is what makes its delta the cost of `calledByNodeLoader()` rather than of a policy
+evaluation. If the loader path ever started attributing, that check flips.
 
 ### Why a vendored fixture, not app-code calls
 
