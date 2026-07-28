@@ -106,10 +106,16 @@ handle.uninstall();
   });
 
   it("Module._load forwards any argument count, unchanged", async () => {
-    // Node ≥22 really is `_load(request, parent, isMain, options = kEmptyObject)`, and
-    // `options.shouldSkipModuleHooks` is what stops a `require` issued from inside the
-    // module-customization hook chain from re-entering it. `_load.length` is 3 (it stops at the
-    // first defaulted parameter), which is exactly why the old signature looked right.
+    // `Module._load`'s call arity is not a fixed fact about "Node ≥22" — it has OSCILLATED, and
+    // within a major as well as across them. Read off the live function: 3 arguments on 20.19.4,
+    // 4 on 22.23.1 (`options = kEmptyObject`), back to 3 on 23.9.0 and 24.5.0, and 4 again on
+    // 24.18.0 and 26.5.0 under a new name and a new payload (`internalOptions`, carrying
+    // `requireResolveOptions` as well as `shouldSkipModuleHooks`). `_load.length` reports 3 on
+    // every one of them, because it stops at the first defaulted parameter — which is exactly
+    // why the old hand-written signature looked right (#135).
+    //
+    // So this row passes counts Node has used, counts it has stopped using, and counts it has
+    // never used, and asserts only that they arrive unchanged.
     const r = await run(`
 import Module from "node:module";
 const seen = [];
@@ -123,6 +129,39 @@ handle.uninstall();
 `);
     expect(r.stderr).toBe("");
     expect(JSON.parse(r.stdout.trim())).toEqual([4, 3]);
+  });
+
+  it("Module._findPath forwards any argument count, unchanged", async () => {
+    // The third wrapper site over a Node internal, and the one whose parameter list has ALREADY
+    // moved under it without anyone noticing: `(request, paths, isMain)` on Node 20.19.4, and
+    // `(request, paths, isMain, conditions = getCjsConditions())` — four arguments passed on
+    // every call — on 22.23.1, 24.18.0 and 26.5.0. `.length` is 3 on all four, so nothing about
+    // the function object says it changed.
+    //
+    // `loader/linked-packages.ts` was written variadic on the #128 rule and so needed no change,
+    // which is precisely the property worth locking down: the site reads args 0 and 1
+    // POSITIONALLY (specifier and search-path list) and forwards the whole list, so a Node that
+    // adds a fifth parameter changes what is forwarded without changing what is observed.
+    const r = await run(`
+import Module from "node:module";
+const seen = [];
+const real = Module._findPath;
+Module._findPath = function (...args) { seen.push(args.length); return Reflect.apply(real, this, args); };
+${INSTALL}
+const patched = Module._findPath;
+// Counts spanning both real signatures plus one no Node has ever used.
+patched("./nope-a", [process.cwd()]);
+patched("./nope-b", [process.cwd()], false);
+patched("./nope-c", [process.cwd()], false, new Set(["node", "require"]));
+patched("./nope-d", [process.cwd()], false, new Set(["node", "require"]), "future-5th");
+console.log(JSON.stringify(seen));
+handle.uninstall();
+`);
+    expect(r.stderr).toBe("");
+    // The install itself resolves modules, so the recorder sees Node's own calls too; assert on
+    // the tail, which is the four this row made.
+    const seen = JSON.parse(r.stdout.trim()) as number[];
+    expect(seen.slice(-4)).toEqual([2, 3, 4, 5]);
   });
 
   it.skipIf(!HAS_TYPE_STRIPPING)("keeps require() of a TypeScript file working — the user-visible half of #128", async () => {

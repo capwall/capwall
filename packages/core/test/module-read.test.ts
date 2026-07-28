@@ -27,6 +27,7 @@
  * which is isolatable in-process. Requires `pnpm build` (CI does build → test).
  */
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import Module from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -44,6 +45,38 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 
 /** The string that must never reach stdout through any channel under a deny-all policy. */
 const SECRET = "AKIA-MODULE-READ-CHANNEL";
+
+/**
+ * Does THIS Node's `Module._load` accept `{ requireResolveOptions }` as its fourth argument and
+ * resolve through it?
+ *
+ * FEATURE-DETECTED, NOT VERSION-GATED, because the feature's history is exactly why the gap it
+ * guards existed: `Module._load` grew a fourth parameter in 22, lost it again in 23 and early 24,
+ * and regained it in a 24 MINOR (24.18) under a new name and a new payload. Any `major >= N` test
+ * written against that would have been wrong for two of the five majors. The probe below asks the
+ * runtime, so it is right on releases that do not exist yet.
+ *
+ * The probe asks for `./package.json` from a parent whose OWN directory does not exist, so the
+ * relative fallback (`dirname(parent.filename)`, which is what a Node without the feature uses)
+ * cannot answer it — only `options.paths` can. Un-mediated: this file installs nothing at module
+ * scope.
+ */
+const HONOURS_REQUIRE_RESOLVE_OPTIONS: boolean = ((): boolean => {
+  const load = (Module as unknown as { _load?: (...args: unknown[]) => unknown })._load;
+  if (typeof load !== "function") return false;
+  const dir = path.join(here, ".."); // packages/core, which has a package.json
+  const parent = new Module("capwall-require-resolve-options-probe", undefined);
+  parent.filename = path.join(dir, "capwall-no-such-directory", "probe.js");
+  parent.paths = [];
+  try {
+    const loaded = load("./package.json", parent, false, {
+      requireResolveOptions: { paths: [dir] },
+    });
+    return typeof loaded === "object" && loaded !== null;
+  } catch {
+    return false;
+  }
+})();
 
 let root: string;
 let proj: string;
@@ -84,6 +117,9 @@ async function buildFixture(): Promise<void> {
   await mkdir(path.join(proj, "config"), { recursive: true });
 
   await writeFile(path.join(vault, "secrets.json"), JSON.stringify({ key: SECRET }));
+  // Reached ONLY through `Module._load`'s four-argument `requireResolveOptions` form — see the
+  // "every spelling of Module._load" block.
+  await writeFile(path.join(vault, "other-secrets.json"), JSON.stringify({ key: SECRET }));
   await writeFile(
     path.join(vault, "payload.js"),
     `console.log("PAYLOAD:cjs-executed");\nmodule.exports = { key: ${JSON.stringify(SECRET)} };\n`,
@@ -200,6 +236,41 @@ try {
 }
 `,
   );
+
+  // The `Module._load` INTERNAL-OPTIONS prober — see the describe block at the bottom of this
+  // file. Two loads of the same file by the same dependency: one through the plain three-argument
+  // call, one through the four-argument form that carries `requireResolveOptions`. They must be
+  // decided identically; a Node minor made them differ.
+  await writeFile(
+    path.join(evil, "internal-options.js"),
+    `const Module = require("node:module");
+const VAULT = ${JSON.stringify(vault)};
+const ABS = ${JSON.stringify(path.join(vault, "secrets.json"))};
+// A DIFFERENT file for the four-argument form, so the two reads are distinguishable in the
+// trace: the preload deduplicates identical decisions per process, and the substance of the
+// claim is that the gate names the file this spelling actually opens — not merely that
+// something threw.
+function parent() {
+  const m = new Module("evil-internal-options", null);
+  m.filename = __filename;
+  m.paths = Module._nodeModulePaths(__dirname);
+  return m;
+}
+function report(name, fn) {
+  try {
+    console.log("LOAD:" + name + ":OK:" + JSON.stringify(fn()));
+  } catch (err) {
+    console.log("LOAD:" + name + ":ERR:" + err.name);
+  }
+}
+module.exports = function run() {
+  report("plain", () => Module._load(ABS, parent(), false));
+  report("require-resolve-options", () =>
+    Module._load("./other-secrets.json", parent(), false, { requireResolveOptions: { paths: [VAULT] } }));
+};
+`,
+  );
+  await writeFile(path.join(proj, "app-internal-options.js"), `require("evil/internal-options.js")();\n`);
 }
 
 beforeAll(async () => {
@@ -291,6 +362,55 @@ describe("#123 CJS — require() is not a way around fs.read", () => {
     expect(r.stdout).toContain("APP:app-inside-json:OK");
     expect(r.stderr).not.toMatch(/DENY '<app>'/);
   }, 30_000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// The four-argument `Module._load` form — a live bypass a Node MINOR opened under the gate.
+//
+// The gate has to know which file a load will open, so `loader/require.ts` re-runs
+// `Module._resolveFilename` before delegating. It used to do that by forwarding `_load`'s OWN
+// argument list verbatim, on the stated reasoning that the two take the same arguments. They do
+// not, and Node 24.18 made that observable: `_load`'s fourth argument became an INTERNAL bag
+// (`CJSModuleLoadInternalOptions`), and Node unwraps its `requireResolveOptions` field before
+// handing it to `_resolveFilename`. capwall passed the bag itself, `_resolveFilename` found no
+// `paths` in it, resolution FAILED, and `resolveQuietly` returned `null` — which the gate reads
+// as "nothing to decide".
+//
+// Measured, not reasoned about: on Node 24.18.0 and 26.5.0, before the fix, a dependency reading
+// a file outside the project through this form under a DENY-ALL enforce policy got the bytes and
+// produced ZERO decisions — no throw, no stderr line, nothing for `observe` or `capwall diff` to
+// see. The three-argument spelling of the identical read was denied correctly, which is what kept
+// it invisible. Node 22 and earlier reject the form outright, so it never showed there.
+//
+// These rows assert the PROPERTY that makes that class of defect impossible to reintroduce
+// quietly: **the same read by the same package is decided the same way whichever spelling of
+// `Module._load` reaches it.** They deliberately do not assert an argument count.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+describe("#123 — every spelling of Module._load reaches the same decision", () => {
+  it.skipIf(!HONOURS_REQUIRE_RESOLVE_OPTIONS)(
+    "denies the `requireResolveOptions` form exactly as it denies the plain one",
+    async () => {
+      const r = await deny(path.join(proj, "app-internal-options.js"));
+      expect(r.stdout).toContain("LOAD:plain:ERR:CapabilityError");
+      expect(r.stdout).toContain("LOAD:require-resolve-options:ERR:CapabilityError");
+      expect(r.stdout).not.toContain(SECRET);
+    },
+    30_000,
+  );
+
+  it.skipIf(!HONOURS_REQUIRE_RESOLVE_OPTIONS)(
+    "names the file THAT spelling opens, so observe and `capwall diff` see the reach",
+    async () => {
+      // Same (entry, env) as the row above, so `share: true` reuses that one child (#145).
+      const r = await deny(path.join(proj, "app-internal-options.js"));
+      // Two DIFFERENT files, so neither line can stand in for the other and the preload's
+      // per-process decision dedup cannot collapse them. Pre-fix, `other-secrets.json` never
+      // appeared here at all — resolution failed inside capwall and the gate declined.
+      expect(r.stderr).toMatch(/DENY 'evil' fs:read [^\n]*[/\\]secrets\.json/);
+      expect(r.stderr).toMatch(/DENY 'evil' fs:read [^\n]*[/\\]other-secrets\.json/);
+    },
+    30_000,
+  );
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════

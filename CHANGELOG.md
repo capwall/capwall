@@ -21,7 +21,40 @@ has to be findable without reading the diff.
 
 ## [Unreleased]
 
-Nothing yet.
+### Security
+
+- **Closed an unrecorded route around the module-read gate (#123) on Node ≥24.18.** capwall
+  re-resolves every `require` of a path specifier so the gate knows which file the load will
+  open, and it did that by forwarding `Module._load`'s own argument list to
+  `Module._resolveFilename`. Node 24.18 changed `_load`'s fourth argument into an internal
+  options bag whose `requireResolveOptions` field is what Node itself passes down, so capwall's
+  re-resolution failed and the gate silently declined. Measured on Node 24.18.0 and 26.5.0: a
+  dependency calling `Module._load(spec, parent, false, { requireResolveOptions: { paths: […] } })`
+  under a **deny-all `enforce` policy** read the file and produced **zero decisions** — nothing
+  thrown, nothing on stderr, nothing for `observe` or `capwall diff`. The ordinary three-argument
+  spelling of the same read was denied correctly, which is what kept it invisible. Node 20 and 22
+  reject the form outright and were never affected.
+
+### Added
+
+- **[`docs/node-api-dependencies.md`](docs/node-api-dependencies.md)** — one row per Node API
+  capwall's mechanism depends on: what it is used for, its real status on Node 22/24/26, the
+  supported replacement if any, and which capability dies without it. Measured against real
+  binaries rather than changelogs. It records, among other things, that
+  **`module.register()` — capwall's entire ESM path — is runtime-deprecated in Node 26 (DEP0205)
+  with removal announced** (#153), and that `Module.prototype._compile` and `process.dlopen` have
+  no replacement at all, so the `compile` and `native` capabilities would simply cease to exist
+  if either were removed.
+
+### Fixed
+
+- Four source comments asserted Node version facts that had stopped being true —
+  `Module._load`'s argument count (which has oscillated 3→4→3→4 across 20/22/23/24.5/24.18/26),
+  `Module._findPath`'s signature (it gained `conditions` after Node 20), and the claim that a bare
+  `import("./x.node")` is rejected by Node (it resolves unflagged on Node 26, and capwall's
+  `process.dlopen` gate covers it — verified end to end). The code was already variadic and
+  correct in each case; the comments are what a future fixed-arity wrapper would have been written
+  from. `test/primitive-arity.test.ts` now covers `Module._findPath` as well.
 
 ## [0.1.0] - unreleased
 
