@@ -173,7 +173,13 @@ Do not start step *n+1* until step *n* has passing tests and a clean typecheck.
 ## 5. Conventions
 
 - **TypeScript strict + `exactOptionalPropertyTypes`.** Config is in `tsconfig.base.json`;
-  each package extends it. Also on: `noUncheckedIndexedAccess`, `noImplicitOverride`.
+  each package extends it. Also on: `noUncheckedIndexedAccess`, `noImplicitOverride`. The
+  compiler is **TypeScript 7** (the Go rewrite). One thing about it is load-bearing and easy to
+  undo by accident: `tsconfig.base.json` sets `"types": ["node"]` explicitly, because TS 7
+  defaults that to `[]` where 5.x auto-included every `@types/*` package in scope. Delete the
+  line and every build config loses all of `@types/node` at once (148 errors in `core` alone —
+  `Cannot find name 'process'`). TS 7.0 also ships **no programmatic API**, so a `.d.ts`
+  validation gate or an api-extractor-style check is not available until 7.1.
 - **CJS-first.** The CJS `require` path is the primary target and was built first; the ESM
   `import` path reached parity in M5 and is on by default under the CLI. New capability work
   still lands CJS-first, then gets ESM coverage — but "ESM is not done yet" is no longer a
@@ -218,6 +224,15 @@ Do not start step *n+1* until step *n* has passing tests and a clean typecheck.
   evaluates the hook module's entire import graph**, so an import added anywhere reachable from
   `loader/esm-hooks.ts` is serial startup cost for every capwall user. `test/esm-hook-graph.test.ts`
   fails on the two shapes that regress it (#150).
+  **The same reasoning applies to `preload.ts`'s graph, and zod 4 is what it cost.** `zod`
+  3 → 4 (#161) added **~58 ms** to that graph: ~+60 ms of zod's own module evaluation (79 ES
+  modules where v3 had 10), ~+11 ms building the schema tree, and *zero* in `parsePolicy` — zod 4
+  validates the real policy file at exactly zod 3's speed. It was taken anyway, because every
+  route to the milliseconds ran through not validating the policy at startup, and a policy that
+  is trusted rather than validated is a fail-open in the one component that decides what
+  everything else may do. Do not re-litigate that from `pnpm outdated`; the measurement, the
+  entry points that were tried (`zod/mini`, `zod/v4/core`, CJS) and the one lever left unpulled
+  (Node's on-disk V8 compile cache, worth ~34 ms) are in `scripts/bench/README.md` § zod 4.
   **`module.register()` is now DEPRECATED (DEP0205) as of Node 26**, which prints a
   DeprecationWarning on stderr in every mediated process on that version. Together with the
   ≥22.15 floor making `module.registerHooks()` unconditionally available, #152 is now unblocked

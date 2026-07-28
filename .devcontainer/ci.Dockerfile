@@ -28,7 +28,7 @@ RUN corepack enable
 WORKDIR /app
 COPY . .
 
-# ci.yml step: "Install dependencies" — pnpm resolves its own pinned version (10.33.0) from
+# ci.yml step: "Install dependencies" — pnpm resolves its own pinned version (11.17.0) from
 # package.json's `packageManager` field via corepack.
 RUN pnpm install --frozen-lockfile=false
 

@@ -6,7 +6,7 @@
     "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
   },
   "onCreateCommand": "corepack enable",
-  "postCreateCommand": "corepack prepare pnpm@10.33.0 --activate && pnpm install --frozen-lockfile=false && pnpm -r build",
+  "postCreateCommand": "corepack prepare pnpm@11.17.0 --activate && pnpm install --frozen-lockfile=false && pnpm -r build",
   "customizations": {
     "vscode": {
       "extensions": ["esbenp.prettier-vscode", "vitest.explorer"],

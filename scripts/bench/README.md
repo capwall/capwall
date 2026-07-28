@@ -313,7 +313,7 @@ and fails nothing.
 | Node's loader-thread bootstrap | ~53 | Node's, and `register()` blocks until it is done. `module.registerHooks()` (synchronous, no thread) would remove it. **The version objection is gone**: it is Node ≥22.15, which is exactly the supported floor, so it needs no gate and no second version-conditional implementation of a security-critical hook. Node 26 additionally DEPRECATED `module.register()` (DEP0205) in its favour. Tracked as #152 — still a follow-up with a real design question in it (the ESM perimeter is where #59/#61/#62 lived), not a tweak. |
 | `real-builtins.cts`'s twelve `require`s on the MAIN thread | 13 | #78. They must be eager and inside `index.js`'s static graph: that is the whole proof that they run against a pristine `Module._load` rather than capturing capwall's own shims. Narrowing helps a realm that needs two of them; it cannot help the realm that needs all twelve. |
 | `globalThis.Request` → undici | 21 | `global-egress.ts` captures the real `Request.prototype.url` getter at module scope, and V8 materializes undici on the first *observation* of that global (even `getOwnPropertyDescriptor` triggers it — verified). The capture is load-bearing: it is what stops a `Request` with a shadowed own `url` accessor reporting a granted destination while undici dials another (#26/#56). Deferring it to first `fetch()` would put that capture *after* dependencies have run, which is the window it exists to close. Note the guard itself is nearly free once undici is resident — `installGlobalEgressGuard` is ~1 ms — so this is the price of the TOCTOU capture, not of the guard. |
-| zod on the MAIN thread | 4 | `parsePolicy` is real validation of a real document, and the preload always parses one. |
+| zod on the MAIN thread | 4 (zod 3) / **~62** (zod 4) | `parsePolicy` is real validation of a real document, and the preload always parses one. See § zod 4 below for the measured breakdown of the increase and why none of it is recoverable without giving that sentence up. |
 | the ESM shim registry being built eagerly | 3 | #150 opened by asking whether lazy shim construction was the win. **It is worth 3 ms.** `registerEsmHook` needs every specifier's export names to ship to the loader thread, so the registry cannot be lazy there — and it turns out not to matter. Recorded because "we checked and it was small" is a result. |
 
 ### Before / after
@@ -595,6 +595,87 @@ unlike those two it is not bought by a guarantee — it is bought by the source 
 separate CJS module for #78's proof to mean anything, and `test/esm-hook-graph.test.ts` holds the
 loader thread's graph in place with a *static scan of the import graph* that a bundle would
 invalidate. Filed as **#171** with these numbers rather than attempted.
+
+### zod 4 — the +58 ms is module load, and it is not recoverable (#161)
+
+zod 3.25.76 → 4.4.3 costs the main thread **+58 ms at p50**, on the one budget this section
+exists for. It was taken anyway. This subsection is the measurement, so the trade is inspectable
+rather than a shrug — and so nobody re-derives it from first principles the next time
+`pnpm outdated` prints the row.
+
+**Where it lives.** Cold `node` processes, ABBA-interleaved, ≥25 samples per arm, importing the
+REAL `@capwall/policy-schema` barrel and then parsing the real policy file. The two arms differ
+only in which `zod` the barrel resolves to.
+
+| phase | zod 3.25.76 | zod 4.4.3 | delta |
+|---|---|---|---|
+| `import("@capwall/policy-schema")` — zod's module graph **plus** schema construction | 25.5 ms | 83.4 ms | **+57.9** |
+| … of which zod's own module graph | ~20 | ~80 | **+60** |
+| … of which building capwall's schema tree | ~5.6 | ~17.0 | **+11** |
+| `parsePolicy(doc)` on the real policy | 5.77 ms | 5.87 ms | **+0.1 — none** |
+
+So **the regression is entirely module load, and validation itself is free**. zod 4 parses this
+document at exactly zod 3's speed; what changed is that `zod`'s ESM entry now evaluates ~79
+modules where zod 3's evaluated ~10.
+
+**Every cheaper door was measured, and none of them opens.** Same harness, import cost only:
+
+| entry point | p50 | |
+|---|---|---|
+| `zod` (v3) | 19.4 ms | the baseline |
+| `zod` (v4 classic) | 68.6 ms | what we now pay |
+| `zod/mini` | 64.7 ms | −4 ms. Its win is minified bundle size after tree-shaking; Node evaluates the graph either way. Confirms #161. |
+| `zod/v4/core` | 54.9 ms | −14 ms, and it would cost the entire inferred-type story — `z.infer` is what makes this package the single source of truth for both the schema and the TS types. Not worth 14 ms. |
+| `require("zod")` (CJS) | 83.6 ms | **slower**, not faster: 79 CJS modules resolved synchronously. |
+
+**Why it was not engineered around.** The preload validates a policy on the main thread before
+the target's entry point, and that is not optional — an unvalidated policy file is a fail-open in
+the component that decides what everything else may do. Three routes were considered and all
+three buy the milliseconds with that sentence:
+
+- *Lazy-load zod behind first validation.* Helps only the INERT preload (a stale `NODE_OPTIONS`
+  in a shell, the case `preload.ts` deliberately handles by touching no files). Every mediated
+  process parses, so the common case pays it anyway. Real but ~0% of the regression, and it would
+  put an `await` into the most order-sensitive file in the repo for no gain.
+- *Construct the schema tree on demand.* Same shape, same answer: the preload constructs it and
+  then immediately parses with it. Worth 17 ms to an embedder who imports `@capwall/core` and
+  never validates; worth nothing to a mediated process.
+- *Trust a policy the parent already validated* — pass the parsed document to the child instead of
+  re-reading and re-validating it. This is the one that would actually work, and it is refused:
+  it makes `@capwall/core`'s guarantees depend on who launched the process.
+
+**What it costs a whole mediated child.** Same discipline as the § Before/after table: ABBA
+interleaved, ≥15 samples per arm, `bare node` and `CAPWALL_ESM=0` as controls. The child prints
+`performance.now()` as its first statement, so the figure is everything the runtime and capwall
+did before the application got control. The two arms are two `dist` trees differing only in
+which `zod` `@capwall/policy-schema` resolves to.
+
+| condition | child | zod 3 p50 | zod 4 p50 | |
+|---|---|---|---|---|
+| 16-core, Node 22 | mediated, esm ON | 283 ms | **334 ms** | +51 ms |
+| | `CAPWALL_ESM=0` (control) | 167 ms | 228 ms | +62 ms |
+| | bare node (control) | 44 ms | 44 ms | 0 — the noise floor |
+| `docker --cpus=2`, Node 22 | mediated, esm ON | 347 ms | **402 ms** | +55 ms |
+| | `CAPWALL_ESM=0` (control) | 204 ms | 263 ms | +59 ms |
+| | bare node (control) | 49 ms | 49 ms | 0 |
+
+**Read the `CAPWALL_ESM=0` row, not the headline.** It moves by the same amount as the mediated
+row — which is the signature of a cost that is entirely on the MAIN thread, exactly where a
+policy parse lives, and not on the loader thread #150 spent a change on. A version of this table
+where `CAPWALL_ESM=0` had *not* moved would mean the two builds differed in something other than
+zod.
+
+**What did NOT move, and the check that says so.** zod is still absent from the ESM loader
+thread's graph — `test/esm-hook-graph.test.ts`'s static scan and its runtime `moduleLoadList`
+probe both pass unchanged against zod 4. #150's work holds; it just never made zod free on the
+main thread, and never claimed to.
+
+**One lever is left, and it is deliberately not pulled here.** Node's on-disk V8 compile cache
+(`module.enableCompileCache()` / `NODE_COMPILE_CACHE`, available on the whole supported range)
+recovers **~34 ms of zod 4's ~80 ms** on a warm cache (45.4 ms vs 79.7 ms p50, same harness) — and
+~6 ms of zod 3's, so it narrows the gap rather than closing it. It also makes a security tool's
+preload write bytecode into a cache directory in the target's environment, which is a decision
+with a threat-model paragraph attached and not a line in a dependency bump. Filed separately.
 
 ## Where the budget does not hold
 

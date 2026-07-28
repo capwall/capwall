@@ -5,6 +5,13 @@
     "lib": ["ES2022"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+    // TypeScript 7 defaults `types` to `[]`; 5.x auto-included every `@types/*` package in
+    // scope. The four `tsconfig.test.json` files already said this explicitly — the four BUILD
+    // configs inherited it ambiently, so without this line `tsc -p packages/core/tsconfig.json`
+    // loses all of `@types/node` at once (`Cannot find name 'process'`, `Cannot find namespace
+    // 'NodeJS'`, `Error.stackTraceLimit` missing). Stating it here is also the safer shape: it
+    // pins the ambient types to exactly one package instead of "whatever the resolver found".
+    "types": ["node"],
     "strict": true,
     "exactOptionalPropertyTypes": true,
     "noUncheckedIndexedAccess": true,

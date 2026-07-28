@@ -3,11 +3,11 @@ packages:
   - 'examples/*'
 
 # capwall runs NO dependency install scripts, and that is a decision rather than an oversight.
-# pnpm 10 blocks them by default; this is where a script that was looked at and deliberately
-# left unbuilt gets recorded, so a silent clone is a reviewed state rather than an open question.
+# pnpm blocks them by default; this is where a script that was looked at and deliberately left
+# unbuilt gets recorded, so a silent clone is a reviewed state rather than an open question.
 #
-# THE LIST IS EMPTY, AND THAT IS NOW LITERALLY TRUE: as of the vitest 4 / vite 8 bump, no
-# package anywhere in the tree declares `preinstall`, `install` or `postinstall`. It held one
+# THERE IS NOTHING TO RECORD, AND THAT IS LITERALLY TRUE: as of the vitest 4 / vite 8 bump, no
+# package anywhere in the tree declares `preinstall`, `install` or `postinstall`. There was one
 # entry, `esbuild`, whose postinstall fetched its platform binary — vite 8 replaced esbuild with
 # rolldown/oxc, which ship prebuilt bindings as ordinary optionalDependencies, and esbuild left
 # the tree entirely (it survives in the lockfile only as an OPTIONAL peer of vite that nothing
@@ -16,13 +16,25 @@ packages:
 # that silently does nothing is the same defect class as the version overrides removed in #158.
 # Verified in a clean `node:22` container, not inferred from a warm store.
 #
-# Recording a script here DOES suppress pnpm 10.33's "Ignored build scripts" warning (an earlier
-# revision of this comment claimed the opposite; a fresh container disproved it). With the list
-# empty, that suppression is switched off — so pnpm will now SAY SO the first time a dependency
-# brings an install script in, which is the signal you actually want. README.md § Prerequisites
-# says the same. Re-verify when pnpm is bumped.
+# THE SPELLING CHANGED IN pnpm 11, AND SO DID THE BEHAVIOUR — the "a package-manager major
+# changes this quietly" case #162 said to re-check, and it did. pnpm 10 read a LIST
+# (`ignoredBuiltDependencies: [esbuild]`), and recording an entry there SUPPRESSED the "Ignored
+# build scripts" warning, so a clone with a declined script was silent. pnpm 11 removed that
+# setting — along with `onlyBuiltDependencies`, `onlyBuiltDependenciesFile`,
+# `neverBuiltDependencies` and `ignoreDepScripts` — in favour of one `allowBuilds` MAP of
+# name -> boolean, and it does not go quiet on the strength of a `false`: it FAILS the install
+# with ERR_PNPM_IGNORED_BUILDS, exit 1, until every package carrying a build script has an
+# explicit true/false. Both directions were measured in a clean `node:22` container.
 #
-# ADDING TO THIS LIST IS A SECURITY DECISION, not a build fix: an install script runs arbitrary
-# code from a dependency, before any of capwall's own mediation exists, at exactly the phase
-# this project exists to talk about. If something genuinely needs to build, say why in the PR.
-ignoredBuiltDependencies: []
+# The two findings compose into the state you want, which is why neither setting appears below.
+# Nothing in the tree declares an install script, so there is nothing to declare — and the first
+# dependency that brings one in will FAIL the install rather than print a line above the
+# summary. There is no longer a suppression that can decay into a cap nobody re-reads, and no
+# longer an entry that refers to nothing. README.md § Prerequisites says the same.
+# Re-verify when pnpm is bumped — that instruction has now earned itself twice.
+#
+# ADDING AN `allowBuilds` ENTRY IS A SECURITY DECISION, not a build fix: an install script runs
+# arbitrary code from a dependency, before any of capwall's own mediation exists, at exactly the
+# phase this project exists to talk about. If something genuinely needs to build, say why in the
+# PR. Write the key back in when there is something to put in it; an empty `allowBuilds: {}`
+# would be the same "refers to nothing" defect this file just removed.
