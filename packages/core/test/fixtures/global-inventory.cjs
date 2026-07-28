@@ -21,10 +21,20 @@ for (const name of ["fetch", "WebSocket", "EventSource"]) {
   };
 }
 
+// Web Storage arrived on Node 26 (`Storage`, `localStorage`, `sessionStorage`). It was reviewed
+// as INERT FOR EGRESS on the strength of its prototype carrying no transport method — report the
+// prototype so the review is an assertion in the test rather than a claim in a comment. `null`
+// on a Node without the class, which is the pre-26 legs of the matrix.
+const storageProto =
+  typeof globalThis.Storage === "function"
+    ? Object.getOwnPropertyNames(globalThis.Storage.prototype).sort()
+    : null;
+
 process.stdout.write(
   JSON.stringify({
     names,
     guarded,
+    storageProto,
     // `navigator.sendBeacon` is the one browser egress API this guard would have to grow if Node
     // ever adds it. Node's `navigator` currently carries only userAgent/platform/language(s)/
     // hardwareConcurrency, so this must stay false.

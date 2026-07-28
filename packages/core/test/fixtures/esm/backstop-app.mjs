@@ -15,7 +15,7 @@
 // Prints `BACKSTOP:UNSUPPORTED` where the API does not exist, rather than silently passing.
 //
 // A NAMESPACE import, not `import { register, registerHooks }`: `registerHooks` does not exist on
-// Node 20, and a named import of a missing export is a SyntaxError at instantiation time — the
+// older runtimes, and a named import of a missing export is a SyntaxError at instantiation time — the
 // module would not even load, on the runtime where the feature is merely absent.
 import * as nodeModule from "node:module";
 

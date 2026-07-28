@@ -36,9 +36,19 @@ const CORE_DIST = createRequire(import.meta.url).resolve("../dist/index.js");
 const CORE_URL = JSON.stringify(pathToFileURL(CORE_DIST).href);
 
 /**
- * Built-in TypeScript type stripping — Node ≥22.18 (and ≥23), absent on the Node 20 leg of the
- * CI matrix. Evaluated at module scope so the dependent test can `skipIf`, which the reporter
- * shows, rather than `return` mid-body, which it does not (#112).
+ * Built-in TypeScript type stripping — Node ≥22.18 (and ≥23).
+ *
+ * THIS PREDICATE SURVIVED THE NODE 20 DROP, and deliberately. The supported floor is ≥22.15
+ * (chosen for `module.registerHooks()`, not for this), so 22.15–22.17 satisfy `engines` without
+ * having type stripping, and the guard is still reachable. It does NOT skip on any leg of the CI
+ * matrix — 22.latest, 24 and 26 all have it — so this is coverage that runs everywhere CI looks,
+ * with a guard that stays honest about the range `engines` actually claims.
+ *
+ * Raising the floor to 22.18 purely to delete this `skipIf` would be the tail wagging the dog:
+ * capwall REQUIRES `registerHooks`, it merely must-not-break type stripping.
+ *
+ * Evaluated at module scope so the dependent test can `skipIf`, which the reporter shows, rather
+ * than `return` mid-body, which it does not (#112).
  */
 const HAS_TYPE_STRIPPING = ((): boolean => {
   const [major, minor] = process.versions.node.split(".").map(Number) as [number, number];
@@ -167,10 +177,11 @@ handle.uninstall();
   it.skipIf(!HAS_TYPE_STRIPPING)("keeps require() of a TypeScript file working — the user-visible half of #128", async () => {
     // The failure mode that gets a defense-in-depth tool uninstalled: no denial, no policy, no
     // attribution — just a SyntaxError from Node's own loader with capwall's frame in the stack.
-    // Skipped on a Node without built-in type stripping, where the third argument does not exist
-    // and there is nothing to drop — via `skipIf`, so the Node-20 leg of the CI matrix REPORTS
-    // the gap. Two stacked `if (…) return;` lines used to make this a green no-op there, and it
-    // is the only coverage of #128's user-visible half (#112).
+    // Skipped on a Node without built-in type stripping (22.15–22.17 — inside `engines`, below
+    // every leg of the CI matrix), where the third argument does not exist and there is nothing
+    // to drop. Via `skipIf`, so such a runtime REPORTS the gap rather than hiding it: two stacked
+    // `if (…) return;` lines used to make this a green no-op, and it is the only coverage of
+    // #128's user-visible half (#112).
     const r = await run(
       `
 ${INSTALL}

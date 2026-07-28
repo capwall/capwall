@@ -49,7 +49,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: [20, 22]
+        # Keep this list identical to ci.yml's — a release that verifies on a narrower matrix
+        # than CI is a release nobody checked on the versions `engines` claims to support.
+        node-version: [22, 24, 26]
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -85,15 +87,21 @@ jobs:
         with:
           version: 10
 
+      # One version publishes, and it is the ACTIVE LTS (24) — the tarball contents do not
+      # depend on which Node packs them, but "whatever the active LTS is" is the least
+      # surprising thing for a released artifact to have been built on. `verify` above is what
+      # covers the whole supported range.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
 
-      # The npm bundled with Node 22 is 10.x, which predates trusted publishing entirely —
-      # without this step the publish falls back to looking for an auth token and fails.
-      # Installing @latest rather than pinning a minimum keeps this correct as npm's OIDC
-      # support moves; the printed version is there so a failed run says which npm ran.
+      # DO NOT DROP THIS STEP JUST BECAUSE NODE 24 SHIPS npm 11. The bundled npm is upgraded
+      # here on purpose: trusted publishing (OIDC) support moves in npm, not in Node, and
+      # pinning the publish to whatever npm a given Node image happened to bundle is how this
+      # silently regresses to looking for an auth token that does not exist. Installing @latest
+      # keeps it correct across Node bumps; the printed version is there so a failed run says
+      # which npm actually ran.
       - name: Upgrade npm for trusted publishing
         run: |
           npm install -g npm@latest

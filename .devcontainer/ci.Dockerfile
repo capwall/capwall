@@ -6,12 +6,23 @@
 # non-ignored files at their current working-tree content) — i.e. exactly what CI checks out:
 # source + the committed vendored test/demo fixtures, WITHOUT the host's installed
 # node_modules/ or dist/. Everything is installed and built fresh here, like CI.
-ARG NODE_VERSION=22
+ARG NODE_VERSION=24
 FROM node:${NODE_VERSION}-bookworm-slim
 
 # Match GitHub Actions: CI=true, non-interactive corepack (uses the repo-pinned pnpm).
 ENV CI=true
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+
+# COREPACK IS NOT BUNDLED FROM NODE 25 ONWARDS. It shipped with Node through 24 and was
+# unbundled in 25, so `node:25`/`node:26` images have no `corepack` on PATH and this image
+# failed at step 5 with "corepack: not found" the first time the matrix reached 26. Install it
+# from npm only when it is missing, so 22 and 24 keep using the bundled one and the pinned pnpm
+# still comes from `packageManager` on every version.
+#
+# ci.yml does not need this: `pnpm/action-setup@v4` installs pnpm directly rather than through
+# corepack. This step is what keeps the container faithful to that on a version where the
+# runtime image alone cannot get there.
+RUN command -v corepack >/dev/null 2>&1 || npm install -g corepack@latest
 RUN corepack enable
 
 WORKDIR /app

@@ -31,16 +31,22 @@
  *    response except the redirect check described below.
  *
  * ── WHICH GLOBALS, AND HOW A FUTURE ONE IS CAUGHT ────────────────────────────────────────────
- * Enumerated against the supported range rather than guessed (Node 20.19 / 22.22 / 24.5,
- * with and without the relevant `--experimental-*` flags):
+ * Enumerated against the supported range rather than guessed (Node 22.23 / 24.18 / 26.5, with
+ * and without the relevant `--experimental-*` flags). The Node 20 column was dropped when 20
+ * went EOL; with the floor at ≥22.15 the range no longer has a version where `WebSocket` is
+ * flag-only, which is why that row is now uniform:
  *
- *  | global                  | Node 20            | Node 22 / 24        | guarded |
- *  |-------------------------|--------------------|---------------------|---------|
- *  | `fetch`                 | yes                | yes                 | YES     |
- *  | `WebSocket`             | `--experimental-websocket` | yes         | YES     |
- *  | `EventSource`           | `--experimental-eventsource` | `--experimental-eventsource` | YES |
- *  | `navigator.sendBeacon`  | no `navigator` at all | `navigator` exists, NO `sendBeacon` | n/a |
- *  | `XMLHttpRequest`        | no                 | no                  | n/a     |
+ *  | global                  | Node 22 / 24 / 26                   | guarded |
+ *  |-------------------------|-------------------------------------|---------|
+ *  | `fetch`                 | yes                                 | YES     |
+ *  | `WebSocket`             | yes (unflagged since 22.4)          | YES     |
+ *  | `EventSource`           | `--experimental-eventsource`        | YES     |
+ *  | `navigator.sendBeacon`  | `navigator` exists, NO `sendBeacon` | n/a     |
+ *  | `XMLHttpRequest`        | no                                  | n/a     |
+ *
+ * Node 26 additionally introduced `Storage`/`localStorage`/`sessionStorage`, `Temporal`,
+ * `ErrorEvent` and `QuotaExceededError`. All six were reviewed and classified INERT for egress —
+ * see `test/global-egress-inventory.test.ts`, which is the canary that caught them.
  *
  * Each guard installs **only if the global is actually present**, so an API that exists only
  * behind a flag is picked up automatically when the flag is on, and nothing is invented on a

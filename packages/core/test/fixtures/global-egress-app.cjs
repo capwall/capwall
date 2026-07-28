@@ -1,6 +1,6 @@
 // Fixture app for the FLAGGED global egress classes (#80). Run under the capwall preload with
 // `--experimental-websocket --experimental-eventsource`, so `WebSocket` and `EventSource` exist
-// on every supported Node — on Node 20 both are flag-only, so an in-process vitest run would
+// on every supported Node — `EventSource` is flag-only on 22/24/26, so an in-process vitest run would
 // silently skip them there and the CI matrix's older half would prove nothing.
 //
 // argv[2]/argv[3] are two DISTINCT `host:port` pairs on loopback that nothing is listening on:

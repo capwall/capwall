@@ -41,3 +41,6 @@ dist-tarballs/
 # (scripts/bench/bench.mjs, issue #134). Created per run, removed at teardown; only left behind
 # by a crashed run.
 scripts/bench/fixtures/node_modules/bench-dep/.bench-scratch/
+
+# Agent worktrees (created by tooling, never part of the tree)
+.claude/worktrees/

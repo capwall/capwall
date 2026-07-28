@@ -150,7 +150,7 @@ describe("fs slice — stream-class + existence-probe surfaces (review findings)
 
   // `skipIf`, not a silent `return` — and a `return` from inside the `withCapwall` CALLBACK was
   // doubly invisible: the test reported green with zero assertions and the reporter showed
-  // nothing at all (#112). The alias is present on Node 20/22/24; the predicate reads the REAL
+  // nothing at all (#112). The alias is present on Node 22/24/26; the predicate reads the REAL
   // `fs` so a runtime that finally drops the deprecated alias shows up as a skip.
   it.skipIf(typeof (nodeFs as { FileReadStream?: unknown }).FileReadStream !== "function")(
     "also mediates the deprecated FileReadStream alias (same bypass class)",

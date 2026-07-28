@@ -50,6 +50,28 @@ const GUARDED_EGRESS_GLOBALS: readonly string[] = ["fetch", "WebSocket", "EventS
  *  - `process` — the door to `child_process` and the module system, both mediated elsewhere;
  *    it is not itself a network API.
  *  - `WebAssembly` — compiles bytes someone else fetched.
+ *
+ * THE NODE 26 ARRIVALS, reviewed when 26 joined the matrix. This canary did its job: all six
+ * appeared at once and none of them was on anyone's radar.
+ *
+ *  - `Temporal` — the TC39 date/time API (`Now`, `PlainDate`, `Instant`, `Duration`, …).
+ *    Arithmetic on calendar values; no transport of any kind.
+ *  - `ErrorEvent` — the event class `WebSocket`/`EventSource` emit on failure
+ *    (`message`/`filename`/`lineno`/`colno`/`error`). A data type ABOUT a failed request, not a
+ *    way to originate one; the classes that do originate are already in the guarded list.
+ *  - `QuotaExceededError` — a `DOMException`-family error carrying `quota`/`requested`. An error.
+ *  - `Storage` / `localStorage` / `sessionStorage` — Web Storage. The prototype is exactly
+ *    `getItem`/`setItem`/`removeItem`/`clear`/`key`/`length`: a key-value store with **no network
+ *    method**, so it is inert for EGRESS, which is the question this file asks.
+ *
+ *    It is not inert in every sense, and that is worth writing down rather than leaving implied.
+ *    `localStorage` is PERSISTENT and file-backed — it materialises only when the user passes
+ *    `--localstorage-file`, and Node does that file I/O internally, below the `fs` shim. So on a
+ *    Node 26 process started with that flag, a dependency could read and write that one file
+ *    without an `fs` grant. It is narrow (opt-in flag, one path, no path control) and it is a
+ *    FILESYSTEM question, not an egress one, so it does not belong in either list here — see
+ *    docs/threat-model.md § Web Storage for the writeup and #156 for the tracking issue.
+ *    `sessionStorage` is in-memory and has no such angle.
  */
 const REVIEWED_INERT_GLOBALS: readonly string[] = [
   "AbortController", "AbortSignal", "AggregateError", "Array", "ArrayBuffer",
@@ -57,32 +79,42 @@ const REVIEWED_INERT_GLOBALS: readonly string[] = [
   "Boolean", "BroadcastChannel", "Buffer", "ByteLengthQueuingStrategy", "CloseEvent",
   "CompressionStream", "CountQueuingStrategy", "Crypto", "CryptoKey", "CustomEvent",
   "DOMException", "DataView", "Date", "DecompressionStream", "DisposableStack", "Error",
-  "EvalError", "Event", "EventTarget", "File", "FinalizationRegistry", "Float16Array",
-  "Float32Array", "Float64Array", "FormData", "Function", "Headers", "Infinity", "Int16Array",
-  "Int32Array", "Int8Array", "Intl", "Iterator", "JSON", "Map", "Math", "MessageChannel",
-  "MessageEvent", "MessagePort", "NaN", "Navigator", "Number", "Object", "Performance",
-  "PerformanceEntry", "PerformanceMark", "PerformanceMeasure", "PerformanceObserver",
-  "PerformanceObserverEntryList", "PerformanceResourceTiming", "Promise", "Proxy", "RangeError",
-  "ReadableByteStreamController", "ReadableStream", "ReadableStreamBYOBReader",
-  "ReadableStreamBYOBRequest", "ReadableStreamDefaultController", "ReadableStreamDefaultReader",
-  "ReferenceError", "Reflect", "RegExp", "Request", "Response", "Set", "SharedArrayBuffer",
-  "String", "SubtleCrypto", "SuppressedError", "Symbol", "SyntaxError", "TextDecoder",
-  "TextDecoderStream", "TextEncoder", "TextEncoderStream", "TransformStream",
-  "TransformStreamDefaultController", "TypeError", "URIError", "URL", "URLPattern",
-  "URLSearchParams", "Uint16Array", "Uint32Array", "Uint8Array", "Uint8ClampedArray", "WeakMap",
-  "WeakRef", "WeakSet", "WebAssembly", "WritableStream", "WritableStreamDefaultController",
-  "WritableStreamDefaultWriter", "atob", "btoa", "clearImmediate", "clearInterval",
-  "clearTimeout", "console", "crypto", "decodeURI", "decodeURIComponent", "encodeURI",
-  "encodeURIComponent", "escape", "eval", "global", "globalThis", "isFinite", "isNaN",
-  "navigator", "parseFloat", "parseInt", "performance", "process", "queueMicrotask",
-  "setImmediate", "setInterval", "setTimeout", "structuredClone", "undefined", "unescape",
+  "ErrorEvent", "EvalError", "Event", "EventTarget", "File", "FinalizationRegistry",
+  "Float16Array", "Float32Array", "Float64Array", "FormData", "Function", "Headers", "Infinity",
+  "Int16Array", "Int32Array", "Int8Array", "Intl", "Iterator", "JSON", "Map", "Math",
+  "MessageChannel", "MessageEvent", "MessagePort", "NaN", "Navigator", "Number", "Object",
+  "Performance", "PerformanceEntry", "PerformanceMark", "PerformanceMeasure",
+  "PerformanceObserver", "PerformanceObserverEntryList", "PerformanceResourceTiming", "Promise",
+  "Proxy", "QuotaExceededError", "RangeError", "ReadableByteStreamController", "ReadableStream",
+  "ReadableStreamBYOBReader", "ReadableStreamBYOBRequest", "ReadableStreamDefaultController",
+  "ReadableStreamDefaultReader", "ReferenceError", "Reflect", "RegExp", "Request", "Response",
+  "Set", "SharedArrayBuffer", "Storage", "String", "SubtleCrypto", "SuppressedError", "Symbol",
+  "SyntaxError", "Temporal", "TextDecoder", "TextDecoderStream", "TextEncoder",
+  "TextEncoderStream", "TransformStream", "TransformStreamDefaultController", "TypeError",
+  "URIError", "URL", "URLPattern", "URLSearchParams", "Uint16Array", "Uint32Array", "Uint8Array",
+  "Uint8ClampedArray", "WeakMap", "WeakRef", "WeakSet", "WebAssembly", "WritableStream",
+  "WritableStreamDefaultController", "WritableStreamDefaultWriter", "atob", "btoa",
+  "clearImmediate", "clearInterval", "clearTimeout", "console", "crypto", "decodeURI",
+  "decodeURIComponent", "encodeURI", "encodeURIComponent", "escape", "eval", "global",
+  "globalThis", "isFinite", "isNaN", "localStorage", "navigator", "parseFloat", "parseInt",
+  "performance", "process", "queueMicrotask", "sessionStorage", "setImmediate", "setInterval",
+  "setTimeout", "structuredClone", "undefined", "unescape",
 ];
+
+/**
+ * Web Storage (`Storage`/`localStorage`/`sessionStorage`) is Node ≥26. Read at module scope, from
+ * the SAME runtime the probe child runs, so the two rows below can `skipIf` visibly rather than
+ * `return` invisibly mid-body (#112).
+ */
+const HAS_WEB_STORAGE = typeof (globalThis as { Storage?: unknown }).Storage === "function";
 
 interface Inventory {
   names: string[];
   /** Descriptor shape of each guarded global that exists, reported from the child. */
   guarded: Record<string, { type: string; configurable: boolean; writable: boolean }>;
   hasSendBeacon: boolean;
+  /** `Storage.prototype`'s own property names, or `null` on a Node without Web Storage. */
+  storageProto: string[] | null;
 }
 
 /**
@@ -120,6 +152,37 @@ describe("#80 — the global egress surface is fully classified", () => {
     // into false coverage); this assertion is what forces one to be written.
     const { hasSendBeacon } = await probe();
     expect(hasSendBeacon).toBe(false);
+  });
+
+  it.skipIf(!HAS_WEB_STORAGE)(
+    "Web Storage carries no transport method — the reason it is classified inert (Node 26)",
+    async () => {
+      // `Storage`/`localStorage`/`sessionStorage` were classified INERT FOR EGRESS when Node 26
+      // joined the matrix, on the strength of the prototype being a plain key-value store. Pin
+      // the EXACT surface, so the classification is re-checked by machine on every run rather
+      // than trusted from a comment: if a future Node grows Storage a sync/push/fetch-shaped
+      // method, this fails and someone re-reviews — the same contract as `sendBeacon` above.
+      //
+      // Deliberately `toEqual` on the whole list rather than `not.toContain("fetch")`: the claim
+      // is that we know every method it has, not that it lacks the one name we thought to name.
+      const { storageProto } = await probe();
+      expect(storageProto).toEqual([
+        "clear", "constructor", "getItem", "key", "length", "removeItem", "setItem",
+      ]);
+    },
+  );
+
+  it("the probe reports Web Storage exactly as the runtime running this test has it", async () => {
+    // The always-running half, so the skip above is never the whole story on a pre-26 leg: this
+    // asserts the probe's view and the test runner's view of the same runtime agree, in BOTH
+    // directions. On 22/24 it pins "absent, and the inventory says so"; on 26 it pins "present".
+    // Without it, a probe that silently stopped reporting `storageProto` would look identical to
+    // a Node without Web Storage.
+    const { names, storageProto } = await probe();
+    expect({ inNames: names.includes("Storage"), reported: storageProto !== null }).toEqual({
+      inNames: HAS_WEB_STORAGE,
+      reported: HAS_WEB_STORAGE,
+    });
   });
 
   it("every guarded name that exists on this Node is a replaceable, restorable function", async () => {

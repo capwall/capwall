@@ -263,10 +263,10 @@ Per-capability notes:
   converted once and the resulting **string** is what is forwarded, so a shadowed `pathname`
   accessor cannot make Node open a file other than the one that was guarded.
   **Directory enumeration through a pattern** — `fs.glob` / `fs.globSync` / `fs.promises.glob`,
-  Node ≥22 only — is mediated as of #106. Until then all three were absent from the shim's tables
+  Node ≥22 — is mediated as of #106. Until then all three were absent from the shim's tables
   and a dependency could list any directory on the machine under a deny-all `enforce` policy with
-  **no decision recorded and nothing denied**. Absent on Node 20, where the wrapper is a clean
-  no-op (asserted, not skipped). See "`fs.glob` semantics" below for what the grant means, what a
+  **no decision recorded and nothing denied**. Present on every supported runtime since the floor
+  moved to Node ≥22.15. See "`fs.glob` semantics" below for what the grant means, what a
   glob can still learn, and the residuals.
   **`fs` is not the only route to a file's bytes.** `require`/`import` of a path is a read too,
   and for `.json` it hands the contents back as data; that is gated as `fs.read` since #123, for
@@ -465,8 +465,8 @@ Per-capability notes:
   code: capwall guards the **name** the call asked for, which is the level a policy is written
   at, and a resolver that answers with somebody else's address is the `dns` residual reached by
   a shorter path. (c2) Node ≥22's built-in proxy support (`--use-env-proxy` /
-  `NODE_USE_ENV_PROXY`, absent on Node 20) makes `http(s).Agent#createConnection` dial the
-  **proxy** rather than the endpoint. capwall guards the endpoint the request named; when that
+  `NODE_USE_ENV_PROXY`) makes `http(s).Agent#createConnection` dial the **proxy** rather than the
+  endpoint. capwall guards the endpoint the request named; when that
   flag is set, the socket that actually opens goes to the configured proxy instead. Grant the
   proxy's host:port as well if you enable it. (d) Reaching the real prototype by climbing past the guard — two
   levels from an instance of a guarded class
@@ -735,12 +735,12 @@ to `observe`/`capwall diff` as well.
 capwall now installs a **global egress guard** (`shims/global-egress.ts`), which replaces those
 globals with guarded equivalents for the life of the install. What it covers and how it behaves:
 
-- **Which globals.** Enumerated against the supported range (Node 20.19 / 22.22 / 24.5, with and
+- **Which globals.** Enumerated against the supported range (Node 22.23 / 24.18 / 26.5, with and
   without the relevant `--experimental-*` flags), not guessed: `fetch` (present everywhere),
-  `WebSocket` (Node ≥22 unflagged; `--experimental-websocket` on 20) and `EventSource`
-  (`--experimental-eventsource` on every supported version). Each is replaced **only if it is
-  already present**, so a flag-only API is picked up when the flag is on and nothing is invented
-  on a Node that lacks it. `navigator.sendBeacon` **does not exist in any supported Node** —
+  `WebSocket` (unflagged since Node 22.4, so present on every supported version now that the
+  floor is ≥22.15) and `EventSource` (`--experimental-eventsource` on every supported version).
+  Each is replaced **only if it is already present**, so a flag-only API is picked up when the
+  flag is on and nothing is invented on a Node that lacks it. `navigator.sendBeacon` **does not exist in any supported Node** —
   Node's `navigator` carries `userAgent`/`platform`/`language(s)`/`hardwareConcurrency` only — so
   there is deliberately no guard code for it.
 - **How a FUTURE global egress API is caught.** `test/global-egress-inventory.test.ts` enumerates
@@ -1652,6 +1652,40 @@ grant from `observe` and change no outcome, so `.node` skips this gate and keeps
   `<project>/app.config.js`) now needs an `fs.read` grant covering them. That is a true statement
   about what those tools do, and `capwall observe` generates the grant from the trace.
 
+## Web Storage (`localStorage`) — a file read/write below the `fs` shim, Node ≥26
+
+**Status: known, un-mediated, flag-gated — tracked as #156. Narrow enough not to be alarming,
+real enough to write down rather than leave implied.**
+
+Node 26 added Web Storage — `Storage`, `localStorage`, `sessionStorage` — to the globals. They
+were found by the global-egress inventory canary (`test/global-egress-inventory.test.ts`) when 26
+joined the CI matrix, and all three were classified **inert for egress**: `Storage.prototype` is
+exactly `getItem`/`setItem`/`removeItem`/`clear`/`key`/`length`, with no transport method. That
+classification is asserted, not asserted-in-a-comment — the prototype's full member list is
+pinned, so a future Node that grows it a sync- or fetch-shaped method fails the test and forces a
+re-review.
+
+Egress is not the only question, and the other answer is less comfortable:
+
+- **`sessionStorage` is in-memory.** No persistence, no file, nothing to mediate.
+- **`localStorage` is file-backed, and capwall does not see the I/O.** It materializes only when
+  the user starts Node with `--localstorage-file=<path>`; without that flag the global is present
+  but throws on use. When it *is* on, Node performs the read and write internally, below the
+  `fs` shim, so a dependency can `localStorage.setItem`/`getItem` against that one file **with no
+  `fs` grant and no recorded decision** — the same shape as the module-system read channel #123
+  closed, on a different Node internal.
+
+**Why it is not treated as urgent.** The flag is opt-in and set by the operator, never by a
+dependency; there is exactly one path, chosen by the operator, and a dependency has no control
+over which file is touched; and the contents are a key-value store the dependency could equally
+have kept in memory. It is a persistence and cross-run-signalling channel, not a route to
+arbitrary files.
+
+**What would change that.** Node making `localStorage` available without a flag, or allowing the
+path to be selected at runtime. Either would move this into the same class as #123 and it should
+be gated as an `fs` read/write on the backing file at that point. #156 carries the reproduction
+and the design notes for whoever picks that up.
+
 ## Native `.node` addons
 
 **What the gate does: a load-time decision. What it does not do: any confinement
@@ -1687,7 +1721,7 @@ The value the gate does provide is real but narrow, and worth stating precisely:
 
 The gate is a patch on `process.dlopen`, which is the single JS-reachable chokepoint every
 addon load passes through: `Module._extensions[".node"]`'s entire body is
-`return process.dlopen(module, path.toNamespacedPath(filename))` (verified against Node 20.20,
+`return process.dlopen(module, path.toNamespacedPath(filename))` (verified against Node 22.23,
 22.22 and 24.18). Consequently it covers `require("./build/Release/foo.node")`, a **direct**
 `process.dlopen(...)` call that bypasses the module system entirely, and the resolver wrappers
 real native packages use — `bindings` and `node-gyp-build` both end at a plain `require()` of
@@ -1723,7 +1757,7 @@ the same fail-open #60 closed for the stack walk, arriving by a different route.
   un-patching any other shim, and the same caveat applies: capwall does not claim to stop
   in-process code that goes looking for the raw primitive.
 - Node's experimental `require.addon()` is a C++-side loader that may not route through
-  `process.dlopen`. It is absent on Node 20.20, 22.22 and 24.18 as shipped, and
+  `process.dlopen`. It is absent on Node 22.23, 24.18 and 26.5 as shipped, and
   `node-gyp-build` prefers it when present (`typeof runtimeRequire.addon === "function"`) —
   so it is a live upgrade risk, not a hypothetical. Recheck this hook when it stabilizes.
 - An addon already loaded into the process **before** capwall installed is not unloaded and

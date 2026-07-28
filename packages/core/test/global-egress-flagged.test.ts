@@ -1,18 +1,20 @@
 /**
  * FLAG-ONLY global egress classes (#80): `WebSocket` and `EventSource`.
  *
- * Node's global egress surface is not the same on the two versions in the CI matrix:
+ * Node's global egress surface is not uniform across the CI matrix:
  *
- *   | global      | Node 20                      | Node 22 / 24                 |
- *   |-------------|------------------------------|------------------------------|
- *   | fetch       | on                           | on                           |
- *   | WebSocket   | --experimental-websocket     | on                           |
- *   | EventSource | --experimental-eventsource   | --experimental-eventsource   |
+ *   | global      | Node 22 / 24 / 26            |
+ *   |-------------|------------------------------|
+ *   | fetch       | on                           |
+ *   | WebSocket   | on (unflagged since 22.4)    |
+ *   | EventSource | --experimental-eventsource   |
  *
- * So an in-process assertion would skip `WebSocket` entirely on Node 20 and `EventSource`
- * everywhere, i.e. the half of the matrix that is most likely to regress would prove nothing.
- * This file spawns a child process with both flags set, under the built preload, so both classes
- * exist and are exercised identically on every supported Node.
+ * Dropping Node 20 removed the `WebSocket` asymmetry — it is now on by default everywhere, so
+ * the in-process suites cover it. `EventSource` is the one that did NOT get better: it is still
+ * flag-only on 22, 24 AND 26, so an in-process assertion would prove nothing about it on any
+ * supported runtime. This file remains the only place it is exercised — it spawns a child with
+ * both flags set, under the built preload, so both classes exist and are covered identically on
+ * every supported Node. Do not delete it because `WebSocket` no longer needs it.
  *
  * Requires `pnpm build` first — it runs against `dist/preload.js` (CI does build → test).
  *
@@ -148,10 +150,11 @@ describe("#80 — WebSocket and EventSource under their experimental flags", () 
  *
  * `hardened-allowed.test.ts` is the "#90 blind spot 2" matrix: for every guarded surface, a
  * GRANTED call still works and an UNGRANTED one is still denied, with `hardened: true`. Its
- * `EventSource` row is gated on `hasGlobal("EventSource")` and therefore skips on Node 20, 22
- * AND 24 — vitest is never handed `--experimental-eventsource` — so that row proved nothing on
+ * `EventSource` row is gated on `hasGlobal("EventSource")` and therefore skips on Node 22, 24
+ * AND 26 — vitest is never handed `--experimental-eventsource` — so that row proves nothing on
  * any supported runtime, and this file's four original cases never set `CAPWALL_HARDENED`.
- * The `WebSocket` row has the same hole on the Node 20 leg of the CI matrix.
+ * The `WebSocket` row had the same hole on the Node 20 leg; that half closed when 20 was
+ * dropped, and the `EventSource` half did not.
  *
  * The gap matters because hardening genuinely touches this guard: `hardenClass` freezes the
  * guarded subclass and its prototype, and `pinGlobalEgress` re-pins the installed global with

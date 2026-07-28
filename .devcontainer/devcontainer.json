@@ -1,7 +1,7 @@
 {
-  "//": "Reproducible dev environment for capwall (VS Code / GitHub Codespaces / any Dev Containers client). Node 22 matches the primary CI target; use scripts/ci-local.sh to run the full Node 20+22 gate matrix in Docker. See docs/ci-local.md.",
+  "//": "Reproducible dev environment for capwall (VS Code / GitHub Codespaces / any Dev Containers client). Node 24 is the active LTS and the primary CI target; use scripts/ci-local.sh to run the full Node 22+24+26 gate matrix in Docker. See docs/ci-local.md.",
   "name": "capwall",
-  "image": "mcr.microsoft.com/devcontainers/javascript-node:22-bookworm",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:24-bookworm",
   "features": {
     "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
   },

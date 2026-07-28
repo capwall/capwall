@@ -198,6 +198,32 @@ const PROBE = path.join(here, "fixtures", "loader-thread-graph.mjs");
 const probe = (): Promise<{ code: number; stdout: string; stderr: string }> =>
   runNode([PROBE], { cwd: here, share: true });
 
+/**
+ * DEP0205 — **Node 26 deprecated `module.register()` in favour of `module.registerHooks()`**, so
+ * capwall's own ESM install now prints a runtime DeprecationWarning on the 26 leg of the matrix.
+ * It is capwall's warning, about capwall's call, and it is correct: the fix is issue #152
+ * (switch the ESM perimeter to the synchronous same-thread hooks), which is deliberately NOT
+ * done here — that perimeter is where #59, #61 and #62 lived and it needs its own PR with the
+ * laundering-vector suite run against it.
+ *
+ * Subtracted by EXACT match rather than by loosening the assertion to `not.toContain`. The claim
+ * this test makes is "the probe writes nothing to stderr" — that is how a loader-thread crash or
+ * an unexpected experimental warning shows up — and a substring check would keep passing through
+ * any future warning that happened to arrive alongside this one. When #152 lands, these lines
+ * simply stop appearing and the filter becomes a no-op; it does not need removing to stay
+ * correct, and leaving it does not hide anything, because ANY other stderr still fails.
+ */
+function stderrWithoutKnownDeprecations(stderr: string): string {
+  const IGNORE = [
+    /^\(node:\d+\) \[DEP0205\] DeprecationWarning: `module\.register\(\)` is deprecated\. Use `module\.registerHooks\(\)` instead\.$/,
+    /^\(Use `node --trace-deprecation \.\.\.` to show where the warning was created\)$/,
+  ];
+  return stderr
+    .split("\n")
+    .filter((line) => line.trim() !== "" && !IGNORE.some((re) => re.test(line)))
+    .join("\n");
+}
+
 describe("#150 — what the built hook module actually loads, measured in a clean process", () => {
   beforeAll(() => {
     assertPreloadBuilt();
@@ -205,7 +231,8 @@ describe("#150 — what the built hook module actually loads, measured in a clea
 
   it("pulls in no mediated builtin beyond fs and worker_threads", async () => {
     const r = await probe();
-    expect(r.stderr, r.stderr).toBe("");
+    const unexpected = stderrWithoutKnownDeprecations(r.stderr);
+    expect(unexpected, r.stderr).toBe("");
     const out = JSON.parse(r.stdout) as { hook: string[]; aggregate: string[] };
     // `fs` is already resident from Node's own bootstrap in most builds, so it is allowed rather
     // than required; `worker_threads` is the one the hook genuinely brings in.

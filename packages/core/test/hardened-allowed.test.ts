@@ -206,18 +206,23 @@ interface Surface {
   name: string;
   run: (dep: FixtureDep) => boolean | Promise<boolean>;
   /**
-   * Skip the whole row when the surface does not exist on this runtime. `WebSocket` needs
-   * `--experimental-websocket` on Node 20 and `EventSource` is behind
-   * `--experimental-eventsource` everywhere; a row that silently reports "not refused" for both
-   * arms because the API is absent would assert nothing while looking green.
+   * Skip the whole row when the surface does not exist on this runtime. A row that silently
+   * reported "not refused" for both arms because the API is absent would assert nothing while
+   * looking green.
    *
-   * A SKIP IS ONLY ACCEPTABLE WITH COVERAGE ELSEWHERE (#112 item 2). vitest is never handed
-   * those flags, so the `EventSource` row skips on Node 20, 22 AND 24 and the `WebSocket` row
-   * skips on the Node 20 leg of the CI matrix. Both cells are covered instead by
-   * `global-egress-flagged.test.ts`, which spawns a child with both flags and now runs the
-   * granted/denied × hardened-on/off matrix there — see its
-   * `#80 × #17 … under hardened mode` block. The `native` row's skip is covered by
-   * `native.test.ts`'s `REAL, loadable addon` suite (same helper, same discovery).
+   * WHERE THIS STANDS AFTER THE NODE 20 DROP:
+   *  - `WebSocket` — **no longer skips**. It is unflagged from Node 22.4, below the ≥22.15 floor,
+   *    so this row now runs in-process on every leg of the matrix. That is coverage gained by
+   *    moving the floor, not by writing a test.
+   *  - `EventSource` — **still skips on 22, 24 AND 26**. It remains behind
+   *    `--experimental-eventsource` on every current Node, and vitest is never handed the flag.
+   *    This is a real, still-open gap in THIS file, not something the floor fixed.
+   *
+   * A SKIP IS ONLY ACCEPTABLE WITH COVERAGE ELSEWHERE (#112 item 2). The `EventSource` cell is
+   * covered by `global-egress-flagged.test.ts`, which spawns a child WITH the flag and runs the
+   * granted/denied × hardened-on/off matrix there — see its `#80 × #17 … under hardened mode`
+   * block. The `native` row's skip is covered by `native.test.ts`'s `REAL, loadable addon` suite
+   * (same helper, same discovery).
    */
   available?: () => boolean;
   /**

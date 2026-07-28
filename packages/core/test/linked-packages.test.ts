@@ -142,9 +142,10 @@ module.exports = function () {
     new Module("x", null)._compile("module.exports = 1;", process.cwd() + "/node_modules/trusted/f.js");
     console.log("compile -> ALLOWED");
   } catch { console.log("compile -> DENIED"); }
-  // Both registration entry points are gated (shims/module.ts § GUARDED_APIS), but
-  // \`registerHooks\` is Node >= 22.15 only, so probe whichever this runtime has — the CI matrix
-  // includes Node 20, where reaching for the missing one would prove nothing about the gate.
+  // Both registration entry points are gated (shims/module.ts § GUARDED_APIS). \`registerHooks\`
+  // is Node >= 22.15, which is exactly the supported floor, so it is present on every leg of the
+  // matrix; the fallback is kept because this fixture probes the runtime rather than trusting a
+  // version table, and \`register\` is gated too.
   try {
     if (typeof Module.registerHooks === "function") Module.registerHooks({ resolve: (s, c, n) => n(s, c) });
     else Module.register("data:text/javascript,");

@@ -986,8 +986,10 @@ function wrapHttpModule<T extends object>(real: T, ctx: ShimContext, defaultPort
   // un-mediated, shimming this copy bought nothing (the global was right there). Now that the
   // global IS guarded, `require("http").WebSocket` is the remaining one-liner, so it gets the
   // same guarded subclass — built through the shared factory so repeated shim builds do not mint
-  // new classes. Absent on Node 20 (and on 22 without `--experimental-websocket`), hence the
-  // presence check.
+  // new classes. Present on every supported Node (the re-export is ≥22, unflagged since 22.4,
+  // and the floor is ≥22.15); the presence check is kept because this shim mirrors the real
+  // module rather than a version table — if Node ever drops the re-export, capwall must not
+  // invent one. `test/composition-matrix.test.ts` asserts both directions of that.
   const realWebSocket = realRecord["WebSocket"];
   if (typeof realWebSocket === "function") {
     shim["WebSocket"] = guardedWebSocketClass(ctx, realWebSocket as AnyCtor);
