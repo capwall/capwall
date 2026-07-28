@@ -166,8 +166,8 @@ to every call capwall cannot attribute, which includes a dependency deliberately
 payload from a path-less frame — the fail-open that
 [`threat-model.md`](threat-model.md) § attribution laundering describes. The preload prints a
 warning at startup when a policy grants `<unknown>` **beyond a concrete `env` key list** — in
-`enforce` mode only. A plain `"<unknown>": { "env": ["WATCH_REPORT_DEPENDENCIES"] }` is silent,
-because it is the shape nearly every correct policy has; anything wider is not.
+`enforce` mode only. A plain, wildcard-free `env` list stays silent (it is a narrow, reviewed
+line); any other capability, or `env: ["*"]`, is not.
 
 Stated plainly, because it is the whole point of the sentinel: before issue #60, "capwall
 could not attribute this call" and "this is the application" were the same value, so

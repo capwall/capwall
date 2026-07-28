@@ -838,10 +838,10 @@ running from a `data:` module — so the preload prints a one-line warning at st
 policy grants it **broadly**. "Broadly" is a precise test, not a figure of speech
 (`preload.ts` § `isBroadGrant`): the warning fires in **`enforce` only**, and only when the
 `<unknown>` entry holds something other than a concrete, wildcard-free list of `env` keys — any
-other capability, or `env: ["*"]`. A concrete `env` list is silent because it is the normal
-shape (see the `WATCH_REPORT_DEPENDENCIES` read above), and warning on every correctly-authored
-policy is the cry-wolf failure #67 removed from the env trace. Keep the grant as narrow as the
-observed keys.
+other capability, or `env: ["*"]`. A concrete `env` list stays silent because it is a narrow,
+reviewed line, and warning on one is the cry-wolf failure #67 removed from the env trace.
+(It used to be the near-universal shape, which is why the exception exists; since #119 most
+policies grant `<unknown>` nothing at all.) Keep the grant as narrow as the observed keys.
 
 Before this split (issue #60), "could not attribute" and "this is the app" were the same value.
 See the § attribution laundering residual for what that cost and what remains.

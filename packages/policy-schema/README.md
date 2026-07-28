@@ -75,7 +75,10 @@ Two wildcard forms widen a leaf, and they are **not** interchangeable:
 | `**>lodash` | an install nested at **any depth** |
 
 A `*` must be the whole first link of a chain; `sneak*` is rejected at load time with an error
-saying so, rather than silently matching nothing.
+saying so, rather than silently matching nothing. Whether a *well-formed* key matches anything
+is a runtime fact, so `capwall observe` and `capwall diff` report keys that granted nothing in
+a run and suggest the chain you probably meant (#118 — `unmatchedPackageKeys` here is what they
+use, deliberately sharing `packageKeyMatches` with the enforcer so the two cannot disagree).
 
 Two sentinel keys complete the set: `"<app>"` (the application's own code — the trust root) and
 `"<unknown>"` (a call capwall could not attribute to any source file — an ordinary
@@ -90,6 +93,11 @@ import { parsePolicy, type Policy, type PackagePolicy } from "@capwall/policy-sc
 
 const policy: Policy = parsePolicy(JSON.parse(raw)); // throws a ZodError on invalid input
 ```
+
+Also exported: `PolicySchema` / `PackagePolicySchema` and friends (the Zod objects themselves),
+the host-pattern grammar (`validateHostPattern`, `matchesHostPattern`, `isIpLiteral`,
+`ANY_HOST`), and the package-key grammar (`validatePackageKey`, `widenedPackageKeys`,
+`packageKeyMatches`, `unmatchedPackageKeys`, `CHAIN_SEP`).
 
 `parsePolicy` validates and applies defaults. It does **not** normalize globs against a project
 root — that is `loadPolicy` in `@capwall/core`, because normalization needs a root and this

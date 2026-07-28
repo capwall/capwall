@@ -201,10 +201,11 @@ A grant is keyed by package name, or by one of two sentinels:
 | `"<unknown>"` | a call capwall could not attribute to any source file: no qualifying frame on the stack, or app code reached only through a `data:`/`eval`/bundled frame. **Not** exempt — deny-by-default in enforce, recorded in observe. |
 
 `<unknown>` exists because "we could not attribute this" must not silently mean "this is the
-app" (issue #60). Grant it only as narrowly as an `observe` run shows you need — Node's ESM
-loader produces one unattributable `env` read per process, and `capwall observe` emits that
-grant for you. See [`../../docs/threat-model.md`](../../docs/threat-model.md) § attribution
-outcomes.
+app" (issue #60). Grant it only as narrowly as an `observe` run shows you need. Most policies
+now need nothing here at all: the one line every generated policy used to carry
+(`"env": ["WATCH_REPORT_DEPENDENCIES"]`) came from Node's own ESM loader, and env reads Node
+initiates stopped being recorded in #119. See
+[`../../docs/threat-model.md`](../../docs/threat-model.md) § attribution outcomes.
 
 ## Layout
 
