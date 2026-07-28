@@ -18,20 +18,40 @@
  *
  * `Module._extensions[".node"]` is a two-line function whose body is
  * `return process.dlopen(module, path.toNamespacedPath(filename))` — verified by reading the
- * live function on Node 20.20, 22.22 and 24.18. `process.dlopen` is therefore the single
- * JS-reachable chokepoint through which EVERY addon load passes, and it is a plain
- * writable+configurable own property of `process` on all three. Hooking it (rather than
- * `Module._extensions`, or the literal `require("*.node")` specifier) is what makes the gate
- * real instead of decorative: it covers, with one patch,
+ * live function on Node 20.20, 22.22, 22.23, 24.18 and 26.5. `process.dlopen` is therefore the
+ * single JS-reachable chokepoint through which EVERY addon load passes, and it is a plain
+ * writable+configurable own property of `process` on all five (`dlopen.length` is 0 on all of
+ * them — it is a C++ binding, so its real arity is not readable from JS, which is a further
+ * reason this wrapper forwards `args` rather than a written-out parameter list). Hooking it
+ * (rather than `Module._extensions`, or the literal `require("*.node")` specifier) is what makes
+ * the gate real instead of decorative: it covers, with one patch,
  *
  *   - `require("./build/Release/foo.node")` — the literal case;
  *   - a DIRECT `process.dlopen(module, file)` call, which bypasses the module system
  *     entirely and would sail past a `Module._extensions` hook;
  *   - `createRequire(...)("…node")` from ESM, which lands back in the same
- *     `_extensions[".node"]`. (A bare `import("./foo.node")` needs no coverage: Node itself
- *     rejects it with `ERR_UNKNOWN_FILE_EXTENSION`, verified on 20/22/24 — `createRequire` is
- *     the only route from ESM.) Hooking `dlopen` rather than a loader is what makes this gate
- *     module-system-independent: it is on whether or not the ESM hook is registered;
+ *     `_extensions[".node"]`;
+ *   - **a bare `import("./foo.node")`, which became a live route while nobody was looking.**
+ *     This comment used to say it needed no coverage because "Node itself rejects it with
+ *     `ERR_UNKNOWN_FILE_EXTENSION`, verified on 20/22/24 — `createRequire` is the only route
+ *     from ESM". Re-measured against real binaries for the Node-internals audit, that is now
+ *     wrong in two steps. Node 24.18 grew `--experimental-addon-modules`, which registers
+ *     `.node` → `format: "addon"` in the ESM `extensionFormatMap`; and on **Node 26.5 the
+ *     import resolves WITH NO FLAG AT ALL**. The `ERR_UNKNOWN_FILE_EXTENSION` sentence is true
+ *     only of 20, 22 and unflagged ≤24.
+ *
+ *     The gate held through both changes without a line of code, and it is worth being precise
+ *     about why, because it is the whole argument for this file's existence: Node's `addon`
+ *     translator (`lib/internal/modules/esm/translators.js`) returns
+ *     `createCJSNoSourceModuleWrap(...)` — it explicitly does NOT read the file as source and
+ *     instead routes the load back through the CJS `.node` extension, i.e. back through
+ *     `process.dlopen`. Verified end to end: on 24.18 with the flag and on 26.5 without it,
+ *     `import("./x.node")` under a deny-all policy raises capwall's `CapabilityError` for the
+ *     `native` capability, not Node's `TypeError`. A gate hooked on `Module._extensions` or on
+ *     the require specifier would have silently stopped covering ESM at Node 26.
+ *
+ *     Hooking `dlopen` rather than a loader is what makes this gate module-system-independent:
+ *     it is on whether or not the ESM hook is registered;
  *   - the resolver wrappers real native packages actually use. Confirmed by reading their
  *     published sources: `bindings@1.5.0` ends at `requireFunc(n)` (plain `require`),
  *     `node-gyp-build@4.8.4` at `runtimeRequire(load.resolve(dir))` (plain `require`), and
@@ -44,8 +64,9 @@
  * `process.dlopen` BEFORE capwall installed keeps an un-gated reference (the same pre-install
  * capture residual as every shim — install via the `--import` preload); and Node's experimental
  * `require.addon()` is a C++-side loader that may not route through `process.dlopen` — absent
- * on Node 20.20/22.22/24.18 as shipped, but `node-gyp-build` PREFERS it when it exists, so
- * recheck this hook when it stabilizes.
+ * on Node 20.20/22.22/22.23/24.18 and on 26.5 as shipped, with and without
+ * `--experimental-addon-modules`, but `node-gyp-build` PREFERS it when it exists, so recheck this
+ * hook when it stabilizes.
  */
 import * as path from "node:path";
 import {

@@ -29,6 +29,33 @@ residual that names this is § What capwall does NOT stop → *Shared mutable pr
 it is worked through with the cheapest concrete instance; **hardened mode does not mitigate it**,
 and neither does anything else capwall ships.
 
+## The second thing every control rests on: unsupported Node internals
+
+The assumption above is about an adversary. This one is about time, and it belongs next to it
+because it has the same scope — every control in this document — and the same absence of an
+in-process fix.
+
+**capwall's enforcement mechanism is built on Node.js module-system internals that are
+undocumented, unsupported, and in one case formally deprecated with removal announced.**
+`Module._load` is the CJS interception point; `Module.prototype._compile` is the `compile` gate;
+`process.dlopen` is the `native` gate; `Module._findPath` and `Module._resolveFilename` feed
+attribution and the module-read gate; `module.register()` is the entire ESM path. Of those, only
+`module.register()` appears in Node's API documentation at all — and it is **Stability 0,
+runtime-deprecated as DEP0205 in Node 26.0.0**, with Node stating it "will be removed in a future
+version". The rest have no deprecation code because they have no support commitment to deprecate.
+
+What that costs, concretely rather than in principle: two of them have already changed shape under
+this project (#128, #135); a third changed shape in a **Node minor** (24.18) and opened a live,
+unrecorded gap in the module-read gate that neither leg of the CI matrix could observe. If
+`Module.prototype._compile` or `process.dlopen` were removed, the `compile` and `native`
+capabilities would not degrade — they would cease to exist, with nothing in Node to rebuild them
+on, and `native` is the capability that subsumes the rest.
+
+Per-API status, measured against real Node 20/22/24/26 binaries, with the replacement (where one
+exists) and what breaks without each: [`node-api-dependencies.md`](node-api-dependencies.md).
+Read it before assuming a capability capwall enforces today is a capability it can enforce
+indefinitely.
+
 ## Implementation status (keep in sync with the roadmap)
 
 As of roadmap **M5**, all core capability surfaces are mediated on **both the CJS `require`

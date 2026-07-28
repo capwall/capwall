@@ -29,12 +29,14 @@
  * materializes every optional binding, and the pre-#140 scan handed this file a 32-bit ARM
  * oxlint binding on an x64 host.
  */
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import * as nodeFs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
+import { runNode } from "./helpers/subprocess.js";
 import {
   install,
   isGranted,
@@ -54,6 +56,8 @@ import {
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const requireCjs = createRequire(import.meta.url);
+/** Built `@capwall/core`, for the one row here that needs a child process. */
+const CORE_DIST = requireCjs.resolve("../dist/index.js");
 const FIXTURE = path.join(here, "fixtures", "node_modules", "fixture-dep");
 const FIXTURE_ADDON = path.join(FIXTURE, "build", "Release", "fixture-addon.node");
 /** A `.node` path OUTSIDE any node_modules tree — owner attributes to `<app>`. */
@@ -523,4 +527,65 @@ describe("#140 — helpers/real-addon picks a binding for THIS machine", () => {
       classifyLoadFailure(err("Error", "/x.node: cannot open shared object file: No such file")),
     ).toBe("missing");
   });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// `import("./x.node")` — a route that did not exist when this gate was written, and does now.
+//
+// `loader/native.ts` used to record that a bare ESM import of a `.node` needed no coverage
+// because Node rejects it with `ERR_UNKNOWN_FILE_EXTENSION`. Re-measured against real binaries:
+// that is true on 20, 22 and unflagged ≤24, and FALSE from there on. Node 24.18 added
+// `--experimental-addon-modules`, which maps `.node` to `format: "addon"` in the ESM
+// `extensionFormatMap`, and on Node 26.5 the import resolves with no flag at all.
+//
+// The gate covers it, and the reason is the design decision this whole file rests on rather
+// than luck: Node's `addon` translator returns `createCJSNoSourceModuleWrap(...)` — it does not
+// read the file as source, it routes the load back through the CJS `.node` extension and so back
+// through `process.dlopen`. A gate hooked on `Module._extensions` or on the `require` specifier
+// would have quietly stopped covering ESM at Node 26.
+//
+// FEATURE-DETECTED IN A CHILD, not version-gated: the route is reachable on 24.18 with a flag and
+// on 26.5 without one, and a `major >= N` predicate cannot express that. The child reports which
+// error it got, and the assertion branches on it — so on a Node where the route does not exist
+// this row asserts Node's OWN rejection rather than reporting a hollow pass (#112).
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+describe("native gate — the ESM import route (Node ≥24.18 flagged, ≥26 unflagged)", () => {
+  it("gates it where it resolves, and Node rejects it where it does not", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "capwall-esm-addon-"));
+    try {
+      // A placeholder, deliberately: the question is whether capwall DECIDES, and a denial
+      // arrives before `dlopen` ever looks at the bytes. Outside the project root, so the owner
+      // subject is `<unknown>` and a deny-all policy denies on the caller anyway.
+      await writeFile(path.join(dir, "probe.node"), "placeholder, not a real addon\n");
+      await writeFile(
+        path.join(dir, "run.mjs"),
+        `import { install, loadPolicyFromObject } from ${JSON.stringify(pathToFileURL(CORE_DIST).href)};
+const policy = loadPolicyFromObject({ version: 1, mode: "enforce" }, { projectRoot: process.cwd() });
+const handle = install(policy, "enforce", { projectRoot: process.cwd(), globalEgress: false });
+try {
+  await import("./probe.node");
+  console.log("RESULT:imported");
+} catch (err) {
+  console.log("RESULT:" + err.name + ":" + (err.code ?? "-"));
+}
+handle.uninstall();
+`,
+      );
+      const r = await runNode([path.join(dir, "run.mjs")], { cwd: dir });
+      const line = r.stdout.split("\n").find((l) => l.startsWith("RESULT:")) ?? "";
+
+      if (line.startsWith("RESULT:TypeError:ERR_UNKNOWN_FILE_EXTENSION")) {
+        // Node has no ESM addon route. Nothing for capwall to gate, and Node says so itself —
+        // which is an assertion about the runtime, not a skipped body.
+        expect(line).toBe("RESULT:TypeError:ERR_UNKNOWN_FILE_EXTENSION");
+      } else {
+        // The route resolves. It MUST have reached capwall's `process.dlopen` gate, and a
+        // deny-all policy MUST have denied it — not Node's loader failing on the placeholder,
+        // which would mean the gate never ran.
+        expect(line).toBe("RESULT:CapabilityError:-");
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

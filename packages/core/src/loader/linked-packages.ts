@@ -47,10 +47,19 @@ export interface LinkObserverHandle {
 }
 
 /**
- * `Module._findPath`'s shape — VARIADIC, and deliberately so (#128). Node's current signature is
- * `(request, paths, isMain)`, but re-stating an arity is a claim about a Node internal that a
- * Node minor can falsify silently; the two arguments this reads are read positionally and the
- * whole list is forwarded verbatim.
+ * `Module._findPath`'s shape — VARIADIC, and deliberately so (#128).
+ *
+ * The comment here used to say "Node's current signature is `(request, paths, isMain)`", and the
+ * Node-internals audit found that had already stopped being true. Read off the live function:
+ * Node 20.19.4 is `(request, paths, isMain)` and passes 3 arguments; Node 22.23.1, 24.18.0 and
+ * 26.5.0 are `(request, paths, isMain, conditions = getCjsConditions())` and pass 4. `.length` is
+ * 3 on all of them, because it stops at the first defaulted parameter — which is exactly the trap
+ * #128 and #135 each fell into.
+ *
+ * Nothing here needed changing when that happened, and that is the point: the two arguments this
+ * reads are read POSITIONALLY and the whole list is forwarded VERBATIM, so a Node that adds a
+ * parameter changes what is forwarded without changing what is observed.
+ * `test/primitive-arity.test.ts` holds the property.
  */
 type FindPath = (this: unknown, ...args: unknown[]) => unknown;
 

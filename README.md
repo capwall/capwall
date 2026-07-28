@@ -250,7 +250,8 @@ packages/sbom-import     @capwall/sbom-import    STRETCH: CycloneDX/CBOM → pol
 examples/express-app                             observe→enforce walkthrough fixture
 examples/malicious-dep-demo                      inert "malicious" dep capwall blocks
 docs/                                            threat-model, architecture, policy-format,
-                                                 roadmap, ci-local, releasing
+                                                 node-api-dependencies, roadmap, ci-local,
+                                                 releasing
 ```
 
 ## License

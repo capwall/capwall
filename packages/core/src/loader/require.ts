@@ -81,26 +81,90 @@ export interface RequirePatchHandle {
  *
  * This site had the same latent defect and was found by the sweep that fix asked for. It used to
  * be `(request, parent, isMain)`, which matches `Module._load.length` — but `.length` stops at the
- * first defaulted parameter, and on Node ≥22 the real signature is
+ * first defaulted parameter, and it is not the count Node passes.
  *
- *   Module._load = function(request, parent, isMain, options = kEmptyObject)
+ * DO NOT RE-STATE AN ARITY HERE, and the reason is no longer hypothetical: this one has
+ * OSCILLATED, within majors as well as across them. Read off the live function on each binary:
  *
- * where `options.shouldSkipModuleHooks` is what keeps a `require` issued from INSIDE the
- * module-customization hook chain from re-entering that chain. Node passes four arguments on
- * every call (measured on v22.22.3); today the fourth is usually `undefined`, so re-stating the
- * arity was invisible rather than harmless. Forward the list verbatim so it stays that way.
+ *   | Node    | declared signature                                       | args passed |
+ *   |---------|----------------------------------------------------------|-------------|
+ *   | 20.19.4 | `(request, parent, isMain)`                               | 3           |
+ *   | 22.23.1 | `(request, parent, isMain, options = kEmptyObject)`       | 4           |
+ *   | 23.9.0  | `(request, parent, isMain)`                              | 3           |
+ *   | 24.5.0  | `(request, parent, isMain)`                              | 3           |
+ *   | 24.18.0 | `(request, parent, isMain, internalOptions = kEmptyObject)` | 4        |
+ *   | 26.5.0  | `(request, parent, isMain, internalOptions = kEmptyObject)` | 4        |
+ *
+ * So a fourth parameter appeared in 22, vanished for 23 and early 24, and came back in a 24
+ * MINOR under a different name and a different payload — `shouldSkipModuleHooks` alone on 22,
+ * `{ requireResolveOptions, shouldSkipModuleHooks }` on 24.18+. A wrapper pinned to any one of
+ * those rows would have been wrong on at least two of the others, silently. Forward verbatim.
  */
 type ModuleLoad = (this: unknown, ...args: unknown[]) => unknown;
 
 /**
  * `Module._resolveFilename`, read LIVE off the real module object — see {@link resolveQuietly}.
  *
- * VARIADIC for the same reason {@link ModuleLoad} is (#128): its real signature on Node ≥22 is
- * `(request, parent, isMain, options = kEmptyObject)`, the same four `Module._load` receives, and
- * the fourth carries `shouldSkipModuleHooks`. Forwarding `_load`'s own argument list verbatim is
- * what makes capwall's resolution provably the one Node is about to perform.
+ * VARIADIC for the same reason {@link ModuleLoad} is (#128). Its signature has been stable at
+ * `(request, parent, isMain, options)` on 20/22/23/24/26 — but the OPTIONS OBJECT IS NOT
+ * `Module._load`'s fourth argument, and conflating the two is what {@link resolveOptionsFrom}
+ * exists to prevent.
  */
 type ResolveFilename = (this: unknown, ...args: unknown[]) => string;
+
+/**
+ * The `options` argument Node itself hands `Module._resolveFilename`, derived from
+ * `Module._load`'s own argument list.
+ *
+ * WHY THIS IS NOT JUST `args[3]`. `Module._load`'s fourth argument is an INTERNAL options bag
+ * that Node unwraps before resolving; it is not `_resolveFilename`'s `ResolveFilenameOptions`.
+ * Read from the live `lib/internal/modules/cjs/loader.js` on each binary:
+ *
+ *  - **Node 22** — `_load(request, parent, isMain, options)` calls
+ *    `resolveForCJSWithHooks(request, parent, isMain, options.shouldSkipModuleHooks)`, whose
+ *    default impl calls `Module._resolveFilename(specifier, parent, isMain)` — with NO options
+ *    argument at all.
+ *  - **Node ≥24.18 / 26** — the fourth argument is `CJSModuleLoadInternalOptions`, and
+ *    `resolveForCJSWithHooks` destructures `{ requireResolveOptions, shouldSkipModuleHooks }`
+ *    and passes `requireResolveOptions` — that field, not the bag — down to
+ *    `Module._resolveFilename`.
+ *
+ * capwall used to forward `_load`'s whole argument list into `_resolveFilename`, which put the
+ * internal bag where `{ paths, conditions }` belongs — and that was NOT merely untidy. Measured on
+ * Node 24.18.0 and 26.5.0: `_resolveFilename` found no `paths` in the bag, resolution THREW,
+ * {@link resolveQuietly} returned `null`, and the module-read gate (#123) read that as "nothing to
+ * decide". A dependency calling
+ *
+ *   Module._load("./secrets.json", parent, false, { requireResolveOptions: { paths: [dir] } })
+ *
+ * under a DENY-ALL enforce policy got the file contents and produced ZERO decisions — nothing
+ * thrown, nothing on stderr, nothing for `observe` or `capwall diff`. The ordinary three-argument
+ * spelling of the identical read was denied and logged, which is precisely what kept it invisible.
+ * Node 22 and earlier reject the form outright, so it never appeared on the CI matrix (#154).
+ *
+ * The durable rule, which is #128's one level up: a DERIVED argument is not a forwarded one.
+ * Forwarding `args` verbatim to the primitive you wrapped is always right; forwarding it to a
+ * DIFFERENT primitive is a claim that the two take the same arguments, and that claim needs the
+ * same treatment as an arity — read it off Node, do not assert it.
+ *
+ * Anything that is not an object (`undefined` on the 3-argument majors) yields `undefined`,
+ * which is what Node passes there too.
+ *
+ * THE FALLBACK IS NOT A GUESS EITHER. The object is classified by the fields it ACTUALLY has,
+ * not by a Node version: a bag carrying `requireResolveOptions` is unwrapped; an object carrying
+ * `ResolveFilenameOptions`' own fields (`paths` / `conditions`) IS the options and is passed
+ * through; anything else — Node 22's `{ shouldSkipModuleHooks }` — contributes nothing, which is
+ * exactly what Node 22 forwards. Given how this parameter has moved (see {@link ModuleLoad}), a
+ * Node that hands `_load` the resolve options directly again is a live possibility, and dropping
+ * a `paths` on the floor would put the gate back to deciding about a file Node is not opening.
+ */
+function resolveOptionsFrom(args: unknown[]): unknown {
+  const internal = args[3];
+  if (typeof internal !== "object" || internal === null) return undefined;
+  const bag = internal as { requireResolveOptions?: unknown; paths?: unknown; conditions?: unknown };
+  if (bag.requireResolveOptions !== undefined) return bag.requireResolveOptions;
+  return bag.paths !== undefined || bag.conditions !== undefined ? internal : undefined;
+}
 
 /**
  * What the load described by `args` (`Module._load`'s own argument list) will resolve to, or
@@ -117,6 +181,14 @@ type ResolveFilename = (this: unknown, ...args: unknown[]) => string;
  * `Module._resolveFilename` is read live rather than captured, so a resolver hook (`tsx`,
  * `tsconfig-paths`, `ts-node`) that replaced it answers this question the same way it will answer
  * Node's own, one line later.
+ *
+ * ONE ROUTE THIS DOES NOT SEE, stated rather than implied. Since Node 22.15/23.5,
+ * `Module._load` resolves through `resolveForCJSWithHooks`, so a SYNCHRONOUS
+ * `module.registerHooks()` `resolve` hook that short-circuits (returns without calling
+ * `nextResolve`) produces a filename `Module._resolveFilename` never computes — and the gate
+ * would then decide about the default resolution rather than the one Node loads. Registering
+ * such a hook is itself gated as an application-only operation (#61, `shims/module.ts`), so
+ * this is a residual for the APPLICATION's own tooling, not a dependency-reachable bypass.
  *
  * COST, measured rather than asserted. Node resolves twice per load, but the second one hits
  * `Module._pathCache` (keyed by request + search paths, populated by the first). Instrumenting
@@ -135,7 +207,12 @@ function resolveQuietly(args: unknown[]): string | null {
     ._resolveFilename;
   if (typeof resolve !== "function") return null; // a Node without the internal — nothing to gate
   try {
-    return Reflect.apply(resolve, realModule, args);
+    return Reflect.apply(resolve, realModule, [
+      args[0],
+      args[1],
+      args[2],
+      resolveOptionsFrom(args),
+    ]);
   } catch {
     return null;
   }
