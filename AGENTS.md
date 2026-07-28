@@ -36,13 +36,17 @@ policy) → shims → policy evaluate, in both modes. Shims: `fs`; the six egres
 `net`/`http`/`https`/`tls`/`http2`/`dgram` (registered **separately** — one shim never covers
 another, see `docs/threat-model.md` for why that is a security property and not a style
 choice); `child_process`; `worker_threads`; `vm`; and `node:module` (gating loader-hook
-registration, #61) — all via the require registry in `core/src/shims/index.ts` — plus **four
+registration, #61) — all via the require registry in `core/src/shims/index.ts` — plus **five
 surfaces that are not import-routed and so are installed eagerly by `install()`**:
 `process.env` (a read allowlist via a Proxy), the `native` `.node` load gate (a
 `process.dlopen` patch, `core/src/loader/native.ts`), the **global egress guard** (#80 —
 `globalThis.fetch`/`WebSocket`/`EventSource` replaced on `globalThis`,
-`core/src/shims/global-egress.ts`), and the **`Module.prototype._compile` gate** (#93 — the
-`compile` capability, `core/src/shims/module.ts`). Capability kinds in the policy language:
+`core/src/shims/global-egress.ts`), the **`Module.prototype._compile` gate** (#93 — the
+`compile` capability, `core/src/shims/module.ts`), and the **Web Storage guard** (#156 —
+`globalThis.localStorage` replaced on `globalThis`, its six members taking an **`fs`** read/write
+decision on the `--localstorage-file` path Node otherwise reads and writes below the `fs` shim;
+Node ≥26 and flag-gated, so it registers no patch site at all anywhere else,
+`core/src/shims/web-storage.ts`). Capability kinds in the policy language:
 `fs`, `net`, `ipc` (#72), `env`, `child_process`, `worker_threads`, `vm`, `native` (#49) and
 `compile` (#93). Two of those are decided at **module-load time** rather than at a capability
 call: `compile`, and (since #123) an `fs.read` on a `require`/`import` of a file outside every

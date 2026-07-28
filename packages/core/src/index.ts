@@ -28,6 +28,11 @@ import {
   installGlobalEgressGuard,
   type GlobalEgressGuardHandle,
 } from "./shims/global-egress.js";
+import {
+  installWebStorageGuard,
+  webStorageHardeningGaps,
+  type WebStorageGuardHandle,
+} from "./shims/web-storage.js";
 import { resolveMaxFrames } from "./attribution/index.js";
 import type { ShimContext } from "./shims/runtime.js";
 import type { Decision } from "./policy/evaluate.js";
@@ -253,6 +258,10 @@ function hardeningGaps(esm: boolean, globalEgress: boolean): string[] {
   // install is not a promise this one broke — and refusing to install over it would be exactly
   // the spurious startup throw this check must never produce.
   if (globalEgress) gaps.push(...globalEgressHardeningGaps());
+  // Not behind an option: the Web Storage guard installs whenever the process has Web Storage at
+  // all, so "did THIS install ask for it" and "is it there" are the same question. Empty on every
+  // runtime without `--localstorage-file`, so it cannot produce a spurious startup throw (#156).
+  gaps.push(...webStorageHardeningGaps());
   return gaps;
 }
 
@@ -292,6 +301,7 @@ export function install(
     | LinkObserverHandle
     | NativeGateHandle
     | GlobalEgressGuardHandle
+    | WebStorageGuardHandle
     | CompileGateHandle
   > = [];
   // First: this pushes `ctx` onto the install stack, so `liveCtx` below already describes THIS
@@ -330,6 +340,12 @@ export function install(
   if (options.globalEgress !== false) {
     handles.push(installGlobalEgressGuard(liveCtx));
   }
+  // Web Storage (#156). `localStorage` is file-backed and Node does that file's I/O below the
+  // `fs` shim, so a dependency reached it with no `fs` grant and no recorded decision. Like the
+  // env and egress guards it is a global rather than a module surface, so it is installed here.
+  // Unconditional and self-limiting: it patches nothing at all unless this process actually has
+  // Web Storage (`--localstorage-file` on Node >=26), which is why there is no option for it.
+  handles.push(installWebStorageGuard(liveCtx));
   if (options.esm) {
     handles.push(registerEsmHook(ctx));
   }

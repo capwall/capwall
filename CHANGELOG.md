@@ -92,6 +92,30 @@ has to be findable without reading the diff.
   deprecated `module.register()` in its favour, DEP0205). If you are on Node 20, upgrade to 24
   (the active LTS, supported to 2028-04-30).
 
+### Security
+
+- **`localStorage` is mediated as an `fs` read/write on its backing file** (#156). Node 26 ships
+  Web Storage, and with `--localstorage-file=<path>` Node performs that file's I/O internally,
+  **below capwall's `fs` shim** — so a dependency read and wrote it with no `fs` grant and no
+  recorded decision: nothing denied in `enforce`, nothing in the `observe` trace, nothing for
+  `capwall diff`. Same shape as the module-system read channel #123 closed, on a different Node
+  internal.
+
+  `getItem`/`key`/`length` are now an `fs` **read** on the resolved backing path and
+  `setItem`/`removeItem`/`clear` an `fs` **write**, charged to the calling package. It is an `fs`
+  capability, not a new kind and not `net` — it was found by the egress inventory canary, but the
+  authority it confers is filesystem authority — so every existing policy, trace, `gen-policy`
+  output and `capwall diff` covers it with no schema change.
+
+  `sessionStorage` is in-memory and is deliberately **not** gated. The guard is a clean no-op on
+  Node 22 and 24 (no such global) and on Node 26 without the flag: capwall detects availability
+  with `Object.keys(globalThis)` and never by reading the property, which would print
+  `ExperimentalWarning: localStorage is not available…` on the same stderr its `DENY` lines use.
+  No process-patch site is registered in that case at all. One deviation, and it fails closed:
+  `Storage.prototype.getItem.call(localStorage, k)` throws `Illegal invocation` against capwall's
+  view — the same class as the guarded `http.globalAgent` view (#65). See
+  `docs/threat-model.md` § Web Storage.
+
 ### Added
 
 - **The `malicious-dep-demo` definition-of-done demo is now gated by a test** (#164), and the

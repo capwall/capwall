@@ -64,13 +64,14 @@ const GUARDED_EGRESS_GLOBALS: readonly string[] = ["fetch", "WebSocket", "EventS
  *    `getItem`/`setItem`/`removeItem`/`clear`/`key`/`length`: a key-value store with **no network
  *    method**, so it is inert for EGRESS, which is the question this file asks.
  *
- *    It is not inert in every sense, and that is worth writing down rather than leaving implied.
- *    `localStorage` is PERSISTENT and file-backed — it materialises only when the user passes
- *    `--localstorage-file`, and Node does that file I/O internally, below the `fs` shim. So on a
- *    Node 26 process started with that flag, a dependency could read and write that one file
- *    without an `fs` grant. It is narrow (opt-in flag, one path, no path control) and it is a
- *    FILESYSTEM question, not an egress one, so it does not belong in either list here — see
- *    docs/threat-model.md § Web Storage for the writeup and #156 for the tracking issue.
+ *    It is not inert in every sense, and that is why it is guarded ELSEWHERE. `localStorage` is
+ *    PERSISTENT and file-backed — it materialises only when the user passes
+ *    `--localstorage-file`, and Node does that file I/O internally, below the `fs` shim, so a
+ *    dependency could read and write that one file without an `fs` grant. That is a FILESYSTEM
+ *    question, not an egress one, so it does not belong in either list here: #156 closed it as an
+ *    `fs` read/write on the backing path in `shims/web-storage.ts`, gated by
+ *    `test/web-storage.test.ts`. It stays on the INERT list here because the question this file
+ *    asks — can it originate a network request? — is still answered no.
  *    `sessionStorage` is in-memory and has no such angle.
  */
 const REVIEWED_INERT_GLOBALS: readonly string[] = [
