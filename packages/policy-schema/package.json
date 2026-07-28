@@ -30,7 +30,7 @@
     },
     "./schema.json": "./schema.json"
   },
-  "files": ["dist", "schema.json"],
+  "files": ["dist", "src", "schema.json"],
   "engines": { "node": ">=20" },
   "scripts": {
     "prepack": "node ../../scripts/assert-pnpm-pack.mjs",

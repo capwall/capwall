@@ -80,6 +80,42 @@ lockstep and refuses to publish `0.0.0`; the release workflow runs it before pac
 - The `capabilities.json` `"version": 1` field is **independent** of the package version and
   does not move with it.
 
+## Source maps — the tarballs ship `src/` (#126)
+
+`"files": ["dist", "src"]` in all four manifests. **The published packages contain their
+TypeScript sources.** That is a decision, not an oversight, and it is worth understanding
+before anyone "trims" the tarball.
+
+`tsconfig.base.json` sets `sourceMap` and `declarationMap`, so the build emits a `.js.map`
+and a `.d.ts.map` beside every output file, and each one names its input as `../src/x.ts`.
+Shipping only `dist` meant all 66 maps in `@capwall/core` resolved to nothing — 22% of the
+tarball delivering no function, and `.d.ts.map` in particular being *worse* than no map,
+because "go to definition" follows it to a file that is not there instead of falling back to
+the real `.d.ts`.
+
+The two honest fixes were "ship the sources" and "ship neither". Sources won:
+
+- **`inlineSources` is not a third option.** It embeds sources in `.js.map` only; tsc never
+  writes `sourcesContent` into a `.d.ts.map` (verified against tsc 5.9). It would fix stack
+  traces under `--enable-source-maps` and leave the go-to-definition case exactly as broken.
+- **Auditability is the product.** capwall's pitch is supply-chain trust. `npm i -D
+  @capwall/cli` and you can read every line that mediates your `fs` calls, and diff the
+  shipped `dist` against the shipped `src`, without cloning anything. A security tool that
+  ships only minified-by-omission output is asking for a trust it will not extend.
+- **The cost is small in absolute terms.** All four tarballs together went from 327 kB to
+  511 kB compressed (+56%); `@capwall/core` went from 262 kB to 425 kB. This is a
+  devDependency installed once per project, not something on a hot path.
+
+`scripts/check-tarball-sources.mjs` enforces it, and the release workflow runs it on the
+packed tarballs before anything is uploaded. To check by hand:
+
+```bash
+for p in policy-schema core sbom-import cli; do
+  (cd "packages/$p" && pnpm pack --pack-destination ../../dist-tarballs)
+done
+node scripts/check-tarball-sources.mjs dist-tarballs/*.tgz
+```
+
 ## Changelog
 
 One `CHANGELOG.md` at the repo root, Keep-a-Changelog format, with an `## [Unreleased]`
@@ -98,13 +134,13 @@ Blocking — a broken or dangerous first artifact:
 | #116 | `npm pack` ships `workspace:*`. **Fixed**: `prepack` guard + the pack-with-pnpm workflow. |
 | #113 | Repo is private. Trusted publishing requires a public repo; the README's only install path is a clone. |
 | #115 | Versions are `0.0.0`, no CHANGELOG. Enforced by `check-release-versions.mjs`. |
+| #126 | Maps shipped without sources. **Fixed**: `"files": ["dist", "src"]`, enforced by `check-tarball-sources.mjs`. Done before the first publish on purpose — `files` decides what a reader can audit, and changing it later silently changes that answer. |
 | #3 | Actions is billing-blocked. OIDC publishing *runs in Actions*, so this gates the whole path. |
 | LICENSE | Now shipped in all four tarballs. |
 
-Not blocking — ship in `0.1.1`:
-#126 (source maps without sources), #124 (`--version`, README for `policy-schema`),
+Not blocking — ship in `0.1.1`: #124 (README for `policy-schema`),
 #119 (`WATCH_REPORT_DEPENDENCIES` noise), #118 (silent unmatched policy keys),
-#117/#121 (stale docs — do these anyway, they are cheap), #122 (pnpm prerequisite).
+#122 (pnpm prerequisite).
 
 ---
 

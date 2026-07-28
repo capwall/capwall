@@ -18,7 +18,7 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": ["dist", "src"],
   "engines": { "node": ">=20" },
   "scripts": {
     "prepack": "node ../../scripts/assert-pnpm-pack.mjs",

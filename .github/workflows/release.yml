@@ -127,6 +127,12 @@ jobs:
           done
           exit $fail
 
+      # Every `.js.map` and `.d.ts.map` must name a `src/` file that is actually in the same
+      # tarball. This is the one class of defect that is invisible to build/test/typecheck and
+      # permanent once published — see issue #126 and docs/releasing.md § Source maps.
+      - name: "Assert every source map resolves inside its own tarball"
+        run: node scripts/check-tarball-sources.mjs dist-tarballs/*.tgz
+
       - name: Upload tarballs as a build artifact
         uses: actions/upload-artifact@v4
         with:
