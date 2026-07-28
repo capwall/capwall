@@ -151,9 +151,10 @@ describe("env shim — enforce (soft deny: hide value, never throw)", () => {
   });
 
   it("allows an unattributable read when the policy grants <unknown> (escape hatch)", async () => {
-    // The documented escape hatch: legitimate path-less frames exist (Node's own ESM loader
-    // reads WATCH_REPORT_DEPENDENCIES from an internal stack), so `<unknown>` is grantable
-    // — explicitly, in capabilities.json, never by silent exemption.
+    // The documented escape hatch: legitimate path-less frames exist, so `<unknown>` is
+    // grantable — explicitly, in capabilities.json, never by silent exemption. (The example
+    // that used to be here, Node's ESM loader reading WATCH_REPORT_DEPENDENCIES, is no longer
+    // one: a read Node itself initiated is not recorded since #119. See env-node-origin.test.ts.)
     const policy = loadPolicyFromObject(
       { version: 1, mode: "enforce", packages: { [UNATTRIBUTED]: { env: ["*"] } } },
       { projectRoot: here },

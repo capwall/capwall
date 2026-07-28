@@ -22,13 +22,62 @@
  * now attribute to `<unknown>` and are gated here exactly like a dependency: evaluated,
  * recorded, soft-denied when not granted.
  *
- * The blast radius of that is small but real, and it is NOT zero: Node's own ESM loader reads
- * `process.env.WATCH_REPORT_DEPENDENCIES` per module job from a purely internal stack, so
- * every run under the CLI produces one unattributable env read. It soft-denies to `undefined`
- * (i.e. behaves as if the variable were unset) and is recorded, so `capwall observe` emits a
- * `"<unknown>": { "env": [...] }` grant for it automatically. That grant is the documented
- * escape hatch for any other setup that legitimately reads env from path-less frames — an
- * explicit, reviewable line in `capabilities.json`, not a silent exemption.
+ * The blast radius of that is small but real, and it is NOT zero: reads from a path-less stack
+ * attribute to `<unknown>` and are gated there. A legitimate setup that genuinely runs from
+ * such frames is granted a `"<unknown>": { "env": [...] }` entry — an explicit, reviewable line
+ * in `capabilities.json`, not a silent exemption.
+ *
+ * WHO READ IT vs WHOSE FRAME IS NEAREST (issue #119) — the rule `record` below implements.
+ *
+ * This guard is the ONE mediated surface Node's own code shares with dependencies. Every other
+ * shim is handed out through `require`/`import`, and Node's internals do not go through the
+ * loader to reach `fs` or `net` — but `process.env` is a live object replaced in place, so a
+ * `node:internal/…` script reading a variable hits this proxy exactly like a dependency does.
+ * Attribution then answers the only question it can: whose is the nearest frame with a package
+ * identity. Node's own frames have none, so the walk skips them and charges the package that
+ * happened to be underneath. Measured on a stock `express` + `pino` tree, that produced:
+ *
+ *   node:internal/source_map/source_map_cache  reads NODE_V8_COVERAGE while compiling a
+ *     dependency that ships a `//# sourceMappingURL`  ->  charged to `type-is`, `body-parser`,
+ *     `router` — three packages that do not contain the string `NODE_V8_COVERAGE`
+ *   node:internal/cluster/primary  reads NODE_CLUSTER_SCHED_POLICY when `node:cluster` is first
+ *     loaded  ->  charged to `express`
+ *   node:internal/modules/esm/loader  reads WATCH_REPORT_DEPENDENCIES per module job, on a stack
+ *     with no package frame at all  ->  charged to `<unknown>`
+ *
+ * Six of the twelve events in that generated policy, and five of its nine principals, described
+ * Node rather than any dependency. A reviewer reading `express: env: [NODE_CLUSTER_SCHED_POLICY]`
+ * concludes express reads that variable; it does not. The artifact is the product, and half of
+ * it was un-reviewable — with no correct answer to "may `type-is` read NODE_V8_COVERAGE?",
+ * because `type-is` never asked.
+ *
+ * So a read whose nearest non-capwall frame is Node's own JS is NOT RECORDED
+ * (`Attribution.initiatedByNode`). It is still attributed, still evaluated, and still hidden on
+ * a denial — only the audit record is dropped, exactly as for the descriptor trap above (#67).
+ *
+ * WHY NOT A LIST OF `NODE_*` NAMES, the obvious alternative. It is wrong in both directions.
+ * It goes stale the next time Node adds a variable, and — measured on the same tree — it
+ * deletes true positives: `thread-stream` reads `process.env.NODE_V8_COVERAGE` in its own
+ * `index.js` (to work around nodejs/node#49344), from its own frame, and `express` reads
+ * `NODE_ENV`. The stack origin separates those from the three Node-initiated reads of the SAME
+ * KEY; a name list cannot, because the name is identical. The rule is about where the read came
+ * from, not what it was called.
+ *
+ * WHAT IT COSTS, STATED PLAINLY. `observe` no longer emits grants for Node's own reads, so
+ * under `enforce` they are soft-denied and Node sees those variables as unset — a `--watch` run
+ * does not report dependencies through this path, `NODE_V8_COVERAGE` does not reach Node's
+ * source-map cache, cluster uses its default scheduling policy. Those are Node's own
+ * configuration knobs, they degrade to the unset default, and the alternative is a policy in
+ * which half the lines are noise. The denial is also no longer logged, which is the same
+ * bounded trade #67 made and is recorded in docs/threat-model.md § residuals.
+ *
+ * NOT AN EXEMPTION. `initiatedByNode` never reaches `evaluate`, and no branch here returns
+ * "allowed" because of it. It could not: a dependency CAN put a `node:` frame directly above a
+ * read it caused — `util.inspect(process.env)` runs in `node:internal/util/inspect` — so
+ * treating Node-initiated as ungated would be a one-call laundering route around the whole
+ * anti-exfiltration control. Under the rule as written that call still gets every key it is not
+ * granted hidden; what it buys is silence in the trace, which is what a `for..in` already bought
+ * it under #67.
  *
  * SOFT DENY: a denied env read returns `undefined` rather than throwing. The security goal
  * is to keep the *value* from the reading package (anti-exfiltration) — hiding it achieves
@@ -96,7 +145,7 @@
  * are not recorded — they are Node's plumbing, not a package's read of a secret, and recording
  * them would widen every generated policy with a key no dependency asked for.
  */
-import { APP_ROOT, attributeCaller } from "../attribution/index.js";
+import { APP_ROOT, attributeCallerDetailed } from "../attribution/index.js";
 import { definePropertyPatch, valueSlot } from "../lifecycle/process-patch.js";
 import { evaluate, type Decision } from "../policy/evaluate.js";
 import {
@@ -128,8 +177,15 @@ export function createEnvProxy(
    * it: `get` decides AND records, `getOwnPropertyDescriptor` decides but must not record (see
    * the #67 discussion in the header). Nothing here mutates state, so calling it without
    * reporting is safe.
+   *
+   * `record` is the #119 half of the same split: false when the read was INITIATED BY NODE
+   * ITSELF rather than written by the attributed package (see the header). The decision is
+   * still made, and the caller still hides the value on a denial — only the audit record is
+   * dropped.
    */
-  function decide(key: string | symbol): { pkg: string; decision: Decision } | null {
+  function decide(
+    key: string | symbol,
+  ): { pkg: string; decision: Decision; record: boolean } | null {
     if (typeof key !== "string") return null;
     // #89: exempt by KEY, not by wall-clock window. Only the fixed non-secret keys Node's own
     // spawn implementation reads by name, and only while a real spawn is on the stack.
@@ -138,22 +194,30 @@ export function createEnvProxy(
     // Shared frame budget with every other attribution site (#15/#58) — a shim that quietly
     // kept the default while the rest honored a raised cap would attribute the same call to a
     // different package depending on which capability it touched.
-    const pkg = attributeCaller(attributionOptionsFor(ctx));
+    const attribution = attributeCallerDetailed(attributionOptionsFor(ctx));
+    const pkg = attribution.pkg;
     // App code is not gated — see header. Since #60 this is a POSITIVE identification (a real
     // application source file on the stack); an unattributable read is `<unknown>`, which
     // falls through to the policy below rather than being exempted here.
     if (pkg === APP_ROOT) return null;
-    return { pkg, decision: evaluate(ctx.policy, ctx.mode, pkg, { kind: "env", key }) };
+    return {
+      pkg,
+      decision: evaluate(ctx.policy, ctx.mode, pkg, { kind: "env", key }),
+      record: !attribution.initiatedByNode,
+    };
   }
 
   /**
    * VALUE-read gate: decides, REPORTS the decision (observe log / gen-policy trace / audit
    * trail), and returns true when the caller must hide the value. Soft deny — never throws.
+   *
+   * The report is skipped for a read Node itself initiated (#119) — the decision, and the
+   * hiding, are unchanged.
    */
   function deniedValueRead(key: string | symbol): boolean {
     const outcome = decide(key);
     if (outcome === null) return false;
-    ctx.onDecision(outcome.pkg, outcome.decision);
+    if (outcome.record) ctx.onDecision(outcome.pkg, outcome.decision);
     return !outcome.decision.allowed;
   }
 

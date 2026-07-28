@@ -45,8 +45,7 @@ policy contains no `"*"`.
 | Package | Grant | Where it came from |
 |---|---|---|
 | `<app>` | `fs.write` on `./logs`, `./logs/requests.log` | observed, kept as-is |
-| `<unknown>` | `env: WATCH_REPORT_DEPENDENCIES` | observed; Node's own ESM loader reads it from a stack with no caller frame — see below |
-| `express` | `env: NODE_ENV, NODE_CLUSTER_SCHED_POLICY` | observed; both come from express's own code (`app.set('env', …)`, and `listen()` reaching Node's cluster module) |
+| `express` | `env: NODE_ENV` | observed; read by name in express's own source (`app.set('env', …)`) |
 | `depd` | `env: NO_DEPRECATION, TRACE_DEPRECATION` | observed; both are read by name in depd's source |
 | `mime` | `env: DEBUG_MIME` | observed; read by name in mime's source |
 | `debug` | `env: DEBUG, DEBUG_FD, DEBUG_COLORS, DEBUG_DEPTH, DEBUG_SHOWHIDDEN` | observed (`DEBUG`, `DEBUG_FD`), plus debug's three other documented option keys — see below |
@@ -92,21 +91,26 @@ drift for that package forever. With concrete keys, a future version of `debug` 
 reading `AWS_SECRET_ACCESS_KEY` is denied in `enforce` and flagged by `capwall diff`.
 `docs/policy-format.md` § `env` has the full guidance on when `"*"` is still the right call.
 
-### Why there is an `<unknown>` entry
+### Why there is no `<unknown>` entry, and no `NODE_CLUSTER_SCHED_POLICY`
 
-`<unknown>` is not a package. It is the principal capwall charges when it cannot tie a call to
-any source file — see [`../../docs/threat-model.md`](../../docs/threat-model.md) § attribution
-outcomes. Node's **own ESM loader** reads `process.env.WATCH_REPORT_DEPENDENCIES` per module
-job, from a stack with no caller frame at all, so every run under the CLI produces exactly one
-such read. `capwall observe` records it and writes the grant, the same way it writes every
-other row in the table.
+There used to be. This policy carried `"<unknown>": { "env": ["WATCH_REPORT_DEPENDENCIES"] }`
+and an extra `NODE_CLUSTER_SCHED_POLICY` key on `express`, and neither described anything a
+dependency did:
 
-Without the grant the example still works — a denied env read is a soft deny, so Node sees
-`undefined`, which is what it would see if the variable were unset — but `enforce` logs one
-`DENY '<unknown>' env:WATCH_REPORT_DEPENDENCIES`, and this example is supposed to run clean
-under its committed policy (issue #57).
+- Node's **own ESM loader** reads `process.env.WATCH_REPORT_DEPENDENCIES` per module job, from
+  a stack with no caller frame at all — so it landed on `<unknown>`.
+- Node's **cluster module** reads `NODE_CLUSTER_SCHED_POLICY` when `listen()` first loads it —
+  so it landed on `express`, the nearest package frame underneath, and read as if express
+  wanted it.
 
-Keep it exactly this narrow. A wide `<unknown>` grant applies to *every* call capwall cannot
-attribute, and that set includes a dependency deliberately running its payload from a `data:`
-URL module or an `eval` — the fail-open that issue #60 closed. It is the one grant in this file
-where `"*"` would hand authority to code that has no name.
+Since issue #119 capwall records an env read only when the nearest frame above it belongs to
+the package rather than to Node itself, so neither is observed and neither is granted. Both
+reads are still *evaluated* — the value is still hidden if a policy does not grant it; what
+changed is that a review artifact stopped describing Node's behaviour as a dependency's. See
+`docs/threat-model.md` § residuals for what that costs.
+
+`<unknown>` remains a real, grantable principal: it is what capwall charges when it cannot tie
+a call to any source file (`docs/threat-model.md` § attribution outcomes). If a legitimate
+setup genuinely reads env from path-less frames, grant it explicitly and keep it narrow — a
+wide `<unknown>` grant applies to *every* unattributable call, including a dependency running
+its payload from a `data:` URL module or an `eval`, which is the fail-open issue #60 closed.

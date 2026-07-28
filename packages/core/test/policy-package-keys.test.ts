@@ -16,7 +16,12 @@
  * key that cannot work is refused at load time rather than left to quietly grant nobody.
  */
 import { describe, expect, it } from "vitest";
-import { parsePolicy, validatePackageKey, widenedPackageKeys } from "@capwall/policy-schema";
+import {
+  parsePolicy,
+  unmatchedPackageKeys,
+  validatePackageKey,
+  widenedPackageKeys,
+} from "@capwall/policy-schema";
 
 /** Would a policy whose only entry is `key` grant `pkg`? Exercises the real lookup. */
 function covers(key: string, pkg: string): boolean {
@@ -127,5 +132,46 @@ describe("package keys — a malformed key is a load-time error, not a silent no
     for (const key of ["a>", ">b", "..", "node_modules", "a b"]) {
       expect(validatePackageKey(key)).toBeNull();
     }
+  });
+});
+
+/**
+ * The other half of "a key that quietly matches nothing is the defect" (issue #118).
+ *
+ * `validatePackageKey` can only judge the GRAMMAR, and every key below is well-formed. Whether
+ * one matches is a runtime fact, so it is answered after a run, against the principals that
+ * actually appeared — and answered with the same matcher `policyFor` uses, because a report
+ * that used a different notion of matching would clear keys that in fact grant nothing.
+ */
+describe("unmatched package keys (#118)", () => {
+  const observed = ["<app>", "outer>inner", "lodash", "a>b>deep"];
+
+  it("says nothing about keys that matched", () => {
+    expect(unmatchedPackageKeys(["<app>", "lodash", "outer>inner"], observed)).toEqual([]);
+  });
+
+  it("counts a wildcard key as matched when it widens to an observed principal", () => {
+    expect(unmatchedPackageKeys(["*>inner", "**>deep"], observed)).toEqual([]);
+  });
+
+  it("reports the bare name of a nested install, and suggests the chain — the #118 case", () => {
+    expect(unmatchedPackageKeys(["inner"], observed)).toEqual([
+      { key: "inner", suggestions: ["outer>inner"] },
+    ]);
+  });
+
+  it("reports a typo and a long-dead key, inventing no suggestion for either", () => {
+    expect(unmatchedPackageKeys(["loadsh", "removed-three-refactors-ago"], observed)).toEqual([
+      { key: "loadsh", suggestions: [] },
+      { key: "removed-three-refactors-ago", suggestions: [] },
+    ]);
+  });
+
+  it("reports a wildcard that is the wrong DEPTH, and names the principal that would work", () => {
+    // `*>deep` widens exactly one leading link; the observed principal has two. The grammar
+    // cannot see this — the key is perfectly legal — but a run can.
+    expect(unmatchedPackageKeys(["*>deep"], observed)).toEqual([
+      { key: "*>deep", suggestions: ["a>b>deep"] },
+    ]);
   });
 });

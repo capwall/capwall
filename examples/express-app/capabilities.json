@@ -13,11 +13,6 @@
         ]
       }
     },
-    "<unknown>": {
-      "env": [
-        "WATCH_REPORT_DEPENDENCIES"
-      ]
-    },
     "debug": {
       "env": [
         "DEBUG",
@@ -35,7 +30,6 @@
     },
     "express": {
       "env": [
-        "NODE_CLUSTER_SCHED_POLICY",
         "NODE_ENV"
       ]
     },

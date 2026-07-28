@@ -34,7 +34,8 @@ app.get("/log", (_req, res) => {
 
 app.listen(PORT, () => {
   // Inbound listener — not a mediated capability (the net shim covers egress). This is also
-  // where express reaches Node's cluster module, which is why the policy grants express
-  // env:NODE_CLUSTER_SCHED_POLICY.
+  // where express reaches Node's cluster module, which reads NODE_CLUSTER_SCHED_POLICY. That
+  // read is Node's, not express's, so since #119 it is not recorded and the policy does not
+  // grant it.
   console.log(`express-app fixture listening on http://localhost:${PORT}`);
 });

@@ -60,12 +60,10 @@ async function writePolicy(dir: string, packages: Record<string, unknown>): Prom
   );
 }
 
-/**
- * Node's own ESM loader reads this from a stack with no caller frame, so every run produces one
- * `<unknown>` env read (#60). Granting it explicitly keeps these tests about the capability
- * under test rather than about that documented escape hatch.
- */
-const LOADER_ENV = { "<unknown>": { env: ["WATCH_REPORT_DEPENDENCIES"] } };
+// Every policy below used to carry `"<unknown>": { env: ["WATCH_REPORT_DEPENDENCIES"] }`, because
+// Node's own ESM loader reads that variable from a stack with no caller frame and the read was
+// recorded as real drift. Since #119 a read Node itself initiated is not recorded at all, so the
+// fixtures grant only the capability each test is about.
 
 // The socket lives inside the project root, so this is the path an app under test uses and
 // `observe` stores as the portable `./api.sock`.
@@ -100,7 +98,6 @@ describe.skipIf(process.platform === "win32")("ipc.paths round-trip (#72)", () =
     appDir = await freshAppDir();
     await writePolicy(appDir, {
       "trace-dep": { ipc: { paths: ["./other.sock"] } },
-      ...LOADER_ENV,
     });
     const r = await runCli(["enforce", "--", "node", "ipc.js"], appDir);
     expect(r.stdout).toContain("ipc: CapabilityError");
@@ -109,7 +106,7 @@ describe.skipIf(process.platform === "win32")("ipc.paths round-trip (#72)", () =
 
   it("a glob over a socket directory grants it", async () => {
     appDir = await freshAppDir();
-    await writePolicy(appDir, { "trace-dep": { ipc: { paths: ["./*.sock"] } }, ...LOADER_ENV });
+    await writePolicy(appDir, { "trace-dep": { ipc: { paths: ["./*.sock"] } } });
     const r = await runCli(["enforce", "--", "node", "ipc.js"], appDir);
     expect(r.stdout).toContain("ipc: connected");
     expect(r.code).toBe(0);
@@ -119,7 +116,6 @@ describe.skipIf(process.platform === "win32")("ipc.paths round-trip (#72)", () =
     appDir = await freshAppDir();
     await writePolicy(appDir, {
       "trace-dep": { net: { hosts: ["<ipc>"], ports: [0] } },
-      ...LOADER_ENV,
     });
     const r = await runCli(["enforce", "--", "node", "ipc.js"], appDir);
     expect(r.stdout).toContain("ipc: connected");
@@ -130,7 +126,6 @@ describe.skipIf(process.platform === "win32")("ipc.paths round-trip (#72)", () =
     appDir = await freshAppDir();
     await writePolicy(appDir, {
       "trace-dep": { ipc: { paths: ["./other.sock"] } },
-      ...LOADER_ENV,
     });
     const r = await runCli(["diff", "--json", "--", "node", "ipc.js"], appDir);
     expect(r.code).toBe(1);
@@ -147,7 +142,7 @@ describe.skipIf(process.platform === "win32")("ipc.paths round-trip (#72)", () =
 
   it("diff reports no drift once the socket is granted", async () => {
     appDir = await freshAppDir();
-    await writePolicy(appDir, { "trace-dep": { ipc: { paths: [SOCK] } }, ...LOADER_ENV });
+    await writePolicy(appDir, { "trace-dep": { ipc: { paths: [SOCK] } } });
     const r = await runCli(["diff", "--", "node", "ipc.js"], appDir);
     expect(r.code).toBe(0);
     expect(r.stderr).toContain("no drift");
@@ -180,7 +175,6 @@ describe("net host globs round-trip (#83)", () => {
     // docs advertised. Before #83 this silently denied every internal host.
     await writePolicy(appDir, {
       "trace-dep": { net: { hosts: ["*.internal"], ports: [9999] } },
-      ...LOADER_ENV,
     });
     const r = await runCli(["enforce", "--", "node", "netglob.js"], appDir);
     expect(r.stdout).toContain("net: allowed-through");
@@ -191,7 +185,6 @@ describe("net host globs round-trip (#83)", () => {
     appDir = await freshAppDir();
     await writePolicy(appDir, {
       "trace-dep": { net: { hosts: ["**.internal"], ports: [9999] } },
-      ...LOADER_ENV,
     });
     expect((await runCli(["enforce", "--", "node", "netglob.js"], appDir)).stdout).toContain(
       "net: allowed-through",
@@ -199,7 +192,6 @@ describe("net host globs round-trip (#83)", () => {
 
     await writePolicy(appDir, {
       "trace-dep": { net: { hosts: ["*.example"], ports: [9999] } },
-      ...LOADER_ENV,
     });
     const denied = await runCli(["enforce", "--", "node", "netglob.js"], appDir);
     expect(denied.stdout).toContain("net: CapabilityError");
@@ -210,13 +202,11 @@ describe("net host globs round-trip (#83)", () => {
     appDir = await freshAppDir();
     await writePolicy(appDir, {
       "trace-dep": { net: { hosts: ["*.internal"], ports: [9999] } },
-      ...LOADER_ENV,
     });
     expect((await runCli(["diff", "--", "node", "netglob.js"], appDir)).code).toBe(0);
 
     await writePolicy(appDir, {
       "trace-dep": { net: { hosts: ["*.example"], ports: [9999] } },
-      ...LOADER_ENV,
     });
     const drifted = await runCli(["diff", "--", "node", "netglob.js"], appDir);
     expect(drifted.code).toBe(1);

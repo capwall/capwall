@@ -109,6 +109,24 @@ message saying what to write instead, as is a bare `"*"` (the key that applies t
 the top-level `default` block). A wildcard that silently matches nothing is the defect issue #83
 was about, and package keys get the same treatment.
 
+**A key that matches nothing is reported after a run (#118).** The grammar can only reject a key
+that *cannot* work; whether a well-formed key matches is a runtime fact. So `capwall observe` and
+`capwall diff` compare the keys in the file against the principals they actually saw and name the
+ones that granted nothing:
+
+```
+[capwall] warning: 1 policy key in capabilities.json matched no package in this run (the grant does nothing):
+  "inner" — did you mean "outer>inner"?
+```
+
+That covers the bare-name mistake above, a typo (`"loadsh"`), and the dead keys a policy accretes
+as dependencies churn. It is a **warning**, not an error: a key that matches nothing fails closed
+(it permits nothing), and a key legitimately matches nothing when the dependency it names is
+optional or on a code path this run did not take. `capwall diff --strict` exits non-zero on one,
+for CI that wants dead keys gone. `capwall explain` prints a matching note — it takes its
+`<package>` argument literally and cannot know whether any code runs as that principal, so it now
+says which entry answered and, on a miss, which keys the policy does contain.
+
 **Upgrading a policy written before this.** Re-run `capwall observe` (or `capwall diff` to see
 the difference first): the trace records chain names, so `capwall gen-policy` writes the right
 keys. Trees installed with yarn 1, which nests far more than npm 3+, will see the most churn.
@@ -126,14 +144,21 @@ Besides real package names, `packages` accepts two sentinels:
 | `"<unknown>"` | capwall could not attribute the call to any source file | e.g. a `data:` URL module, `eval`'d code with no trustworthy origin, or a native function invoked straight from a timer |
 
 `<unknown>` is gated like any dependency — deny-by-default in `enforce` — so a legitimate
-setup that produces path-less frames needs an explicit grant. Node's own ESM loader reads
-`WATCH_REPORT_DEPENDENCIES` from such a stack, so most projects end up with:
+setup that produces path-less frames needs an explicit grant.
+
+Until issue #119 every generated policy contained one of these, because Node's own ESM loader
+reads `WATCH_REPORT_DEPENDENCIES` from a path-less stack on every run:
 
 ```jsonc
-"<unknown>": { "env": ["WATCH_REPORT_DEPENDENCIES"] }
+"<unknown>": { "env": ["WATCH_REPORT_DEPENDENCIES"] }   // no longer generated
 ```
 
-`capwall observe` writes that for you. **Keep it narrow.** A broad `<unknown>` grant applies
+That read is *Node's*, not any package's, and env reads Node initiates are no longer recorded
+(see § "Reads Node makes, not your dependencies" below), so a fresh policy no longer has this
+line. An existing policy that carries it is harmless — the key simply matches nothing now, and
+`capwall observe`/`diff` will say so — and can be deleted.
+
+**Keep any `<unknown>` grant narrow.** A broad `<unknown>` grant applies
 to every call capwall cannot attribute, which includes a dependency deliberately running its
 payload from a path-less frame — the fail-open that
 [`threat-model.md`](threat-model.md) § attribution laundering describes. The preload prints a
@@ -502,6 +527,40 @@ prefix would express safely.)
 
 A denied env read is still logged and still shows up in `capwall diff`. See
 `docs/threat-model.md`.
+
+#### Reads Node makes, not your dependencies (#119)
+
+`process.env` is the one mediated surface Node's own code shares with your dependencies —
+every other shim is handed out through `require`, and Node's internals do not use it to reach
+`fs` or `net`. So when a `node:internal/…` script reads a variable, it hits the same gate a
+dependency does, and attribution charges the nearest frame that *has* a package name: whichever
+package happened to be underneath. Measured on a stock `express` + `pino` tree, that produced
+grants like
+
+```jsonc
+"type-is":     { "env": ["NODE_V8_COVERAGE"] },        // Node's source-map cache read it
+"body-parser": { "env": ["NODE_V8_COVERAGE"] },        //   while compiling a dependency that
+"router":      { "env": ["NODE_V8_COVERAGE"] },        //   ships a sourceMappingURL
+"express":     { "env": ["NODE_CLUSTER_SCHED_POLICY"] } // node:cluster read it on listen()
+```
+
+— six of twelve events, and five of nine principals, describing Node rather than any
+dependency. None of those packages contains the string `NODE_V8_COVERAGE`, and there is no
+correct answer to "may `type-is` read it?", because `type-is` never asked.
+
+An env read is therefore recorded **only when the nearest frame above it is not one of Node's
+own scripts**. The rule is about where the read came from, not what it is called: a package's
+own read of a `NODE_*` variable is kept — `thread-stream` really does read
+`process.env.NODE_V8_COVERAGE` in its own `index.js`, and `express` really does read
+`NODE_ENV` — while the same key read from `node:internal/source_map/source_map_cache` is not.
+A denylist of names could not tell those apart.
+
+Nothing about *enforcement* changes: such a read is still attributed, still evaluated against
+the package's grants, and still hidden when they do not cover it. What you give up is the log
+line for it, and the grants Node's own reads used to generate — so under `enforce` those
+variables read as unset to Node (a `--watch` run does not report dependencies through this
+path, cluster uses its default scheduling policy). See
+[`threat-model.md`](threat-model.md) § residuals.
 
 #### When `["*"]` is the right call — and what it costs
 
