@@ -120,6 +120,7 @@ import { CapabilityError } from "../errors.js";
 import { isInstalled, liveCtx } from "./live-context.js";
 import {
   decideEsmModuleRead,
+  recordLoadedModuleUrl,
   type EsmGateOutcome,
   type EsmGateSnapshot,
 } from "./module-read.js";
@@ -369,6 +370,12 @@ function synthesize(specifier: string): { format: string; source: string; shortC
 }
 
 export function load(url: string, context: LoadContext, nextLoad: NextLoad): LoadResult {
+  // GROUND TRUTH FOR THE IMPORTER CHECK (#180). Being asked to load a URL is Node's own statement
+  // that it is loading that module, and a module is loaded before it is evaluated — so by the time
+  // its `import`s resolve, its URL is here. `recordLoadedModuleUrl` keeps `file:` URLs only. This
+  // runs before every branch below, including the ones that throw, because "Node asked for it" is
+  // the fact being recorded and it is true either way.
+  recordLoadedModuleUrl(url);
   if (!url.startsWith(PREFIX)) {
     // DEFENSE IN DEPTH (#59, #61): capwall's own `resolve` never emits a bare `node:<mediated>`
     // URL, so reaching here with one means SOMETHING ELSE produced it — a resolution route we

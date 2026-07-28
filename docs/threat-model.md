@@ -1793,6 +1793,35 @@ loader machinery with the importer somewhere below it.
 > `require`-conditioned resolution, so those loads are decided by the CJS half, whose subject is
 > the stack walk.
 
+**And on the surviving `import` path it is now CHECKED, not asserted.** "The host sets `parentURL`
+there" is a sound argument, and it *is* an argument — the same one had already stopped being true
+once, one paragraph up. So a `file:` importer is additionally required to be **the URL of a module
+Node actually has loaded**, witnessed by capwall's own `load` hook (which Node consults for every
+module before it evaluates it, so a parent's `load` always precedes its children's `resolve`) or by
+the recorded process root (the one case a late programmatic `install()` can miss). Anything else is
+`<unknown>`, which holds nothing and is never the trust root — so #180's `node_modules/impostor/`,
+a directory that need not exist, is not a principal on this path either. Instrumented on 22.23.1 /
+24.18.0 / 26.5.0 over `examples/express-app`, an ESM entry point, dynamic `import()` and a `data:`
+module: **zero** `import`-path importers were unknown to the `load` hook, so the check costs a `Set`
+lookup and no compatibility. The fallback is deliberately the host-root record and **not**
+"does that file exist" — an exists-on-disk arm would let any real path inside a granted package be
+worn as a principal, which is most of what the check is for. The two routes that can still choose
+`parentURL` at all both require a capability first (registering a loader hook, so a fabricated
+context can be passed to `nextResolve` — gated by #61/#181; or a `vm` module with a chosen
+identifier — gated by `vm`), which is why this is defense in depth rather than the fix for a live
+hole.
+
+**`<app>` still short-circuits before the decision is recorded, deliberately (#123's design).** A
+module read the *application* performs of a file outside every `node_modules` tree is allowed and
+leaves no record. #180 listed that as its second half, because a forged `parentURL` naming an app
+file bought the exemption outright — that forgery is what the paragraph above closes; the exemption
+itself is kept, and the reason is about the decision stream rather than about trust. The stream is
+not a log: it is the **input** to `capwall observe` and `capwall diff`, so recording these would put
+`packages["<app>"]` `fs.read` grants in every generated policy and report drift for an application
+loading its own source — against a principal the policy never consults. It would also be half a
+change: every gate in the table above exempts `<app>` before recording, and one site with a
+different rule for one principal is worse than either rule applied consistently.
+
 **The process entry point is a host fact, not a claim (#177).** The gate runs for the entry point
 too, and the entry point has no requiring package — the stack above its load is nothing but Node's
 module machinery, so attribution answers `<unknown>`, which is deny-by-default. It therefore needs

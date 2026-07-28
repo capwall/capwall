@@ -331,6 +331,67 @@ export function forgetHostRootTargets(): void {
   hostRootTargets.clear();
 }
 
+/**
+ * `file:` URLs capwall's `load` hook has been consulted for — i.e. modules NODE ACTUALLY LOADED.
+ *
+ * WHY THIS EXISTS (#180's residual). On the surviving `import` path `context.parentURL` is set by
+ * the host from the module record that contains the `import`, and {@link decideEsmModuleRead}
+ * charges the package that URL belongs to. That is a good subject and the argument for trusting it
+ * is sound — but it *is* an argument, not a check, and #180's whole finding was that an argument
+ * about who set `parentURL` had already stopped being true once on the `require` path. The two
+ * spellings that can reach this hook with a chosen `parentURL` today both need a capability
+ * (registering a loader hook, so it can call `nextResolve` with a fabricated context — gated by
+ * #61/#181; or a `vm` module with a chosen identifier — gated by `vm`), so this is defense in
+ * depth rather than a live hole. It is worth having anyway, because it converts "no in-process
+ * code can choose it" from a claim into something capwall verifies.
+ *
+ * THE VERIFICATION. An importer URL that names no module Node has loaded cannot be the module that
+ * contains an `import`. #180's PoC wore `node_modules/impostor/index.js` — **a directory that does
+ * not exist** — so this is the exact shape it defeats: unrecognised importer ⇒ `<unknown>`, which
+ * holds nothing and is never the trust root.
+ *
+ * WHY THE `load` HOOK IS A SOUND SOURCE, measured rather than assumed. Node loads a module before
+ * it evaluates it, and it resolves that module's imports only after evaluating its source — so a
+ * parent's `load` always precedes its children's `resolve`. Instrumented on 22.23.1 / 24.18.0 /
+ * 26.5.0 over the `examples/express-app` tree (CJS entry, deep dependency graph), an ESM entry
+ * point, dynamic `import()` and a `data:` URL module: **zero** `import`-path `parentURL`s were
+ * unknown to the `load` hook. The one miss on any leg was a `require`-conditioned resolution from
+ * `node -e`'s `[eval]` pseudo-URL, which never reaches here — {@link decideEsmModuleRead} is the
+ * `import` path only.
+ *
+ * THE ONE FALLBACK, and why it is not "does the file exist". capwall installs from a preload, so
+ * the set is complete for every module the process loads. A programmatic embedder that calls
+ * `install()` LATE has modules the hooks never saw, and the one that matters is the entry point
+ * itself — which is why {@link hostRootTargets} is consulted as well. Those are HOST facts
+ * (`process.argv[1]`, and a parentless non-`require` resolution), not "there is a file there": an
+ * exists-on-disk fallback would let any real path inside a granted package be worn as a principal,
+ * which is most of what this check is for.
+ *
+ * ONLY `file:` URLS ARE RECORDED. It is the only shape the check consults, and it means a
+ * dependency importing a fresh `data:` module in a loop cannot grow this set (those are already
+ * `<unknown>` here). What remains is one string per real module file — the same order as Node's
+ * own registry, which is holding the identical set.
+ */
+const loadedModuleUrls = new Set<string>();
+
+/** Record one URL Node's loader was consulted about. Called by `loader/esm-hooks.ts`'s `load`. */
+export function recordLoadedModuleUrl(url: string): void {
+  if (url.startsWith("file:")) loadedModuleUrls.add(url);
+}
+
+/** Drop every recorded module URL. For tests only. */
+export function forgetLoadedModuleUrls(): void {
+  loadedModuleUrls.clear();
+}
+
+/**
+ * Is `importerUrl` the URL of a module Node actually has loaded? See {@link loadedModuleUrls}.
+ * `importerPath` is its filesystem spelling, for the host-root arm.
+ */
+function isLoadedModule(importerUrl: string, importerPath: string): boolean {
+  return loadedModuleUrls.has(importerUrl) || isHostRootTarget(importerPath);
+}
+
 /** The capability request a module read raises. Identical in shape to a `readFileSync`. */
 function moduleReadRequest(resolvedPath: string): {
   kind: "fs";
@@ -418,10 +479,18 @@ export interface EsmGateOutcome {
  *
  * WHY THE IMPORTER'S URL IS THE SUBJECT HERE, when the CJS half insists on a stack walk. On the
  * `import` path `context.parentURL` is set by the HOST from the module record that actually
- * contains the `import`, and no in-process code can choose it the way it can choose a
+ * contains the `import`, so no in-process code can choose it the way it can choose a
  * `createRequire` filename. The two spellings a dependency CAN reach — a `data:` URL module and a
  * synthetic/`vm` module — are not `file:` URLs, and this function charges those to `<unknown>`
  * rather than inferring the trust root from them, which is #60's rule applied on this path.
+ *
+ * AND SINCE #180 THAT IS CHECKED RATHER THAN ASSERTED. The sentence above is an argument about who
+ * sets `parentURL`, and the same argument had already stopped being true once — on the `require`
+ * path `registerHooks` added, where the module record is an ordinary argument (below). So a
+ * `file:` importer must additionally be **a module Node actually has loaded**, witnessed by
+ * capwall's own `load` hook or by the host-root record; anything else is `<unknown>`, which holds
+ * nothing and is never the trust root. See {@link loadedModuleUrls} for the measurement behind
+ * "the `load` hook sees them all" and for the one fallback.
  *
  * THAT WAS NOT TRUE OF THE `require()` PATH `registerHooks` ADDED (#180), and the claim used to be
  * stated without the qualifier — here and in `docs/threat-model.md`. There `parentURL` is derived
@@ -482,7 +551,13 @@ export function decideEsmModuleRead(
   let pkg: string;
   if (importerUrl.startsWith("file:")) {
     try {
-      pkg = packageForPath(fileURLToPath(importerUrl.split("?")[0] ?? importerUrl), snapshot.projectRoot);
+      const importerPath = fileURLToPath(importerUrl.split("?")[0] ?? importerUrl);
+      // #180's residual: `parentURL` is the HOST's record here, and this is where capwall checks
+      // that rather than asserting it. An importer naming no module Node has loaded is not an
+      // importer. See {@link loadedModuleUrls}.
+      pkg = isLoadedModule(importerUrl, importerPath)
+        ? packageForPath(importerPath, snapshot.projectRoot)
+        : UNATTRIBUTED;
     } catch {
       pkg = UNATTRIBUTED;
     }
@@ -491,6 +566,25 @@ export function decideEsmModuleRead(
     // identity. Never the trust root — that inference is exactly what #60 closed.
     pkg = UNATTRIBUTED;
   }
+  // THE TRUST ROOT, UNLOGGED, AND WHY THAT STAYS (#123's design, re-examined for #180). An `<app>`
+  // importer short-circuits before `evaluate`, so a module read the application performs of a file
+  // outside every `node_modules` tree is allowed AND leaves no record. #180 listed that as one of
+  // its two halves, because a forged `parentURL` naming an app file bought the exemption outright.
+  // The forgery is what got fixed — above, and by the `require` half not being decided here at all
+  // — and the exemption itself is deliberately kept, for reasons that are about the decision
+  // stream rather than about trust:
+  //  - The decision stream is not a log. It is the INPUT to `capwall observe` and `capwall diff`,
+  //    so recording these would put `packages["<app>"]` fs.read grants in every generated policy
+  //    and report drift for an application loading its own source — against a principal the policy
+  //    never consults. That is the availability failure mode AGENTS.md warns about, paid for a
+  //    record nobody can act on.
+  //  - It would also be half a change. Every gate in capwall exempts `<app>` before recording
+  //    (`shims/env.ts`, both of `shims/module.ts`'s, and the CJS half of this one); making this
+  //    single site the exception would mean two rules for one principal, which is worse than
+  //    either rule applied consistently — the #87 lesson.
+  // Since #60 `<app>` is a POSITIVE identification, and since the check above it is a
+  // positively identified module Node loaded, so the exemption is now reachable only by actually
+  // being the application. Recorded here so the choice is visible rather than implied.
   if (pkg === APP_ROOT) return null;
 
   const decision = evaluate(snapshot.policy, snapshot.mode, pkg, moduleReadRequest(resolvedPath));

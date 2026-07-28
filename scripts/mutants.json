@@ -384,6 +384,18 @@
       ],
       "needsBuild": true,
       "note": "The mutation restores the exact defect: the window is still there and nothing says so. It is the same class as the CAPWALL_ENV=0 warning \u2014 a control that is off while the process still looks guarded \u2014 and the whole finding was the silence, so a mutant on the flag is a mutant on the finding. The claimed suite also pins the CONSEQUENCE (node:net RAW vs node:dgram REMEDIATED through one application-registered hook), so the warning cannot drift into a claim nothing backs."
+    },
+    {
+      "id": "esm-importer-must-be-a-module-node-loaded",
+      "mechanism": "#180 \u2014 on the `import` path `parentURL` is the host's record, and that is VERIFIED rather than asserted: a `file:` importer is charged to its package only when it names a module Node actually loaded (witnessed by capwall's own load hook, or by the recorded process root). Anything else is `<unknown>`, which holds nothing and is never the trust root",
+      "file": "packages/core/src/loader/module-read.ts",
+      "anchor": "      pkg = isLoadedModule(importerUrl, importerPath)",
+      "mutation": "      pkg = isLoadedModule(importerUrl, importerPath) || true",
+      "tests": [
+        "packages/core/test/module-read.test.ts"
+      ],
+      "needsBuild": true,
+      "note": "The mutation is the pre-#180 code exactly \u2014 trust `parentURL` because the host set it \u2014 and it is the plausible one, because the argument for it is correct on this path and was correct in the file's own header. It keeps every identifier referenced so the build still succeeds and the mutant is decided by the tests rather than by tsc. Caught by the rows that grant BOTH the forged principal and `<app>` and still require `<unknown>`."
     }
   ]
 }
