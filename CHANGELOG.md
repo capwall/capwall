@@ -41,6 +41,20 @@ has to be findable without reading the diff.
   documented as a **known, un-mediated, flag-gated file channel**: with `--localstorage-file`,
   Node's internal read/write of that one file happens below the `fs` shim. See
   `docs/threat-model.md` § Web Storage, tracked as #156.
+- **A startup-graph budget on the main thread** (#167), in `test/esm-hook-graph.test.ts`. #150
+  guards the blocking `module.register()` graph; nothing guarded the graph the main thread
+  evaluates before the target's entry point, where the policy is parsed — which is how zod 4's
+  ~58 ms arrived with `test`, `bench:gate`, `mutation:gate` and `ci:local` on three Node versions
+  all green.
+
+  It gates a **module count, not a time**: AGENTS.md § 7 forbids a wall-clock threshold, and
+  startup has no co-sampled reference for `bench.mjs`'s ratio trick. The count is immune to
+  machine speed and is what actually moved — zod's graph went from **19 resolves to 180** across
+  the upgrade. Measured identical on 22, 24 and 26, and byte-stable across runs. The ceiling has
+  headroom so a zod patch release cannot turn CI red on its own (`ci.yml` installs with
+  `--frozen-lockfile=false`), and the headroom is **derived** — 15 ms at the measured ~0.34 ms per
+  resolve — rather than picked. A self-check pins the ceiling to the observed floor in both
+  directions, so raising one without re-deriving the other fails.
 
 ### Changed
 
