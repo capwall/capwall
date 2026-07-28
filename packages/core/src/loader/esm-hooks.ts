@@ -398,11 +398,18 @@ export function load(url: string, context: LoadContext, nextLoad: NextLoad): Loa
     // registered ahead of capwall's, including one that declares `format: "builtin"`.
     //
     // What still bounds it, honestly: this is capwall's second layer, not its first. `resolve`
-    // classifying on the RESOLVED URL is what closes #59. A hostile hook that short-circuits
-    // `load` as well as `resolve` never lets this run, and a host process that ESM-imported a
-    // mediated builtin BEFORE capwall installed has already cached it raw — the `--import`
-    // preload exists so that window is empty. The gate that actually stops #61's PoC is
-    // `shims/module.ts`. See docs/threat-model.md § ESM.
+    // classifying on the RESOLVED URL is what closes #59, and THREE things stop this one — the
+    // third added by #152's real `deregister()` and enumerated since #182:
+    //  1. a hostile hook that short-circuits `load` as well as `resolve` never lets this run;
+    //  2. a host process that ESM-imported a mediated builtin BEFORE capwall installed has
+    //     already cached it raw — the `--import` preload exists so that window is empty, and a
+    //     programmatic embedder that calls `install()` late does not get that guarantee;
+    //  3. an `uninstall()` → `import("node:fs")` → `install()` cycle caches it raw in the GAP,
+    //     where capwall is not in the chain at all. The preload cannot close that one either —
+    //     it is after startup — so `loader/esm-hook.ts` warns once when an install follows a
+    //     deregistration, which is the moment the fact becomes true. See its § THE THIRD WINDOW
+    //     for why it is a warning rather than a fix.
+    // The gate that actually stops #61's PoC is `shims/module.ts`. See docs/threat-model.md § ESM.
     const mediated = mediatedSpecifierForUrl(url);
     if (mediated !== null) {
       // Loud, because reaching here is never normal: in a clean run capwall's own `resolve`

@@ -334,11 +334,29 @@ What it does **not** do, plainly:
   fails the build if any file in `core/src` re-introduces such an import, because a single one
   silently retires the backstop for that specifier.
   This is still the **second** layer — `resolve` classifying on the RESOLVED URL is what closes
-  #59 — and it does not reach two cases: a hostile hook that short-circuits `load` as well as
-  `resolve` never lets capwall run at all, and a host process that ESM-imported a mediated
-  builtin **before** capwall installed has already cached it raw (the `--import` preload exists
-  so that window is empty; a programmatic embedder that calls `install()` late does not get this
-  guarantee).
+  #59 — and it does not reach **three** cases. This list said *two* until #182; the third is one
+  #152's real `deregister()` created, so it did not exist when the sentence was written:
+  1. a hostile hook that short-circuits `load` as well as `resolve` never lets capwall run at all;
+  2. a host process that ESM-imported a mediated builtin **before** capwall installed has already
+     cached it raw (the `--import` preload exists so that window is empty; a programmatic embedder
+     that calls `install()` late does not get this guarantee);
+  3. an **`uninstall()` → `import("node:fs")` → `install()`** cycle caches it raw *in the gap*.
+     The `--import` preload cannot close this one either, because the gap is **after** startup,
+     and capwall is not in the hook chain while it is open, so it cannot see or enumerate what
+     was imported. Since #182 an `install()` that follows a deregistration **warns once**, naming
+     the consequence rather than the specifiers; there is no API that reports ESM-registry
+     residency, and probing for it by importing would cause the caching it is testing for
+     (`process.moduleLoadList` is not it — it records native module compilation, fires for
+     `require` too, and capwall requires every mediated builtin at startup, so it answers "yes"
+     for all of them in every process; measured on 22/24/26). Keeping a dormant hook registered
+     through the gap *would* close it, and is declined: it means capwall never really leaves, and
+     `import.meta.resolve` would answer a capwall URL in a process that believes capwall is gone —
+     a #183-class deviation introduced in the one state where capwall claims to have no effect, to
+     close an embedder-only window. What is lost in the gap is the **second layer only**:
+     mediation is unaffected, because a mediated import resolves to a `capwall-esm:` URL, a
+     different registry key from the raw one the gap import cached. #181 also shrank the attacker
+     set — a dependency can no longer register a hook by any route — so exploiting this now needs
+     a hook the **application** or the host process put ahead of capwall.
 
 Net: a dependency doing this opportunistically is now stopped and logged. A dependency that
 knows about capwall has routes left. Treat ESM mediation as effective against packages that do

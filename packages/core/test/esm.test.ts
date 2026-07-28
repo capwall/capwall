@@ -455,4 +455,35 @@ describe("#62 — a runtime policy swap reaches already-imported ESM specifiers"
     expect(out.stdout).toContain("SWAP:reloose:OK:esm fixture data");
     expect(out.code).toBe(0);
   });
+
+  /*
+   * #182 rides on the same fixture, because it is the same cycle seen from the other side. The
+   * assertions above say what the gap import does NOT cost (mediation); these say what it does.
+   */
+  it("#182 — WARNS once when an install follows a deregistration, instead of retiring the backstop silently", () => {
+    // The finding was the silence, not the window: `uninstall()` → `import("node:fs")` →
+    // `install()` left the raw `node:` URL in the ESM registry, so the load-level backstop was
+    // dead for that specifier for the rest of the process, with no WARN, no decision and nothing
+    // in `observe`. capwall is not in the hook chain during the gap and cannot enumerate what was
+    // imported, so the warning names the CONSEQUENCE — which is still the difference between a
+    // control that is off and a control that is off and says so (`CAPWALL_ENV=0`'s rule).
+    expect(out.stderr).toMatch(/WARN capwall was uninstalled and re-installed/);
+    // Once, not once per install: the fixture installs three times in total.
+    expect(out.stderr.match(/WARN capwall was uninstalled and re-installed/g)?.length).toBe(1);
+  });
+
+  it("#182 — and the backstop really is inert for the gap-imported specifier, and only for it", () => {
+    // The consequence, demonstrated rather than asserted from the code. Both imports go through a
+    // hook the APPLICATION registered — which is allowed, it is the trust root — that
+    // short-circuits `resolve` straight to the raw `node:` URL, so capwall is reached at `load`
+    // and only the backstop can save either one. `node:net` was imported during the gap and its
+    // raw URL is cached, so the load chain is never consulted for it; `node:dgram` never was, so
+    // the same hook, the same install and the same policy re-mediate it.
+    expect(out.stdout).toContain("SWAP:backstop:node:net:RAW");
+    expect(out.stdout).toContain("SWAP:backstop:node:dgram:REMEDIATED");
+    // …and the one that survived says so on stderr, which is how an operator would see it.
+    expect(out.stderr).toContain(
+      "WARN another module-customization hook resolved 'node:dgram' straight to the raw builtin",
+    );
+  });
 });

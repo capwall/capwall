@@ -66,3 +66,30 @@ console.log(
 second.uninstall();
 install(loose, "enforce", opts);
 console.log("SWAP:reloose:" + attempt(readFromDep));
+
+// ── #182: the THIRD window, and what it actually costs ──────────────────────────────────────
+// The gap import above (`node:net`, while capwall was uninstalled) put the RAW `node:` URL in
+// Node's ESM registry, permanently. That does not de-mediate the reinstall — the phase above
+// proves it — but it does retire the `load`-level re-mediation backstop for that one specifier,
+// because a cached URL is served without the load chain being consulted.
+//
+// To see the backstop at all, something has to get ahead of capwall's `resolve`. The application
+// is the trust root and may register a hook, and Node runs the most recently registered first, so
+// the two imports below reach capwall only at `load` — which is exactly the position the backstop
+// exists for. `node:net` was imported during the gap; `node:dgram` never was. Same policy, same
+// install, same hook: the only difference is the gap.
+//
+// Inert per AGENTS.md § 8: the hook body only rewrites a specifier string.
+const { registerHooks } = await import("node:module");
+registerHooks({
+  resolve: (s, c, n) =>
+    s === "node:net" || s === "node:dgram"
+      ? { url: s, shortCircuit: true, format: "builtin" }
+      : n(s, c),
+});
+for (const spec of ["node:net", "node:dgram"]) {
+  const got = await import(spec);
+  console.log(
+    `SWAP:backstop:${spec}:` + (got.default === process.getBuiltinModule(spec) ? "RAW" : "REMEDIATED"),
+  );
+}

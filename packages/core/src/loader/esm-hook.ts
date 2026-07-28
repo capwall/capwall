@@ -75,6 +75,46 @@ let hooks: RegisteredHooks | null = null;
 let activations = 0;
 
 /**
+ * THE THIRD WINDOW (#182), and the fact capwall can still state about it.
+ *
+ * `deregister()` is #152's headline and it creates a gap the `--import` preload cannot close,
+ * because the gap is after startup. Between the last `uninstall()` and the next `install()` there
+ * are no hooks: a mediated builtin ESM-imported in that window resolves to its raw `node:` URL and
+ * Node caches it there **permanently** — the ESM registry is per-process and keyed by URL. A
+ * cached URL is served from cache without the load chain being consulted, so the `load`-level
+ * re-mediation backstop (#78) is dead for that specifier for the rest of the process.
+ *
+ * WHAT IS AND IS NOT LOST. Mediation itself is unaffected: a mediated import under the new install
+ * resolves to a `capwall-esm:` URL, which is a different registry key from the raw one the gap
+ * import cached — `test/esm.test.ts` § #62 asserts exactly that. What is lost is the SECOND layer:
+ * the backstop is capwall's only in-band signal that something else is ahead of it in the hook
+ * chain, and it is what still holds when a hook registered before capwall (or by the application,
+ * which is the trust root and may) short-circuits `resolve` to the raw builtin. #181 shrank the
+ * attacker set here considerably — a dependency can no longer register a hook by any route — so
+ * what remains needs a hook the application or the host process put there.
+ *
+ * WHY A WARNING AND NOT A FIX. Three fixes were considered and each costs more than it buys:
+ *  - **Enumerate the affected specifiers.** There is no API to ask whether a URL is resident in
+ *    the ESM registry, and probing by importing it would CAUSE the caching it is testing for.
+ *    `process.moduleLoadList` is not it: it records native module compilation, fires for `require`
+ *    as well as `import`, and capwall's own bootstrap requires every mediated builtin at startup,
+ *    so it says "yes" for all of them in every process (measured on 22/24/26).
+ *  - **Keep a dormant hook registered through the gap**, resolving mediated builtins to a
+ *    pass-through synthetic URL so the raw one never enters the cache. This works, and it means
+ *    capwall never really leaves: after `uninstall()` its hook is still in the chain and
+ *    `import.meta.resolve("fs")` answers a capwall URL in a process that believes capwall is gone.
+ *    That is the #183 class of deviation, introduced in the one state where capwall claims to have
+ *    no effect, to close an embedder-only window.
+ *  - **Refuse to serve a cached raw builtin** (`install({ esmStrict: true })`). Cannot be done —
+ *    the cache is consulted before any hook.
+ *
+ * So: say it, once, loudly, at the moment the fact becomes true. Same class of statement as
+ * `CAPWALL_ENV=0`'s — a control that is off while the process still looks guarded.
+ */
+let anEraHasEnded = false;
+let gapWarned = false;
+
+/**
  * The PRISTINE `registerHooks`, read at module evaluation (#181).
  *
  * Since #181 the loader-hook gate is a patch on `Module.registerHooks` itself, not a wrapper the
@@ -105,6 +145,22 @@ export function registerEsmHook(ctx: ShimContext): EsmHookHandle {
   activations += 1;
 
   if (hooks === null) {
+    // A REGISTRATION FOLLOWING A DEREGISTRATION — see {@link anEraHasEnded}. Warned here rather
+    // than at `uninstall()`, because at uninstall time nothing has gone wrong yet: the gap only
+    // costs something if it is ever closed, and an embedder that uninstalls and stays uninstalled
+    // has simply removed capwall. Once per process: a policy swapper does this on a loop.
+    if (anEraHasEnded && !gapWarned) {
+      gapWarned = true;
+      process.stderr.write(
+        `[capwall] WARN capwall was uninstalled and re-installed. Any mediated builtin ` +
+          `ESM-imported during that gap is cached in Node's ESM registry as the RAW builtin, and ` +
+          `a cached URL is served without the load chain being consulted — so the load-level ` +
+          `re-mediation backstop is inert for it for the rest of the process. capwall was not in ` +
+          `the hook chain during the gap and cannot name which specifiers those are. Mediation ` +
+          `itself is unaffected; the second layer behind a hijacked resolve hook is not (see ` +
+          `docs/threat-model.md § ESM known limits)\n`,
+      );
+    }
     // Enumerate each mediated specifier's export names BEFORE the hooks go live (the hook must
     // not import a mediated builtin itself — that would recurse through `resolve` and loop), and
     // while an install is active so the registry is built with this install's hardened-ness. See
@@ -143,6 +199,9 @@ export function registerEsmHook(ctx: ShimContext): EsmHookHandle {
         // limit. Deregistering makes the two paths agree: a FRESH access after the last
         // `uninstall()` is un-mediated on both, and a stale CAPTURE fails closed on both.
         live.deregister();
+        // Recorded only on a deregistration that actually happened — the gap is real from here
+        // until the next `install()`, and #182 is what happens in it.
+        anEraHasEnded = true;
       } catch (err) {
         // Never throw from a teardown — `install()` unwinds a list of handles and one failure
         // here would strand the loader patch, the env proxy and the dlopen gate still installed
