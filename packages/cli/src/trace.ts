@@ -4,6 +4,7 @@
  * accumulate coverage without clobbering hand edits — docs/policy-format.md).
  */
 import { readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import * as path from "node:path";
 import { placeholderizeIpcPath, type CapabilityRequest } from "@capwall/core";
 import {
@@ -217,6 +218,40 @@ export async function loadExistingPolicy(file: string): Promise<Policy | null> {
   return parsePolicy(JSON.parse(raw));
 }
 
-export async function writePolicy(file: string, policy: Policy): Promise<void> {
-  await writeFile(file, JSON.stringify(policy, null, 2) + "\n");
+/**
+ * The `$schema` pointer to write into a generated policy, or undefined (issue #124).
+ *
+ * A generated `capabilities.json` is the file the user is immediately told to hand-edit, and
+ * editor validation/completion is worth most exactly there — the `outer>inner` package-key
+ * grammar and the `*>` / `**>` wildcards are the subtleties a schema catches for free. Without
+ * a `$schema` key nobody gets any of it.
+ *
+ * ONLY WHEN THE TARGET REALLY EXISTS. A dangling `$schema` is worse than none: most editors
+ * surface an unresolvable pointer as a diagnostic on line 2 of a file capwall just wrote, which
+ * would make every generated policy look broken. So this checks the path and stays silent
+ * otherwise — which today means it stays silent on the from-a-clone path, where nothing is
+ * installed under `node_modules/@capwall`. Revisit at first publish: a stable `https://` schema
+ * URL would be better than a relative one and would work for everyone.
+ */
+function schemaRefFor(projectRoot: string): string | undefined {
+  const rel = path.join("node_modules", "@capwall", "policy-schema", "schema.json");
+  return existsSync(path.join(projectRoot, rel)) ? "./" + rel.split(path.sep).join("/") : undefined;
+}
+
+/**
+ * Serialize a policy.
+ *
+ * `$schema` is added for a policy that has none, and written FIRST — that is where every
+ * convention puts it and where a reader looks. An existing `$schema` is never rewritten: the
+ * author may be pointing at a checkout, a pinned version, or a vendored copy, and silently
+ * retargeting a field they set is not something a merge should do.
+ */
+export async function writePolicy(
+  file: string,
+  policy: Policy,
+  projectRoot: string,
+): Promise<void> {
+  const ref = policy.$schema === undefined ? schemaRefFor(projectRoot) : undefined;
+  const out = ref === undefined ? policy : { $schema: ref, ...policy };
+  await writeFile(file, JSON.stringify(out, null, 2) + "\n");
 }

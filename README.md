@@ -175,6 +175,10 @@ capwall diff -- node ./src/server.js
 
 # Explain why a given call was allowed/denied:
 capwall explain pino fs:write ./logs/app.log
+
+# Which build is this? (the CLI's version, and the @capwall/core it injects into the target —
+# they are two different processes, so they are two different questions.)
+capwall --version
 ```
 
 See [`examples/express-app`](./examples/express-app) for a full observe→enforce walkthrough
@@ -235,7 +239,7 @@ anything.
 ```
 packages/core            @capwall/core          interception engine + policy evaluator
 packages/cli             @capwall/cli           capwall observe|enforce|run|diff|gen-policy|explain
-packages/policy-schema   @capwall/policy-schema  capabilities.json schema + TS types
+packages/policy-schema   @capwall/policy-schema  capabilities.json schema + TS types + schema.json
 packages/sbom-import     @capwall/sbom-import    STRETCH: CycloneDX/CBOM → policy
 examples/express-app                             observe→enforce walkthrough fixture
 examples/malicious-dep-demo                      inert "malicious" dep capwall blocks

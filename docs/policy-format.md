@@ -10,7 +10,10 @@ types are exported from `@capwall/policy-schema`.
 
 ```jsonc
 {
-  "$schema": "./packages/policy-schema/schema.json",
+  // Editor validation + completion. From a project that has capwall installed:
+  "$schema": "./node_modules/@capwall/policy-schema/schema.json",
+  // (Inside a capwall checkout the schema is at "./packages/policy-schema/schema.json"
+  //  instead. `capwall observe` writes the node_modules form for you when it resolves.)
   "version": 1,               // policy format version
   "mode": "enforce",          // optional: "observe" | "enforce" — see § Enforcement mode
   "default": { /* PackagePolicy applied to any package with no explicit entry */ },
