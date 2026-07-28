@@ -42,7 +42,7 @@
  * the real shape that produced it — an egress global some un-mediated code made non-configurable.
  */
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import * as os from "node:os";
