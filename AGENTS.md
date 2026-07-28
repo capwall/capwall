@@ -224,6 +224,22 @@ as the gate.
 - Keep smoke tests trivial but real (`packages/core/test/core.test.ts` asserts the
   evaluator's deny-by-default semantics and observe-mode pass-through — extend, don't
   delete).
+- **A security test must be able to FAIL.** `pnpm test` is the only gate that runs (#3), so a
+  test that passes for the wrong reason is worse than a missing one — it is a green light
+  nobody re-examines. Issue #112 found six, including a "ReDoS hardening" test that passed
+  with the hardening deleted. Two rules follow, and both are mechanically checkable:
+  - **No silent `if (…) return;` in a test body.** Use `it.skipIf(...)`, which the reporter
+    shows. A body that returns after doing nothing reports green with zero assertions, so an
+    environment where it never runs looks exactly like coverage. Same for `if (cond) { expect
+    … }` with no `else`: assert the other branch too.
+  - **No assertion that the UN-guarded outcome would also satisfy.** `toMatch(/CapabilityError|
+    TypeError/)`, `expect(typeof x).toBe("function")` on a guarded method, `expect(inside)
+    .toEqual(outside)`, `.not.toThrow()` on its own — each is true whether or not the guard
+    exists. Pin the identity, the decision, or the exact value.
+- When you add or change a **guard, gate, pin or attribution rule**, add a mutant to
+  `scripts/mutants.json` and run `pnpm mutation:gate`. It deletes the mechanism and re-runs
+  only the tests that claim to cover it; anything it reports `SURVIVED` is an untested
+  security property. See `docs/ci-local.md` § A sixth gate.
 
 ## 8. Threat-model guardrails
 

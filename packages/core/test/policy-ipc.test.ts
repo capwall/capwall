@@ -125,11 +125,15 @@ describe("machine portability: <tmp> and <home> placeholders", () => {
 
   it("rewrites a home-dir socket and expands it back", () => {
     const observed = slashed(os.homedir()) + "/.myapp/api.sock";
-    // A TMPDIR inside $HOME would make `<tmp>` win; skip the assertion in that case rather
-    // than encode one machine's layout.
-    if (!observed.startsWith(slashed(os.tmpdir()) + "/")) {
-      expect(placeholderizeIpcPath(observed)).toBe("<home>/.myapp/api.sock");
-    }
+    // A TMPDIR inside $HOME makes `<tmp>` win. That is a real, documented precedence rule, so
+    // it gets asserted rather than skipped: dropping the rewrite half on such a machine left
+    // the test's title claiming a rewrite it never checked (#112).
+    const tmpPrefix = slashed(os.tmpdir()) + "/";
+    expect(placeholderizeIpcPath(observed)).toBe(
+      observed.startsWith(tmpPrefix)
+        ? "<tmp>" + observed.slice(tmpPrefix.length - 1)
+        : "<home>/.myapp/api.sock",
+    );
     expect(expandIpcPlaceholders("<home>/.myapp/api.sock")).toBe(observed);
   });
 

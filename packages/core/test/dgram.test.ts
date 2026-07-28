@@ -70,6 +70,12 @@ interface FixtureDep {
     allowed: Target,
     cb: (outcome: string) => void,
   ): void;
+  replayStolenUdpSendRepeatedly(
+    flavor: Flavor,
+    allowed: Target,
+    times: number,
+    cb: (stolenType: string, outcomes: string[]) => void,
+  ): void;
 }
 
 function loadFixtureFresh(): FixtureDep {
@@ -375,6 +381,39 @@ describe("#86 — attacking the authorization the replay fix carries", () => {
         // would forward the second one silently and leave exactly one.
         expect(result).toBe("sent");
         expect(decisions.filter((d) => d.decision.observed.kind === "net")).toHaveLength(2);
+      });
+
+      it(`a stolen authorization is SINGLE-USE (${flavor}, hardened=${hardened})`, async () => {
+        /*
+         * FOUND BY `scripts/mutation-guard.mjs` (#112). Deleting the `spent` guard from
+         * `mintDgramReplayToken` left `dgram.test.ts` and `net.test.ts` fully green: the two
+         * cases above vary the DESTINATION and the SOCKET, and both fall back to the guard for
+         * reasons that have nothing to do with `spent`. Nothing anywhere spent a valid token
+         * twice, so "one use" was asserted by the comment and by nothing else.
+         *
+         * What a re-spendable token buys an attacker: an un-gated `send` to that socket and
+         * destination that lives as long as the reference does — including across an
+         * `install()` that tightened the policy — and, because it never reaches the guard, one
+         * that is absent from the audit trail.
+         *
+         * The destination is granted, so "did it send?" cannot tell the two apart. The DECISION
+         * COUNT can: 1 for the original send, plus one per use that correctly fell back to the
+         * guard. 3 uses ⇒ 1 + 2 = 3 decisions; a re-spendable token records exactly 1.
+         */
+        const USES = 3;
+        const { result, decisions } = await withCapwall(grantReceiver(), hardened, (dep) => {
+          return new Promise<{ stolenType: string; outcomes: string[] }>((resolve) => {
+            dep.replayStolenUdpSendRepeatedly(
+              flavor,
+              { host: HOST, port: allowedPort },
+              USES,
+              (stolenType, outcomes) => resolve({ stolenType, outcomes }),
+            );
+          });
+        });
+        expect(result.stolenType).toBe("function"); // the steal itself still succeeds
+        expect(result.outcomes).toEqual(["sent", "sent", "sent"]); // all granted, none throws
+        expect(decisions.filter((d) => d.decision.observed.kind === "net")).toHaveLength(USES);
       });
     }
   }

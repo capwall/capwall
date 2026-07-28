@@ -43,6 +43,8 @@ import {
   type InstallHandle,
   type Policy,
 } from "../src/index.js";
+import { packageForPath } from "../src/attribution/index.js";
+import { REAL_ADDON } from "./helpers/real-addon.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const requireCjs = createRequire(import.meta.url);
@@ -151,6 +153,11 @@ const GRANT_ALL = (port: number): Policy =>
         },
         // The addon file the native gate charges as the OWNER subject lives in this package.
         "fixture-native-loader": { native: true },
+        // The native gate charges BOTH the caller and the package that OWNS the `.node` file
+        // (loader/native.ts). The borrowed real addon lives in the pnpm store, so its owner is
+        // whatever binding package that is — resolved rather than hard-coded, because it is
+        // platform-keyed.
+        ...(REAL_ADDON === null ? {} : { [packageForPath(REAL_ADDON, here)]: { native: true } }),
       },
     },
     { projectRoot: here },
@@ -194,10 +201,20 @@ async function refusedAsync(fn: () => Promise<unknown>): Promise<boolean> {
 interface Surface {
   name: string;
   run: (dep: FixtureDep) => boolean | Promise<boolean>;
-  /** Skip the whole row when the surface does not exist on this runtime. `WebSocket` needs
+  /**
+   * Skip the whole row when the surface does not exist on this runtime. `WebSocket` needs
    * `--experimental-websocket` on Node 20 and `EventSource` is behind
    * `--experimental-eventsource` everywhere; a row that silently reports "not refused" for both
-   * arms because the API is absent would assert nothing while looking green. */
+   * arms because the API is absent would assert nothing while looking green.
+   *
+   * A SKIP IS ONLY ACCEPTABLE WITH COVERAGE ELSEWHERE (#112 item 2). vitest is never handed
+   * those flags, so the `EventSource` row skips on Node 20, 22 AND 24 and the `WebSocket` row
+   * skips on the Node 20 leg of the CI matrix. Both cells are covered instead by
+   * `global-egress-flagged.test.ts`, which spawns a child with both flags and now runs the
+   * granted/denied × hardened-on/off matrix there — see its
+   * `#80 × #17 … under hardened mode` block. The `native` row's skip is covered by
+   * `native.test.ts`'s `REAL, loadable addon` suite (same helper, same discovery).
+   */
   available?: () => boolean;
 }
 
@@ -286,8 +303,18 @@ const SURFACES: Surface[] = [
   {
     // The `native` gate is a `process.dlopen` patch, not a shim — hardened mode does not touch
     // it, which is exactly why it belongs in this row: nothing should CHANGE.
+    //
+    // POINTED AT A REAL ADDON (#112 item 5). This row used to load fixture-dep's own
+    // `build/Release/fixture-addon.node`, which is UTF-8 text, not an addon. `process.dlopen`
+    // therefore threw a format error on BOTH arms, and `refused()` reports any non-
+    // `CapabilityError` as "not refused" — so the granted arm read identically whether the gate
+    // allowed the load or never ran at all. The denied arm discriminated; the granted arm, which
+    // is the entire point of this file (#86 broke ALLOWED operations), could not.
+    // `helpers/real-addon.ts` borrows a genuinely loadable binding out of the pnpm store; where
+    // no such binding exists the row skips loudly rather than reporting a hollow pass.
     name: "native .node load (process.dlopen)",
-    run: (dep) => refused(() => dep.loadNativeViaDlopen()),
+    run: (dep) => refused(() => dep.loadNativeViaDlopen(REAL_ADDON!)),
+    available: () => REAL_ADDON !== null,
   },
   {
     // `Module.prototype._compile` (#93). Also not a shim, also refcounted, also unaffected by
@@ -325,6 +352,39 @@ describe("#90 — hardened mode lets GRANTED operations through, on every guarde
     });
   }
 });
+
+describe.skipIf(REAL_ADDON === null)(
+  "#90 — a GRANTED native load genuinely initializes, hardened ON and OFF (#112)",
+  () => {
+    /**
+     * The matrix row above can only say "capwall did not refuse". This says the load actually
+     * happened: `process.dlopen` mapped the addon in and its `module.exports` came back
+     * populated. That is the discriminating half the stub fixture could never provide — the
+     * whole reason `native .node load` was flagged in #112 as a row whose granted arm proved
+     * nothing.
+     *
+     * `helpers/real-addon.ts` documents why loading the same binding repeatedly is safe.
+     */
+    it("dlopen returns a populated exports object under both hardening settings", () => {
+      for (const hardened of [false, true]) {
+        const dep = capwall(GRANT_ALL(PORT), hardened);
+        const exports = dep.loadNativeViaDlopen(REAL_ADDON!);
+        expect({ hardened, type: typeof exports }).toEqual({ hardened, type: "object" });
+        expect({ hardened, keys: Object.keys(exports as object).length > 0 }).toEqual({
+          hardened,
+          keys: true,
+        });
+        expect(
+          decisions.filter((d) => d.decision.observed.kind === "native").length,
+        ).toBeGreaterThan(0);
+        expect(
+          decisions.filter((d) => d.decision.observed.kind === "native" && !d.decision.allowed),
+        ).toEqual([]);
+        open.pop()?.uninstall();
+      }
+    });
+  },
+);
 
 describe("#90 — hardened mode does not change what is RECORDED either", () => {
   /**
@@ -368,17 +428,30 @@ describe("#90 — the hardened pin does not break ordinary use of a guarded obje
       });
       expect(isCapabilityError(err)).toBe(false);
     }
+    // "No CapabilityError" is also what a DELETED dgram guard looks like. The three sends must
+    // additionally have been SEEN and allowed — three trips through the guard, not zero (#112).
+    const netDecisions = decisions.filter(
+      (d) => d.pkg === "fixture-dep" && d.decision.observed.kind === "net",
+    );
+    expect(netDecisions).toHaveLength(3);
+    expect(netDecisions.every((d) => d.decision.allowed)).toBe(true);
   });
 
-  it("a granted package can still read `socket.send` and get a callable function", () => {
+  it("a granted package can still read `socket.send` and get capwall's guarded function", () => {
     const dep = capwall(GRANT_ALL(PORT), true) as FixtureDep & {
       patchUdpSocketSend(flavor: string, replacement: unknown): unknown;
     };
     // Hardened: the write is refused (sloppy mode → silent no-op), and what reads back must
     // still be capwall's guarded function, not `undefined` and not the raw method.
-    const after = dep.patchUdpSocketSend("factory", () => "PATCHED");
+    //
+    // The comparison is against the REPLACEMENT ITSELF, not against the string it returns.
+    // `expect(after).not.toBe("PATCHED")` compared a function to a string, which is true for
+    // every function including the attacker's — so it passed with the hardened pin removed
+    // entirely (#112). `dgram.test.ts` has always compared identities; this now matches it.
+    const replacement = (): string => "PATCHED";
+    const after = dep.patchUdpSocketSend("factory", replacement);
     expect(typeof after).toBe("function");
-    expect(after).not.toBe("PATCHED");
+    expect(after).not.toBe(replacement);
   });
 
   it("a granted package can still tune http.globalAgent's live pool state under hardening", () => {

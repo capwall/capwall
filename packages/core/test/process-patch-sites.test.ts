@@ -358,13 +358,13 @@ describe("#107 — every registered site survives a nested, out-of-LIFO-order te
 
       const outer = site.install(liveCtx);
       const inner = site.install(liveCtx);
-      if (site.depth() === 0) {
-        // The site declined (an absent global / an exotic runtime). Its handles must be inert.
-        outer.uninstall();
-        inner.uninstall();
-        expect(sameIdentity(site.probe(), before)).toBe(true);
-        return;
-      }
+      // NO "the site declined" ESCAPE HATCH (#112). This used to early-return when
+      // `site.depth() === 0`, asserting only "nothing changed" — which is trivially true of a
+      // site that never patched, so a site that silently STOPPED patching took the quiet branch
+      // and reported green. That is the one regression this whole file exists to catch, and
+      // "is not decorative" above already establishes that every registered site engages, so
+      // declining here is a failure, not a runtime variation.
+      expect(site.depth(), `${site.name} declined to install`).toBeGreaterThan(0);
       expect(site.depth(), "a second install must be counted").toBe(2);
       expect(sameIdentity(site.probe(), before), `${site.name} did not patch`).toBe(false);
 
@@ -400,9 +400,10 @@ describe("#107 — every registered site survives a nested, out-of-LIFO-order te
       const before = site.probe();
       site.install(liveCtx).uninstall();
       const again = site.install(liveCtx);
-      if (site.depth() > 0) {
-        expect(sameIdentity(site.probe(), before), `${site.name} did not re-patch`).toBe(false);
-      }
+      // Unconditional, for the same reason as the nesting row above: `if (site.depth() > 0)`
+      // let a site that stopped patching skip the only assertion that says it re-patched (#112).
+      expect(site.depth(), `${site.name} declined to re-install`).toBeGreaterThan(0);
+      expect(sameIdentity(site.probe(), before), `${site.name} did not re-patch`).toBe(false);
       again.uninstall();
       expect(sameIdentity(site.probe(), before)).toBe(true);
     }

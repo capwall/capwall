@@ -144,8 +144,16 @@ describe("worker_threads shim — passthrough", () => {
   it("exposes non-Worker exports unmodified", () => {
     const { ctx } = makeCtx(emptyEnforcePolicy(), "enforce");
     const shim = createWorkerThreadsShim(ctx);
-    expect(typeof shim.isMainThread).toBe("boolean");
-    expect(typeof shim.MessageChannel).toBe("function");
-    expect(shim.SHARE_ENV).toBeDefined();
+    // IDENTITY, not shape. `typeof shim.MessageChannel === "function"` is true of the real
+    // class, of a silently substituted one, and of anything else callable — so the shape-only
+    // version of this test passed against a shim that handed out something else entirely, and
+    // would have passed with no shim at all. "Unmodified" means `===` the real export (#112).
+    expect(shim.isMainThread).toBe(realWorkerThreads.isMainThread);
+    expect(shim.MessageChannel).toBe(realWorkerThreads.MessageChannel);
+    expect(shim.MessagePort).toBe(realWorkerThreads.MessagePort);
+    expect(shim.SHARE_ENV).toBe(realWorkerThreads.SHARE_ENV);
+    // …and the one export that must NOT be unmodified, so this cannot be satisfied by simply
+    // re-exporting the builtin wholesale.
+    expect(shim.Worker).not.toBe(realWorkerThreads.Worker);
   });
 });

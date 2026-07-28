@@ -23,6 +23,23 @@ The five gates are genuinely five different checks:
 | `lint` | [oxlint](https://oxc.rs) once over the whole repo, config in `.oxlintrc.json` | Defects `tsc` does not check — unused bindings, unreachable/duplicate code, `no-explicit-any`, misuse patterns. It is **not** a style gate; see the config's comments for why the pedantic rules are off. |
 | `bench:gate` | `scripts/bench/bench.mjs --quick`, ~10s | Performance regressions on the mediated hot path. Gates on a **ratio** against a CPU calibration co-sampled in the same loop, not on absolute microseconds, so it is portable and not flaky on a busy machine — see `scripts/bench/README.md` § The regression gate for the derivation. Needs `pnpm build` first (it runs against `dist/`). `CI_BENCH=0 pnpm ci:local` skips it. |
 
+### A sixth gate, run periodically rather than per-commit: `pnpm mutation:gate`
+
+`node scripts/mutation-guard.mjs` (~2 min) answers the question issue #112 was opened over:
+**does this test still pass with the mechanism it names deleted?** For each entry in
+`scripts/mutants.json` it establishes that the claimed tests pass unmutated, edits one anchor
+string out of one source file, re-runs only those tests, and restores. A mutant the tests still
+pass is reported `SURVIVED` — not a bug in the source, a hole in the tests.
+
+It is not in `ci:local` because it runs vitest once per mutant plus a baseline. What *is* in
+`pnpm test` is the cheap half: `packages/core/test/mutation-catalog.test.ts` asserts every anchor
+still occurs exactly once in its file, so a refactor that moves a guarded mechanism breaks loudly
+instead of silently retiring a mutant into a no-op edit.
+
+Run it when you touch a guard, a gate, the pinning, or the attribution rules — and add a mutant
+when you add one. `pnpm mutation:gate --only <id>` runs a single entry; `--list` prints the
+catalog.
+
 ## The CI-faithful path (Docker matrix)
 
 `.github/workflows/ci.yml` runs on **Node 20 and 22**. To reproduce that matrix — clean install, both Node versions, all gates — in Docker:

@@ -8,6 +8,7 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import * as nodeModule from "node:module";
 import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -27,6 +28,20 @@ const POLICY_SWAP_APP = path.join(APP_DIR, "policy-swap-app.mjs");
 /** #78 regression entry: a loader hook ahead of capwall's, caught by the load()-level backstop. */
 const BACKSTOP_APP = path.join(APP_DIR, "backstop-app.mjs");
 const PRELOAD = createRequire(import.meta.url).resolve("../dist/preload.js");
+
+/**
+ * `module.registerHooks()` is Node ≥22.15 — absent on the Node 20 leg of the CI matrix.
+ *
+ * Evaluated ONCE here, at module scope, so the two tests that depend on it can `skipIf` (which
+ * the reporter shows) instead of accepting an `UNSUPPORTED` alternative in an assertion or
+ * returning silently mid-body (which it does not). #112 found both shapes here: an
+ * `expect(...).toMatch(/…|UNSUPPORTED/)` that the Node-20 leg satisfied without ever testing
+ * the gate, and a `if (…UNSUPPORTED) return;` that made a whole test a no-op there.
+ */
+// Read off the namespace rather than imported by name: `@types/node` is pinned at v20 here, so
+// `registerHooks` is not in the declarations even on a runtime that has it.
+const HAS_REGISTER_HOOKS =
+  typeof (nodeModule as { registerHooks?: unknown }).registerHooks === "function";
 
 interface RunResult {
   code: number;
@@ -164,7 +179,16 @@ describe("#61 — a dependency cannot register a loader hook ahead of capwall's"
     );
     // `registerHooks` is Node >=22.15; on an older runtime the API is simply absent, which is
     // not a bypass. `register` (Node >=20.6) is always present, so it always asserts.
-    expect(r.stdout).toMatch(/HOOKJACK:registerHooks:(BLOCKED:esm-hookjack-dep|UNSUPPORTED)/);
+    //
+    // The expected string is DERIVED from the runtime rather than offered as an alternation:
+    // `/…(BLOCKED:esm-hookjack-dep|UNSUPPORTED)/` let the Node-20 leg pass on the un-guarded
+    // outcome, so the `registerHooks` gate had no coverage there and would not have had any if
+    // it were deleted on 22 either — the alternation accepted both (#112).
+    expect(r.stdout).toContain(
+      HAS_REGISTER_HOOKS
+        ? "HOOKJACK:registerHooks:BLOCKED:esm-hookjack-dep"
+        : "HOOKJACK:registerHooks:UNSUPPORTED",
+    );
     expect(r.stdout).toContain("HOOKJACK:register:BLOCKED:esm-hookjack-dep");
     expect(r.stderr).toMatch(/DENY 'esm-hookjack-dep' module\.register/);
   });
@@ -270,7 +294,7 @@ describe("#78 — the load()-level re-mediation backstop actually fires", () => 
     }
   });
 
-  it("holds against the SYNCHRONOUS registerHooks chain too, which runs ahead of capwall's", async () => {
+  it.skipIf(!HAS_REGISTER_HOOKS)("holds against the SYNCHRONOUS registerHooks chain too, which runs ahead of capwall's", async () => {
     // `module.registerHooks()` (Node ≥22.15) is the strictly stronger position: its resolve chain
     // runs entirely ahead of the asynchronous `register` chain capwall lives in. The asynchronous
     // LOAD chain still descends to capwall, which is what makes the backstop reach this case —
@@ -284,7 +308,10 @@ describe("#78 — the load()-level re-mediation backstop actually fires", () => 
       },
       BACKSTOP_APP,
     );
-    if (r.stdout.includes("BACKSTOP:UNSUPPORTED")) return;
+    // The runtime-level skip is `skipIf(!HAS_REGISTER_HOOKS)` above, which the reporter shows.
+    // This pins that the CHILD agrees with the parent's view — a silent `return` here used to
+    // turn the whole test into a green no-op on Node 20 (#112).
+    expect(r.stdout).not.toContain("BACKSTOP:UNSUPPORTED");
     for (const spec of MEDIATED) {
       expect(r.stdout, `${spec} reached the raw builtin via the sync chain`).toContain(
         `BACKSTOP:${spec}:SHIM`,

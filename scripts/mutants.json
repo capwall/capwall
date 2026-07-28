@@ -1,0 +1,141 @@
+{
+  "_readme": [
+    "MUTATION CATALOG — the structural guard for 'tests that pass for the wrong reason' (issue #112).",
+    "",
+    "Each entry names ONE security-critical mechanism, an exact anchor string in the source that",
+    "IS that mechanism, a mutation that removes it, and the test files that CLAIM to cover it.",
+    "`node scripts/mutation-guard.mjs` applies each mutation in turn, runs only the claimed tests,",
+    "and reports SURVIVED for any mutant those tests still pass against. A survivor is not a bug in",
+    "the source — it is a hole in the tests, which is the thing #112 found six of.",
+    "",
+    "`packages/core/test/mutation-catalog.test.ts` runs in the ordinary `pnpm test` and asserts that",
+    "every `anchor` still occurs EXACTLY ONCE in its `file`, and that every `tests` path exists. That",
+    "is what keeps this catalog from rotting into a no-op: a refactor that moves a mechanism breaks",
+    "the catalog loudly instead of silently turning its mutant into a no-op edit.",
+    "",
+    "`needsBuild` marks mutants whose claimed tests spawn a subprocess against `dist/` — those need",
+    "a rebuild after mutating and after restoring."
+  ],
+  "mutants": [
+    {
+      "id": "glob-star-collapse",
+      "mechanism": "#21 — collapse runs of `**` segments so a glob compiles to ONE unbounded group (ReDoS hardening)",
+      "file": "packages/core/src/policy/glob.ts",
+      "anchor": "if (seg === \"**\" && segments[segments.length - 1] === \"**\") continue;",
+      "mutation": "if (false && seg === \"**\" && segments[segments.length - 1] === \"**\") continue;",
+      "tests": ["packages/core/test/glob.test.ts"],
+      "needsBuild": false,
+      "note": "The #112 item-1 regression anchor. SURVIVED before #112; must stay CAUGHT."
+    },
+    {
+      "id": "nodeglob-dotdot-fail-closed",
+      "mechanism": "#106 — a `..` segment after the first magic segment makes an fs.glob pattern unbounded (fail closed to the filesystem root)",
+      "file": "packages/core/src/policy/glob.ts",
+      "anchor": "if (rest.includes(\"..\")) return null;",
+      "mutation": "if (false && rest.includes(\"..\")) return null;",
+      "tests": ["packages/core/test/glob.test.ts", "packages/core/test/fs-glob.test.ts"],
+      "needsBuild": false
+    },
+    {
+      "id": "nodeglob-brace-escape",
+      "mechanism": "#106 — a brace group spanning a `/` or containing `..` moves an fs.glob walk's root, so it is unbounded",
+      "file": "packages/core/src/policy/glob.ts",
+      "anchor": "if (!bracesAreSegmentLocal(rest.join(\"/\"))) return null;",
+      "mutation": "if (false && !bracesAreSegmentLocal(rest.join(\"/\"))) return null;",
+      "tests": ["packages/core/test/glob.test.ts", "packages/core/test/fs-glob.test.ts"],
+      "needsBuild": false
+    },
+    {
+      "id": "evaluate-own-property-only",
+      "mechanism": "policy evaluation reads grants as OWN properties only, so a polluted Object.prototype cannot inject a grant into the empty deny-by-default grant",
+      "file": "packages/core/src/policy/evaluate.ts",
+      "anchor": "return Object.hasOwn(grant, key) ? grant[key] : undefined;",
+      "mutation": "return grant[key];",
+      "tests": ["packages/core/test/core.test.ts"],
+      "needsBuild": false
+    },
+    {
+      "id": "native-two-subjects",
+      "mechanism": "#49/#99 — a `.node` load is charged to BOTH the caller and the package that owns the addon file; caller-only makes a shared resolver a skeleton key",
+      "file": "packages/core/src/loader/native.ts",
+      "anchor": "const subjects = caller === owner ? [caller] : [caller, owner];",
+      "mutation": "const subjects = [caller];",
+      "tests": ["packages/core/test/native.test.ts"],
+      "needsBuild": false
+    },
+    {
+      "id": "native-filename-pin",
+      "mechanism": "#99 — the dlopen filename argument is stringified ONCE and the pinned string is forwarded, so a toString that answers twice cannot load a file the gate never saw",
+      "file": "packages/core/src/loader/native.ts",
+      "anchor": "    const converted = String(raw); // the ONE conversion — Node's `node::Utf8Value`, in JS\n    return { path: normalizeAddonPath(converted), forward: converted };",
+      "mutation": "    return { path: UNKNOWN_ADDON, forward: undefined };",
+      "tests": ["packages/core/test/native.test.ts"],
+      "needsBuild": false
+    },
+    {
+      "id": "attribution-unattributed-not-app",
+      "mechanism": "#60 — an unattributable call charges `<unknown>`, an ordinary deny-by-default principal, and NOT the exempt `<app>` trust root",
+      "file": "packages/core/src/attribution/index.ts",
+      "anchor": "  if (chain.length === 0) return UNATTRIBUTED;",
+      "mutation": "  if (chain.length === 0) return APP_ROOT;",
+      "tests": [
+        "packages/core/test/attribution.test.ts",
+        "packages/core/test/attribution-laundering.test.ts",
+        "packages/core/test/attribution-maxframes.test.ts"
+      ],
+      "needsBuild": false
+    },
+    {
+      "id": "harden-freeze-namespace",
+      "mechanism": "#17 — hardened mode freezes the shim namespaces capwall hands out, so `fs.readFileSync = evil` cannot remove a guard",
+      "file": "packages/core/src/shims/harden.ts",
+      "anchor": "  if (ctx.hardened === true) Object.freeze(o);",
+      "mutation": "  if (false && ctx.hardened === true) Object.freeze(o);",
+      "tests": ["packages/core/test/hardened.test.ts"],
+      "needsBuild": true
+    },
+    {
+      "id": "harden-freeze-class",
+      "mechanism": "#17/#70 — hardened mode freezes guarded SUBCLASSES and their prototypes, closing `net.Socket.prototype.connect = evil`",
+      "file": "packages/core/src/shims/harden.ts",
+      "anchor": "  if (ctx.hardened !== true) return;\n  if (typeof Cls !== \"function\") return;",
+      "mutation": "  if (ctx.hardened !== true) return;\n  if (typeof Cls !== \"function\") return;\n  if (Cls) return;",
+      "tests": ["packages/core/test/hardened.test.ts", "packages/core/test/class-escapes.test.ts"],
+      "needsBuild": true
+    },
+    {
+      "id": "global-egress-hardened-pin",
+      "mechanism": "#97 — a hardened install pins the capwall-installed global egress functions writable:false, even when an un-hardened install built them",
+      "file": "packages/core/src/shims/global-egress.ts",
+      "anchor": "    slot.pin(replacement); // best-effort — a global someone made non-configurable is reported below",
+      "mutation": "    void slot; void replacement;",
+      "tests": [
+        "packages/core/test/global-egress.test.ts",
+        "packages/core/test/install-option-parity.test.ts"
+      ],
+      "needsBuild": true
+    },
+    {
+      "id": "env-authorized-key-scoping",
+      "mechanism": "#98 — the env-gate suspension during a real spawn is scoped to the exact keys Node itself reads, not a blanket 'gate off' window",
+      "file": "packages/core/src/shims/runtime.ts",
+      "anchor": "  return authorizedEnvKeys !== null && authorizedEnvKeys.has(key);",
+      "mutation": "  return authorizedEnvKeys !== null;",
+      "tests": [
+        "packages/core/test/child_process-env.test.ts",
+        "packages/core/test/env.test.ts",
+        "packages/core/test/composition-matrix.test.ts"
+      ],
+      "needsBuild": false
+    },
+    {
+      "id": "dgram-replay-single-use",
+      "mechanism": "#60/#86 — the dgram auto-bind replay token is single-use, so a dependency that reads `socket.send` cannot keep an un-gated send around",
+      "file": "packages/core/src/shims/net.ts",
+      "anchor": "      spent ||\n      this !== auth.socket ||",
+      "mutation": "      this !== auth.socket ||",
+      "tests": ["packages/core/test/dgram.test.ts", "packages/core/test/net.test.ts"],
+      "needsBuild": false
+    }
+  ]
+}

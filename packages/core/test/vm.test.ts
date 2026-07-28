@@ -129,21 +129,54 @@ describe("vm shim — class escape surfaces (#64)", () => {
     );
   });
 
-  it("SourceTextModule/SyntheticModule are gated when present, and absent ones don't throw", () => {
-    // These live behind `--experimental-vm-modules`; the shim must build either way.
+  /*
+   * `vm.SourceTextModule` / `vm.SyntheticModule` live behind `--experimental-vm-modules`, and
+   * vitest is never handed that flag (`packages/core/vitest.config.ts` sets only
+   * `esbuild.include`; `.github/workflows/ci.yml` runs plain `pnpm test`). So they are
+   * `undefined` on Node 20, 22 AND 24 as this suite runs.
+   *
+   * This used to be ONE test whose title claimed both halves — "gated when present, and absent
+   * ones don't throw" — with the present-half behind a `continue` that has never executed on any
+   * supported runtime (#112). Splitting it makes the state of affairs legible in the reporter: a
+   * row that runs everywhere, and a row that visibly SKIPS everywhere. And the present-half now
+   * asserts the gate BEHAVIORALLY (a `CapabilityError`), not just that the class was replaced —
+   * `Cls !== real[name]` would hold for any substitute, guarded or not.
+   */
+  const VM_MODULE_CLASSES = ["SourceTextModule", "SyntheticModule"] as const;
+  const realVmRecord = realVm as unknown as Record<string, unknown>;
+  const HAS_VM_MODULES = VM_MODULE_CLASSES.every(
+    (n) => typeof realVmRecord[n] === "function",
+  );
+
+  it("omits SourceTextModule/SyntheticModule when the runtime does not have them", () => {
     const { ctx } = makeCtx(emptyEnforcePolicy(), "enforce");
     const vmShim = createVmShim(ctx) as unknown as Record<string, unknown>;
-    const real = realVm as unknown as Record<string, unknown>;
-    for (const name of ["SourceTextModule", "SyntheticModule"]) {
-      if (typeof real[name] !== "function") {
-        expect(vmShim[name]).toBeUndefined();
-        continue;
-      }
-      const Cls = vmShim[name] as new (...a: never[]) => unknown;
-      expect(Cls).not.toBe(real[name]);
-      expect((Cls as { prototype: Record<string, unknown> }).prototype["constructor"]).toBe(Cls);
+    for (const name of VM_MODULE_CLASSES) {
+      // Mirrors the real module either way, so this row asserts something on both kinds of
+      // runtime instead of silently doing nothing on one of them.
+      expect({ name, shimmed: vmShim[name] === undefined }).toEqual({
+        name,
+        shimmed: typeof realVmRecord[name] !== "function",
+      });
     }
   });
+
+  it.skipIf(!HAS_VM_MODULES)(
+    "gates SourceTextModule/SyntheticModule when the runtime has them (--experimental-vm-modules)",
+    () => {
+      const { ctx } = makeCtx(emptyEnforcePolicy(), "enforce");
+      const vmShim = createVmShim(ctx) as unknown as Record<string, unknown>;
+      for (const name of VM_MODULE_CLASSES) {
+        const Cls = vmShim[name] as new (...a: never[]) => unknown;
+        expect(Cls).not.toBe(realVmRecord[name]);
+        expect((Cls as { prototype: Record<string, unknown> }).prototype["constructor"]).toBe(Cls);
+        // The load-bearing half: a guarded class that does not DENY is not a gate.
+        expect(() => new Cls(...(["export default 1;"] as never[]))).toThrowError(
+          expect.objectContaining({ name: "CapabilityError" }),
+        );
+      }
+    },
+  );
 });
 
 describe("vm shim — observe mode never blocks", () => {
