@@ -70,6 +70,19 @@ has to be findable without reading the diff.
 
 ### Added
 
+- **The `malicious-dep-demo` definition-of-done demo is now gated by a test** (#164), and the
+  committed `examples/malicious-dep-demo/node_modules/sneaky-dep` fixture it needs — deleted by
+  accident for the third time, most recently in the merge of #173 — is restored.
+
+  AGENTS.md § 6 names "blocked in `enforce`, only logged in `observe`" as part of the definition
+  of done, and nothing mechanical checked it. With the fixture gone, `pnpm test`,
+  `pnpm mutation:gate`, `pnpm bench:gate` and `pnpm ci:local` were **green on all three Node
+  versions**. `packages/cli/test/malicious-dep-demo.test.ts` runs the demo end to end and asserts
+  the observable outcome — the env read soft-denies to `undefined`, the fs read is denied before
+  any bytes are read, both `DENY` lines are printed, and the `observe` policy lists exactly the
+  two capabilities the dependency attempted and no `net` grant (AGENTS.md § 8's "stays obviously
+  inert", mechanically). A third test runs the demo with the fixture absent and asserts the
+  enforce assertions genuinely stop holding, so the gate cannot pass for the wrong reason.
 - **Node 24 and Node 26 are tested.** 24 is the active LTS; 26 becomes LTS on 2026-10-28 and is
   carried early so breakage surfaces before it is everyone's runtime.
 - **Web Storage is classified.** Node 26 introduced `Storage`/`localStorage`/`sessionStorage`,
