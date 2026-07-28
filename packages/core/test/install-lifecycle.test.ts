@@ -25,6 +25,7 @@
  *   - installs NEST. `uninstall()` deactivates one install and re-exposes the one below it —
  *     including for already-captured shims — in any order, not just LIFO.
  */
+import { readFileSync as fsReadFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -91,6 +92,49 @@ function track(handle: InstallHandle): InstallHandle {
 afterEach(() => {
   while (open.length > 0) open.pop()?.uninstall();
 });
+
+/* ── the co-sampled reference for the ratio backstop at the bottom of this file (#145) ────── */
+
+/**
+ * The UNMEDIATED form of the exact call the backstop measures: the same `readFileSync`, on the
+ * same file, reached through this test file's own `node:fs` binding rather than through the
+ * fixture's captured shim.
+ *
+ * `scripts/bench/bench.mjs` gates on a ratio against a co-sampled CPU calibration for the same
+ * reason this does — an absolute microsecond figure is a statement about the machine, not about
+ * the code. Here the reference can be stronger than a synthetic CPU loop: capwall's overhead on
+ * `readFileSync` is a MULTIPLIER on `readFileSync`, so dividing by the raw call cancels CPU
+ * speed AND filesystem contention, which a pure-CPU calibration does not. That mattered
+ * empirically: a CPU-only reference put the gate's own margin at 4.8 during a parallel suite
+ * run, because the mediated arm does real I/O and the reference arm did not.
+ *
+ * Imported at module scope, before any `install()` in this file, so it is the real builtin.
+ */
+const rawReadFileSync = fsReadFileSync;
+const DATA_FILE = path.join(FIXTURE, "data.txt");
+/** Kept live so V8 cannot eliminate the reference loop as dead code. */
+let SINK: unknown = null;
+
+/**
+ * MEASURED, then given ~2x headroom. The gated figure — the MINIMUM per-block ratio of mediated ÷
+ * raw `readFileSync` — observed on this tree, Node 22 (#145):
+ *
+ *   | condition                                              | min per-block ratio |
+ *   |--------------------------------------------------------|---------------------|
+ *   | this file alone, 16-core host                           |         7.0 – 8.9   |
+ *   | inside a full parallel `vitest run`, 16-core host       |         2.9 – 6.8   |
+ *   | inside a full parallel run at ~4x CPU oversubscription  |         3.1 – 3.4   |
+ *   | inside a full parallel run in `docker run --cpus=2`     |               5.4   |
+ *
+ * Note which direction contention moves it: DOWN, because the reference arm is slowed too. The
+ * binding case for the limit is the quiet machine, not the busy one — the opposite of the
+ * wall-clock assertion this replaced, and the reason it is a usable gate.
+ *
+ * 18 is ~2x the widest of those. It is not tuned until the run goes green: a per-call proxy or a
+ * per-call registry rebuild — the regressions this exists to catch — multiplies the mediated arm
+ * again, landing far outside it.
+ */
+const RATIO_LIMIT = 18;
 
 const isDenied = (fn: () => unknown): boolean => {
   try {
@@ -335,19 +379,67 @@ describe("#87 — the fix adds no per-call work to the hot path", () => {
   });
 
   /**
-   * A crude wall-clock backstop for the same claim. The bound is deliberately enormous relative
-   * to the measured cost (single-digit µs per mediated call) — it exists to catch an accidental
-   * order-of-magnitude regression such as a per-call proxy or a per-call registry rebuild, not
-   * to benchmark. Tightening it would buy nothing and would flake on a loaded CI box.
+   * A backstop for the same claim, stated as a RATIO rather than a wall clock (#145).
+   *
+   * This used to assert `perCallUs < 500` against a measured single-digit µs — a ~100x margin,
+   * which still went red on a loaded box. A per-call wall clock cannot be made
+   * contention-proof by widening it: the loop measures elapsed time, and a descheduled process
+   * accumulates elapsed time it did not spend running. 200 ms of scheduler stall spread over
+   * 2000 iterations reads as +100 µs per call, and no bound that still catches a real
+   * regression survives that.
+   *
+   * So it is measured the way `scripts/bench/bench.mjs` gates the perf budget: divided by a
+   * reference CO-SAMPLED in the same interleaved loop, with the gate taking the MINIMUM
+   * per-block ratio. Both arms are descheduled together, so a stall that inflates one inflates
+   * the other and mostly cancels, and the minimum block is the least-disturbed sample. The
+   * reference here is the SAME `readFileSync` on the SAME file, unmediated — so the number is
+   * literally "what capwall multiplies this call by", and it says the same thing on a 2-core
+   * runner, on a 16-core box, and on either at 4x oversubscription.
+   *
+   * It is still a coarse backstop, not a benchmark: it exists to catch an accidental
+   * order-of-magnitude regression (a per-call proxy, a per-call registry rebuild), and
+   * {@link RATIO_LIMIT} is set from a measurement rather than nudged until green. The real
+   * per-call budget lives in the bench harness, which controls its own environment.
    */
-  it("stays in the microsecond range per mediated call", () => {
+  it("costs a bounded multiple of the same unmediated call, per mediated call", () => {
     track(install(loose(), "enforce", OPTS));
     const dep = loadFixtureFresh();
-    for (let i = 0; i < 200; i++) dep.readData(); // warm up JIT + fs cache
-    const N = 2000;
-    const t0 = process.hrtime.bigint();
-    for (let i = 0; i < N; i++) dep.readData();
-    const perCallUs = Number(process.hrtime.bigint() - t0) / 1000 / N;
-    expect(perCallUs).toBeLessThan(500);
+    // Warm both arms: JIT, the page cache, and each call site's own inline caches.
+    for (let i = 0; i < 300; i++) dep.readData();
+    for (let i = 0; i < 300; i++) SINK = rawReadFileSync(DATA_FILE, "utf8");
+
+    // Interleave at ~50 µs granularity: a scheduler stall long enough to matter then lands on
+    // both arms in roughly the proportion they occupy, instead of on whichever one it
+    // interrupted. Coarser interleaving (a whole arm, then the other) measurably widened the
+    // spread when this was written.
+    const BLOCKS = 15;
+    const CHUNKS = 30;
+    const PER_CHUNK = 10;
+    const ratios: number[] = [];
+    for (let b = 0; b < BLOCKS; b++) {
+      let mediatedNs = 0;
+      let rawNs = 0;
+      for (let c = 0; c < CHUNKS; c++) {
+        const t0 = process.hrtime.bigint();
+        for (let i = 0; i < PER_CHUNK; i++) SINK = dep.readData();
+        const t1 = process.hrtime.bigint();
+        for (let i = 0; i < PER_CHUNK; i++) SINK = rawReadFileSync(DATA_FILE, "utf8");
+        const t2 = process.hrtime.bigint();
+        mediatedNs += Number(t1 - t0);
+        rawNs += Number(t2 - t1);
+      }
+      ratios.push(mediatedNs / rawNs);
+    }
+    // Both arms must really have read the file — a mediated read that started returning a
+    // constant, or a reference arm optimised away, would make the ratio meaningless.
+    expect(SINK, "the last co-sampled reference read did not return the fixture's bytes").toBe(
+      DATA,
+    );
+    const best = Math.min(...ratios);
+    expect(
+      best,
+      `mediated ÷ co-sampled unmediated readFileSync, per block: ` +
+        `${ratios.map((r) => r.toFixed(2)).join(", ")} (gate takes the minimum, limit ${RATIO_LIMIT})`,
+    ).toBeLessThan(RATIO_LIMIT);
   });
 });

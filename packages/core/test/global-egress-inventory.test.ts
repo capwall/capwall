@@ -19,10 +19,10 @@
  *    bindings and a lazy alias for every builtin module;
  *  - with the flags, so the flag-only egress classes are in the inventory on every version.
  */
-import { execFile } from "node:child_process";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { runNode } from "./helpers/subprocess.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PROBE = path.join(here, "fixtures", "global-inventory.cjs");
@@ -85,17 +85,18 @@ interface Inventory {
   hasSendBeacon: boolean;
 }
 
-function probe(): Promise<Inventory> {
-  return new Promise((resolve, reject) => {
-    execFile(
-      process.execPath,
-      ["--experimental-websocket", "--experimental-eventsource", PROBE],
-      (err, stdout) => {
-        if (err) return reject(err);
-        resolve(JSON.parse(stdout) as Inventory);
-      },
-    );
-  });
+/**
+ * All three cases below ask the same question of the same probe process; `runNode` runs it once
+ * and shares the answer (#145), so the file costs one child rather than three.
+ */
+async function probe(): Promise<Inventory> {
+  const r = await runNode(
+    ["--experimental-websocket", "--experimental-eventsource", PROBE],
+    // Sound to share: the probe reads only this Node's own globals — it has no inputs at all.
+    { share: true, cwd: here },
+  );
+  if (r.code !== 0) throw new Error(`global-egress probe exited ${String(r.code)}: ${r.stderr}`);
+  return JSON.parse(r.stdout) as Inventory;
 }
 
 describe("#80 — the global egress surface is fully classified", () => {

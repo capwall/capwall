@@ -10,6 +10,13 @@
 #   scripts/ci-local.sh 22              # just Node 22 (fast iteration)
 #   CI_NODE_VERSIONS="18 20 22" scripts/ci-local.sh
 #   CI_BENCH=0 scripts/ci-local.sh      # skip the perf gate (scripts/bench/README.md)
+#   CI_CPUSET=0,1 scripts/ci-local.sh   # pin the build to 2 cores — a GitHub hosted runner
+#
+# CI_CPUSET is the one axis this script cannot otherwise reproduce: GitHub's hosted runners are
+# 2-core, and a 16-core dev box hides everything that is only slow on two. It maps straight to
+# `docker build --cpuset-cpus`. It is OFF by default because it roughly triples the wall time
+# (the suite spawns ~190 child `node` processes); the timeouts the suite runs under were
+# measured with it on — see packages/core/test/helpers/subprocess.ts and issue #145.
 #
 # The build context is your current working tree's tracked + new (non-ignored) files — the
 # same set CI would check out, including the committed vendored fixtures and any uncommitted
@@ -42,11 +49,18 @@ CACHEBUST="$(date +%s)"
 # Stream only tracked + new, non-ignored files (current working-tree content) as the context.
 build_context() { git ls-files --cached --others --exclude-standard -z | tar --null -T - -cf - ; }
 
+# Optional CPU pin (see the header): `--cpuset-cpus` takes the same syntax docker does, e.g.
+# "0,1" or "0-1". Empty means "every core", which is the default.
+declare -a CPUSET_ARGS=()
+if [ -n "${CI_CPUSET:-}" ]; then
+  CPUSET_ARGS=(--cpuset-cpus "${CI_CPUSET}")
+fi
+
 declare -a RESULTS=()
 overall=0
 for v in "${NODE_VERSIONS[@]}"; do
   echo ""
-  echo "═════════════════════ CI simulation · Node ${v} ═════════════════════"
+  echo "═════════════════════ CI simulation · Node ${v}${CI_CPUSET:+ · cpus ${CI_CPUSET}} ═════════════════════"
   # Use the classic builder (DOCKER_BUILDKIT=0): it streams every RUN step's output live (so
   # you see the test results) and needs no buildx CLI plugin. Override with CI_BUILDKIT=1 if
   # you have buildx wired up and prefer it.
@@ -54,6 +68,7 @@ for v in "${NODE_VERSIONS[@]}"; do
       --build-arg "NODE_VERSION=${v}" \
       --build-arg "CACHEBUST=${CACHEBUST}" \
       --build-arg "BENCH=${CI_BENCH:-1}" \
+      "${CPUSET_ARGS[@]+"${CPUSET_ARGS[@]}"}" \
       -f "${DOCKERFILE}" \
       -t "capwall-ci:node${v}" \
       - ; then

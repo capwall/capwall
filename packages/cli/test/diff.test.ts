@@ -8,32 +8,21 @@
  * - a policy missing that grant → diff exits 1 and names the drifted capability
  * - --json emits the same finding as a machine-readable array
  */
-import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { cp, mkdtemp, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { runNode, type NodeRunResult } from "../../core/test/helpers/subprocess.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CLI = path.resolve(here, "..", "dist", "index.js");
 const FIXTURE_APP = path.join(here, "fixtures", "app");
 
-interface RunResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
-
 /** Run the built CLI; resolves (never rejects) with exit code + output. */
-function runCli(args: string[], cwd: string): Promise<RunResult> {
-  return new Promise((resolve, reject) => {
-    execFile(process.execPath, [CLI, ...args], { cwd }, (err, stdout, stderr) => {
-      if (err && typeof err.code !== "number") return reject(err);
-      resolve({ code: err ? (err.code as number) : 0, stdout, stderr });
-    });
-  });
+function runCli(args: string[], cwd: string): Promise<NodeRunResult> {
+  return runNode([CLI, ...args], { cwd });
 }
 
 let appDir: string;

@@ -8,7 +8,7 @@
  * - observe never blocks, even for the un-granted read
  * - the express-app example boots under both observe and enforce (AGENTS.md § 7)
  */
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { cp, mkdtemp, readFile, rm } from "node:fs/promises";
 import * as os from "node:os";
@@ -16,26 +16,16 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Policy } from "@capwall/policy-schema";
+import { runNode, type NodeRunResult } from "../../core/test/helpers/subprocess.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CLI = path.resolve(here, "..", "dist", "index.js");
 const FIXTURE_APP = path.join(here, "fixtures", "app");
 const EXPRESS_APP = path.resolve(here, "..", "..", "..", "examples", "express-app");
 
-interface RunResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
-
 /** Run the built CLI; resolves (never rejects) with exit code + output. */
-function runCli(args: string[], cwd: string): Promise<RunResult> {
-  return new Promise((resolve, reject) => {
-    execFile(process.execPath, [CLI, ...args], { cwd }, (err, stdout, stderr) => {
-      if (err && typeof err.code !== "number") return reject(err);
-      resolve({ code: err ? (err.code as number) : 0, stdout, stderr });
-    });
-  });
+function runCli(args: string[], cwd: string): Promise<NodeRunResult> {
+  return runNode([CLI, ...args], { cwd });
 }
 
 let appDir: string;
@@ -214,7 +204,9 @@ describe("trace → policy → enforce round-trip (package identity, #92 / #93)"
     expect(r.stdout).toContain("compile: compiled-ok");
   });
 
-  it("explain answers for a chain key and for `compile`", async () => {
+  // Two claims, two tests: they were one `it` running four CLI subprocesses, which is over the
+  // two-per-test budget the timeouts are computed from (#145).
+  it("explain answers for a chain key, and a bare name is a different principal", async () => {
     const chain = await runCli(
       ["explain", "--policy", generated, "trace-dep>nested-dep", "fs:read", "./nested.txt"],
       appDir,
@@ -229,7 +221,9 @@ describe("trace → policy → enforce round-trip (package identity, #92 / #93)"
     );
     expect(bare.code).toBe(1);
     expect(bare.stdout).toMatch(/^DENY/);
+  });
 
+  it("explain answers for `compile`, from the generated policy and from no policy", async () => {
     const compileAllowed = await runCli(
       ["explain", "--policy", generated, "trace-dep", "compile"],
       appDir,

@@ -5,7 +5,6 @@
  * The interesting assertion is the pair: the SAME command and the SAME fixture app produce a
  * deny or an allow depending only on the one word in the committed policy file.
  */
-import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
@@ -13,36 +12,21 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Policy } from "@capwall/policy-schema";
+import { runNode, type NodeRunResult } from "../../core/test/helpers/subprocess.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CLI = path.resolve(here, "..", "dist", "index.js");
 const FIXTURE_APP = path.join(here, "fixtures", "app");
-
-interface RunResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
 
 /** Run the built CLI; resolves (never rejects) with exit code + output. */
 function runCli(
   args: string[],
   cwd: string,
   env: Record<string, string | undefined> = {},
-): Promise<RunResult> {
-  return new Promise((resolve, reject) => {
-    execFile(
-      process.execPath,
-      [CLI, ...args],
-      // CAPWALL_MODE outranks the policy file, so the runner's own environment must not leak
-      // one in; individual cases set it deliberately.
-      { cwd, env: { ...process.env, CAPWALL_MODE: undefined, ...env } },
-      (err, stdout, stderr) => {
-        if (err && typeof err.code !== "number") return reject(err);
-        resolve({ code: err ? (err.code as number) : 0, stdout, stderr });
-      },
-    );
-  });
+): Promise<NodeRunResult> {
+  // CAPWALL_MODE outranks the policy file, so the runner's own environment must not leak one
+  // in; individual cases set it deliberately.
+  return runNode([CLI, ...args], { cwd, env: { CAPWALL_MODE: undefined, ...env } });
 }
 
 let appDir: string;

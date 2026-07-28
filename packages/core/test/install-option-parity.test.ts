@@ -39,7 +39,6 @@
  * matrix would assert nothing. The probes themselves are batched: one process runs BOTH paths
  * and every observable at once, rather than one process per (path, option) pair.
  */
-import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
@@ -47,6 +46,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { install, loadPolicyFromObject, type InstallHandle, type Policy } from "../src/index.js";
 import { liveRegistry } from "../src/loader/live-context.js";
+import { HOOK_TIMEOUT_MS, runNode } from "./helpers/subprocess.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const APP_DIR = path.join(here, "fixtures", "esm");
@@ -75,30 +75,20 @@ interface ParityConfig {
   options?: Record<string, unknown>;
 }
 
-function runApp(entry: string, config?: ParityConfig): Promise<string> {
-  return new Promise((resolve, reject) => {
-    execFile(
-      process.execPath,
-      [entry],
-      {
-        cwd: APP_DIR,
-        env: {
-          ...process.env,
-          PARITY_PROBE_SECRET: "s3cr3t",
-          // The app installs capwall itself, so the preload channel must stay out of the way.
-          CAPWALL_MODE: "",
-          CAPWALL_POLICY_FILE: "",
-          NODE_OPTIONS: "",
-          ...(config ? { CAPWALL_TEST_CONFIG: JSON.stringify(config) } : {}),
-        },
-      },
-      (err, stdout, stderr) => {
-        if (err && typeof err.code !== "number") return reject(err);
-        if (err) return reject(new Error(`${entry} exited ${String(err.code)}: ${stderr}`));
-        resolve(stdout);
-      },
-    );
+async function runApp(entry: string, config?: ParityConfig): Promise<string> {
+  const r = await runNode([entry], {
+    cwd: APP_DIR,
+    env: {
+      PARITY_PROBE_SECRET: "s3cr3t",
+      // The app installs capwall itself, so the preload channel must stay out of the way.
+      CAPWALL_MODE: "",
+      CAPWALL_POLICY_FILE: "",
+      NODE_OPTIONS: "",
+      ...(config ? { CAPWALL_TEST_CONFIG: JSON.stringify(config) } : {}),
+    },
   });
+  if (r.code !== 0) throw new Error(`${entry} exited ${String(r.code)}: ${r.stderr}`);
+  return r.stdout;
 }
 
 async function parity(config: ParityConfig): Promise<ParityReport> {
@@ -116,7 +106,7 @@ let base: ParityReport;
 beforeAll(async () => {
   expect(existsSync(DIST), `built core not found at ${DIST} — run 'pnpm build' first`).toBe(true);
   base = await parity(BASE);
-}, 60_000);
+}, HOOK_TIMEOUT_MS);
 
 /** Which observables changed between two reports, per path. Comparing the SET of changes is what
  * makes "the option had the same effect on both paths" a single assertion instead of a

@@ -9,7 +9,6 @@
  *    `"*.internal"`, and enforce/diff/explain all agree — the exact workflow the issue says
  *    silently failed before. Plus: a malformed pattern is a load-time error.
  */
-import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
@@ -17,24 +16,14 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { Policy } from "@capwall/policy-schema";
+import { runNode, type NodeRunResult } from "../../core/test/helpers/subprocess.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CLI = path.resolve(here, "..", "dist", "index.js");
 const FIXTURE_APP = path.join(here, "fixtures", "app");
 
-interface RunResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
-
-function runCli(args: string[], cwd: string): Promise<RunResult> {
-  return new Promise((resolve, reject) => {
-    execFile(process.execPath, [CLI, ...args], { cwd }, (err, stdout, stderr) => {
-      if (err && typeof err.code !== "number") return reject(err);
-      resolve({ code: err ? (err.code as number) : 0, stdout, stderr });
-    });
-  });
+function runCli(args: string[], cwd: string): Promise<NodeRunResult> {
+  return runNode([CLI, ...args], { cwd });
 }
 
 let appDir: string;
@@ -213,10 +202,19 @@ describe("net host globs round-trip (#83)", () => {
     expect(drifted.stderr).toMatch(/net api\.internal:9999 \(not granted\)/);
   });
 
-  it("explain agrees with enforce", async () => {
+  // Split in two so neither test needs more than the two-subprocess per-test budget (#145);
+  // `*.internal` makes two separate claims anyway — what it grants, and what it does not.
+  it("explain agrees with enforce about the host `*.internal` grants", async () => {
     appDir = await freshAppDir();
     await writePolicy(appDir, { "trace-dep": { net: { hosts: ["*.internal"], ports: [443] } } });
     expect((await runCli(["explain", "trace-dep", "net", "api.internal:443"], appDir)).code).toBe(0);
+  });
+
+  it("explain refuses the hosts a single-label `*.internal` does not cover", async () => {
+    // The bare apex and a two-label subdomain are both outside `*.internal` — one `*` matches
+    // exactly one label. `**.internal` (above) is the spelling that covers them.
+    appDir = await freshAppDir();
+    await writePolicy(appDir, { "trace-dep": { net: { hosts: ["*.internal"], ports: [443] } } });
     expect((await runCli(["explain", "trace-dep", "net", "internal:443"], appDir)).code).toBe(1);
     expect((await runCli(["explain", "trace-dep", "net", "a.b.internal:443"], appDir)).code).toBe(1);
   });
