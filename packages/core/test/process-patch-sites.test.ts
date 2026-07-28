@@ -58,6 +58,10 @@ import {
   processPatchSites,
   type PatchKind,
 } from "../src/lifecycle/process-patch.js";
+// Blanking comments and string bodies before matching is what keeps this scan off prose. It
+// lives in a helper because #139's two scans need exactly the same thing for exactly the same
+// reason; the meta-tests that prove it works are still the ones at the bottom of section 1.
+import { blankNonCode, tsFilesUnder } from "./helpers/source-scan.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const SRC_ROOT = path.join(here, "..", "src");
@@ -91,91 +95,6 @@ const SITES = [...processPatchSites()];
 
 /** Identifiers that name a process-level object. An alias of one of these is one of these. */
 const PROCESS_ROOTS = ["globalThis", "process", "Module", "realModule"] as const;
-
-/**
- * Blank out comments and string/template bodies, PRESERVING OFFSETS so line numbers still
- * compute. Without this the scan trips over prose — `global-egress.ts` discusses
- * `globalThis.fetch = evil` three times in its header, which is the thing it exists to prevent.
- */
-function blankNonCode(src: string): string {
-  const out = src.split("");
-  const blank = (from: number, to: number): void => {
-    for (let i = from; i < to && i < out.length; i++) if (out[i] !== "\n") out[i] = " ";
-  };
-  let i = 0;
-  // Depth of `${` interpolations we are inside, so a template can contain code containing a
-  // template. `0` means "not in a template".
-  const templateStack: number[] = [];
-  while (i < src.length) {
-    const two = src.slice(i, i + 2);
-    if (two === "//") {
-      const end = src.indexOf("\n", i);
-      const stop = end === -1 ? src.length : end;
-      blank(i, stop);
-      i = stop;
-      continue;
-    }
-    if (two === "/*") {
-      const end = src.indexOf("*/", i + 2);
-      const stop = end === -1 ? src.length : end + 2;
-      blank(i, stop);
-      i = stop;
-      continue;
-    }
-    const ch = src[i];
-    if (ch === '"' || ch === "'") {
-      let j = i + 1;
-      while (j < src.length && src[j] !== ch) j += src[j] === "\\" ? 2 : 1;
-      blank(i + 1, j);
-      i = j + 1;
-      continue;
-    }
-    if (ch === "`") {
-      let j = i + 1;
-      while (j < src.length) {
-        if (src[j] === "\\") {
-          j += 2;
-          continue;
-        }
-        if (src[j] === "`") break;
-        if (src[j] === "$" && src[j + 1] === "{") break;
-        j++;
-      }
-      blank(i + 1, j);
-      if (src[j] === "$") {
-        templateStack.push(1);
-        i = j + 2;
-        continue;
-      }
-      i = j + 1;
-      continue;
-    }
-    if (templateStack.length > 0 && ch === "}") {
-      // Close the interpolation and resume the template literal.
-      templateStack.pop();
-      let j = i + 1;
-      while (j < src.length) {
-        if (src[j] === "\\") {
-          j += 2;
-          continue;
-        }
-        if (src[j] === "`") break;
-        if (src[j] === "$" && src[j + 1] === "{") break;
-        j++;
-      }
-      blank(i + 1, j);
-      if (src[j] === "$") {
-        templateStack.push(1);
-        i = j + 2;
-        continue;
-      }
-      i = j + 1;
-      continue;
-    }
-    i++;
-  }
-  return out.join("");
-}
 
 const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -223,18 +142,6 @@ function processWrites(file: string, source: string): Finding[] {
     }
   }
   return findings;
-}
-
-/** `.cts`/`.mts` too — `src/real-builtins.cts` (#78) is source like any other and must not escape
- *  the scan on a filename technicality. */
-function tsFilesUnder(dir: string): string[] {
-  const out: string[] = [];
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) out.push(...tsFilesUnder(full));
-    else if (/\.[cm]?ts$/.test(entry.name)) out.push(full);
-  }
-  return out.sort();
 }
 
 describe("#107 — every process-level write goes through lifecycle/process-patch.ts", () => {

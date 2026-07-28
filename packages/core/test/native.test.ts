@@ -20,6 +20,14 @@
  *     dependency tree (pnpm pulls platform-keyed native bindings for `rollup`/`oxlint`). That
  *     covers the end-to-end "granted, and the addon really loads" case on the platforms where
  *     such a binding exists, and skips with an explicit message where it does not.
+ *
+ * WHICH FAILURE, NOT JUST "A FAILURE" (#140). Every row here asserts WHY a load failed rather
+ * than that it failed, via {@link classifyLoadFailure}. `name !== "CapabilityError"` collapses
+ * three different outcomes into one — and the third of them, a real addon built for another
+ * architecture (`wrong ELF class`), reads exactly like the "gate passed, placeholder rejected"
+ * result these rows claim to prove. That is not hypothetical: `pnpm install --force`
+ * materializes every optional binding, and the pre-#140 scan handed this file a 32-bit ARM
+ * oxlint binding on an x64 host.
  */
 import { createRequire } from "node:module";
 import * as nodeFs from "node:fs";
@@ -34,7 +42,15 @@ import {
   type Decision,
   type Policy,
 } from "../src/index.js";
-import { REAL_ADDON } from "./helpers/real-addon.js";
+import {
+  classifyLoadFailure,
+  hostBinaryVerdict,
+  matchesHostTriple,
+  REAL_ADDON,
+  REAL_ADDON_SKIP_REASON,
+  scanForRealAddon,
+  titleWithSkipReason,
+} from "./helpers/real-addon.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const requireCjs = createRequire(import.meta.url);
@@ -105,6 +121,19 @@ const nativeDecisions = (o: Outcome): Recorded[] =>
 
 /** Package names a native decision was recorded against, in order. */
 const subjects = (o: Outcome): string[] => nativeDecisions(o).map((d) => d.pkg);
+
+/**
+ * Why the call failed, as one of the four outcomes `helpers/real-addon.ts` distinguishes —
+ * `"none"` when it did not fail at all. `"loader"` is the expected answer wherever a
+ * placeholder `.node` is used: capwall stood aside and the platform loader rejected the FILE.
+ * `"arch"` there would mean the test borrowed a binding for another machine (#140), which is
+ * neither a capwall answer nor a proof of anything.
+ */
+const failure = (o: Outcome): string =>
+  o.error === undefined ? "none" : classifyLoadFailure(o.error);
+
+/** The message with it, so a surprise reads as itself rather than as `expected 'arch'`. */
+const failureDetail = (o: Outcome): string => `${failure(o)}: ${o.error?.message ?? "(no error)"}`;
 
 const DENY_ALL = { version: 1, mode: "enforce" };
 const GRANT = (packages: Record<string, unknown>): Record<string, unknown> => ({
@@ -189,7 +218,7 @@ describe("native gate — enforce mode, granted", () => {
     // is a placeholder rather than a real addon. A platform-loader error here (and NOT a
     // CapabilityError) is the proof that the gate stopped being the thing in the way.
     expect(o.error).toBeDefined();
-    expect(o.error!.name).not.toBe("CapabilityError");
+    expect(failure(o), failureDetail(o)).toBe("loader");
   });
 
   it("does not leak the grant to other packages (deny-by-default still holds)", () => {
@@ -245,7 +274,7 @@ describe("native gate — resolver wrappers (bindings / node-gyp-build shape)", 
     // row discriminating, exactly as its four siblings above do (#112).
     expect(subjects(o)).toEqual(["fixture-native-loader", "fixture-dep"]);
     expect(nativeDecisions(o).every((d) => d.decision.allowed)).toBe(true);
-    expect(o.error!.name).not.toBe("CapabilityError");
+    expect(failure(o), failureDetail(o)).toBe("loader");
   });
 });
 
@@ -291,7 +320,7 @@ describe("native gate — observe mode", () => {
     expect(nativeDecisions(o)[0]!.decision.allowed).toBe(true);
     expect(nativeDecisions(o)[0]!.decision.reason).toContain("observe: recorded native");
     // Not a CapabilityError: observe never blocks, so dlopen ran and rejected the placeholder.
-    expect(o.error!.name).not.toBe("CapabilityError");
+    expect(failure(o), failureDetail(o)).toBe("loader");
   });
 });
 
@@ -311,7 +340,7 @@ describe("native gate — install/uninstall hygiene", () => {
     } catch (e) {
       err = e as Error;
     }
-    expect(err!.name).not.toBe("CapabilityError");
+    expect(classifyLoadFailure(err), err?.message).toBe("loader");
   });
 
   it("uninstalling an inner window out of order does not resurrect or drop the gate", () => {
@@ -333,26 +362,165 @@ describe("native gate — install/uninstall hygiene", () => {
     } catch (e) {
       err = e as Error;
     }
-    expect(err!.name).not.toBe("CapabilityError");
+    expect(classifyLoadFailure(err), err?.message).toBe("loader");
   });
 });
 
-describe.skipIf(REAL_ADDON === null)("native gate — a REAL, loadable addon", () => {
-  it("denies it by default and loads it for real once granted", () => {
-    const denied = withCapwall(DENY_ALL, "enforce", (dep) =>
-      dep.loadNativeViaDlopen(REAL_ADDON!),
-    );
-    expect(denied.error?.name).toBe("CapabilityError");
+describe.skipIf(REAL_ADDON === null)(
+  titleWithSkipReason("native gate — a REAL, loadable addon"),
+  () => {
+    it("denies it by default and loads it for real once granted", () => {
+      const denied = withCapwall(DENY_ALL, "enforce", (dep) =>
+        dep.loadNativeViaDlopen(REAL_ADDON!),
+      );
+      expect(failure(denied), failureDetail(denied)).toBe("gate");
 
-    // Grant every subject (the caller `fixture-dep`, and the binding package that owns the
-    // file) and confirm the addon genuinely initializes — the end-to-end proof that the gate
-    // is a decision point and not a wall.
-    const allowed = withCapwall({ version: 1, mode: "enforce", default: { native: true } }, "enforce", (dep) => {
-      const exports = dep.loadNativeViaDlopen(REAL_ADDON!);
-      expect(typeof exports).toBe("object");
-      expect(Object.keys(exports as object).length).toBeGreaterThan(0);
+      // Grant every subject (the caller `fixture-dep`, and the binding package that owns the
+      // file) and confirm the addon genuinely initializes — the end-to-end proof that the gate
+      // is a decision point and not a wall.
+      const allowed = withCapwall({ version: 1, mode: "enforce", default: { native: true } }, "enforce", (dep) => {
+        const exports = dep.loadNativeViaDlopen(REAL_ADDON!);
+        expect(typeof exports).toBe("object");
+        expect(Object.keys(exports as object).length).toBeGreaterThan(0);
+      });
+      // On a failure this prints the loader's own words — `wrong ELF class: ELFCLASS32` says
+      // "the borrowed binding is for another machine" (#140), which is a very different report
+      // from `file too short` or a `CapabilityError`.
+      expect(allowed.error?.message ?? null, `borrowed addon: ${REAL_ADDON}`).toBeNull();
+      expect(nativeDecisions(allowed).every((d) => d.decision.allowed)).toBe(true);
     });
-    expect(allowed.error).toBeUndefined();
-    expect(nativeDecisions(allowed).every((d) => d.decision.allowed)).toBe(true);
+  },
+);
+
+/* ═══════════════════════════════════════════════════════════════════════════════════════════
+ * #140 — the borrowed-addon scan itself. A test suite that borrows a binary off the disk is
+ * only as good as the choosing, and the choosing used to be "the first `.node` under a store
+ * directory whose name contains `linux`".
+ * ═════════════════════════════════════════════════════════════════════════════════════════ */
+
+describe("#140 — helpers/real-addon picks a binding for THIS machine", () => {
+  it("matches the host triple by token, not by substring", () => {
+    const hostArch = process.arch;
+    // The real shapes, spelled for whatever host runs this.
+    expect(matchesHostTriple(`@oxlint+binding-linux-${hostArch}-gnu/oxlint.node`)).toBe(
+      process.platform === "linux",
+    );
+    expect(matchesHostTriple(`prebuilds/${process.platform}-${hostArch}/node.napi.node`)).toBe(
+      true,
+    );
+    // The #140 regression, both directions of it: `arm64` CONTAINS `arm`, and `x64` does not
+    // contain `ia32` — a substring test gets one of those wrong on every host it runs on.
+    const foreign = hostArch === "arm64" ? "x64" : "arm64";
+    expect(matchesHostTriple(`@oxlint+binding-linux-${foreign}-gnu/oxlint.node`)).toBe(false);
+    expect(matchesHostTriple(`@rollup+rollup-linux-arm-gnueabihf/rollup.node`)).toBe(
+      hostArch === "arm" && process.platform === "linux",
+    );
+    // A foreign platform with the host's arch is not a candidate either.
+    const otherOs = process.platform === "darwin" ? "win32" : "darwin";
+    expect(matchesHostTriple(`@pkg+${otherOs}-${hostArch}/binding.node`)).toBe(false);
+    // Names no architecture at all: not preferred, so not taken (skip beats a coin flip).
+    expect(matchesHostTriple("some-package/build/Release/binding.node")).toBe(false);
+  });
+
+  it("reads the architecture out of the binary, and says 'unknown' rather than guessing", () => {
+    // A text file is not a format this can decode — and "unknown" must not reject, or a
+    // decoding gap would silently skip every dependent suite.
+    const text = path.join(os.tmpdir(), `capwall-verdict-${process.pid}.node`);
+    nodeFs.writeFileSync(text, "placeholder, not a real addon\n");
+    try {
+      expect(hostBinaryVerdict(text)).toBe("unknown");
+    } finally {
+      nodeFs.rmSync(text, { force: true });
+    }
+    expect(hostBinaryVerdict(path.join(os.tmpdir(), "capwall-no-such-file.node"))).toBe("unknown");
+    // node itself is a binary for this machine by definition — the positive control.
+    expect(hostBinaryVerdict(process.execPath)).toBe("host");
+    // And a foreign one, synthesized: an ELF64 header claiming aarch64 (or x86-64 on an arm
+    // host). This is the file the pre-#140 scan handed the suite.
+    const elf = Buffer.alloc(64);
+    elf.writeUInt32BE(0x7f454c46, 0);
+    elf[4] = 2; // ELFCLASS64
+    elf[5] = 1; // little-endian
+    elf.writeUInt16LE(process.arch === "arm64" ? 0x3e : 0xb7, 18);
+    const fake = path.join(os.tmpdir(), `capwall-foreign-${process.pid}.node`);
+    nodeFs.writeFileSync(fake, elf);
+    try {
+      expect(hostBinaryVerdict(fake)).toBe("foreign");
+    } finally {
+      nodeFs.rmSync(fake, { force: true });
+    }
+  });
+
+  it("does not skip silently — either it found a binding, or it says what it rejected", () => {
+    const scan = scanForRealAddon();
+    if (scan.file === null) {
+      // Skipping is legitimate (a platform with no prebuilt binding, a non-pnpm layout), but it
+      // has to be legible: an empty reason is how a suite quietly stops testing anything.
+      expect(scan.reason).not.toBe("");
+      expect(scan.reason).toContain(`${process.platform}-${process.arch}`);
+    } else {
+      expect(hostBinaryVerdict(scan.file)).not.toBe("foreign");
+      expect(matchesHostTriple(path.relative(here, scan.file))).toBe(true);
+      expect(REAL_ADDON_SKIP_REASON).toBe("");
+    }
+  });
+
+  it("refuses a foreign binding outright, and takes the host one sitting next to it", () => {
+    // THE #140 REGRESSION, reproduced: a store where the FIRST `.node` in sort order is a
+    // binding for another architecture whose directory name contains `process.platform`. The
+    // pre-#140 scan returned it and `native.test.ts` failed with `wrong ELF class`.
+    const store = nodeFs.mkdtempSync(path.join(os.tmpdir(), "capwall-fake-store-"));
+    const foreignArch = process.arch === "arm64" ? "x64" : "arm64";
+    const put = (dir: string, bytes: Buffer): string => {
+      const full = path.join(store, dir, "node_modules", dir.split("@")[1] ?? dir);
+      nodeFs.mkdirSync(full, { recursive: true });
+      const file = path.join(full, "binding.node");
+      nodeFs.writeFileSync(file, bytes);
+      return file;
+    };
+    // 32-bit ARM ELF, the exact shape the oxlint optional binding had.
+    const foreignElf = Buffer.alloc(64);
+    foreignElf.writeUInt32BE(0x7f454c46, 0);
+    foreignElf[4] = 1;
+    foreignElf[5] = 1;
+    foreignElf.writeUInt16LE(0x28, 18);
+    try {
+      const foreign = put(`@aaa+binding-${process.platform}-${foreignArch}@1.0.0`, foreignElf);
+      const only = scanForRealAddon(store);
+      // Not "return it and hope": no candidate for this machine means skip, with the reason
+      // naming the host triple AND the files that were passed over.
+      expect(only.file, `picked a ${foreignArch} binding on ${process.arch}`).toBeNull();
+      expect(only.reason).toContain(`${process.platform}-${process.arch}`);
+      expect(only.reason).toContain("binding.node");
+      expect(only.seen).toContain(foreign);
+
+      // Now add the host's own binding — the first 64 bytes of the running `node` are a header
+      // for this machine by construction, whatever format the platform uses.
+      const host = put(
+        `@zzz+binding-${process.platform}-${process.arch}@1.0.0`,
+        nodeFs.readFileSync(process.execPath).subarray(0, 64),
+      );
+      // `@aaa…` still sorts first. Choosing by order rather than by architecture is the bug.
+      expect(scanForRealAddon(store).file).toBe(host);
+    } finally {
+      nodeFs.rmSync(store, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies the three ways a load can fail, and does not confuse them", () => {
+    // The distinction the native suite is built on. `wrong ELF class` used to read as
+    // `loader`, i.e. as "the gate passed and the platform rejected the placeholder".
+    const err = (name: string, message: string): Error =>
+      Object.assign(new Error(message), { name });
+    expect(classifyLoadFailure(err("CapabilityError", "enforce: DENY"))).toBe("gate");
+    expect(classifyLoadFailure(err("Error", "/x.node: wrong ELF class: ELFCLASS32"))).toBe("arch");
+    expect(classifyLoadFailure(err("Error", "dlopen(/x.node): incompatible architecture"))).toBe(
+      "arch",
+    );
+    expect(classifyLoadFailure(err("Error", "/x.node: file too short"))).toBe("loader");
+    expect(classifyLoadFailure(err("Error", "/x.node: invalid ELF header"))).toBe("loader");
+    expect(
+      classifyLoadFailure(err("Error", "/x.node: cannot open shared object file: No such file")),
+    ).toBe("missing");
   });
 });
