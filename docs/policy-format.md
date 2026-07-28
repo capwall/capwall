@@ -109,6 +109,24 @@ message saying what to write instead, as is a bare `"*"` (the key that applies t
 the top-level `default` block). A wildcard that silently matches nothing is the defect issue #83
 was about, and package keys get the same treatment.
 
+**A key that matches nothing is reported after a run (#118).** The grammar can only reject a key
+that *cannot* work; whether a well-formed key matches is a runtime fact. So `capwall observe` and
+`capwall diff` compare the keys in the file against the principals they actually saw and name the
+ones that granted nothing:
+
+```
+[capwall] warning: 1 policy key in capabilities.json matched no package in this run (the grant does nothing):
+  "inner" — did you mean "outer>inner"?
+```
+
+That covers the bare-name mistake above, a typo (`"loadsh"`), and the dead keys a policy accretes
+as dependencies churn. It is a **warning**, not an error: a key that matches nothing fails closed
+(it permits nothing), and a key legitimately matches nothing when the dependency it names is
+optional or on a code path this run did not take. `capwall diff --strict` exits non-zero on one,
+for CI that wants dead keys gone. `capwall explain` prints a matching note — it takes its
+`<package>` argument literally and cannot know whether any code runs as that principal, so it now
+says which entry answered and, on a miss, which keys the policy does contain.
+
 **Upgrading a policy written before this.** Re-run `capwall observe` (or `capwall diff` to see
 the difference first): the trace records chain names, so `capwall gen-policy` writes the right
 keys. Trees installed with yarn 1, which nests far more than npm 3+, will see the most churn.

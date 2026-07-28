@@ -8,6 +8,13 @@
  * rule (used by the Zod schema, making a bad key a load-time error) and the MATCHING rule (used
  * by `@capwall/core`'s `policyFor`) live in one file. Zero dependencies, pure string work.
  *
+ * #118 added the third member of that family, {@link unmatchedPackageKeys}: a key can be
+ * well-formed, load without a murmur, and still match no principal that ever runs (`"inner"`
+ * when the principal is `outer>inner`; `"loadsh"`; a dependency removed three refactors ago).
+ * Load-time validation cannot see that — whether a key matches is a runtime fact — so the CLI
+ * asks this module after a run, when the set of principals is known. Same standard as the
+ * wildcard rule, applied to the keys the grammar cannot judge.
+ *
  * ## What a `packages` key names
  *
  * A principal, as attribution reports it (issue #92): the INSTALL CHAIN from the project root,
@@ -110,6 +117,70 @@ export function widenedPackageKeys(pkg: string): string[] {
   return links.length === 2
     ? [`${ONE_LINK}${CHAIN_SEP}${leaf}`, `${ANY_LINKS}${CHAIN_SEP}${leaf}`]
     : [`${ANY_LINKS}${CHAIN_SEP}${leaf}`];
+}
+
+/**
+ * Does `key` grant `pkg`? The same rule `policyFor` (core's `policy/evaluate.ts`) applies, asked
+ * from the other side — exact principal, or one of the wildcard keys that widen to it.
+ *
+ * It lives here, next to `widenedPackageKeys`, so the two can only ever disagree by someone
+ * editing this file: a "did this key match anything?" report that used a *different* notion of
+ * matching from the enforcer would be worse than no report, because it would name keys that
+ * work and clear keys that do not.
+ */
+export function packageKeyMatches(key: string, pkg: string): boolean {
+  return key === pkg || widenedPackageKeys(pkg).includes(key);
+}
+
+/** A `packages` key that granted nothing, with the principals it was probably meant to name. */
+export interface UnmatchedPackageKey {
+  key: string;
+  /** Observed principals with the same LEAF as `key` — the near-misses, most likely first. */
+  suggestions: string[];
+}
+
+/** The last link of a key or principal (`outer>inner` -> `inner`), wildcards stripped. */
+function leafOf(key: string): string {
+  const links = key.split(CHAIN_SEP);
+  return links[links.length - 1] ?? key;
+}
+
+/**
+ * Which of `keys` matched NONE of `principals` (issue #118).
+ *
+ * `validatePackageKey` rejects a key that cannot match anything *by grammar*; this answers the
+ * other half — a perfectly well-formed key that, in a run that just happened, matched nothing
+ * that ran. The two are complementary and neither subsumes the other: `"loadsh"` is a valid key
+ * and a dead one, and no amount of load-time validation can know that without watching a
+ * process.
+ *
+ * IT IS A REPORT, NOT A VERDICT, and the caller must keep it that way. A key matching nothing
+ * fails CLOSED — the grant simply does not apply — so this is a usability and trust defect
+ * rather than a hole: the harm is that `capabilities.json` says something the reader believes
+ * and the runtime does not honor. It is also *legitimately* possible for a key to match nothing
+ * in one run (an optional dependency, a code path this run did not take), which is exactly why
+ * this cannot be a load-time error and why the CLI reports it as a warning.
+ *
+ * The suggestion is the leaf trick from #118: the mistake a real author makes is writing the
+ * bare name they read in `package.json` when the principal is an install chain, so an unmatched
+ * `"inner"` next to an observed `outer>inner` is almost always that. Suggestions are drawn only
+ * from principals actually seen, so they can never point at a key that would also be dead.
+ */
+export function unmatchedPackageKeys(
+  keys: Iterable<string>,
+  principals: Iterable<string>,
+): UnmatchedPackageKey[] {
+  const seen = [...principals];
+  const unmatched: UnmatchedPackageKey[] = [];
+  for (const key of keys) {
+    if (seen.some((pkg) => packageKeyMatches(key, pkg))) continue;
+    const leaf = leafOf(key);
+    const suggestions = seen
+      .filter((pkg) => pkg !== key && leafOf(pkg) === leaf)
+      .sort((a, b) => a.length - b.length || a.localeCompare(b));
+    unmatched.push({ key, suggestions });
+  }
+  return unmatched;
 }
 
 /**

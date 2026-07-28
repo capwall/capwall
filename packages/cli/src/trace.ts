@@ -6,7 +6,12 @@
 import { readFile, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { placeholderizeIpcPath, type CapabilityRequest } from "@capwall/core";
-import { parsePolicy, type PackagePolicy, type Policy } from "@capwall/policy-schema";
+import {
+  parsePolicy,
+  unmatchedPackageKeys,
+  type PackagePolicy,
+  type Policy,
+} from "@capwall/policy-schema";
 
 export interface TraceEntry {
   pkg: string;
@@ -156,6 +161,49 @@ export function mergeTraceIntoPolicy(
     Object.entries(policy.packages).sort(([a], [b]) => a.localeCompare(b)),
   );
   return policy;
+}
+
+/**
+ * The one-or-more warning lines for `packages` keys that granted nothing in this run (#118),
+ * or `""` when every key matched something.
+ *
+ * WHY THIS IS A WARNING AND NOT AN ERROR — the judgment call #118 asks for. A key that matches
+ * nothing is fail-CLOSED: the grant does not apply, nothing is permitted that would not
+ * otherwise be, and no denial is missed. The defect is one of trust in the artifact — the file
+ * claims a grant the runtime never uses, `explain` cheerfully answers for a principal that does
+ * not exist, and `diff` calls the resulting denial DRIFT, which sends the reader to look at the
+ * dependency instead of at their own key. So it deserves to be said out loud, at the moment the
+ * evidence exists, and it does not deserve to fail the build: a key legitimately matches nothing
+ * when the dependency it names is optional, platform-specific, or simply on a code path this run
+ * did not exercise. Erroring would break policies that are entirely correct. `capwall diff
+ * --strict` is the opt-in for CI that wants dead keys gone.
+ *
+ * Rendered here rather than in each command so `observe` and `diff` say the same thing.
+ */
+export function unmatchedKeyWarning(
+  policy: Policy,
+  entries: readonly TraceEntry[],
+  policyFile: string,
+): string {
+  // A run that recorded nothing at all (the target crashed on line 1, or genuinely touched no
+  // capability) says nothing about the policy — every key would be "unmatched", which is a
+  // report about the run, not about the file. Stay quiet rather than cry wolf.
+  if (entries.length === 0) return "";
+  const principals = new Set(entries.map((e) => e.pkg));
+  const unmatched = unmatchedPackageKeys(Object.keys(policy.packages), principals);
+  if (unmatched.length === 0) return "";
+  const noun = unmatched.length === 1 ? "key" : "keys";
+  let out =
+    `[capwall] warning: ${unmatched.length} policy ${noun} in ${policyFile} matched no ` +
+    `package in this run (the grant does nothing):\n`;
+  for (const { key, suggestions } of unmatched) {
+    const hint =
+      suggestions.length > 0
+        ? ` — did you mean ${suggestions.slice(0, 3).map((s) => `"${s}"`).join(" or ")}?`
+        : "";
+    out += `  "${key}"${hint}\n`;
+  }
+  return out;
 }
 
 /** Load an existing capabilities.json as-authored (no glob normalization), or null. */

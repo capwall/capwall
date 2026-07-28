@@ -15,6 +15,7 @@ import {
   loadExistingPolicy,
   mergeTraceIntoPolicy,
   parseTrace,
+  unmatchedKeyWarning,
   writePolicy,
 } from "../trace.js";
 
@@ -74,6 +75,9 @@ export async function runObserve(args: string[], target: string[]): Promise<numb
     process.stderr.write(
       `[capwall] observed ${entries.length} capability event(s) across ` +
         `${pkgCount} package(s); ${existing ? "merged into" : "wrote"} ${outFile}\n` +
+        // #118: keys this run proved dead. Only ever pre-existing hand edits — everything the
+        // merge just wrote matched by construction — which is exactly the audience.
+        unmatchedKeyWarning(policy, entries, outFile) +
         `[capwall] review/tighten it, then run: capwall enforce -- ${target.join(" ")}\n`,
     );
     return result.exitCode;

@@ -177,7 +177,14 @@ export type Policy = z.infer<typeof PolicySchema>;
 // The `net.hosts` grammar. Validation (above) and matching (@capwall/core's evaluator) come
 // from the same module on purpose — #83 was the two disagreeing. See ./host.ts.
 export { ANY_HOST, isIpLiteral, matchesHostPattern, validateHostPattern } from "./host.js";
-export { CHAIN_SEP, validatePackageKey, widenedPackageKeys } from "./package-key.js";
+export {
+  CHAIN_SEP,
+  packageKeyMatches,
+  unmatchedPackageKeys,
+  validatePackageKey,
+  widenedPackageKeys,
+  type UnmatchedPackageKey,
+} from "./package-key.js";
 
 /** Enforcement mode. `observe` logs violations; `enforce` denies-by-default and throws. */
 export type Mode = "observe" | "enforce";

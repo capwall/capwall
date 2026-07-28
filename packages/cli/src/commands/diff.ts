@@ -14,7 +14,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { evaluate, loadPolicy, type CapabilityRequest } from "@capwall/core";
 import { runWithCapwall } from "../run.js";
-import { parseTrace } from "../trace.js";
+import { parseTrace, unmatchedKeyWarning } from "../trace.js";
 
 const HELP = `usage: capwall diff [--policy <capabilities.json>] [--json] -- <command...>
 
@@ -22,12 +22,19 @@ Runs <command> in observe mode and diffs what it actually did against the commit
 (default ./capabilities.json): any observed capability the policy would DENY in enforce mode
 is reported as drift (e.g. a dependency using a capability it never used before).
 
+Drift is reported in both directions (#118): observed-but-not-granted (a dependency using a
+capability it never had) and declared-but-never-matched (a "packages" key that names no
+principal that ran, so the grant does nothing).
+
 CI-friendly: exit 0 = no drift, 1 = drift found, 2 = usage error / policy file missing.
 
   --policy, -p <file>   policy file to diff against (default ./capabilities.json)
+  --strict              also exit 1 when a policy key matched no package in this run
   --json                emit drift as a single compact JSON array of {pkg, kind, detail},
                          written as the LAST line of stdout (the target's own stdout is
-                         inherited and may precede it — take the last line to parse)
+                         inherited and may precede it — take the last line to parse).
+                         Unmatched keys are reported on stderr in every mode: the array is
+                         a stable, documented contract that parsers already read.
 `;
 
 /** One observed capability the committed policy would deny — a drift signal. */
@@ -72,6 +79,7 @@ function describeRequest(req: CapabilityRequest): string {
 export async function runDiff(args: string[], target: string[]): Promise<number> {
   let policyFile = "capabilities.json";
   let json = false;
+  let strict = false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === "-h" || arg === "--help") {
@@ -87,6 +95,8 @@ export async function runDiff(args: string[], target: string[]): Promise<number>
       policyFile = value;
     } else if (arg === "--json") {
       json = true;
+    } else if (arg === "--strict") {
+      strict = true;
     } else {
       process.stderr.write(`capwall diff: unknown option '${arg}'\n${HELP}`);
       return 2;
@@ -159,13 +169,22 @@ export async function runDiff(args: string[], target: string[]): Promise<number>
       }
     }
 
+    // The other half of drift (#118): keys the policy declares that named nothing which ran.
+    // Reported in `--json` mode too, on stderr — the JSON array is a documented contract that
+    // parsers already read as "the drift list", and quietly changing its shape to carry a
+    // second, differently-shaped category is how a CI check starts passing for the wrong
+    // reason. Non-gating unless `--strict`: see `unmatchedKeyWarning` for why a dead key is a
+    // trust defect rather than a hole.
+    const unmatched = unmatchedKeyWarning(policy, entries, policyFile);
+    if (unmatched) process.stderr.write(unmatched);
+
     if (result.exitCode !== 0) {
       process.stderr.write(
         `[capwall] diff: note: target exited with code ${result.exitCode}\n`,
       );
     }
 
-    return drift.length > 0 ? 1 : 0;
+    return drift.length > 0 || (strict && unmatched !== "") ? 1 : 0;
   } finally {
     await rm(tmpDir, { recursive: true, force: true });
   }

@@ -7,6 +7,7 @@
  */
 import * as path from "node:path";
 import { canonicalIpcPath, evaluate, loadPolicy, type CapabilityRequest } from "@capwall/core";
+import { CHAIN_SEP, widenedPackageKeys, type Policy } from "@capwall/policy-schema";
 
 const HELP = `usage: capwall explain [--policy <file>] <package> <capability> [target]
 
@@ -83,6 +84,49 @@ function buildRequest(
   }
 }
 
+/**
+ * The stderr note that says WHICH ENTRY answered, and — when nothing did — which principals the
+ * policy actually names (issue #118).
+ *
+ * `explain` takes its `<package>` argument literally, as it must: whether any code runs as that
+ * principal is a runtime fact and this command does not run anything. That is fine until the
+ * author's belief about the principal is the thing that is wrong, which is the common case,
+ * because the name in `package.json` is not the principal for a nested install (`outer>inner`,
+ * #92). Then `explain inner …` answers ALLOW about a principal that never runs, and the tool the
+ * reader reached for to debug a denial has confirmed the belief that caused it. They have to
+ * already know the answer to ask the question that reveals it.
+ *
+ * So the note is printed on EVERY answer, not only on a miss: an exact hit says which key was
+ * used and that the tool cannot vouch for the key naming anything, and a miss lists the keys
+ * that do exist — where a reader who typed `outer>inner` sees their own `inner` sitting in the
+ * list. It goes to stderr so the ALLOW/DENY line on stdout stays the machine-readable answer,
+ * and the exit code is untouched.
+ */
+function principalNote(policy: Policy, pkg: string, policyFile: string): string {
+  const keys = Object.keys(policy.packages);
+  const exact = Object.hasOwn(policy.packages, pkg);
+  const widened = widenedPackageKeys(pkg).find((k) => Object.hasOwn(policy.packages, k));
+  const chainHint =
+    !pkg.includes(CHAIN_SEP) && !pkg.startsWith("<")
+      ? ` A bare name is the TOP-LEVEL install only; a copy installed under another package is` +
+        ` a different principal ('other${CHAIN_SEP}${pkg}').`
+      : "";
+
+  if (exact) {
+    return (
+      `[capwall] note: answered from the "${pkg}" entry in ${policyFile}. ` +
+      `explain cannot know whether any code actually runs as '${pkg}' — a key that names no ` +
+      `principal grants nothing, and 'capwall diff' reports those.${chainHint}\n`
+    );
+  }
+  const source = widened === undefined ? `the "default" block` : `the "${widened}" wildcard key`;
+  const known = keys.length > 0 ? keys.sort().join(", ") : "(none)";
+  return (
+    `[capwall] note: no "${pkg}" key in ${policyFile}; answered from ${source}.` +
+    `${chainHint}\n[capwall] note: keys in this policy: ${known}\n`
+  );
+}
+
 export async function runExplain(args: string[]): Promise<number> {
   let policyFile = "capabilities.json";
   const positional: string[] = [];
@@ -119,5 +163,6 @@ export async function runExplain(args: string[]): Promise<number> {
   const policy = await loadPolicy(path.resolve(projectRoot, policyFile), { projectRoot });
   const decision = evaluate(policy, "enforce", pkg, request);
   process.stdout.write(`${decision.allowed ? "ALLOW" : "DENY"}: ${decision.reason}\n`);
+  process.stderr.write(principalNote(policy, pkg, policyFile));
   return decision.allowed ? 0 : 1;
 }
