@@ -111,6 +111,13 @@ const BUDGET_NS = 1 * NS_PER_MS;
  *
  * If you change {@link CAL_REPEATS} or the calibration body, this number is invalid until it is
  * re-derived the same way. Do not nudge it until a red run goes green.
+ *
+ * #143 MOVED THE NUMERATOR AND THIS LIMIT WAS DELIBERATELY NOT MOVED WITH IT. Every figure above
+ * is pre-#143; the observed ratio is now 0.89–1.73 on a contended box, so the gate has far more
+ * headroom than it was designed with — and, stated plainly, a change that undid #143 entirely
+ * would come back around 2.5 and still pass. Tightening it honestly means re-running the
+ * contention sweep on an idle machine, which is the one thing the paragraph above says not to
+ * shortcut. See `scripts/bench/README.md` § The regression gate.
  */
 const RATIO_LIMIT = Number(process.env["CAPWALL_BENCH_RATIO_LIMIT"] ?? 7);
 
@@ -961,7 +968,7 @@ const fsDeep = runPaired({
   mediated: () => dep.readSyncAtDepth(24),
   reference: calibrationUnit, // co-sampled: this is the row the ratio gate is computed from
   iters: 2000,
-  note: "attribution captures up to maxFrames=25 CallSites; a real app's stack is not 3 deep",
+  note: "since #143 the capture starts at the shim's OWN entry frame, so this row is close to the shallow one — before it, a 27-frame stack cost ~40% more",
 });
 printRow(fsDeep);
 

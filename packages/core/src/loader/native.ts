@@ -196,6 +196,17 @@ function ownerOfAddon(ctx: ShimContext, addonPath: string): string {
  * Both decisions are recorded BEFORE anything throws, so an enforce-mode denial still shows
  * the operator the full picture (which of the two subjects was missing the grant) instead of
  * only the first.
+ *
+ * THIS GATE DELIBERATELY DOES NOT USE THE `guard(ctx, hideAbove, req)` FAST PATH (#143). Every
+ * other guarded surface hands its own entry frame to `Error.captureStackTrace` so the caller sits
+ * at frame 0 and a 3-frame capture answers instead of a 25-frame one. That argument does not hold
+ * here, and the frames say so: measured on Node 22, `require('x.node')` reaches `process.dlopen`
+ * through SEVEN frames of `node:internal/modules/*` (plus capwall's own `Module._load` link)
+ * before the requiring package's frame appears. A 3-frame prefix would therefore find nothing but
+ * neutral machinery on every real addon load, decline, and pay the short capture ON TOP OF the
+ * full walk — a regression dressed as an optimization. Sizing the shared prefix for this shape
+ * instead would make every `fs` and `net` call pay for a gate that fires a handful of times per
+ * process and is dominated by `dlopen` itself. So this one stays on the full walk, on purpose.
  */
 function gateNativeLoad(ctx: ShimContext, resolved: ResolvedAddon): void {
   const addonPath = resolved.path;

@@ -2,7 +2,7 @@
  * `child_process` capability shim (roadmap M4, issue #6; env-interaction hardened in #89).
  *
  * Gates whether a package may START a subprocess at all — `spawn`, `exec`, `execFile`,
- * `fork`, and their sync counterparts each call `guard(ctx, { kind: "child_process" })`
+ * `fork`, and their sync counterparts each call `guard(ctx, <entry point>, { kind: "child_process" })`
  * before delegating, so an enforce-mode denial throws synchronously BEFORE any process is
  * created. The `ChildProcess` class is also wrapped: `new ChildProcess().spawn(opts)` is the
  * low-level launch primitive the module functions are sugar over, so a bare instance's
@@ -334,8 +334,11 @@ function pinSpawnArgs(shape: EntryShape, args: unknown[], injectEnv: boolean): u
  */
 export function createChildProcessShim(ctx: ShimContext): typeof import("node:child_process") {
   function wrapFn(orig: AnyFn, shape: EntryShape): AnyFn {
+    // `wrapped` is what a dependency holds as `child_process.spawnSync`, so it is also the frame
+    // below which the caller sits — see `guard` (#143) for why that makes the attribution
+    // capture 3 CallSites instead of 25.
     const wrapped: AnyFn = function (this: unknown, ...args: unknown[]) {
-      guard(ctx, { kind: "child_process" }); // throws on enforce-deny, before any spawn
+      guard(ctx, wrapped, { kind: "child_process" }); // throws on enforce-deny, before any spawn
       // Pin FIRST (caller accessors run here, un-privileged), authorize SECOND, and authorize
       // only the handful of keys Node reads by name. See the module header.
       const pinnedArgs = pinSpawnArgs(shape, args, true);
@@ -369,8 +372,9 @@ export function createChildProcessShim(ctx: ShimContext): typeof import("node:ch
     const Guarded = class extends RealCP {};
     if (typeof realSpawn === "function") {
       Object.defineProperty(Guarded.prototype, "spawn", {
-        value: function (this: unknown, ...spawnArgs: unknown[]) {
-          guard(ctx, { kind: "child_process" });
+        // A NAMED function expression so it can hand itself in as the stack boundary (#143).
+        value: function guardedSpawn(this: unknown, ...spawnArgs: unknown[]) {
+          guard(ctx, guardedSpawn, { kind: "child_process" });
           // NO env authorization window here at all (#89): this primitive takes the
           // already-assembled `options.envPairs` and `lib/internal/child_process.js` contains no
           // `process.env` read, so there is nothing to authorize. The options object is still

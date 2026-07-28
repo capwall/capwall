@@ -462,14 +462,30 @@ function walkFrames(sites: readonly NodeJS.CallSite[], projectRoot?: string): Wa
  * Frames the {@link attributeCallerVia} fast path materializes before it gives up and falls
  * back to the full walk.
  *
- * Three, and the third one is not padding. Measured frame shapes at a Proxy trap (Node 20/22):
- * an inline `{...env}` / `for..in` / `env.K` puts the reading package at frame 0, but every
- * enumeration that goes through a builtin — `Object.assign({}, env)` (dotenv's shape),
- * `JSON.stringify(env)`, `Object.entries(env)`, `Object.keys(env)` — inserts ONE native frame
- * (no file name, skipped as neutral machinery) above it, and a read reached through a `node:`
- * internal inserts another. Two would cover today's observed shapes; three leaves a frame of
- * margin so a Node release that adds an internal hop degrades to "slightly slower" rather than
- * "fast path never hits".
+ * Three, and the third one is not padding.
+ *
+ * THE BOUNDARY CONVENTION THIS NUMBER ASSUMES (#133, extended to every guarded surface by #143):
+ * a caller hands in **the frame a dependency actually calls** — the Proxy trap, the shimmed
+ * `fs.readFileSync`, the shimmed `net.connect`, the guarded subclass constructor — never an
+ * inner helper. V8 then skips capwall's whole call chain (the walk would skip it anyway; skipping
+ * it *earlier* is the point), so the calling package sits at frame 0. Measured on Node 20/22
+ * with `Error.captureStackTrace(holder, <entry point>)`, frame 0 is the dependency for a direct
+ * `fs.readFileSync(p)`, a `.apply(null, …)` of it, `net.connect(opts)`, `spawnSync(…)`,
+ * `fetch(url)`, a direct `Module.prototype._compile` call, and an inline `env.K`.
+ *
+ * The other two frames are the margin, and each is a shape that was measured rather than
+ * guessed. Going through a builtin — `Object.assign({}, env)` (dotenv's shape),
+ * `JSON.stringify(env)`, `[p].map(fs.readFileSync)` — inserts ONE native frame (no file name,
+ * skipped as neutral machinery) above the caller; a call reached through a `node:` internal
+ * inserts another. Two would cover every shape observed today; three leaves a frame of margin so
+ * a Node release that adds an internal hop degrades to "slightly slower" rather than "fast path
+ * never hits".
+ *
+ * IT IS DELIBERATELY NOT SIZED FOR SURFACES WHOSE CALLER IS FAR AWAY. `require('x.node')` reaches
+ * `process.dlopen` through seven `node:internal/modules/*` frames, so a 3-frame prefix there
+ * would decline on every real load and cost a short capture on top of the full one. That gate is
+ * therefore left on the full walk — see the note in `loader/native.ts`. Raising this constant to
+ * cover it would make every other surface pay for it.
  */
 const FAST_PATH_FRAMES = 3;
 
@@ -492,16 +508,24 @@ const FAST_PATH_MIN_BUDGET = 8 + FAST_PATH_FRAMES;
  *
  * WHY THIS EXISTS. Attribution's cost is dominated by the NUMBER OF FRAMES V8 materializes, not
  * by the package lookup (which is memoized at ~20 ns). A 25-frame capture from a realistic stack
- * is ~38 µs; a 3-frame one is ~9 µs. That is invisible on a single `fs.readFileSync`, and it is
- * the whole story for `{...process.env}`, where ONE JS call is two attributions per environment
- * variable — ~160 stack walks, milliseconds, for a single line of `dotenv`.
+ * is ~38 µs; a 3-frame one is ~8 µs. That was the whole story for `{...process.env}`, where ONE
+ * JS call is two attributions per environment variable — ~160 stack walks, milliseconds, for a
+ * single line of `dotenv` (#133). The perf audit (#132) then measured that attribution is ~70% of
+ * capwall's added latency on EVERY mediated surface at a realistic stack depth, so #143 pointed
+ * the same lever at the rest of them: `fs`, `net`/`http`/`https`/`http2`/`tls`/`dgram`,
+ * `child_process`, the global egress guards, `vm`, `worker_threads` and the `_compile` gate all
+ * hand in their own entry frame now. Nothing about the ANSWER changes; only how much of the stack
+ * V8 is asked to build before the walk finds it.
  *
  * WHAT `hideAbove` IS AND WHY IT IS NOT A TRUST DECISION. It is a function object the CALLER
  * passes and V8 matches against its own frame records; it names where to start materializing,
  * and nothing else. It is not read, not compared against a policy, and never contributes to the
- * principal. Pass the shim's own trap/guard function so the capture starts at the frame below
- * it — capwall's own frames are skipped by the walk anyway, so skipping them earlier costs
- * nothing and saves materializing them. If `hideAbove` is not on the stack V8 returns NO frames
+ * principal. Pass the shim's own ENTRY POINT — the trap, the wrapped builtin, the guarded
+ * constructor: whatever frame a dependency's own code calls — so the capture starts at the caller
+ * itself. capwall's own frames are skipped by the walk anyway, so skipping them earlier costs
+ * nothing and saves materializing them; handing in an INNER helper instead is not wrong, merely
+ * wasteful, because the frames between it and the entry point are materialized and then
+ * discarded (and eat into {@link FAST_PATH_FRAMES}). If `hideAbove` is not on the stack V8 returns NO frames
  * (verified on Node 20 and 22), the walk finds nothing, and this falls back to the full capture:
  * a wrong boundary is slow, never permissive.
  *

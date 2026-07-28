@@ -66,6 +66,7 @@ import {
   type ShimContext,
   type ShimRegistry,
 } from "./runtime.js";
+import type { StackBoundary } from "../attribution/index.js";
 import { harden } from "./harden.js";
 import { CapabilityError } from "../errors.js";
 
@@ -648,15 +649,39 @@ function denyWriteStream(err: CapabilityError, streamPath: unknown): Writable {
  * (constants, fd-based ops, Stats, …) is the real thing, passed through.
  */
 export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
+  /*
+   * ─────────────────────────────────────────────────────────────────────────────────────────
+   * THE `via` PARAMETER THREADED THROUGH EVERY GUARD HELPER BELOW (#143)
+   * ─────────────────────────────────────────────────────────────────────────────────────────
+   * It is the SHIMMED FUNCTION A DEPENDENCY CALLED — `fs.readFileSync`, `fs.existsSync`, the
+   * guarded `ReadStream` class — handed to `guard` as the frame below which V8 should start
+   * materializing CallSites. Attribution's cost is the number of CallSites built (~4 µs floor
+   * plus ~1.4 µs each), and `Error.stackTraceLimit` applies AFTER the boundary skip, so starting
+   * at the entry point costs 3 frames instead of 25: ~8 µs against ~38 µs on every mediated fs
+   * call. The walk, the rules and the answer are unchanged — see `attribution/index.ts`.
+   *
+   * IT IS THREADED RATHER THAN TAKEN FROM `guard`'s OWN FRAME because there are three capwall
+   * frames between the entry point and the decision (`wrapped` → `guardCall` → `check`), and
+   * every one of them would otherwise be materialized and then discarded by the walk. Measured:
+   * with the entry point as the boundary the calling package is at frame 0 for a direct call, a
+   * `.apply`, and a `[p].map(fs.readFileSync)`; using `guard`'s frame instead puts it at 3 and
+   * costs ~4 µs more per call for nothing.
+   *
+   * It is NOT an identity and contributes nothing to the principal: V8 matches it against its own
+   * frame records and that is all. A boundary that is wrong or missing yields zero frames, the
+   * short walk finds nothing, and `attributeCallerDetailedVia` falls back to the verbatim full
+   * walk — slower, never more permissive.
+   */
+
   /**
    * Attribute + evaluate one path/access via the shared shim runtime. Skips non-path args
    * (fd / FileHandle — out of scope). Throws `CapabilityError` on an enforce-mode denial;
    * the caller decides whether to propagate, reject, or translate that into a return value.
    */
-  function check(access: Access, arg: unknown): ResolvedPathArg | null {
+  function check(access: Access, arg: unknown, via: StackBoundary): ResolvedPathArg | null {
     const resolved = coercePath(arg);
     if (resolved === null) return null;
-    guard(ctx, { kind: "fs", access, path: resolved.target });
+    guard(ctx, via, { kind: "fs", access, path: resolved.target });
     return resolved;
   }
 
@@ -676,7 +701,7 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
    * Returns the argument list to FORWARD: the caller's own options bag and pattern array are
    * never handed to Node, because Node re-reads both after capwall has decided.
    */
-  function guardGlobCall(args: unknown[]): unknown[] {
+  function guardGlobCall(args: unknown[], via: StackBoundary): unknown[] {
     warmGlobInternals(); // before anything else — see the constant's doc for what this is for
     const out = args.slice();
 
@@ -718,17 +743,17 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
     // like the other multi-path methods here (`copyFile`, `rename`). An EMPTY array enumerates
     // nothing and correctly records nothing.
     for (const pattern of patterns) {
-      guard(ctx, { kind: "fs", access: "read", path: globBase(pattern, cwd) });
+      guard(ctx, via, { kind: "fs", access: "read", path: globBase(pattern, cwd) });
     }
     return out;
   }
 
-  function guardCall(args: unknown[], spec: MethodSpec): unknown[] {
-    if (spec === "glob") return guardGlobCall(args);
+  function guardCall(args: unknown[], spec: MethodSpec, via: StackBoundary): unknown[] {
+    if (spec === "glob") return guardGlobCall(args, via);
     const specs = spec === "open" ? openSpecs(args) : spec === "access" ? accessSpecs(args) : spec;
     let out = args;
     for (const { index, access } of specs) {
-      const resolved = check(access, args[index]);
+      const resolved = check(access, args[index], via);
       if (resolved === null || resolved.forward === args[index]) continue;
       if (out === args) out = args.slice();
       out[index] = resolved.forward;
@@ -741,9 +766,12 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
    * enforce-mode denial we report "does not exist" instead of throwing: `existsSync` → false,
    * `exists(path, cb)` → `cb(false)`. Observe mode allows and falls through to the real call.
    */
-  function probeExistence(pathArg: unknown): { denied: boolean; forward: unknown } {
+  function probeExistence(
+    pathArg: unknown,
+    via: StackBoundary,
+  ): { denied: boolean; forward: unknown } {
     try {
-      const resolved = check("read", pathArg);
+      const resolved = check("read", pathArg, via);
       return { denied: false, forward: resolved === null ? pathArg : resolved.forward };
     } catch (err) {
       if (err instanceof CapabilityError) return { denied: true, forward: pathArg };
@@ -765,11 +793,12 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
   function guardPathClass(RealClass: AnyCtor, access: Access): AnyCtor {
     return guardedConstructorSubclass(
       RealClass,
-      (args) => {
+      (args, via) => {
         // Throws on enforce-deny, before super() opens anything. The returned array carries the
         // PINNED path when the caller passed a file URL (#99) — `guardedConstructorSubclass`
-        // forwards what the check returns.
-        const resolved = check(access, args[0]);
+        // forwards what the check returns. `via` is the guarded class itself: the frame
+        // `new fs.ReadStream(p)` runs, so the caller is directly below it (#143).
+        const resolved = check(access, args[0], via);
         if (resolved === null || resolved.forward === args[0]) return undefined;
         const out = args.slice();
         out[0] = resolved.forward;
@@ -780,17 +809,20 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
   }
 
   function wrapFn(orig: AnyFn, spec: MethodSpec, delivery: Delivery): AnyFn {
+    // `wrapped` hands ITSELF down as the stack boundary (#143). It is the object a dependency
+    // holds as `fs.readFileSync`, so V8 starts materializing CallSites at the caller's own frame
+    // and capwall's three intervening frames are never built. See the `via` note above `check`.
     const wrapped: AnyFn = function (this: unknown, ...args: unknown[]) {
       switch (delivery) {
         case "throw": {
           // Real sync fs throws synchronously — matches, no translation needed.
-          return orig.apply(this, guardCall(args, spec));
+          return orig.apply(this, guardCall(args, spec, wrapped));
         }
         case "reject": {
           // Real fs.promises rejects — matches, no translation needed.
           let forwarded: unknown[];
           try {
-            forwarded = guardCall(args, spec);
+            forwarded = guardCall(args, spec, wrapped);
           } catch (err) {
             return Promise.reject(err);
           }
@@ -802,7 +834,7 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
           // (try/catch-free) callback code isn't crashed by an uncaught exception (#16).
           let forwarded: unknown[];
           try {
-            forwarded = guardCall(args, spec);
+            forwarded = guardCall(args, spec, wrapped);
           } catch (err) {
             if (!(err instanceof CapabilityError)) throw err;
             const cb = args[args.length - 1];
@@ -818,7 +850,7 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
           // returned stream emits 'error' asynchronously. Mirror that on denial (#16).
           let forwarded: unknown[];
           try {
-            forwarded = guardCall(args, spec);
+            forwarded = guardCall(args, spec, wrapped);
           } catch (err) {
             if (!(err instanceof CapabilityError)) throw err;
             return delivery === "streamRead"
@@ -832,7 +864,7 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
           // the first `next()`, so a denial does too (#106).
           let forwarded: unknown[];
           try {
-            forwarded = guardCall(args, spec);
+            forwarded = guardCall(args, spec, wrapped);
           } catch (err) {
             if (!(err instanceof CapabilityError)) throw err;
             return denyAsyncIterator(err);
@@ -898,8 +930,10 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
   }
 
   // Bespoke non-throwing existence probes (deny → "does not exist").
+  // NAMED function expressions, so each can hand ITSELF in as the stack boundary (#143) — the
+  // same reason the env traps are named declarations rather than method shorthands.
   shimRecord["existsSync"] = harden(ctx, function existsSync(p: unknown): boolean {
-    const probe = probeExistence(p);
+    const probe = probeExistence(p, existsSync);
     if (probe.denied) return false;
     return realFs.existsSync(probe.forward as Parameters<typeof realFs.existsSync>[0]);
   });
@@ -909,7 +943,7 @@ export function createFsShim(ctx: ShimContext): typeof import("node:fs") {
       (realFs.exists as (...a: unknown[]) => void)(p, cb);
       return;
     }
-    const probe = probeExistence(p);
+    const probe = probeExistence(p, exists);
     if (probe.denied) {
       (cb as (exists: boolean) => void)(false);
       return;

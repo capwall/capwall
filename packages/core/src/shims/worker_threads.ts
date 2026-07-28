@@ -2,7 +2,7 @@
  * `worker_threads` capability shim (roadmap M4, issue #7).
  *
  * Gates whether a package may START a Worker at all: `new Worker(...)` goes through a guarded
- * SUBCLASS whose constructor calls `guard(ctx, { kind: "worker_threads" })` before `super(...)`,
+ * SUBCLASS whose constructor calls `guard(ctx, Guarded, { kind: "worker_threads" })` before `super(...)`,
  * so an enforce-mode denial throws synchronously before the worker thread is created — the
  * real `Worker` constructor is what spawns the thread, so nothing runs on denial. `instanceof`
  * still works for real and guarded instances alike via a `Symbol.hasInstance` override.
@@ -46,8 +46,10 @@ export function createWorkerThreadsShim(ctx: ShimContext): typeof import("node:w
   if (typeof RealWorker === "function") {
     shim["Worker"] = guardedConstructorSubclass(
       RealWorker as AnyCtor,
-      () => {
-        guard(ctx, { kind: "worker_threads" }); // throws on enforce-deny, BEFORE super() spawns
+      (_args, via) => {
+        // `via` is the guarded `Worker` class itself — the frame `new Worker(f)` runs, so the
+        // caller is directly below it and the capture builds 3 CallSites instead of 25 (#143).
+        guard(ctx, via, { kind: "worker_threads" }); // throws on enforce-deny, BEFORE super() spawns
         // Nothing to pin: `worker_threads` is a boolean gate, so no argument decides a target
         // that Node could later re-read differently (the #99 audit's verdict for this entry
         // point). The `filename`/`options` bag is forwarded exactly as the caller wrote it.

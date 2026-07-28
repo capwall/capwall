@@ -56,8 +56,9 @@ import { realModule } from "../real-builtins.cjs"; // never `import … from "no
 import {
   APP_ROOT,
   attributeCaller,
-  attributeCallerDetailed,
+  attributeCallerDetailedVia,
   packageForPath,
+  type StackBoundary,
 } from "../attribution/index.js";
 import { CapabilityError } from "../errors.js";
 import { definePropertyPatch, valueSlot } from "../lifecycle/process-patch.js";
@@ -270,9 +271,21 @@ function calledByNodeLoader(hideAbove: CompileFn): boolean {
  * A non-absolute `filename` is never self-compilation: `packageForPath` would resolve it to the
  * trust root, which would turn "compile under a bare label" into a free `<app>` impersonation.
  * `path.isAbsolute` is checked explicitly rather than relied on implicitly.
+ *
+ * `hideAbove` is the PATCHED `_compile` itself — the same function object
+ * {@link calledByNodeLoader} already uses as its boundary, for the same reason: it is the frame a
+ * direct caller invokes, so the caller sits directly below it and the capture materializes 3
+ * CallSites instead of 25 (#143). Note what this does and does not buy. It only helps the DIRECT
+ * call, which is the adversarial shape #93 is about; the per-module-load path — Node's loader
+ * calling `_compile` for every CJS module in the process — short-circuits in
+ * `calledByNodeLoader` above and never reaches attribution at all, so its cost is unchanged and
+ * remains the one-frame capture that function performs.
  */
-function guardCompile(ctx: ShimContext, filename: unknown): void {
-  const attribution = attributeCallerDetailed(attributionOptionsFor(ctx));
+function guardCompile(ctx: ShimContext, filename: unknown, hideAbove: CompileFn): void {
+  const attribution = attributeCallerDetailedVia(
+    hideAbove as unknown as StackBoundary,
+    attributionOptionsFor(ctx),
+  );
   if (attribution.pkg === APP_ROOT) return;
   if (
     typeof filename === "string" &&
@@ -369,7 +382,7 @@ const compileGatePatch = definePropertyPatch<CompileFn>("Module.prototype._compi
       // what is forwarded without changing what is gated. `guardCompile` already treats a
       // non-string / non-absolute filename as "never self-compilation", so a runtime that ever
       // reordered the parameters fails closed here rather than waving the compile through.
-      if (!calledByNodeLoader(patched)) guardCompile(ctx, args[1]);
+      if (!calledByNodeLoader(patched)) guardCompile(ctx, args[1], patched);
       return Reflect.apply(realCompile, this, args);
     };
     // Keep `.name`/`.length` faithful: `require.extensions` tooling feature-detects on this

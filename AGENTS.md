@@ -183,12 +183,20 @@ Do not start step *n+1* until step *n* has passing tests and a clean typecheck.
   quote the headline without them. See `scripts/bench/README.md` § Where the budget does not
   hold — including why two captures per key is the floor rather than a to-do.
   Two more things the benchmark now says that older notes here did not:
-  **cost scales with stack depth** (attribution materializes up to `maxFrames` CallSites per
-  call, so a 3-frame stack — what the old harness measured — under-reports a realistic one by
-  ~40%), and at a realistic depth **attribution is ~70% of the added latency**, not the ~50%
-  issue #34 recorded from a shallow stack. `evaluate()` is negligible (~125ns). Cache
-  module→package resolution (the path→package cache gives ~50x cold-vs-warm); if you need
-  headroom, the stack walk is where it is.
+  **cost was attribution-dominant** — ~70% of the added latency at a realistic stack depth, not
+  the ~50% issue #34 recorded from a shallow stack — and **it scaled with stack depth**, so a
+  3-frame stack (what the old harness measured) under-reported a realistic one by ~40%.
+  Issue #143 took that lever: every guarded surface now hands its OWN entry frame to
+  `Error.captureStackTrace`, which applies `stackTraceLimit` *after* the boundary skip, so a
+  mediated call materializes 3 CallSites instead of 25 — same walk, same principal, and the
+  depth-dependence is largely gone with it. Measured 2.8x on `fs` at the frame cap, 1.9x on
+  `net.connect`, 1.7–2.0x on the deny paths; `spawnSync` shows no resolvable change because a
+  3 ms syscall dominates it, and the `dlopen` gate is deliberately excluded (its callers are
+  seven `node:internal/modules/*` frames away, so a short prefix would decline every time).
+  When you add a guarded surface, `guard()` REQUIRES the entry frame — that is not a style
+  preference, it is a 30 µs default nobody would notice.
+  `evaluate()` is negligible (~125ns). Cache module→package resolution (the path→package cache
+  gives ~50x cold-vs-warm).
 - **License hygiene.** capwall is MIT. **Do NOT** pull in non-compete / source-available
   code (e.g. PolyForm-licensed Socket code). Prefer permissive (MIT/BSD/Apache-2.0) deps
   only.
