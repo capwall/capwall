@@ -121,6 +121,29 @@ tracked, and this list is a description of scope, not of progress.
 > you would run against a published build. The whole loop — all capabilities, CJS and ESM —
 > works from a clone right now.
 
+### Prerequisites
+
+| | |
+|---|---|
+| **Node** | ≥ 20 (tested on 20 and 22) |
+| **pnpm** | ≥ 10 — **required, not a preference** |
+
+capwall is a pnpm workspace, and the root manifest has no npm `workspaces` field. `npm install`
+at the clone root therefore *succeeds* while linking none of the four packages, and the build
+then fails with `Cannot find module 'zod'` — which reads as "this project is broken" rather than
+"wrong package manager". A root `preinstall` guard now stops that with an explanation, but the
+easy path is to let Corepack hand you the pnpm version the repo already pins
+(`packageManager: "pnpm@10.33.0"`):
+
+```bash
+corepack enable   # provides the pnpm version this repo pins
+```
+
+`pnpm install` prints `Ignored build scripts: esbuild@0.28.1` on a fresh clone. That is
+expected and deliberate — capwall runs no dependency install scripts, and the ones it has
+reviewed and declined are recorded in `pnpm-workspace.yaml` § `ignoredBuiltDependencies`.
+Nothing needs approving.
+
 ```bash
 # 1. Build capwall from a clone (there is no published package yet — see the note above).
 git clone https://github.com/williamzujkowski/capwall.git ~/src/capwall
@@ -133,7 +156,8 @@ alias capwall='node ~/src/capwall/packages/cli/dist/index.js'
 # 2. OBSERVE: run your app or test suite; capwall records what each package actually does
 #    and writes a starter policy. Nothing is blocked in this mode.
 capwall observe -- node ./src/server.js
-#   → [capwall] observed 41 capability event(s) across 12 package(s); wrote ./capabilities.json
+#   → [capwall] observed 41 capability event(s) across 12 package(s); wrote capabilities.json
+#   → [capwall] review/tighten it, then run: capwall enforce -- node ./src/server.js
 
 # 3. Review & tighten capabilities.json by hand. Remove anything a dep shouldn't need.
 

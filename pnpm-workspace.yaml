@@ -1,3 +1,19 @@
 packages:
   - 'packages/*'
   - 'examples/*'
+
+# capwall runs NO dependency install scripts, and that is a decision rather than an oversight.
+# pnpm 10 blocks them by default; this records which ones were looked at and deliberately left
+# unbuilt, so "Ignored build scripts: esbuild" on a fresh clone is a reviewed state rather than
+# an open question. esbuild is a vitest transitive whose postinstall only fetches/links its
+# platform binary; nothing in this workspace needs it, and every suite passes without it.
+#
+# pnpm 10.33 prints its "Ignored build scripts" warning regardless of this list — it suppresses
+# only for scripts you APPROVE, not for ones you record as declined. So README.md § Prerequisites
+# also says the line is expected. Re-check whether the note is still needed when pnpm is bumped.
+#
+# ADDING TO THIS LIST IS A SECURITY DECISION, not a build fix: an install script runs arbitrary
+# code from a dependency, before any of capwall's own mediation exists, at exactly the phase
+# this project exists to talk about. If something genuinely needs to build, say why in the PR.
+ignoredBuiltDependencies:
+  - esbuild

@@ -98,7 +98,9 @@ the request has gone out, `init.dispatcher`, pre-install capture, and
 `.github/workflows/release.yml` is the workflow (whose *filename* is part of npm trusted
 publishing's trust configuration — do not rename it). Two guards enforce the one rule that
 matters: `scripts/assert-pnpm-pack.mjs` (`prepack`) refuses an `npm pack`, because only pnpm
-rewrites `workspace:*` into a real version (#116). `scripts/check-release-versions.mjs` is the
+rewrites `workspace:*` into a real version (#116); `scripts/assert-pnpm-install.mjs` (root
+`preinstall`) refuses an `npm install` at the clone root, which otherwise exits 0 having linked
+nothing (#122). `scripts/check-release-versions.mjs` is the
 pre-publish guard that keeps the four packages in **version lockstep** and matching the tag
 (#115) — so a version bump is all four manifests or none. All four are `0.0.0` today; read
 version numbers from `package.json`, never hardcode one.
