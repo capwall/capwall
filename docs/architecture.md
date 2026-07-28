@@ -173,7 +173,9 @@ is the only value a site is ever given. That is what makes the empty-child-envir
 structurally impossible rather than merely fixed.
 
 **Adding a new process-level patch is enforced, not remembered.**
-`test/process-patch-sites.test.ts` scans `packages/core/src` and fails on any write to
+`test/process-patch-sites.test.ts` scans **every** `packages/*/src` (#125 — core plus `cli`,
+`policy-schema` and `sbom-import`, which get the stricter rule of *no* process-global write at
+all, since the lifecycle helper is internal to core) and fails on any write to
 `process.*`, `globalThis.*`, a `Module` prototype or a local alias of one outside
 `lifecycle/process-patch.ts`; asserts the registered sites match a reviewed inventory (which
 records *which sites stack*); and runs every registered site through the nested / out-of-order /

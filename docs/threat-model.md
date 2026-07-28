@@ -112,8 +112,11 @@ be revoked.
   an escaping `TypeError` there would abort teardown and strand every other patch.
   #90 found the bugs; **#107 made the rule structural.** All five patch sites now go through one
   reference-counted relink chain, `core/src/lifecycle/process-patch.ts`, which is the only file in
-  `core/src` permitted to write a process global — asserted by a source scan in
-  `test/process-patch-sites.test.ts`, so a sixth patch site cannot be added off to the side. See
+  the whole workspace permitted to write a process global — asserted by a source scan in
+  `test/process-patch-sites.test.ts`, so a sixth patch site cannot be added off to the side. The
+  scan covers **`packages/*​/src`** since #125, not core alone: the other three packages get the
+  stricter rule of *no* process-global write at all, because the lifecycle helper is not on
+  `@capwall/core`'s `exports` map and they could not use it even if they had a reason to. See
   `docs/architecture.md` § Process-patch lifecycle.
 - **`hardened` is the one setting that is not per-install: it is a process-wide RATCHET (#129).**
   Every other option follows the newest install. `hardened` engages the moment **any** install
@@ -591,6 +594,17 @@ Per-capability notes:
   would require write-grant vocabulary the policy language does not have, and soft deny does not
   compose with writes (a silently dropped write leaves the dependency believing it succeeded; a
   throwing write reintroduces the crash). Tracked as a policy-language question, not a bug.
+
+  **Switchable off**: `install(…, { env: false })` / `CAPWALL_ENV=0` (#125), for a workload that
+  reads env in a hot loop and cannot pay the Proxy. `install()` has always documented the option;
+  the preload channel is new, and its absence was an omission rather than a safeguard — the
+  entire preload configuration surface is the environment, so anyone who can set `CAPWALL_ENV`
+  already has `CAPWALL_MODE=observe` or a substituted `CAPWALL_POLICY_FILE`, both strictly more
+  powerful, and no dependency can reach any of them (every `CAPWALL_*` variable is read once,
+  before the target's entry point, so a runtime `process.env` write — which is not mediated, see
+  above — changes nothing). It is the one switch that **warns on stderr** when set, because
+  turning it off makes every `env` grant in the policy unenforced and unrecorded while `enforce`
+  keeps denying every other capability: a process that looks guarded and is not.
 
 **Capability-bearing classes are guarded subclasses, not Proxies.** Where a capability can be
 reached through a class rather than a module function, capwall replaces the class with a

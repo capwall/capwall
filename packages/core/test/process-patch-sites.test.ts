@@ -10,11 +10,22 @@
  * `lifecycle/process-patch.ts` is the shared shape. This file is what makes using it mandatory
  * rather than customary, in three independent ways — a new patch site has to get past all three:
  *
- *   1. **THE SOURCE SCAN.** Every write to a process-level location in `packages/core/src` —
+ *   1. **THE SOURCE SCAN.** Every write to a process-level location in **`packages/*​/src`** —
  *      `process.*`, `globalThis.*`, a `Module` prototype, or any local alias of those — must be
  *      inside `lifecycle/process-patch.ts`. A patch site cannot reach a global without going
  *      through a slot, and it cannot hold a slot without going through one of the two lifecycle
  *      helpers. This is the half that catches somebody hand-rolling a save/restore.
+ *
+ *      The scan ran over `packages/core/src` only until #125, while its own header stated the
+ *      rule without that qualifier. The other three packages are not *structurally* incapable of
+ *      writing a global — `@capwall/cli` in particular already builds child environments and
+ *      composes `NODE_OPTIONS`, which is the neighbourhood a stray `process.env[…] = …` appears
+ *      in — they simply have none today. So the scope is widened rather than the header narrowed.
+ *      The rule they get is STRICTER, and deliberately so: `lifecycle/process-patch.ts` is
+ *      internal to `@capwall/core` (its `exports` map publishes `.` and `./preload`, nothing
+ *      else), so no other package can route a patch through the helper even if it wanted to.
+ *      For them the bar is therefore **zero** process-global writes, and a legitimate need for
+ *      one is a signal that the patch belongs in core behind a lifecycle helper.
  *
  *   2. **THE INVENTORY.** The set of registered sites must match a reviewed list, the same
  *      canary shape `global-egress-inventory.test.ts` uses for `globalThis`. Adding a patch is
@@ -50,7 +61,23 @@ import {
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const SRC_ROOT = path.join(here, "..", "src");
+const PACKAGES_ROOT = path.join(here, "..", "..");
 const HELPER_REL = path.join("lifecycle", "process-patch.ts");
+
+/**
+ * The trees the source scan covers, and what each is allowed (#125).
+ *
+ * `exempt` is the ONE file in that tree permitted to write a process global. Only core has one,
+ * because only core can hold a `PatchSlot`; see the header. A package added to the workspace
+ * without being added here is caught by the last assertion in the scan block, which cross-checks
+ * this list against `pnpm-workspace.yaml`'s `packages/*` — so the scan cannot silently shrink.
+ */
+const SCANNED: { pkg: string; root: string; exempt: string | null }[] = [
+  { pkg: "core", root: SRC_ROOT, exempt: HELPER_REL },
+  { pkg: "cli", root: path.join(PACKAGES_ROOT, "cli", "src"), exempt: null },
+  { pkg: "policy-schema", root: path.join(PACKAGES_ROOT, "policy-schema", "src"), exempt: null },
+  { pkg: "sbom-import", root: path.join(PACKAGES_ROOT, "sbom-import", "src"), exempt: null },
+];
 
 /**
  * The sites as they stand after `src/index.js` is evaluated — snapshotted at module load so a
@@ -211,21 +238,45 @@ function tsFilesUnder(dir: string): string[] {
 }
 
 describe("#107 — every process-level write goes through lifecycle/process-patch.ts", () => {
-  it("finds no process-global mutation anywhere else in packages/core/src", () => {
-    const offenders: Finding[] = [];
-    for (const file of tsFilesUnder(SRC_ROOT)) {
-      const rel = path.relative(SRC_ROOT, file);
-      if (rel === HELPER_REL) continue; // the one file allowed to write a process global
-      offenders.push(...processWrites(rel, readFileSync(file, "utf8")));
-    }
+  for (const { pkg, root, exempt } of SCANNED) {
+    it(`finds no process-global mutation in packages/${pkg}/src`, () => {
+      expect(existsSync(root), `packages/${pkg}/src does not exist — fix SCANNED`).toBe(true);
+      const offenders: Finding[] = [];
+      for (const file of tsFilesUnder(root)) {
+        const rel = path.relative(root, file);
+        if (rel === exempt) continue; // the one file allowed to write a process global
+        offenders.push(...processWrites(`packages/${pkg}/src/${rel}`, readFileSync(file, "utf8")));
+      }
+      expect(
+        offenders,
+        exempt === null
+          ? `packages/${pkg} writes a process-level location. Only @capwall/core may patch one, ` +
+              `and only through a PatchSlot in lifecycle/process-patch.ts — that helper is not on ` +
+              `core's exports map, so this package cannot get the lifecycle right (#125). If the ` +
+              `patch is genuinely needed, it belongs in core behind defineRelinkedPatch or ` +
+              `defineSharedPatch / definePropertyPatch. Offenders:\n` +
+              offenders.map((o) => `  ${o.file}:${o.line}  ${o.text}`).join("\n")
+          : `A process-level location is written outside lifecycle/process-patch.ts. Every such ` +
+              `write must go through a PatchSlot held by defineRelinkedPatch (stacking) or ` +
+              `defineSharedPatch / definePropertyPatch (single, refcounted) — see issue #107 for ` +
+              `the three lifecycle bugs a bare save/restore produced. Offenders:\n` +
+              offenders.map((o) => `  ${o.file}:${o.line}  ${o.text}`).join("\n"),
+      ).toEqual([]);
+    });
+  }
+
+  it("covers every workspace package — a new one cannot land unscanned", () => {
+    // The scope is the point of #125, so it is asserted rather than trusted to a list somebody
+    // remembers to extend. `packages/*` is the workspace glob; every entry with a `src/` must
+    // appear in SCANNED.
+    const onDisk = readdirSync(PACKAGES_ROOT, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && existsSync(path.join(PACKAGES_ROOT, e.name, "src")))
+      .map((e) => e.name)
+      .sort();
     expect(
-      offenders,
-      `A process-level location is written outside lifecycle/process-patch.ts. Every such write ` +
-        `must go through a PatchSlot held by defineRelinkedPatch (stacking) or defineSharedPatch ` +
-        `/ definePropertyPatch (single, refcounted) — see issue #107 for the three lifecycle bugs ` +
-        `a bare save/restore produced. Offenders:\n` +
-        offenders.map((o) => `  ${o.file}:${o.line}  ${o.text}`).join("\n"),
-    ).toEqual([]);
+      SCANNED.map((s) => s.pkg).sort(),
+      "a workspace package under packages/*/src is not in SCANNED — add it (exempt: null)",
+    ).toEqual(onDisk);
   });
 
   it("is a scan that actually fires — a hand-rolled save/restore is detected", () => {

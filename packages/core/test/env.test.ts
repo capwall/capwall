@@ -9,11 +9,15 @@
  * walk cannot attribute at all is `<unknown>` and is gated like any dependency — see the two
  * `<unknown>` cases below, and `attribution-laundering.test.ts` for the end-to-end vectors.
  */
+import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import * as os from "node:os";
 import * as path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   install,
   loadPolicyFromObject,
@@ -197,5 +201,113 @@ describe("env shim — uninstall restores process.env", () => {
     withCapwall(enforce([]), "enforce", () => undefined);
     const dep = loadFixtureFresh();
     expect(dep.readEnv(SECRET)).toBe("s3cr3t"); // would throw if proxy still installed
+  });
+});
+
+/* ------------------------------------------------------------------------------------------- */
+/* CAPWALL_ENV — the preload channel for `install({ env: false })` (#125).                       */
+
+/**
+ * `env` was the ONE install option with no environment-variable channel: `projectRoot`, `esm`,
+ * `globalEgress`, `hardened` and `attribution.maxFrames` all had one, so the escape hatch
+ * `install()` documents was unreachable from the CLI. #125 asked whether that was deliberate —
+ * "an env-var switch for the anti-exfiltration control hands an attacker a one-line disable" —
+ * and it is not: the whole configuration channel is the environment, so anyone who can set
+ * `CAPWALL_ENV` already has `CAPWALL_MODE=observe`, a substituted `CAPWALL_POLICY_FILE`, or
+ * dropping the `--import` altogether, each strictly more powerful. It was an omission.
+ *
+ * Runs against the built `dist/preload.js` in a subprocess, because that IS the channel under
+ * test. The probe reads through the dependency: `<app>` is exempt from the env gate either way.
+ */
+const PRELOAD = requireCjs.resolve("../dist/preload.js");
+const ENV_APP = path.join(here, "fixtures", "env-preload-app.cjs");
+
+interface PreloadRun {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+function runPreload(env: Record<string, string>): Promise<PreloadRun> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      process.execPath,
+      [ENV_APP, SECRET],
+      {
+        cwd: path.join(here, "fixtures"),
+        env: {
+          ...process.env,
+          NODE_OPTIONS: `--import ${pathToFileURL(PRELOAD).href}`,
+          CAPWALL_PROJECT_ROOT: path.join(here, "fixtures"),
+          [SECRET]: "s3cr3t",
+          ...env,
+        },
+      },
+      (err, stdout, stderr) => {
+        if (err && typeof err.code !== "number") return reject(err);
+        resolve({ code: err ? (err.code as number) : 0, stdout, stderr });
+      },
+    );
+  });
+}
+
+describe("#125 — CAPWALL_ENV is the preload channel for env: false", () => {
+  let tmpDir: string;
+  let denyPolicy: string;
+
+  beforeAll(async () => {
+    expect(existsSync(PRELOAD), `built preload not found at ${PRELOAD} — run 'pnpm build'`).toBe(true);
+    tmpDir = await mkdtemp(path.join(os.tmpdir(), "capwall-env-preload-"));
+    denyPolicy = path.join(tmpDir, "deny.json");
+    await writeFile(denyPolicy, JSON.stringify({ version: 1, mode: "enforce", packages: {} }));
+  });
+  afterAll(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("gates a dependency's read by default, exactly as before", async () => {
+    const r = await runPreload({ CAPWALL_MODE: "enforce", CAPWALL_POLICY_FILE: denyPolicy });
+    expect(r.stdout).toContain("ENV:undefined");
+    expect(r.stderr).toContain(`DENY 'fixture-dep' env:${SECRET}`);
+  });
+
+  it("CAPWALL_ENV=0 leaves process.env un-proxied — the read succeeds and is not recorded", async () => {
+    const r = await runPreload({
+      CAPWALL_MODE: "enforce",
+      CAPWALL_POLICY_FILE: denyPolicy,
+      CAPWALL_ENV: "0",
+    });
+    expect(r.stdout).toContain("ENV:s3cr3t");
+    expect(r.stderr).not.toContain(`env:${SECRET}`);
+  });
+
+  it("warns loudly when it is set, because the process still looks enforced", async () => {
+    // The reason this switch warns and `CAPWALL_GLOBAL_EGRESS=0` does not: turning the env guard
+    // off makes every `env` grant in the policy decorative and records nothing, while `enforce`
+    // keeps printing DENY lines for the other capabilities. Silence there is the "looks guarded,
+    // isn't" shape.
+    const off = await runPreload({
+      CAPWALL_MODE: "enforce",
+      CAPWALL_POLICY_FILE: denyPolicy,
+      CAPWALL_ENV: "0",
+    });
+    expect(off.stderr).toContain("CAPWALL_ENV=0");
+    const on = await runPreload({ CAPWALL_MODE: "enforce", CAPWALL_POLICY_FILE: denyPolicy });
+    expect(on.stderr).not.toContain("CAPWALL_ENV=0");
+  });
+
+  it("only the exact value '0' disables it — any other value leaves the guard on", async () => {
+    // Same contract as CAPWALL_ESM / CAPWALL_GLOBAL_EGRESS: a typo must not silently disarm the
+    // anti-exfiltration control, so the comparison is `!== "0"` rather than a truthiness test.
+    for (const value of ["", "false", "off", "1"]) {
+      const r = await runPreload({
+        CAPWALL_MODE: "enforce",
+        CAPWALL_POLICY_FILE: denyPolicy,
+        CAPWALL_ENV: value,
+      });
+      expect(r.stdout, `CAPWALL_ENV=${JSON.stringify(value)} must not disable the guard`).toContain(
+        "ENV:undefined",
+      );
+    }
   });
 });
