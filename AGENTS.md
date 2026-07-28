@@ -291,6 +291,14 @@ as the gate.
 - The "what it does NOT stop" list (prototype pollution, shared mutable primordials,
   fd/symlink escapes, un-patching shims, `vm`/`eval`, native `.node` addons, subprocess
   internals) is a feature of the docs, not an embarrassment. Do not quietly drop it.
+- **capwall's mechanism rests on unsupported Node internals, and the docs say so.**
+  `docs/node-api-dependencies.md` is the per-API inventory — status on 22/24/26, the replacement
+  if any, which capability dies without it — measured against real binaries rather than
+  changelogs. Two rules follow. (1) A wrapper over a Node primitive forwards
+  `Reflect.apply(real, this, args)` and states no arity (#128, #135); a *derived* argument handed
+  to a DIFFERENT primitive needs the same treatment, which is where the #123 gate sprang a leak on
+  Node 24.18. (2) If you change one of those call sites, or claim a version fact in a comment,
+  re-measure it — § Reproducing the measurement is written to be repeatable.
 - **Malicious fixtures must stay obviously inert.** `examples/malicious-dep-demo` may only
   `console.log("would exfiltrate …")`. Never write real exfiltration, real network egress,
   or anything that touches a real secret. The demo proves the **block**, not the attack.
