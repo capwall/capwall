@@ -12,12 +12,14 @@ above the generated section, unattributed, reading as a second changelog. Put th
 commit subject instead; it is the same sentence, in the place that ships it.
 
 **Which means the commit subject is now the entry, and has to be worth reading.** `feat:` →
-*Added*, `fix:` → *Fixed*, `perf:` → *Performance*, `refactor:` → *Changed*. `security:` is a
+*Added*, `fix:` → *Fixed*, `perf:` → *Performance*, `refactor:` → *Changed*, `revert:` →
+*Reverted*. `security:` is a
 type this project adds to the conventional set, mapped to a *Security* section that sorts above
 everything else: "capwall stopped mediating X" is a security regression for every user and has to
 be findable without reading the diff. `docs`, `test`, `build`, `ci`, `chore` and `style` are
-hidden. `commitlint` enforces all of it on every pull request; see
-[`CONTRIBUTING.md`](CONTRIBUTING.md).
+hidden. `scripts/check-commit-messages.mjs` enforces all of it on every pull request — it reads
+the type list out of `release-please-config.json`, so this paragraph and the pipeline cannot
+disagree about what a type does. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 The two sections below — `[Unreleased]` and `[0.1.0]` — are the hand-written ones, from before
 this repository adopted release-please and before anything was published. They stay as they are.

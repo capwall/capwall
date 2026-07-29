@@ -9,7 +9,7 @@
 
   Types: security | feat | fix | perf | refactor | revert | docs | test | build | ci | chore | style
   `!` or a `BREAKING CHANGE:` footer moves the minor while the major is 0.
-  Check it locally: printf '%s' "<your title>" | pnpm exec commitlint
+  Check it locally: node scripts/check-commit-messages.mjs --message "<your title>"
 
   DO NOT edit CHANGELOG.md. release-please generates it from these subjects.
   Security problem? Close this and read SECURITY.md — there is a private channel.
