@@ -1,0 +1,24 @@
+# https://editorconfig.org — descriptive, not aspirational: this matches the tree as it is.
+#
+# There is no formatter in this repository and this file is not one. `pnpm lint` is oxlint, which
+# is configured as a DEFECT gate with its style rules deliberately off (see .oxlintrc.json).
+# Nothing here is enforced by CI; it exists so an editor stops fighting the existing files.
+#
+# Every section below covers file types that are actually in the tree. An entry that refers to
+# nothing reads as "this was reviewed and declined" when the truth is "this does not exist here".
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+indent_style = space
+indent_size = 2
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# Markdown uses two trailing spaces as a hard line break, and this repo's prose is hand-wrapped at
+# ~100 columns. Stripping trailing whitespace here silently changes rendered output.
+[*.md]
+trim_trailing_whitespace = false
+max_line_length = 100

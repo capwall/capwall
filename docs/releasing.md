@@ -459,6 +459,9 @@ overstated. What **was** verified, locally, against release-please 17.6.0 (the v
 - a `security:` commit lands in a `### Security` section and bumps the patch;
 - release-please's changelog updater leaves this repository's existing `CHANGELOG.md` untouched
   and inserts above the first section;
+- **the whole chain joins up**: release-please's updaters were applied to a copy of this tree for
+  a `0.2.0` release and `check-release-versions.mjs v0.2.0` — the exact command `release.yml` runs
+  before packing — passes on the result, and still fails for `v0.3.0`;
 - `commitlint` accepts and rejects the intended messages (`pnpm lint:commits`);
 - `check-release-versions.mjs` fails on each of: a lockstep break, a caret internal dep, a
   drifted release-please manifest, a package on disk that is missing from the release config, a

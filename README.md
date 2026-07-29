@@ -238,6 +238,8 @@ with no DX. The observe→review→enforce loop is what capwall adds.
 | [`docs/ci-local.md`](./docs/ci-local.md) | reproducing the CI matrix locally; drift detection in CI |
 | [`docs/roadmap.md`](./docs/roadmap.md) | build order, and the one place milestone status is tracked |
 | [`docs/releasing.md`](./docs/releasing.md) | the publish runbook, and what is (and is not) in the release |
+| [`SECURITY.md`](./SECURITY.md) | how to report a bypass **privately**, what is in scope, and which residuals are already documented |
+| [`CONTRIBUTING.md`](./CONTRIBUTING.md) | pnpm is required, `pnpm ci:local` is the gate, and commit messages write the changelog |
 | [`packages/core/README.md`](./packages/core/README.md) | the `install()` API, hardened mode, and the complete `CAPWALL_*` table |
 | [`scripts/bench/README.md`](./scripts/bench/README.md) | the performance numbers, and where the per-call budget does not hold |
 

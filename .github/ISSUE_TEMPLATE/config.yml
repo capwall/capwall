@@ -1,0 +1,25 @@
+# `blank_issues_enabled: false` is the load-bearing line. capwall is a security tool, and the
+# failure mode being designed against is someone pasting a working bypass into a public issue
+# because it was the first box on the page. Every route out of this chooser either asks the right
+# questions or sends the reporter to the private channel.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/williamzujkowski/capwall/security/advisories/new
+    about: >-
+      A bypass, an attribution confusion, or an operation that succeeds with no decision recorded.
+      Do NOT open a public issue. Read SECURITY.md first — it lists the documented residuals that
+      are deliberately not vulnerabilities, including the one-line Error.captureStackTrace escape.
+
+  - name: Read the threat model before reporting a bypass
+    url: https://github.com/williamzujkowski/capwall/blob/main/docs/threat-model.md
+    about: >-
+      capwall is defense-in-depth, not a sandbox. "What capwall does NOT stop" is a long,
+      deliberate section, and most first bypass reports are already in it.
+
+  - name: How to build, test and contribute
+    url: https://github.com/williamzujkowski/capwall/blob/main/CONTRIBUTING.md
+    about: >-
+      pnpm is required, `pnpm ci:local` is the real gate (Actions is billing-blocked), and commit
+      messages are enforced because they write the changelog.

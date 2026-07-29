@@ -1,0 +1,29 @@
+# Every path has an owner; the entries below the catch-all exist so that a change to the release
+# path or to an enforcement claim cannot be reviewed as if it were an ordinary change.
+#
+# CODEOWNERS only requests review — it does not block. It blocks when a branch protection rule on
+# `main` turns on "Require review from Code Owners", which is a repository setting and therefore a
+# HUMAN CHECKLIST item, not something this file can do on its own.
+
+* @williamzujkowski
+
+# The release path. A change here can publish something irreversible: npm's unpublish window is
+# 72 hours, and the trusted-publisher configuration is bound to release.yml BY FILENAME.
+/.github/workflows/release.yml          @williamzujkowski
+/.github/workflows/release-please.yml   @williamzujkowski
+/release-please-config.json             @williamzujkowski
+/.release-please-manifest.json          @williamzujkowski
+/scripts/check-release-versions.mjs     @williamzujkowski
+/scripts/check-tarball-sources.mjs      @williamzujkowski
+/scripts/assert-pnpm-pack.mjs           @williamzujkowski
+/scripts/assert-pnpm-install.mjs        @williamzujkowski
+
+# The claims. docs/threat-model.md is where capwall says what it does and does not stop; a diff
+# here is a change to the product's honesty, not to its prose.
+/docs/threat-model.md                   @williamzujkowski
+/SECURITY.md                            @williamzujkowski
+
+# The test gates that decide whether a security test can fail at all.
+/scripts/mutants.json                   @williamzujkowski
+/scripts/mutation-guard.mjs             @williamzujkowski
+/scripts/mutation-sentinel.mjs          @williamzujkowski

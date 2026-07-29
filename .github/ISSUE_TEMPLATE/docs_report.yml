@@ -1,0 +1,50 @@
+name: Documentation is wrong
+description: A claim in the README, the threat model or docs/ does not match the code.
+labels: ["documentation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is a first-class issue type here, not a courtesy. capwall's documentation makes
+        load-bearing claims — what is mediated, what is not, what a measurement was — and a stale
+        one is worse than a missing feature: it is a security claim nobody can rely on. Several
+        past issues were exactly this.
+
+  - type: input
+    id: where
+    attributes:
+      label: Which file, and which line or heading
+      placeholder: "docs/threat-model.md § Native `.node` addons"
+    validations:
+      required: true
+
+  - type: textarea
+    id: claim
+    attributes:
+      label: What it says
+      description: Quote it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reality
+    attributes:
+      label: What is actually true, and how you know
+      description: >-
+        A test, a measurement, a line of source, or a transcript. "How you know" is the part that
+        makes this actionable.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Does this overstate what capwall protects?
+      description: >-
+        Documentation that promises more enforcement than exists is treated as a security-adjacent
+        defect. Documentation that undersells is a normal bug.
+      options:
+        - "Yes — it claims protection that is not there"
+        - "No — it is stale, unclear or understated"
+    validations:
+      required: true

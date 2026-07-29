@@ -1,0 +1,59 @@
+name: Capability or feature proposal
+description: A surface capwall should mediate, a policy-format change, or a CLI improvement.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two things make a proposal here land or not, and both are unusual enough to state up
+        front:
+
+        - **A new mediated surface costs startup time and per-call latency, and those are measured
+          budgets, not vibes.** `scripts/bench/README.md` has the numbers and the method.
+        - **A new runtime dependency is close to a non-starter.** The entire runtime closure of all
+          four publishable packages is currently one package. Every dependency is attack surface
+          for a supply-chain tool.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What can a malicious (or merely careless) dependency do today that it should not?
+      description: >-
+        Or, for non-enforcement proposals: what is hard to do with capwall now? Concrete beats
+        general — a real package doing a real thing.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you are proposing
+      description: >-
+        If it is a policy-format change, show the `capabilities.json` you want to be able to write.
+    validations:
+      required: true
+
+  - type: textarea
+    id: threatmodel
+    attributes:
+      label: Where this sits in the threat model
+      description: >-
+        Does it close something [docs/threat-model.md](https://github.com/williamzujkowski/capwall/blob/main/docs/threat-model.md)
+        currently lists as out of scope? If so, say which bullet — several of them are out of scope
+        for reasons that will not change (primordials are SES's job).
+
+  - type: textarea
+    id: cost
+    attributes:
+      label: What it would cost
+      description: >-
+        New runtime dependency? A new process-global patch? Work at startup, or work per call?
+        A guess with reasoning is fine; pretending there is no cost is not.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you file
+      options:
+        - label: "I checked [docs/roadmap.md](https://github.com/williamzujkowski/capwall/blob/main/docs/roadmap.md) and the open issues"
+        - label: "This does not require a new runtime dependency (or I have said why it must)"
