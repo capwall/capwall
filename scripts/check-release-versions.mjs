@@ -55,6 +55,24 @@
  *      writes `## [0.2.0](https://.../compare/v0.1.0...v0.2.0) (2026-08-01)`, the hand-written
  *      sections up to 0.1.0 read `## [0.1.0] - 2026-08-01`.
  *
+ *   7. THE SHIPPED READMEs ARE FIT TO BE THE PACKAGE PAGE. `files` includes `README.md`, so each
+ *      published package's README is what npmjs.com renders, and a README on the registry can
+ *      only be changed by publishing a NEW VERSION — there is no edit button. Two mistakes are
+ *      therefore permanent under a version number and are checked here:
+ *
+ *        a. RELATIVE LINKS OUT OF THE PACKAGE (`](../../docs/x.md)`). They resolve on GitHub and
+ *           404 on npmjs.com, which renders the README at a URL that has no repository above it.
+ *           Checked always — there is no state of the world in which one of these works.
+ *        b. A "NOT PUBLISHED YET" NOTE. True today, self-refuting the instant it is published,
+ *           and the first paragraph an evaluator reads on the package page. Checked ONLY when a
+ *           tag is supplied, exactly like the changelog-date rule above: the note is honest
+ *           right up until the release that makes it false, so the gate belongs at the moment of
+ *           irreversibility and not before it.
+ *
+ *      Found by the 0.1.0 publish rehearsal: `@capwall/core` shipped 7 dead links and
+ *      `@capwall/cli` 5, and `cli`/`policy-schema` both opened with "Not published to npm yet —
+ *      run it from a clone". None of it is catchable by build, test, typecheck or lint.
+ *
  *   6. RELEASE-PLEASE'S OWN CONFIGURATION STILL HAS THE SHAPE LOCKSTEP DEPENDS ON. One package
  *      (`"."`), a bare `vX.Y.Z` tag, every directory under `packages/` listed in that package's
  *      `extra-files`, and no `node-workspace` plugin. A package added to the workspace but not to
@@ -182,6 +200,44 @@ if (changelog !== "") {
     errors.push(
       `CHANGELOG.md's '${line.trim()}' carries no ISO date.\n` +
         `    A tagged release needs a real date (YYYY-MM-DD) on that heading.`,
+    );
+  }
+}
+
+// --- 7. the shipped READMEs are fit to be the package page --------------------------------
+// Only the PUBLISHED set: a held-back package's README reaches nobody.
+for (const p of PUBLISHED) {
+  const rel = `packages/${p}/README.md`;
+  let readme;
+  try {
+    readme = readFileSync(join(ROOT, "packages", p, "README.md"), "utf8");
+  } catch {
+    errors.push(
+      `${rel} is missing. It is in that package's "files", so npm would render an empty page.`,
+    );
+    continue;
+  }
+
+  // (a) always: a link that climbs out of the package resolves nowhere on npmjs.com.
+  const escaping = [...readme.matchAll(/\]\((\.\.\/[^)]*)\)/g)].map((m) => m[1]);
+  if (escaping.length > 0) {
+    const shown = [...new Set(escaping)].slice(0, 4);
+    errors.push(
+      `${rel} has ${escaping.length} link(s) that climb out of the package: ${shown.join(", ")}` +
+        `${escaping.length > shown.length ? ", ..." : ""}\n` +
+        `    npmjs.com renders this file with no repository above it, so each one 404s there\n` +
+        `    while still working on GitHub. Use an absolute URL:\n` +
+        `    https://github.com/williamzujkowski/capwall/blob/main/<path>`,
+    );
+  }
+
+  // (b) only when cutting a release: a note saying the package is unpublished, published.
+  if (tag !== "" && /not published to npm yet/i.test(readme)) {
+    errors.push(
+      `${rel} still says "Not published to npm yet", and you are cutting ${tag}.\n` +
+        `    That sentence is what npmjs.com will show as the package page's opening paragraph,\n` +
+        `    and a README can only be corrected by publishing another version. Replace it with\n` +
+        `    the install path before packing — see docs/releasing.md § THE FIRST MANUAL PUBLISH.`,
     );
   }
 }
