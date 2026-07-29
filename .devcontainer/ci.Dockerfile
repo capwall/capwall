@@ -43,6 +43,13 @@ ARG CACHEBUST=0
 RUN echo "run ${CACHEBUST}" && pnpm test
 RUN pnpm lint
 
+# The enforcement canary (issue #184). Not a ci.yml step — this is the container asserting, once
+# per Node version, that the `dist/` it just built actually enforces: one granted operation is
+# allowed and two ungranted ones are denied, in a child process launched the way the CLI launches
+# one (`--import dist/preload.js`). It runs even when BENCH=0, because "did the build produce a
+# capwall that still says no?" is not a performance question. ~0.5s.
+RUN echo "run ${CACHEBUST}" && pnpm canary
+
 # ci.yml step: "Perf gate" — the reduced-iteration benchmark run (scripts/bench/bench.mjs
 # --quick, ~10s). It gates on a CO-SAMPLED RATIO rather than an absolute microsecond figure, so
 # it is portable across machines and does not go red because the host is busy; see

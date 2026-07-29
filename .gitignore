@@ -44,3 +44,9 @@ scripts/bench/fixtures/node_modules/bench-dep/.bench-scratch/
 
 # Agent worktrees (created by tooling, never part of the tree)
 .claude/worktrees/
+
+# The mutation-guard run stamp (issue #184). Written by `pnpm mutation:gate` for exactly as long
+# as it holds a mutation, and carrying the original bytes of the file it mutated. Its PRESENCE is
+# the signal — bench, canary and ci:local refuse to start while it exists — so it must never be
+# committed, and `pnpm mutation:recover` is what removes it.
+.capwall-mutation-guard.json

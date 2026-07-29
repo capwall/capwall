@@ -25,7 +25,10 @@
     "bench": "node scripts/bench/bench.mjs",
     "bench:gate": "node scripts/bench/bench.mjs --quick",
     "bench:startup": "node scripts/bench/startup.mjs",
+    "canary": "node scripts/canary.mjs",
     "mutation:gate": "node scripts/mutation-guard.mjs",
+    "mutation:recover": "node scripts/mutation-guard.mjs --recover",
+    "mutation:status": "node scripts/mutation-sentinel.mjs --status",
     "ci:local": "bash scripts/ci-local.sh",
     "ci:local:22": "bash scripts/ci-local.sh 22",
     "ci:local:24": "bash scripts/ci-local.sh 24"

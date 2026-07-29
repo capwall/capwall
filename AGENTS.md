@@ -384,6 +384,14 @@ the matrix as early warning: it becomes LTS on 2026-10-28, and it is already the
   `scripts/mutants.json` and run `pnpm mutation:gate`. It deletes the mechanism and re-runs
   only the tests that claim to cover it; anything it reports `SURVIVED` is an untested
   security property. See `docs/ci-local.md` § A sixth gate.
+- **Before you trust a measurement or a bypass PoC, check that this tree is still armed.**
+  `packages/*/dist` is gitignored and is what the CLI, `examples/` and every
+  `--import .../dist/preload.js` reproduction execute, so a deleted gate there is invisible to
+  `git status` — #184 lost an audit a batch of measurements that way. `pnpm canary` proves
+  enforcement end to end in ~0.5s; `pnpm mutation:status` says whether a mutation-guard run is
+  holding the tree; `pnpm mutation:recover` undoes an interrupted one. `bench`, `canary`,
+  `ci:local` and `mutation:gate` now refuse to start on a tree that is or may be mutated, so
+  "never run `mutation:gate` and `ci:local` concurrently" is enforced rather than remembered.
 
 ## 8. Threat-model guardrails
 

@@ -60,11 +60,14 @@
  * results on stdout), --no-esm (skip the ESM arm).
  */
 
+import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
+
+import { preflight } from "../mutation-sentinel.mjs";
 
 // ── configuration ─────────────────────────────────────────────────────────────────────────
 
@@ -128,6 +131,36 @@ function fail(msg) {
 
 if (!fs.existsSync(CORE_DIST)) {
   fail(`${CORE_DIST} not found — run "pnpm -r build" first (see scripts/bench/README.md).`);
+}
+
+// ── is this capwall still armed? (issue #184) ─────────────────────────────────────────────
+//
+// Everything below measures `packages/core/dist`, which is GITIGNORED. #184 is an audit that
+// spent a batch of measurements against a `dist/loader/module-read.js` carrying a deleted gate
+// while `git status` was clean. Numbers taken from a disarmed capwall are not conservative or
+// noisy — they are a different program's numbers, and they read as a real result.
+//
+// Two cheap checks, in the order that gives the most specific message first: the sentinel/stamp
+// scan names the file and line if a mutation is present, and the canary then proves end to end,
+// in a child process under the real `--import dist/preload.js`, that one granted operation is
+// allowed and two ungranted ones are denied. Both are silent when correct.
+const armed = preflight({ kinds: ["src", "dist"], label: "the benchmark" });
+if (!armed.ok) {
+  process.stderr.write(`\n${armed.message}\n`);
+  process.exit(1);
+}
+{
+  const canary = spawnSync(process.execPath, [path.join(here, "..", "canary.mjs")], {
+    encoding: "utf8",
+  });
+  if (canary.status !== 0) {
+    process.stderr.write(
+      `${canary.stdout ?? ""}${canary.stderr ?? ""}\n` +
+        "error: the enforcement canary failed — refusing to benchmark a capwall that is not\n" +
+        "enforcing. Any number produced here would be a measurement of the wrong program (#184).\n",
+    );
+    process.exit(1);
+  }
 }
 
 // ── stats + timing primitives ─────────────────────────────────────────────────────────────
