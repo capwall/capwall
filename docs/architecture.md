@@ -36,10 +36,13 @@ package's slice of the policy.
 
 ### Loader interception (`core/src/loader`)
 
-- **CJS (`require.ts`)** — patch the module loader (`Module._load` /
-  `Module.prototype.require`) so that when a package requires a capability-sensitive core
-  module (`fs`, `net`, …), it receives capwall's **shimmed** version rather than the raw
-  builtin. This is the primary, first-implemented path.
+- **CJS (`require.ts`)** — patch `Module._load` so that when a package requires a
+  capability-sensitive core module (`fs`, `net`, …), it receives capwall's **shimmed** version
+  rather than the raw builtin. This is the primary, first-implemented path. A second patch in
+  the same file, on **`Module.prototype.load`**, takes the `fs.read` decision for a module load
+  outside every `node_modules` tree (#123, see `module-read.ts` below). `Module.prototype.require`
+  is deliberately *not* patched — it funnels into `Module._load`, and a second gate on the way
+  in would double-decide every load.
 - **ESM (`esm-hook.ts` + `esm-hooks.ts` + `esm-runtime.ts`)** — implemented (M5), moved to
   `module.registerHooks()` in #152. A **synchronous, same-realm** `resolve` hook
   (`esm-hooks.ts`) rewrites a mediated builtin specifier to a synthetic `capwall-esm:` module;
@@ -114,9 +117,24 @@ lower-level module is the reasoning error that produces a real bypass. See
 [`threat-model.md`](./threat-model.md) § per-capability notes, which states the same rule as
 a security property.
 
-`node:module` is also mediated: the shim gates `register`/`registerHooks` so a dependency cannot
-install a loader hook ahead of capwall's and un-mediate the ESM path process-wide (#61). That
-half is not a policy capability. Everything else on `node:module` passes through.
+`node:module` is also mediated, but **the loader-hook gate is not in the shim** — since #181 it
+is a patch on `Module.register` and `Module.registerHooks` themselves, installed eagerly by
+`install()`, so a dependency cannot install a loader hook ahead of capwall's and un-mediate the
+ESM path process-wide (#61). It has to be at the functions: `node:module`'s CJS export *is* the
+`Module` class, so every CJS module in the process already holds those two as
+`module.constructor` without requiring anything, and `process.getBuiltinModule("node:module")`
+returns the un-shimmed module. A gate that lived in the shim's `get` trap would have missed the
+shortest routes to it. That gate is not a policy capability, and it can be relaxed for
+dependencies with `CAPWALL_ALLOW_LOADER_HOOKS=1` (which still warns loudly).
+
+The `node:module` shim itself remains, as defense in depth. It is a `Proxy` over the real module
+rather than a copied object, because copying own keys onto `{}` would break
+`new (require("module"))(…)`, `Module.prototype`, `instanceof`, and every consumer that reaches
+an internal. The one thing its trap changes is stated over the *value* rather than as a list of
+names: `node:module` exposes itself under its own key (`Module.Module === Module`), so a trap
+forwarding values verbatim would hand a caller the raw module object through the shim — and any
+own key a future Node adds pointing back at the module would have the same shape. Everything
+else on `node:module` passes through.
 
 `Module.prototype._compile` is gated **separately, and not by that shim** (#93). It is the one
 primitive that lets a caller choose what V8 reports as `getFileName()` on the frames of the code
@@ -148,10 +166,15 @@ by construction. Gating only: capwall cannot confine an addon once it is loaded 
 
 ### Process-patch lifecycle (`core/src/lifecycle/process-patch.ts`)
 
-Five of capwall's controls are not module shims at all — they replace a **process-level
-location**: `Module._load`, `process.dlopen`, `process.env`, `Module.prototype._compile`, and the
-egress globals `fetch`/`WebSocket`/`EventSource`. Those five share one rule, and #107 made it
-structural after #103 found three separate bugs that were all the same defect:
+Most of capwall's controls are not module shims at all — they replace a **process-level
+location**. Nine sites are registered on every platform: `Module._load`, `Module.prototype.load`
+(the module-read gate, #177/#189), `Module._findPath` (the passive link observer, #127),
+`Module.prototype._compile`, `Module.register`, `Module.registerHooks`, `process.dlopen`,
+`process.env`, and the egress globals `fetch`/`WebSocket`/`EventSource`. A tenth,
+`globalThis.localStorage` (#156), registers only where the process actually has Web Storage
+(Node ≥26 behind `--localstorage-file`), which is why it is absent from the inventory on 22 and
+24. They all share one rule, and #107 made it structural after #103 found three separate bugs
+that were all the same defect:
 
 > **Every process-level patch capwall installs is a reference-counted relink chain, never a bare
 > save/restore.**
@@ -290,10 +313,11 @@ are imported from there directly — core does not restate or re-export them.
 - `enforce` — launch the target with capwall in enforce mode.
 - `run` — launch the target in the mode the policy document declares (`mode`), for projects
   that want the committed file, not the command line, to be the authority.
-- `diff` — run the target in observe mode, then report every observed capability the
-  committed policy would deny in enforce mode (drift detection, roadmap S3). Exits 0 = no
-  drift, 1 = drift, 2 = usage error / missing policy, and takes `--json`, so it can gate a
-  merge. See [`ci-local.md`](./ci-local.md) § Drift detection.
+- `diff` — run the target in observe mode, then report drift against the committed policy in
+  both directions (roadmap S3, #118): observed capabilities the policy would deny in enforce
+  mode, and declared keys that matched no principal that ran. Exits 0 = no drift, 1 = drift,
+  2 = usage error / missing policy, and takes `--json` and `--strict`, so it can gate a merge.
+  See [`cli.md`](./cli.md) § `diff` and [`ci-local.md`](./ci-local.md) § Drift detection.
 - `gen-policy` — (re)generate a policy from a prior observe trace.
 - `explain` — explain why a `(package, capability, target)` tuple would be allowed or denied.
 

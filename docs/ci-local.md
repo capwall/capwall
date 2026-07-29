@@ -13,13 +13,21 @@ pnpm build && pnpm typecheck && pnpm test && pnpm lint && pnpm bench:gate
 
 This is what you should run while iterating. It uses whatever Node you have installed.
 
+**`pnpm install` can fail on a fresh clone, and the failure is a security decision rather than a
+build problem.** pnpm 11 removed `ignoredBuiltDependencies` and now **fails the install** with
+`ERR_PNPM_IGNORED_BUILDS` (exit 1) where pnpm 10 printed a warning you could scroll past. It
+fires when a dependency brings in an install script that `pnpm-workspace.yaml`'s `allowBuilds`
+map does not decide. Today nothing in the tree declares one, so `allowBuilds` deliberately does
+not exist as a key — read that file's header before adding it, because `true` there means "this
+package may run arbitrary code at install time".
+
 The five gates are genuinely five different checks:
 
 | Gate | Runs | Catches |
 |---|---|---|
 | `build` | `tsc` emit, per package | Type errors in `src/`; produces `dist/`, which the CLI and ESM tests run against. |
 | `typecheck` | `tsc --noEmit` over src **and** tests | Type errors the build never sees — `build` does not compile `test/`. |
-| `test` | vitest, per package | Behaviour. ~190 of its assertions run in a child `node` process (122 in `@capwall/core`, 69 in `@capwall/cli`), because hardened mode, ESM module caching and loader-hook registration are process-sticky. Those children go through `packages/core/test/helpers/subprocess.ts`, which owns the per-child wall-clock budget, the measurements it is derived from, and the failure message you get when one overruns (issue #145). |
+| `test` | vitest, per package | Behaviour. It starts ~190 child `node` processes (122 from `@capwall/core`, 69 from `@capwall/cli` — children, not assertions: the core suite's 122 children carry 1052 assertions between them), because hardened mode and the ESM module registry are process-sticky. Those children go through `packages/core/test/helpers/subprocess.ts`, which owns the per-child wall-clock budget, the measurements it is derived from, and the failure message you get when one overruns (issue #145). |
 | `lint` | [oxlint](https://oxc.rs) once over the whole repo, config in `.oxlintrc.json` | Defects `tsc` does not check — unused bindings, unreachable/duplicate code, `no-explicit-any`, misuse patterns. It is **not** a style gate; see the config's comments for why the pedantic rules are off. |
 | `bench:gate` | `scripts/bench/bench.mjs --quick`, ~10s | Performance regressions on the mediated hot path. Gates on a **ratio** against a CPU calibration co-sampled in the same loop, not on absolute microseconds, so it is portable and not flaky on a busy machine — see `scripts/bench/README.md` § The regression gate for the derivation. Needs `pnpm build` first (it runs against `dist/`). `CI_BENCH=0 pnpm ci:local` skips it. |
 
@@ -66,7 +74,8 @@ Four things now enforce what used to be prose. None of them says anything when t
 ```bash
 pnpm mutation:status     # what the stamp says, and whether any sentinel is present
 pnpm mutation:recover    # restore the recorded bytes, rebuild, re-scan, clear the stamp
-pnpm canary              # is the dist/ in this tree actually enforcing?
+pnpm canary              # is the dist/ in this tree actually enforcing?  (~0.5s)
+node scripts/canary.mjs --json   # the same four checks, machine-readable
 ```
 
 `ci:local` deliberately does **not** refuse a dirty tree in general — streaming your uncommitted
@@ -102,14 +111,19 @@ when it is missing. `ci.yml` is unaffected — `pnpm/action-setup` installs pnpm
 
 **What this script does NOT reproduce, and it is the whole of `.github/workflows/`'s dependency
 surface.** `ci:local` runs the *steps* in a container: install, build, typecheck, test, lint,
-bench:gate. It never runs `actions/checkout`, `actions/setup-node`, `pnpm/action-setup` or
+canary, bench:gate. It never runs `actions/checkout`, `actions/setup-node`, `pnpm/action-setup` or
 `actions/upload-artifact` — it checks out nothing, installs no toolchain through an action, and
-uploads no artifact. So a green matrix here says exactly nothing about the four `uses:` lines in
-each workflow, which since #168 are SHA-pinned and, while Actions billing is blocked (#3),
-entirely unexercised. "A green run here is a green CI run" is a claim about capwall's code, not
-about the workflow files.
+uploads no artifact. So a green matrix here says exactly nothing about the `uses:` lines in the
+workflows — **three in `ci.yml`, seven in `release.yml`, four distinct actions between them** —
+which since #168 are SHA-pinned and, while Actions billing is blocked (#3), entirely unexercised.
+"A green run here is a green CI run" is a claim about capwall's code, not about the workflow
+files.
 
-Each version builds `.devcontainer/ci.Dockerfile` and runs, in order: `pnpm install --frozen-lockfile=false` → `build` → `typecheck` → `test` → `lint` → `bench:gate`. **A green build == a green CI run for that Node version.** The script exits non-zero if any gate fails on any version, so it can gate a merge.
+Each version builds `.devcontainer/ci.Dockerfile` and runs, in order: `pnpm install --frozen-lockfile=false` → `build` → `typecheck` → `test` → `lint` → **`canary`** → `bench:gate`. **A green build == a green CI run for that Node version.** The script exits non-zero if any gate fails on any version, so it can gate a merge.
+
+Note where `canary` sits: it runs **unconditionally**, including under `CI_BENCH=0`, because its
+job is to prove the `dist/` in the container is actually enforcing before anything downstream is
+believed. Skipping the benchmark does not skip it.
 
 ### How the context is built (why it's faithful)
 
@@ -122,11 +136,19 @@ The script streams the build context from `git ls-files --cached --others --excl
 - Uses the classic Docker builder (`DOCKER_BUILDKIT=0`) so it works without the `buildx` CLI plugin and streams each step's output live. Set `CI_BUILDKIT=1` to force BuildKit if you have it wired up.
 - `install`/`build`/`typecheck` layers cache when the source is unchanged; `test`/`lint`/`bench:gate` are forced to re-run every invocation (via a `CACHEBUST` arg) so `ci:local` always actually executes them.
 - **`CI_CPUSET` is the one axis a dev box cannot otherwise reproduce.** GitHub's hosted runners are 2-core; a 16-core box hides everything that is only slow on two. `CI_CPUSET=0,1` maps to `docker build --cpuset-cpus` and takes the same syntax. It is off by default because it roughly triples the wall time — the suite starts ~190 child `node` processes, each ~0.5s of mostly-serial startup. The suite's timeouts were measured with it on: see `packages/core/test/helpers/subprocess.ts`, which states the budget, the measurements behind it, and why vitest's default 5000ms was not one (issue #145).
+- **`pnpm bench:startup` is a second, separate performance axis and is in no gate.** `bench` and
+  `bench:gate` measure cost *per intercepted call*; `scripts/bench/startup.mjs` measures what a
+  mediated process pays **before it runs a line of your code** — ~100–135 ms on top of a bare
+  `node`, paid once per process by every user of capwall on every process they mediate. Nothing
+  in `ci:local` measures it, so a change that widens capwall's module graph passes every gate
+  green. Run it by hand on 22/24/26 if you add an import to the preload's or the ESM hooks'
+  graph; the derivation and the per-major numbers are in `scripts/bench/README.md` § Startup and
+  § After #152.
 - The perf gate adds ~10s per Node version. It is a genuine gate, not a smoke test — it fails the build on a ~2.7x regression on the mediated hot path. If a run ever goes red for reasons that turn out to be the machine rather than the code, that is a bug in the threshold derivation and belongs in an issue, not in a nudged constant; `CI_BENCH=0` is the escape hatch while it is investigated.
 
 ## Drift detection in CI (`capwall diff`)
 
-Separate from the four gates above, and about *your* project rather than about capwall:
+Separate from the five gates above, and about *your* project rather than about capwall:
 capwall ships a CI-facing subcommand for exactly this file's use case. `capwall diff` runs
 your target in observe mode, then reports every capability the run actually used that the
 committed `capabilities.json` would **deny** in enforce mode — a dependency that started
@@ -135,18 +157,28 @@ doing something it never did before.
 ```bash
 capwall diff -- node ./src/server.js            # human-readable
 capwall diff --json -- node ./src/server.js     # machine-readable
+capwall diff --strict -- node ./src/server.js   # also fail on dead policy keys
 capwall diff -p ./policies/prod.json -- npm test
 ```
 
 | Exit code | Meaning |
 |---|---|
 | `0` | no drift — everything the run did is already granted |
-| `1` | drift found — one or more observed capabilities the policy would deny |
+| `1` | drift found — one or more observed capabilities the policy would deny. **Under `--strict`, also**: a `packages` key that matched no principal in this run |
 | `2` | usage error, or the policy file is missing |
+
+`--strict` is the flag to reach for once a policy is mature. Drift is reported in both directions
+(#118) — observed-but-not-granted, and declared-but-never-matched — but only the first is an
+error by default, because a key legitimately matches nothing when the dependency it names is
+optional or on a path this run did not take. `--strict` promotes the second to a failure too, for
+a pipeline that wants dead keys gone rather than accreted.
 
 `--json` writes the drift as a compact JSON array of `{pkg, kind, detail}` on the **last**
 line of stdout; the target's own stdout is inherited and may precede it, so parse the last
-line. Because a drifting dependency exits `1`, `capwall diff` can gate a merge directly.
+line. Unmatched keys are reported on stderr in every mode — the array is the stable contract.
+Because a drifting dependency exits `1`, `capwall diff` can gate a merge directly.
+
+Full flag and exit-code reference: [`cli.md`](./cli.md) § `diff`.
 
 This repo uses it on itself: `packages/cli/test/express-app-policy.test.ts` asserts that
 `examples/express-app` reports no drift under its committed policy, in a scrubbed

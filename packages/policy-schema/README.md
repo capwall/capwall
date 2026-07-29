@@ -12,7 +12,7 @@ documentation is [`docs/policy-format.md`](https://github.com/williamzujkowski/c
 > **Not published to npm yet** (staged at `0.1.0`, in lockstep with the other three
 > packages — see [`docs/releasing.md`](https://github.com/williamzujkowski/capwall/blob/main/docs/releasing.md)).
 > See the root
-> [README](https://github.com/williamzujkowski/capwall#readme) § Quickstart for the
+> [README](https://github.com/williamzujkowski/capwall#readme) § Install for the
 > run-from-a-clone path.
 
 ## Point your editor at the schema

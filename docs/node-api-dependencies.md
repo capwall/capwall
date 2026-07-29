@@ -56,6 +56,7 @@ changelog summary. See § Reproducing the measurement.
 | `Error.prepareStackTrace` + `Error.captureStackTrace` + structured CallSites | **All of attribution**, plus the `compile` gate's one-frame loader check and the "initiated by Node?" discriminator (#119). `attribution/index.ts`, `shims/module.ts` | **V8, not Node.** `prepareStackTrace` is non-standard and unspecified; `captureStackTrace` is at **TC39 Stage 2** (`proposal-error-capturestacktrace`, which does *not* specify `prepareStackTrace`). Writable on all four | none | **Everything.** capwall answers exactly one question — whose code is calling — and this is how |
 | `Error.stackTraceLimit` | Bounds the frame budget; the #143 optimization depends on the limit applying *after* `captureStackTrace`'s boundary skip | **V8, non-standard.** Writable on all four | none | The frame budget and the #143 cost reduction; attribution still works |
 | `globalThis.fetch` / `WebSocket` / `EventSource` | The global egress guard (#80). `shims/global-egress.ts` | `fetch` documented+stable on all four; `WebSocket` global from 22; **`EventSource` is still flag-only (`--experimental-eventsource`) on 26.5** | n/a — these are the API | Egress via globals is un-gated. Each guard installs only if the global exists, so a flag-only API is picked up when the flag is on and nothing is invented when it is not |
+| `globalThis.localStorage` / `Storage.prototype` / `process.execArgv` | The Web Storage guard (#156): `localStorage`'s six members take an `fs` read/write decision on the file `--localstorage-file` names, which Node otherwise reads and writes below the `fs` shim. The whole object is replaced rather than the prototype's methods, because **`Storage.prototype.length` is a non-configurable getter on 26.5.0** (measured) and `length` is a read of the file's state. `process.execArgv` (plus `NODE_OPTIONS`, in Node's own precedence order) is how the backing path is recovered. `shims/web-storage.ts` | **Documented, experimental.** Web Storage exists only on **Node ≥26** and only behind `--localstorage-file`; absent on 22 and 24, so the guard registers no patch site there at all. Availability is probed with `Object.keys(globalThis)` and never by reading the property, because a read on an unflagged Node 26 emits `ExperimentalWarning` on the same stderr as capwall's DENY lines. `process.execArgv` is documented and stable | n/a — these are the API | `localStorage` becomes an un-gated route to `fs` bytes again, on Node ≥26 with the flag. Nothing on 22 or 24, where the surface does not exist |
 | `process.moduleLoadList` | ONE narrow question, on the fail-safe side: has anything in this realm materialized undici yet (#170)? `internal/deps/undici/undici` enters the list at the instant `globalThis.Request` is first read and not before — merely reading `globalThis.fetch` does NOT put it there. It decides whether capwall WARNS that a deferred `Request.prototype.url` capture is unprovable; it never decides whether capwall guards. `shims/global-egress.ts` (also used by `test/fixtures/startup-graph.mjs`) | **Undocumented**, no DEP code. An own array on `process`, populated by the bootstrap, on 22.22.3 / 24.18.0 / 26.5.0 | none | Nothing that gates anything. Anything unrecognizable — a Node that drops the array, a dependency that replaced it — reads as "already materialized", i.e. as doubt, so the fallback is the noisy one |
 | `process.binding()` | **Not used.** Named in the threat model as an escape route capwall does not claim to stop | **Docs-only deprecated, DEP0111** (supports `--pending-deprecation`); unavailable under the permission model | `process.getBuiltinModule()` for the module cases | Nothing. Confirmed by a `--pending-deprecation` run of the whole suite: the only DEP0111 warnings come from `@vitest/snapshot`, a dev dependency |
 | `Module._cache`, `require.extensions` | **Not used.** Referenced only in comments explaining why the shim is a `Proxy` over the real `Module` class | `require.extensions`: docs-only deprecated, **DEP0039** | n/a | Nothing |
@@ -272,12 +273,15 @@ interception occupies, and it is documented where `_load` is not.
 
 **Four things it would not cover, and they are most of what `loader/require.ts` is for.**
 
-1. **The `Module._resolveFilename` call.** The #123 module-read gate needs to know *which file a
-   load will open* before it opens it. A `resolve` hook does learn that — but it learns it for the
-   load Node is performing, not for the load a caller *described*, and the two differ: the ≥24.18
-   bypass this document records came from `Module._load`'s fourth argument carrying
-   `requireResolveOptions`. A hook sees the specifier and the parent, never the caller's
-   `{ paths }`.
+1. **The filename Node is actually about to open.** The #123 module-read gate has to decide on
+   that file, and since #178 it takes it from `Module.prototype.load(filename)` — the point Node
+   has already decided, with no second resolution of its own. (This item used to argue from a
+   `Module._resolveFilename` call inside the `Module._load` wrapper; that call, and the double
+   resolve it performed, are deleted — see § Superseded by #178, which is the reason. The
+   conclusion is unchanged and the argument is stronger for it.) A `resolve` hook does learn a
+   filename, but it learns it for the load Node is performing at a point *before* `load` runs, and
+   the CJS half must not then decide the same load twice; the arbitration between the two is what
+   `loader/module-read.ts` § WHICH OF THE GATES DECIDES A GIVEN LOAD exists to state.
 2. **The subject.** The CJS gate's subject is a **stack walk**, precisely because
    `createRequire()` lets a caller choose the `parent.filename` a hook would be handed. A
    `registerHooks` hook runs in capwall's realm now, so a walk is *possible* there — but at
@@ -461,7 +465,9 @@ Being direct, because the rest of this document is detail:
 **capwall's exposure to Node internal churn is real, structural, and currently well-managed
 rather than reduced — though #152 reduced it by exactly one item.** Of the seven things that make
 capwall work, five are undocumented Node internals with no support commitment (`Module._load`,
-`_resolveFilename`, `_findPath`, `Module.prototype._compile`, `process.dlopen`), one is
+`Module.prototype.load`, `_findPath`, `Module.prototype._compile`, `process.dlopen` — this list
+read `_resolveFilename` rather than `Module.prototype.load` until #178 deleted the last call to
+it), one is
 **documented but at Stability 1.2, release candidate** (`module.registerHooks()`), and one is not
 a Node API at all (V8's `prepareStackTrace` / CallSites, which is all of attribution). Exactly
 zero are documented *and stable*. That middle row was `module.register()` — Stability 0, removal
