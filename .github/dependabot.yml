@@ -1,0 +1,61 @@
+# Dependabot, chosen over Renovate for one concrete reason: ci.yml's header already says every
+# `uses:` is pinned to a commit SHA with a trailing `# vX.Y.Z` comment, "the form Dependabot writes
+# and updates, if it is ever turned on here". This turns it on. Renovate would do the same job with
+# more configuration and a third-party app installed on the repository, which is a strange thing to
+# add to a supply-chain security tool to save reading a diff.
+#
+# NOTHING HERE CAN BE VERIFIED WHILE ACTIONS IS BILLING-BLOCKED (#3). Dependabot itself still runs
+# — it is not Actions — but the pull requests it opens will have NO CI on them, so every one has to
+# be taken through `pnpm ci:local` by hand before it is merged. That is the reason for the low
+# limits and the monthly cadence below: an unreviewable PR queue is worse than a slightly stale
+# lockfile.
+#
+# THREE LICENCE RULES, NOT ONE, apply to anything Dependabot proposes — AGENTS.md § 5. In
+# decreasing severity: non-compete / source-available is refused at any depth; runtime deps are
+# MIT/BSD/Apache-2.0 only; weak copyleft is acceptable in devDependencies. Dependabot cannot check
+# any of that. `pnpm --filter '@capwall/*' licenses list --prod` is the one-command check for the
+# rule that matters most, and it should print exactly one package.
+
+version: 2
+updates:
+  # The workflows that build, test and PUBLISH this repository. This is the ecosystem worth having
+  # automated: a pinned SHA is only as good as the process that moves it, and hand-resolving one
+  # (`gh api repos/<owner>/<repo>/git/ref/tags/<tag>`) is exactly the chore that gets skipped.
+  # release.yml holds `id-token: write`, so a stale action there is code with an OIDC token in
+  # reach.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    labels: ["dependencies", "ci"]
+    commit-message:
+      prefix: "ci"
+      include: scope
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # devDependencies only — the four publishable packages' runtime closure is one package (`zod`),
+  # and a runtime dependency bump is a decision with a paragraph in the PR description, not a
+  # notification. Grouped and monthly because AGENTS.md § 5 is explicit that dependency currency
+  # here is decided by MEASUREMENT (`pnpm bench:startup`, `pnpm ci:local` on 22/24/26), not by
+  # reading release notes: #158 removed two version overrides that had aged into caps nobody
+  # re-read, and #161 priced a single major (zod 3 → 4) at ~58 ms of startup. A weekly stream of
+  # single-package PRs would produce the opposite of that discipline.
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    versioning-strategy: increase
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "chore"
+      include: scope
+    allow:
+      - dependency-type: development
+    groups:
+      dev-dependencies:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]

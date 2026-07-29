@@ -11,15 +11,22 @@
   },
   "homepage": "https://github.com/williamzujkowski/capwall#readme",
   "bugs": "https://github.com/williamzujkowski/capwall/issues",
-  "publishConfig": { "access": "public" },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "bin": {
     "capwall": "./dist/index.js"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist", "src"],
-  "engines": { "node": ">=22.15.0" },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "engines": {
+    "node": ">=22.15.0"
+  },
   "scripts": {
     "prepack": "node ../../scripts/assert-pnpm-pack.mjs",
     "build": "tsc -p tsconfig.json",

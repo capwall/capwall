@@ -1,6 +1,6 @@
 # Publish the @capwall packages to npm.
 #
-# READ docs/releasing.md BEFORE TOUCHING THIS FILE. Three things about it are load-bearing in
+# READ docs/releasing.md BEFORE TOUCHING THIS FILE. Five things about it are load-bearing in
 # ways that are not obvious from the YAML:
 #
 #  1. THE FILENAME IS PART OF THE TRUST CONFIGURATION. npm trusted publishing binds a package
@@ -29,6 +29,14 @@
 #     moved tag on any of these four actions is code with an OIDC token in reach. The versions
 #     themselves are UNVERIFIED — Actions is billing-blocked (#3) and `pnpm ci:local` does not
 #     run actions, only steps. Rehearse with `dry_run` before trusting any of it.
+#
+#  5. THE TAG COMES FROM release-please, NOT FROM A HUMAN. `.github/workflows/release-please.yml`
+#     opens the release PR (versions + CHANGELOG.md) and, when it is merged, creates the `vX.Y.Z`
+#     tag that triggers this file. Nothing else about this workflow changed when that landed, and
+#     that is the point: the publish path is bound to this filename by npm's trusted publisher
+#     configuration, so it stays exactly where it is. `workflow_dispatch` remains the manual
+#     escape hatch — see docs/releasing.md § HUMAN CHECKLIST step 17 for the one case that needs
+#     it (a tag pushed with the default GITHUB_TOKEN does not trigger this workflow).
 #
 # npm publishes are effectively permanent (the unpublish window is 72 hours and narrow even
 # inside it). Rehearse with the `dry_run` input before tagging anything.

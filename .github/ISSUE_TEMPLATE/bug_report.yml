@@ -1,0 +1,72 @@
+name: Bug report
+description: capwall does something wrong that is not a security bypass.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **If this is a capability bypass — a dependency doing something the policy does not grant,
+        a call charged to the wrong package, or an operation that succeeds with no decision
+        recorded — stop and use the private channel in
+        [SECURITY.md](https://github.com/williamzujkowski/capwall/blob/main/SECURITY.md).**
+        A public issue describing a working bypass is a zero-day with a README.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >-
+        The smallest thing that shows it. A `capabilities.json` and the command you ran is usually
+        enough. Please include the exact `capwall observe` / `capwall enforce` invocation.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: What capwall printed
+      description: The decision lines, the error, or the trace. Whole output beats an excerpt.
+      render: shell
+
+  - type: input
+    id: node
+    attributes:
+      label: Node version
+      description: "`node -v`. The supported range is >= 22.15.0, tested on 22, 24 and 26."
+      placeholder: v22.15.0
+    validations:
+      required: true
+
+  - type: input
+    id: capwall
+    attributes:
+      label: capwall version
+      description: >-
+        `npx capwall --version`, or the commit SHA if you are running from a clone. Nothing is
+        published to npm yet, so a clone is the expected answer today.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Platform
+      options: [Linux, macOS, Windows, other/container]
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you file
+      options:
+        - label: "`pnpm canary` passes on this tree (if running from a clone) — `dist/` is gitignored, so a stale or broken build is invisible to `git status`"
+        - label: "I checked [docs/threat-model.md](https://github.com/williamzujkowski/capwall/blob/main/docs/threat-model.md) § What capwall does NOT stop"

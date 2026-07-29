@@ -4,49 +4,74 @@
  *
  * WHY. Publishing is not atomic and it is not reversible. `.github/workflows/release.yml`
  * pushes tarballs one at a time; npm's unpublish window is 72 hours and narrow inside it. If
- * the third publish fails because someone bumped three manifests and forgot the fourth, the
- * registry is left half-released and the only way out is a new version number. Checking first
- * costs nothing; checking after is not a thing you can do.
+ * the third publish fails because one manifest is at a different version, the registry is left
+ * half-released and the only way out is a new version number. Checking first costs nothing;
+ * checking after is not a thing you can do.
  *
- * WHAT IT ENFORCES, and the decision behind each (issue #115, docs/releasing.md):
+ * WHAT THIS SCRIPT NO LONGER DOES, because release-please took it over (see docs/releasing.md
+ * § How a release happens):
  *
- *   1. LOCKSTEP. All four manifests carry the same version — including the one that is not
- *      published (see 4). The four packages are one product on one cadence; `@capwall/cli`
- *      does not merely call `@capwall/core`, it injects it into a *different process* via
- *      NODE_OPTIONS, so a mismatched core is a silently differently-behaving firewall.
+ *   - IT NO LONGER TELLS ANYONE TO BUMP A MANIFEST BY HAND. release-please writes all five
+ *     `version` fields and `.release-please-manifest.json` in its release PR.
+ *   - The `0.0.0` placeholder rule is gone with the workflow that needed it. There is no longer a
+ *     hand-staged version waiting to be filled in; the manifest file is the current version and
+ *     release-please computes the next one from the commits.
+ *   - The changelog "you forgot to replace `unreleased` with a date" rule is gone. release-please
+ *     dates the heading when it writes it. What survives is the weaker, still-useful assertion
+ *     that a dated section for THIS version exists at all — which is what catches a tag pushed
+ *     for a version release-please never released.
+ *
+ * WHAT IT STILL ENFORCES, and the decision behind each (issue #115, docs/releasing.md):
+ *
+ *   1. LOCKSTEP, VERIFIED RATHER THAN ASSUMED. All four package manifests, the private root
+ *      manifest and `.release-please-manifest.json` carry the same version — including the
+ *      package that is not published (see 4). release-please PRODUCES this by writing all five
+ *      from one root component (check 6); a package added to `packages/` and not to the release
+ *      config, or a hand edit, lands here rather than on the registry. The four packages are one
+ *      product on one cadence: `@capwall/cli` does not merely call `@capwall/core`, it injects it
+ *      into a *different process* via NODE_OPTIONS, so a mismatched core is a silently
+ *      differently-behaving firewall.
  *
  *   2. EXACT PINS BETWEEN THE FOUR, expressed as `workspace:*`, which pnpm rewrites to the
  *      concrete version at pack time (`"@capwall/core": "0.1.0"`, not `^0.1.0`). A range would
  *      let a resolver seat one `@capwall/policy-schema` under `core` and a different one under
  *      `cli` in the same tree, and the failure mode is a policy that generates one way and
- *      evaluates another. Writing a caret here by hand is the mistake this catches. Caret
- *      ranges are correct for third-party deps; `zod` is the only one.
+ *      evaluates another. Writing a caret here by hand is one way to break it; adding
+ *      release-please's `node-workspace` plugin is the other, and check 6 refuses that at the
+ *      config rather than waiting for the tarball. Caret ranges are correct for third-party
+ *      deps; `zod` is the only one.
  *
  *   3. NO PUBLISHED PACKAGE MAY DEPEND ON A HELD-BACK ONE. Cheap check, unrecoverable
  *      failure: pnpm would rewrite the specifier to a version that is not on the registry and
  *      the published package would be uninstallable for everyone.
  *
  *   4. THE PUBLISH SET IS DECLARED HERE, once, and the workflow asks for it (`--publish-list`)
- *      rather than repeating it. `@capwall/sbom-import` is deliberately not published yet —
- *      no CLI subcommand exposes it, so it would land on npm as an unreachable library and be
- *      republished on every lockstep release forever.
+ *      rather than repeating it. release-please knows nothing about it and must not:
+ *      `@capwall/sbom-import` is deliberately not published yet — no CLI subcommand exposes it,
+ *      so it would land on npm as an unreachable library and be republished on every lockstep
+ *      release forever — while still being versioned, packed and verified like the rest.
  *
- *   5. A CHANGELOG ENTRY EXISTS FOR THIS VERSION, and when an actual tag is being released,
- *      it carries a real date rather than the `unreleased` placeholder. A hand-written
- *      changelog's characteristic failure is being forgotten at the moment it matters.
+ *   5. A DATED CHANGELOG SECTION EXISTS FOR THIS VERSION. Accepts both spellings: release-please
+ *      writes `## [0.2.0](https://.../compare/v0.1.0...v0.2.0) (2026-08-01)`, the hand-written
+ *      sections up to 0.1.0 read `## [0.1.0] - 2026-08-01`.
  *
- *   6. NOT 0.0.0 — the unreleased placeholder.
+ *   6. RELEASE-PLEASE'S OWN CONFIGURATION STILL HAS THE SHAPE LOCKSTEP DEPENDS ON. One package
+ *      (`"."`), a bare `vX.Y.Z` tag, every directory under `packages/` listed in that package's
+ *      `extra-files`, and no `node-workspace` plugin. A package added to the workspace but not to
+ *      the release config would sit at a stale version forever with every other gate green —
+ *      which is exactly the shape of defect that only shows up on a release, i.e. the moment it
+ *      cannot be undone.
  *
  * Usage:
  *   node scripts/check-release-versions.mjs [v1.2.3]   run the checks; tag is optional and,
  *                                                      when empty (a workflow_dispatch run),
- *                                                      only the date check is relaxed
+ *                                                      the changelog date is not required
  *   node scripts/check-release-versions.mjs --publish-list
  *                                                      print the publish order, one name per
  *                                                      line, and exit
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -75,32 +100,35 @@ if (process.argv[2] === "--publish-list") {
   process.exit(0);
 }
 
+const readJson = (...parts) => JSON.parse(readFileSync(join(ROOT, ...parts), "utf8"));
+
 const manifests = new Map();
 for (const p of PACKAGES) {
-  manifests.set(p, JSON.parse(readFileSync(join(ROOT, "packages", p, "package.json"), "utf8")));
+  manifests.set(p, readJson("packages", p, "package.json"));
 }
+const rootManifest = readJson("package.json");
 
 const errors = [];
 
 // --- 1. lockstep -------------------------------------------------------------------------
-const distinct = new Set([...manifests.values()].map((m) => m.version));
+// The private root manifest is in here because release-please's root component is what carries
+// the `vX.Y.Z` tag and the CHANGELOG; its version is not cosmetic, it is the release's identity.
+const versioned = [
+  [rootManifest.name, rootManifest.version],
+  ...[...manifests.values()].map((m) => [m.name, m.version]),
+];
+const distinct = new Set(versioned.map(([, v]) => v));
 if (distinct.size !== 1) {
   errors.push(
-    `the four packages are not in version lockstep:\n` +
-      [...manifests.values()].map((m) => `    ${m.name.padEnd(24)} ${m.version}`).join("\n") +
-      `\n    Held-back packages stay in lockstep too — see docs/releasing.md § What is published.`,
+    `the workspace is not in version lockstep:\n` +
+      versioned.map(([n, v]) => `    ${n.padEnd(24)} ${v}`).join("\n") +
+      `\n    Held-back packages stay in lockstep too — see docs/releasing.md § What is published.` +
+      `\n    release-please's linked-versions plugin produces this; if it has drifted, the config` +
+      `\n    is wrong rather than the manifests.`,
   );
 }
 
 const version = manifests.get("core").version;
-
-// --- 6. not the placeholder --------------------------------------------------------------
-if (version === "0.0.0") {
-  errors.push(
-    `refusing to publish version 0.0.0 — this is the unreleased placeholder.\n` +
-      `    Set a real version in all four manifests first (see docs/releasing.md).`,
-  );
-}
 
 // --- 2 & 3. internal dependency specifiers -----------------------------------------------
 const internal = new Set([...manifests.values()].map((m) => m.name));
@@ -138,20 +166,115 @@ try {
 }
 
 if (changelog !== "") {
-  // `## [0.1.0] - 2026-08-01` or `## [0.1.0] - unreleased`. Scanned line by line rather than
-  // built into a RegExp, so a version string never has to be escaped into a pattern.
+  // Two spellings are accepted, because both are in the file: release-please writes
+  // `## [0.2.0](https://.../compare/v0.1.0...v0.2.0) (2026-08-01)`, and the hand-written
+  // sections up to 0.1.0 read `## [0.1.0] - 2026-08-01`. Scanned line by line rather than built
+  // into a RegExp, so a version string never has to be escaped into a pattern.
   const prefix = `## [${version}]`;
   const line = changelog.split("\n").find((l) => l.startsWith(prefix));
-  const heading = line === undefined ? null : /^-\s*(\S+)/.exec(line.slice(prefix.length).trim());
-  if (heading === null) {
+  if (line === undefined) {
     errors.push(
-      `CHANGELOG.md has no '## [${version}] - ...' section.\n` +
-        `    Every released version gets an entry, written by hand, before it is tagged.`,
+      `CHANGELOG.md has no '## [${version}]' section.\n` +
+        `    release-please writes one into the release PR. If this fails on a tag, the tag was\n` +
+        `    not created from a merged release PR.`,
     );
-  } else if (tag !== "" && !/^\d{4}-\d{2}-\d{2}$/.test(heading[1])) {
+  } else if (tag !== "" && !/\d{4}-\d{2}-\d{2}/.test(line)) {
     errors.push(
-      `CHANGELOG.md still says '## [${version}] - ${heading[1]}'.\n` +
-        `    A tagged release needs a real ISO date (YYYY-MM-DD) on that heading.`,
+      `CHANGELOG.md's '${line.trim()}' carries no ISO date.\n` +
+        `    A tagged release needs a real date (YYYY-MM-DD) on that heading.`,
+    );
+  }
+}
+
+// --- 6. release-please configuration agrees with this file --------------------------------
+// release-please owns the numbers; this owns the shape. A package that exists on disk but not in
+// the release config is versioned by nobody, and nothing else in the repo would notice.
+let rpConfig = null;
+let rpManifest = null;
+try {
+  rpConfig = readJson("release-please-config.json");
+} catch {
+  errors.push(`release-please-config.json is missing or unparseable.`);
+}
+try {
+  rpManifest = readJson(".release-please-manifest.json");
+} catch {
+  errors.push(`.release-please-manifest.json is missing or unparseable.`);
+}
+
+if (rpConfig !== null && rpManifest !== null) {
+  const configured = Object.keys(rpConfig.packages ?? {});
+
+  // ONE release-please package, the repository root. This is the shape that makes lockstep
+  // structural instead of conditional. release-please's `linked-versions` plugin is the
+  // documented way to link a monorepo, and it was tried first — it cannot include a component
+  // whose tag is a bare `vX.Y.Z`, because `include-component-in-tag: false` makes the strategy
+  // report an EMPTY component and the plugin skips those. The root would then have been versioned
+  // on its own, and a commit touching only `scripts/` or `docs/` (`fix(tooling): ...`, which this
+  // repo does routinely) would have bumped the root and nothing else. See docs/releasing.md.
+  if (configured.length !== 1 || configured[0] !== ".") {
+    errors.push(
+      `release-please-config.json must declare exactly one package, '.'; it declares\n` +
+        `    ${JSON.stringify(configured)}.\n` +
+        `    Per-package entries mean per-package versions and per-package tags: release.yml\n` +
+        `    listens on 'v*' and would see one tag per package, each starting its own publish.`,
+    );
+  }
+  if (rpConfig.packages?.["."]?.["include-component-in-tag"] === true) {
+    errors.push(
+      `release-please-config.json sets 'include-component-in-tag' on '.'.\n` +
+        `    The tag would become '<component>-vX.Y.Z', which release.yml's 'v*' trigger never\n` +
+        `    matches — the release would tag and then silently publish nothing.`,
+    );
+  }
+  if (Object.keys(rpManifest).length !== 1 || rpManifest["."] !== version) {
+    errors.push(
+      `.release-please-manifest.json should be exactly {".": "${version}"}; it is\n` +
+        `    ${JSON.stringify(rpManifest)}.`,
+    );
+  }
+
+  // Every package directory that exists on disk must be in the root package's `extra-files`.
+  // Read the workspace from disk, not from PACKAGES: the failure being caught is "a fifth
+  // package was added", and a list in this file would be just as easy to forget as the config.
+  const extraFiles = rpConfig.packages?.["."]?.["extra-files"] ?? [];
+  const updated = new Set(
+    extraFiles
+      .filter((f) => f?.type === "json" && f?.jsonpath === "$.version")
+      .map((f) => f.path),
+  );
+  const onDisk = readdirSync(join(ROOT, "packages"), { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => e.name)
+    .sort();
+  for (const p of onDisk) {
+    if (!updated.has(`packages/${p}/package.json`)) {
+      errors.push(
+        `release-please-config.json does not update packages/${p}/package.json.\n` +
+          `    Add { "type": "json", "path": "packages/${p}/package.json", "jsonpath": "$.version" }\n` +
+          `    to the root package's extra-files. A package missing there is never bumped: it sits\n` +
+          `    at a stale version through every release with all the other gates green.`,
+      );
+    }
+  }
+  for (const path of updated) {
+    if (!onDisk.some((p) => path === `packages/${p}/package.json`)) {
+      errors.push(
+        `release-please-config.json updates '${path}', which is not a workspace package.\n` +
+          `    A stale extra-files entry fails the release PR on a file that no longer exists.`,
+      );
+    }
+  }
+
+  const hasNodeWorkspace = (rpConfig.plugins ?? []).some(
+    (p) => p === "node-workspace" || p?.type === "node-workspace",
+  );
+  if (hasNodeWorkspace) {
+    errors.push(
+      `release-please-config.json enables the 'node-workspace' plugin. Remove it.\n` +
+        `    It rewrites internal dependency specifiers to concrete versions, which would replace\n` +
+        `    every 'workspace:*' with a range or a pin written by something other than pnpm's pack\n` +
+        `    step — the #116 failure, reintroduced from the release config.`,
     );
   }
 }
