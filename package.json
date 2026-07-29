@@ -38,7 +38,7 @@
   "devDependencies": {
     "@commitlint/cli": "^21.2.1",
     "@commitlint/config-conventional": "^21.2.0",
-    "@types/node": "^22.15.0",
+    "@types/node": "^26.1.2",
     "oxlint": "1.76.0",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
