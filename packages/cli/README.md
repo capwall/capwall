@@ -5,11 +5,11 @@ The `capwall` command-line interface — the primary way users drive the observe
 > **Status:** all **six** commands are implemented and work for every capability, on both the
 > CJS `require` and the ESM `import` paths. `observe`/`enforce`/`run`/`diff` launch the target
 > with `@capwall/core/preload` injected via `NODE_OPTIONS --import`. Milestone status is
-> tracked in one place, [`../../docs/roadmap.md`](../../docs/roadmap.md).
+> tracked in one place, [`docs/roadmap.md`](https://github.com/williamzujkowski/capwall/blob/main/docs/roadmap.md).
 >
 > Not published to npm yet (staged at `0.1.0`) — run it as
 > `node <clone>/packages/cli/dist/index.js` after `pnpm install && pnpm build`. See the root
-> [`README.md`](../../README.md) § Install.
+> [`README.md`](https://github.com/williamzujkowski/capwall/blob/main/README.md) § Install.
 
 ## Commands
 
@@ -51,14 +51,14 @@ project root is the CLI's working directory.
 `diff` is the CI-facing command: exit **0** = no drift, **1** = drift found, **2** = usage
 error or missing policy file. It reports drift in **both** directions (#118) —
 observed-but-not-granted, and declared-but-never-matched. See [`docs/ci-local.md` § Drift
-detection in CI](../../docs/ci-local.md).
+detection in CI](https://github.com/williamzujkowski/capwall/blob/main/docs/ci-local.md).
 
 **The full reference — every flag, exit code and `explain` capability spelling — is
-[`docs/cli.md`](../../docs/cli.md).** This README is the orientation.
+[`docs/cli.md`](https://github.com/williamzujkowski/capwall/blob/main/docs/cli.md).** This README is the orientation.
 
 `observe`, `enforce` and `diff` name the mode themselves (they set `CAPWALL_MODE`, which
 outranks everything); `run` takes it from the policy document. Full precedence table:
-[`docs/policy-format.md` § Enforcement mode](../../docs/policy-format.md#enforcement-mode).
+[`docs/policy-format.md` § Enforcement mode](https://github.com/williamzujkowski/capwall/blob/main/docs/policy-format.md#enforcement-mode).
 
 ## Generated policies point at the schema
 

@@ -10,8 +10,15 @@ undone: **npm's unpublish window is 72 hours and narrow even inside it.** A brok
 version sits in the `@capwall` namespace forever, which is a poor opening argument for a
 supply-chain security tool.
 
+**There are two publish paths in this file and they are not interchangeable.** The OIDC path
+(release-please → tag → `release.yml` → `npm publish --provenance`) is described first and is the
+norm from `0.1.1` onwards. It needs GitHub Actions, which is billing-blocked (#3). The one-time
+route to `0.1.0` is § THE FIRST MANUAL PUBLISH below — a paste-ready sequence run from a
+workstation with a granular token, rehearsed end to end against the real tarballs. Read that
+section, not this one, if you are about to publish today.
+
 Everything a machine can check about a release is checked by
-`scripts/check-release-versions.mjs` (lockstep, pins, publish set, changelog, and that
+`scripts/check-release-versions.mjs` (lockstep, pins, publish set, changelog, shipped READMEs, and that
 release-please's own config still says what this file says it says) and
 `scripts/check-tarball-sources.mjs` (what is actually inside the tarballs). Both run in the
 release workflow before anything is uploaded. Read them; they carry the reasoning inline.
@@ -470,7 +477,34 @@ overstated. What **was** verified, locally, against release-please 17.6.0 (the v
 - `commitlint` accepts and rejects the intended messages (`pnpm lint:commits`);
 - `check-release-versions.mjs` fails on each of: a lockstep break, a caret internal dep, a
   drifted release-please manifest, a package on disk that is missing from the release config, a
-  removed `linked-versions` plugin, an added `node-workspace` plugin.
+  removed `linked-versions` plugin, an added `node-workspace` plugin, a shipped README with a
+  link that climbs out of its package, and — only when a tag is supplied — a shipped README that
+  still says the package is unpublished.
+
+And what a full **publish rehearsal** verified against the real `0.1.0` tarballs — every shell
+step in `release.yml`'s `publish` job, run verbatim outside Actions:
+
+- all four packages pack with `pnpm pack`; `workspace:*` is rewritten to the exact pin `0.1.0`
+  in `core` and `cli`, and no `workspace:` string survives into any tarball;
+- `check-tarball-sources.mjs` reports **0 dangling** across 96 maps (68 core, 20 cli, 6
+  policy-schema, 2 sbom-import), and every tarball carries `dist/`, `src/`, `LICENSE` and
+  `README.md`; `policy-schema` also carries `schema.json`;
+- **nothing leaks.** `files` is an allowlist, so the 79 committed `node_modules/` fixture files
+  under `packages/*/test/` and `examples/malicious-dep-demo/` cannot reach a tarball, and do not;
+- `npm publish --dry-run ./<tarball> --access public` succeeds for all three, each reporting
+  *"with tag latest and public access"* — `publishConfig.access` is doing its job;
+- the missing-`./` failure reproduces exactly as documented: exit **128**, `git ls-remote
+  ssh://git@github.com/dist-tarballs/capwall-cli-0.1.0.tgz.git`;
+- the tarballs install into a bare `npm init -y` directory in dependency order and `npx capwall`
+  drives the whole documented loop — `observe` writes a `capabilities.json` whose `$schema`
+  resolves, `enforce` denies an ungranted `fs:read`, `diff` reports no drift, `explain` answers
+  both ways;
+- **the ESM path works from the tarball layout**, not just CJS: an `.mjs` entry importing two
+  ESM-only dependencies attributes `env:XDG_*` to `env-paths` under `observe` and is denied under
+  `enforce`. `esm-runtime.js` ships beside `esm-hook.js`, so the bridge URL resolves, and
+  `CAPWALL_ROOT` narrows to `<pkg>/dist` rather than widening (#171);
+- publishing out of order is a real failure and not a stylistic one: with only the `cli` tarball
+  available, `npm i` dies with `404 '@capwall/core@0.1.0' is not in this registry`.
 
 What **cannot** be verified without pushing to GitHub and running Actions:
 
@@ -487,6 +521,15 @@ What **cannot** be verified without pushing to GitHub and running Actions:
    the same reason every other pin in `ci.yml` has never run (see its header).
 4. **Everything downstream of the tag** that was already unverified: OIDC trusted publishing,
    provenance attachment, and the `verify` matrix in Actions rather than in `pnpm ci:local`.
+5. **`--provenance` itself — including in the workflow's own dry run.** The rehearsal ran
+   `npm publish ./<tarball> --provenance --access public --dry-run` and it exits **0**, printing
+   nothing about provenance: with `--dry-run`, npm never reaches the step that mints an
+   attestation. So `dry_run = true` proves the pack, the assertions, the manifest and the file
+   list — and proves *nothing at all* about provenance, the OIDC token exchange, or the
+   `id-token: write` permission. The first evidence that provenance works will be the first real
+   publish; check it with `npm audit signatures` immediately afterwards rather than assuming a
+   green dry run covered it.
+6. **`actions/upload-artifact`.** The only step with no local equivalent at all.
 
 ---
 
@@ -503,11 +546,17 @@ npm trusted publishing runs **inside GitHub Actions**, which is currently billin
 4. **Human configures the trusted publisher, per package, on npmjs.com** — see the checklist.
 5. **Merge the release PR → tag → publish.**
 
-### Alternative: first publish with a granular token, then move to OIDC
+---
 
-Because step 4 requires the package to *already exist* on npm for some flows, and because
-#3 may take a while, there is a legitimate shortcut: publish `0.1.0` manually from a
-workstation with a granular access token, then configure trusted publishing and let every
+# THE FIRST MANUAL PUBLISH (granular token, no Actions)
+
+**This is the alternative to the OIDC path above, and it is the only one that works today.**
+Everything from § How a release happens down to here describes the OIDC path, which is the norm
+from `0.1.1` onwards. This section is the one-time route to `0.1.0`, written to be pasted.
+
+Why it exists: step 4 of the ordering constraint requires the package to *already exist* on npm
+for some flows, and #3 may take a while. So publish `0.1.0` manually from a workstation with a
+granular access token, then configure trusted publishing (§ HUMAN CHECKLIST C) and let every
 release after that run through release-please and Actions.
 
 This is also the path that cuts `v0.1.0` itself. `.release-please-manifest.json` says `0.1.0`, so
@@ -515,38 +564,200 @@ release-please treats it as the baseline and proposes `0.1.1` / `0.2.0` for the 
 it will not cut `0.1.0`, and it should not: that entry in `CHANGELOG.md` is hand-written and
 better than anything a generator would produce for 73 commits of pre-adoption history.
 
-**Which Node and npm.** The workflow verifies on the full **22 / 24 / 26** matrix but packs and
-publishes on **Node 24**, and it upgrades npm to `@latest` first — deliberately, and not because
-Node 24's bundled npm is too old to work. Trusted publishing and `--provenance` track npm's own
-releases, so a manual publish should do the same rather than trusting whatever npm your Node
-shipped with:
+## The token, and exactly what it needs
+
+npmjs.com → avatar → **Access Tokens** → *Generate New Token* → **Granular Access Token**.
+
+| Field | Value | Why |
+|---|---|---|
+| Expiration | 7 days, or the shortest the form offers | It is used once, on one afternoon, and then deleted (checklist step 20). A 90-day token on a laptop is the standing credential capwall exists to argue against. |
+| Packages and scopes → Permissions | **Read and write** | Anything less cannot create a package. |
+| Packages and scopes → *Select packages* | **the `@capwall` scope**, not individual packages | None of the three packages exist yet, so there is nothing to select by name. Scope-level write is what lets a token create the first version. |
+| Organizations | **Read and write** *only if* the `@capwall` org still needs creating | Publishing into an org that already exists needs no org permission. Prefer creating the org in the web UI (checklist step 11) and leaving this at *No access*. |
+
+Then put it somewhere that dies with the terminal, rather than in `~/.npmrc` where `npm config
+set` would leave it forever:
 
 ```bash
-npm install -g npm@latest        # trusted publishing / --provenance track npm, not Node
-pnpm install --frozen-lockfile && pnpm build
-
-# Date the 0.1.0 heading in CHANGELOG.md first (see § Changelog), then:
-node scripts/check-release-versions.mjs v0.1.0
-
-# Pack everything (the assertions below need something to inspect)...
-for d in packages/*/; do (cd "$d" && pnpm pack --pack-destination ../../dist-tarballs); done
-node scripts/check-tarball-sources.mjs dist-tarballs/*.tgz
-
-# ...but publish only the declared set, in the declared order.
-for p in $(node scripts/check-release-versions.mjs --publish-list); do
-  npm publish ./dist-tarballs/capwall-$p-*.tgz --access public   # no --provenance outside CI
-done
-
-git tag v0.1.0 && git push origin v0.1.0   # so release-please's baseline matches the registry
+export NPM_CONFIG_USERCONFIG="$(mktemp)"
+printf '//registry.npmjs.org/:_authToken=%s\n' 'npm_…' > "$NPM_CONFIG_USERCONFIG"
+npm whoami                                 # must print your username, not an error
+# ...and when you are done, before closing the terminal:
+#   rm -f "$NPM_CONFIG_USERCONFIG"
 ```
 
-**Recommendation: wait for OIDC if #3 will be resolved in days; take the token path if it
-will be weeks.** The trade is real and worth naming. A manual publish cannot attach a
-provenance attestation — provenance requires a trusted CI publisher — so `0.1.0` would ship
-without one, and "the supply-chain firewall shipped without provenance" is a fair thing for a
-reviewer to notice. It also puts a long-lived credential on a laptop, which is the exact
-threat model capwall exists to talk about. Neither is fatal, and `0.1.1` would carry
-provenance either way, but if the wait is short the OIDC path is strictly better.
+**`export NPM_CONFIG_TOKEN=…` does not work** — it looks like it should, and npm ignores it.
+Verified during the rehearsal against an unreachable local registry: with the temp-`.npmrc`
+form npm gets as far as `ECONNREFUSED` (auth accepted, transport failed), and with
+`NPM_CONFIG_TOKEN` it stops at `ENEEDAUTH: This command requires you to be logged in`. `npm
+login` also works and is fine; it just writes to `~/.npmrc`, so remember step 20.
+
+**If the account requires 2FA for writes** (it should — checklist step 10), expect npm to accept
+the token without prompting for an OTP: a write-scoped granular token is the credential class
+that exists so CI and scripts can publish, which is exactly why the expiry is short and why step
+20 deletes it. If npm *does* prompt, answer it — do not go and loosen the 2FA setting. *Neither
+branch was verified during the rehearsal; no token was created.*
+
+## The sequence
+
+Run it top to bottom in a clean clone of `main` at the commit you intend to release. Every
+command below was executed during the rehearsal against the real `0.1.0` tarballs — the ones
+that reach the registry with `--dry-run`, everything else for real.
+
+```bash
+# ── 0. Preconditions ─────────────────────────────────────────────────────────────────────
+npm install -g npm@latest                  # trusted publishing / --provenance track npm, not Node
+node --version                             # use Node 24 — the version release.yml packs on
+git status --porcelain                     # must be empty; you are about to ship this tree
+
+# ── 1. Fold and date CHANGELOG.md ────────────────────────────────────────────────────────
+# CHANGELOG.md carries BOTH `## [Unreleased]` and `## [0.1.0] - unreleased`. Fold the first
+# into the second and replace `unreleased` with today's date (§ Changelog, checklist step 15).
+# Until you do, the next command FAILS — by design:
+#   release check failed: CHANGELOG.md's '## [0.1.0] - unreleased' carries no ISO date.
+
+# ── 2. Rewrite the shipped READMEs ───────────────────────────────────────────────────────
+# npmjs.com renders package/README.md on the package page, and a README can only be changed by
+# publishing a NEW VERSION. `packages/cli/README.md` and `packages/policy-schema/README.md` each
+# open with a "Not published to npm yet — run it from a clone" note that is false the instant it
+# is published, and it is the first paragraph every evaluator reads. Replace both with the
+# `npm i -D @capwall/cli` install path. This is checklist step 21 moved BEFORE the publish,
+# because after the publish it costs a 0.1.1.
+#
+# You cannot forget: check-release-versions.mjs check 7 fails on that sentence WHEN A TAG IS
+# SUPPLIED — which is the next command, and the one release.yml runs. It also refuses any
+# `](../..)` link in a shipped README, always, because those 404 on npmjs.com.
+
+# ── 3. Build and verify ──────────────────────────────────────────────────────────────────
+pnpm install --frozen-lockfile
+pnpm build
+pnpm typecheck && pnpm test && pnpm lint
+node scripts/check-release-versions.mjs v0.1.0
+
+# ── 4. Pack — with pnpm, never npm (#116) ────────────────────────────────────────────────
+# Pack ALL FOUR. @capwall/sbom-import is not published, but the assertions below need it: a
+# held-back package that has quietly stopped packing is a nasty surprise on the release that
+# finally publishes it.
+rm -rf dist-tarballs && mkdir -p dist-tarballs
+for d in packages/*/; do (cd "$d" && pnpm pack --pack-destination ../../dist-tarballs); done
+ls -l dist-tarballs
+
+# ── 5. Open the tarballs before anything leaves the machine ──────────────────────────────
+node scripts/check-tarball-sources.mjs dist-tarballs/*.tgz
+for t in dist-tarballs/*.tgz; do
+  tar xzOf "$t" package/package.json | grep -q '"workspace:' \
+    && { echo "FAIL: $t still contains a workspace: specifier"; break; }
+done
+# Expect an EXACT pin written by pnpm — `"@capwall/policy-schema": "0.1.0"`, never `^0.1.0`:
+tar xzOf dist-tarballs/capwall-core-0.1.0.tgz package/package.json | grep '@capwall/'
+tar xzOf dist-tarballs/capwall-cli-0.1.0.tgz  package/package.json | grep '@capwall/'
+
+# This one must print NOTHING. `files: ["dist","src"]` is an allowlist, so the 79 committed
+# node_modules fixtures under packages/*/test/ and examples/malicious-dep-demo/ cannot reach a
+# tarball — but the fixtures are git-tracked, so confirm it rather than reasoning about it.
+for t in dist-tarballs/*.tgz; do tar tzf "$t" | grep -E 'node_modules|/test/|fixture'; done
+
+# ── 6. Dry-run each publish ──────────────────────────────────────────────────────────────
+# THE LEADING `./` IS NOT OPTIONAL. `npm publish dist-tarballs/x.tgz` is parsed as the GitHub
+# shorthand <user>/<repo> and exits 128 on a `git ls-remote` of
+# ssh://git@github.com/dist-tarballs/capwall-cli-0.1.0.tgz.git.
+# NOTE: no --provenance. It requires a trusted CI publisher; see § What a manual publish loses.
+for p in $(node scripts/check-release-versions.mjs --publish-list); do
+  npm publish ./dist-tarballs/capwall-$p-*.tgz --access public --dry-run
+done
+# Each must end `Publishing to https://registry.npmjs.org/ with tag latest and public access`.
+# "public access" comes from publishConfig.access in the manifest; a scoped package without it
+# is rejected as restricted on a free org.
+
+# ── 7. Publish, ONE AT A TIME, IN THIS ORDER, verifying between each ─────────────────────
+npm publish ./dist-tarballs/capwall-policy-schema-0.1.0.tgz --access public
+npm view @capwall/policy-schema version                 # -> 0.1.0
+npm view @capwall/policy-schema dist.tarball
+
+npm publish ./dist-tarballs/capwall-core-0.1.0.tgz --access public
+npm view @capwall/core version                          # -> 0.1.0
+npm view @capwall/core dependencies                     # -> { '@capwall/policy-schema': '0.1.0' }
+
+npm publish ./dist-tarballs/capwall-cli-0.1.0.tgz --access public
+npm view @capwall/cli version                           # -> 0.1.0
+npm view @capwall/cli dependencies                      # -> both siblings at exactly 0.1.0
+npm view @capwall/cli bin                               # -> { capwall: './dist/index.js' }
+
+# ── 8. Tag, so release-please's baseline matches the registry ────────────────────────────
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+### Why the order is not a preference
+
+pnpm rewrote `workspace:*` to an **exact** pin, so the published `@capwall/cli@0.1.0` names
+`"@capwall/core": "0.1.0"` and nothing else can satisfy it. Publishing `cli` first leaves a
+window — minutes, or hours if a publish fails — in which `npm i -D @capwall/cli` is a hard error
+for everyone. Rehearsed, in an empty directory, with only the `cli` tarball available:
+
+```
+npm error code E404
+npm error 404 '@capwall/core@0.1.0' is not in this registry.
+```
+
+npm does not *enforce* the order (it does not resolve dependencies at publish time), which is
+precisely why nothing but this list will catch it. Publish the leaf first and the tree is
+consistent at every intermediate moment.
+
+### Then verify it as a stranger, from the registry
+
+Do this before announcing anything. It is the only check that exercises what a user actually
+gets rather than what the workspace contains:
+
+```bash
+mkdir /tmp/capwall-smoke && cd /tmp/capwall-smoke && npm init -y
+npm i -D @capwall/cli express                       # one install; the siblings come with it
+npx capwall --version                               # -> capwall 0.1.0 / @capwall/core 0.1.0
+echo 'const fs=require("node:fs");require("express");fs.writeFileSync("out.txt","ok");' > app.js
+npx capwall observe -- node app.js
+cat capabilities.json                               # $schema must point at a file that EXISTS
+npx capwall enforce -- node app.js
+npx capwall diff    -- node app.js                  # -> "no drift"
+
+# The ESM path is separate machinery (the loader hook, the synthetic-module bridge, and the
+# .cts real-builtins capture) and packing can disturb the file layout all three depend on (#171).
+# Exercise a dependency that uses `import`, not just require:
+npm i env-paths
+printf 'import fs from "node:fs";\nimport p from "env-paths";\np("x");\nfs.writeFileSync("e.txt","ok");\n' > esm.mjs
+npx capwall observe -- node esm.mjs                 # must attribute env:XDG_* to 'env-paths'
+
+# And the claim docs/ makes to anyone deciding whether to trust this (#126):
+ls node_modules/@capwall/core/src/shims/fs.ts
+ls node_modules/@capwall/policy-schema/schema.json
+```
+
+`Unsupported URL Type "workspace:"` at `npm i` is the #116 failure and means the version is
+unusable. (`workspace:`, the pnpm protocol — an earlier revision of this line said `workflow:`,
+which npm never prints, so grepping for it found nothing.)
+
+## What a manual publish loses, and whether to buy it back
+
+**One thing: the provenance attestation.** `--provenance` requires a trusted CI publisher —
+npm reads an OIDC token that only GitHub Actions can mint — so a workstation publish cannot
+attach one however the flag is spelled. `0.1.0` would therefore carry no attestation, `npm audit
+signatures` would not vouch for it, and "the supply-chain firewall shipped without provenance"
+is a fair thing for a reviewer to notice. A manual publish also puts a write-capable credential
+on a laptop, which is the other half of the same argument.
+
+Nothing else is lost. The tarball bytes are identical either way — the same `pnpm pack` produces
+them, and `npm publish <tarball>` uploads a finished archive without re-reading anything.
+Provenance is metadata *about* the upload, not a property of what is in it.
+
+**Do not republish a patch to gain it.** A `0.1.1` whose only change is "published from CI this
+time" is a version number that means nothing, on a package with no installed base, and it makes
+the registry's first two entries a story about the publisher rather than about capwall. The
+honest sequence is: publish `0.1.0` manually, configure the trusted publishers (§ HUMAN CHECKLIST
+C) while it is fresh, and let the first real change — whatever it is — be `0.1.1` **with**
+provenance through Actions. Every version anyone actually installs will be attested; exactly one
+early version will not, and `CHANGELOG.md` can say so in a line.
+
+The one thing that would change this answer is #3 being resolved in days rather than weeks. If
+Actions comes back before you have published, delete the token, do nothing manual, and take the
+OIDC path — it is strictly better and this whole section becomes unnecessary.
 
 ---
 
@@ -646,10 +857,15 @@ node scripts/check-release-versions.mjs --publish-list   # the authoritative lis
     standing credential to steal.
 
 > If a package does not exist on the registry yet, npm may not offer the Trusted Publisher
-> form. That is the chicken-and-egg the "granular token" alternative above solves: publish
-> `0.1.0` manually, then come back and do steps 12–13 for each package.
+> form. That is the chicken-and-egg § THE FIRST MANUAL PUBLISH above solves: publish `0.1.0`
+> from a workstation with a granular token, then come back and do steps 12–13 for each package.
 
 ### D. Cutting a release
+
+> **Cutting `0.1.0` by hand instead?** Steps 14–19 describe the OIDC path and need Actions.
+> Go to § THE FIRST MANUAL PUBLISH and run that sequence; it covers steps 15 and 19 itself, and
+> steps 16–18 do not apply. Come back to section C afterwards — the trusted-publisher form
+> appears once the packages exist.
 
 14. **Nothing to prepare.** Merge PRs with conventional titles; release-please keeps a release PR
     open and up to date on every push to `main`. Read it: it names the version and shows the
@@ -707,9 +923,14 @@ node scripts/check-release-versions.mjs --publish-list   # the authoritative lis
 ### E. Afterwards
 
 20. Delete any granular access token used for a manual first publish.
-21. Update the README: replace the "nothing is published" note and the from-clone quickstart
-    with `npm i -D @capwall/cli`, keeping the clone path as the contributor route. Also update
-    `packages/policy-schema/README.md` and `packages/cli/README.md`, which each carry their own
-    "not published yet" note.
+21. Update the **root** `README.md`: replace the "nothing is published" note and the from-clone
+    quickstart with `npm i -D @capwall/cli`, keeping the clone path as the contributor route.
+    The root README is not in any tarball, so this one really is an afterwards job.
+    **`packages/policy-schema/README.md` and `packages/cli/README.md` are not** — they ship
+    inside the tarballs and are what npmjs.com renders on the package page, and a README on the
+    registry can only be changed by publishing a new version. Both carry a "Not published to npm
+    yet — run it from a clone" note that is false the moment it is published. Rewrite them
+    **before** packing (§ THE FIRST MANUAL PUBLISH step 2, or a PR merged before the release
+    PR). Doing it here instead costs a `0.1.1` whose only content is a paragraph.
 22. Nothing to do to `CHANGELOG.md`. There is no `[Unreleased]` section to reopen — release-please
     creates the next section when the next releasable commit lands.
