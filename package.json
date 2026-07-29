@@ -7,10 +7,10 @@
   "author": "William Zujkowski",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/williamzujkowski/capwall.git"
+    "url": "git+https://github.com/capwall/capwall.git"
   },
-  "homepage": "https://github.com/williamzujkowski/capwall#readme",
-  "bugs": "https://github.com/williamzujkowski/capwall/issues",
+  "homepage": "https://github.com/capwall/capwall#readme",
+  "bugs": "https://github.com/capwall/capwall/issues",
   "type": "module",
   "engines": {
     "node": ">=22.15.0"

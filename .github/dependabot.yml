@@ -59,3 +59,21 @@ updates:
       dev-dependencies:
         patterns: ["*"]
         update-types: ["minor", "patch"]
+    # A MAJOR is deliberately left OUT of the group above, so each one arrives as its own PR with
+    # its own measurement. One of them is not a decision at all, and is declined here.
+    ignore:
+      # `@types/node` MUST TRACK THE `engines` FLOOR, NOT THE NEWEST RUNTIME TESTED. The floor is
+      # `>=22.15.0` (root package.json), so the types have to describe Node 22 — that is the whole
+      # job they do here. Typing against 26 does not "add support" for anything: it makes `tsc`
+      # accept calls to APIs that do not exist on the oldest runtime capwall claims to run on, and
+      # the failure surfaces at a user's runtime rather than in this repository's build. `pnpm
+      # ci:local` on 22/24/26 would not catch it either — it runs the code, and code that was
+      # never written because the types forbade it is exactly what is missing.
+      #
+      # WHEN THIS MOVES: when the `engines` floor moves. Bump `@types/node`'s major to match the
+      # new floor's major in the same PR that raises `engines`, and delete or re-target this rule
+      # there — it is a statement about the floor, not a permanent pin. Only majors are ignored;
+      # 22.x minors and patches still come through the group above, which is where real Node 22
+      # typing fixes live.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]

@@ -23,7 +23,7 @@ Closes #
 
 ## Gates run
 
-**There is no CI ([#3](https://github.com/williamzujkowski/capwall/issues/3)) — nobody can run
+**There is no CI ([#3](https://github.com/capwall/capwall/issues/3)) — nobody can run
 these for you.** Tick what you actually ran, and say which Node versions.
 
 - [ ] `pnpm build && pnpm typecheck && pnpm test && pnpm lint`

@@ -28,7 +28,7 @@ there and capwall wants it without a version gate.
 
 ## 2. `pnpm ci:local` is the gate, because there is no CI
 
-**GitHub Actions is billing-blocked ([#3](https://github.com/williamzujkowski/capwall/issues/3)),
+**GitHub Actions is billing-blocked ([#3](https://github.com/capwall/capwall/issues/3)),
 so nothing runs on your pull request.** Not the tests, not the lint, not the matrix. A green
 checkmark you did not produce yourself does not exist here.
 

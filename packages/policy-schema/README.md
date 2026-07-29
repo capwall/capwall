@@ -6,13 +6,13 @@ your editor validation and completion while you hand-edit a policy.
 
 `@capwall/core` imports these types directly and never restates them; the CLI validates every
 user-supplied policy file against `PolicySchema`. The authoritative field-by-field
-documentation is [`docs/policy-format.md`](https://github.com/williamzujkowski/capwall/blob/main/docs/policy-format.md)
+documentation is [`docs/policy-format.md`](https://github.com/capwall/capwall/blob/main/docs/policy-format.md)
 — this README is the orientation, not the reference.
 
 > **Not published to npm yet** (staged at `0.1.0`, in lockstep with the other three
-> packages — see [`docs/releasing.md`](https://github.com/williamzujkowski/capwall/blob/main/docs/releasing.md)).
+> packages — see [`docs/releasing.md`](https://github.com/capwall/capwall/blob/main/docs/releasing.md)).
 > See the root
-> [README](https://github.com/williamzujkowski/capwall#readme) § Install for the
+> [README](https://github.com/capwall/capwall#readme) § Install for the
 > run-from-a-clone path.
 
 ## Point your editor at the schema
@@ -85,7 +85,7 @@ use, deliberately sharing `packageKeyMatches` with the enforcer so the two canno
 Two sentinel keys complete the set: `"<app>"` (the application's own code — the trust root) and
 `"<unknown>"` (a call capwall could not attribute to any source file — an ordinary
 deny-by-default principal, deliberately not an exemption). Both are documented in
-[`docs/policy-format.md`](https://github.com/williamzujkowski/capwall/blob/main/docs/policy-format.md)
+[`docs/policy-format.md`](https://github.com/capwall/capwall/blob/main/docs/policy-format.md)
 § Two sentinel keys.
 
 ## API
@@ -116,4 +116,4 @@ schema.json         the JSON Schema, kept in sync with src/index.ts by hand
 
 ## License
 
-[MIT](https://github.com/williamzujkowski/capwall/blob/main/LICENSE) © 2026 William Zujkowski.
+[MIT](https://github.com/capwall/capwall/blob/main/LICENSE) © 2026 William Zujkowski.

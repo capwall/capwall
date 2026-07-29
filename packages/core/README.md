@@ -13,11 +13,11 @@ interception, the capability shims, package attribution, and policy evaluation l
 > `worker_threads`; `vm`; `process.env`; plus a `node:module` shim, which mediates no policy
 > capability and is defense-in-depth behind the `_compile` and loader-hook gates named above).
 > Per-milestone
-> status lives in one place, [`docs/roadmap.md`](https://github.com/williamzujkowski/capwall/blob/main/docs/roadmap.md); what the
+> status lives in one place, [`docs/roadmap.md`](https://github.com/capwall/capwall/blob/main/docs/roadmap.md); what the
 > mediation is worth against which adversary lives in
-> [`docs/threat-model.md`](https://github.com/williamzujkowski/capwall/blob/main/docs/threat-model.md). See also
-> [`AGENTS.md`](https://github.com/williamzujkowski/capwall/blob/main/AGENTS.md) and
-> [`docs/architecture.md`](https://github.com/williamzujkowski/capwall/blob/main/docs/architecture.md).
+> [`docs/threat-model.md`](https://github.com/capwall/capwall/blob/main/docs/threat-model.md). See also
+> [`AGENTS.md`](https://github.com/capwall/capwall/blob/main/AGENTS.md) and
+> [`docs/architecture.md`](https://github.com/capwall/capwall/blob/main/docs/architecture.md).
 
 ## API
 
@@ -86,7 +86,7 @@ ESM teardown was fail-closed rather than reversible.
 The one ESM-specific residual is a gap rather than a residue: with no hooks in the chain, a
 mediated builtin imported between the last `uninstall()` and the next `install()` is cached raw
 and stays raw (#182). See
-[`docs/threat-model.md`](https://github.com/williamzujkowski/capwall/blob/main/docs/threat-model.md) § ESM known limits.
+[`docs/threat-model.md`](https://github.com/capwall/capwall/blob/main/docs/threat-model.md) § ESM known limits.
 
 ## Configuration
 
@@ -110,7 +110,7 @@ yourself when wiring the preload by hand.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `CAPWALL_MODE` | *(unset)* | `observe` or `enforce`, and it outranks everything. When unset, the mode comes from the policy document's own `mode` field (that is what `capwall run` relies on); if neither declares one, capwall stays **inert**. An unrecognized value is inert too, not a fall-through. Full precedence table: [`docs/policy-format.md` § Enforcement mode](https://github.com/williamzujkowski/capwall/blob/main/docs/policy-format.md#enforcement-mode). |
+| `CAPWALL_MODE` | *(unset)* | `observe` or `enforce`, and it outranks everything. When unset, the mode comes from the policy document's own `mode` field (that is what `capwall run` relies on); if neither declares one, capwall stays **inert**. An unrecognized value is inert too, not a fall-through. Full precedence table: [`docs/policy-format.md` § Enforcement mode](https://github.com/capwall/capwall/blob/main/docs/policy-format.md#enforcement-mode). |
 | `CAPWALL_POLICY_FILE` | *(none)* | Path to `capabilities.json`. Optional in observe; required in enforce (enforce with no policy denies everything). |
 | `CAPWALL_TRACE_FILE` | *(none)* | Append the JSONL decision trace here, for `capwall gen-policy`. |
 | `CAPWALL_PROJECT_ROOT` | `process.cwd()` | Project root for attribution and glob resolution. |
@@ -119,7 +119,7 @@ yourself when wiring the preload by hand.
 | `CAPWALL_GLOBAL_EGRESS` | on | `0` disables the global egress guard — `globalThis.fetch`/`WebSocket`/`EventSource` (#80). They are the one surface capwall reaches by writing to `globalThis`; the switch exists for a process where that write is unacceptable. Read at capwall's module evaluation, not just at install: setting it also skips the `Request.prototype.url` capture that materializes undici, which is ~21 ms of startup (#170). |
 | `CAPWALL_MAX_FRAMES` | `25` | Attribution frame budget — see below. |
 | `CAPWALL_HARDENED` | off | `1` (exactly) enables hardened mode — see below. Any other value leaves it off. |
-| `CAPWALL_ALLOW_LOADER_HOOKS` | off | `1` (exactly) lets a **dependency** call `module.register`/`registerHooks`, which is otherwise application-only (#61). Still warns loudly. See [`docs/threat-model.md` § Loader-hook registration](https://github.com/williamzujkowski/capwall/blob/main/docs/threat-model.md). |
+| `CAPWALL_ALLOW_LOADER_HOOKS` | off | `1` (exactly) lets a **dependency** call `module.register`/`registerHooks`, which is otherwise application-only (#61). Still warns loudly. See [`docs/threat-model.md` § Loader-hook registration](https://github.com/capwall/capwall/blob/main/docs/threat-model.md). |
 
 That is the complete list — ten variables, and capwall reads no other `CAPWALL_*` one. The
 same table lives in `src/preload.ts`'s header, which is the authority; if the two disagree,
@@ -133,7 +133,7 @@ mediated child measures 178.8 ms on Node 22, 161.9 on 24 and 141.0 on 26 (min es
 16-core) where a bare `node` costs 37–45 ms. Quote those rather than the ~180 ms figure this
 paragraph used to carry, which was the pre-#173 p50 and is high by ~80–95 ms — removing the ESM
 loader thread took that much off ([`scripts/bench/README.md` § Startup and § After
-#152](https://github.com/williamzujkowski/capwall/blob/main/scripts/bench/README.md)). Node's own on-disk V8
+#152](https://github.com/capwall/capwall/blob/main/scripts/bench/README.md)). Node's own on-disk V8
 compile cache recovers a slice of that, and it needs no capwall code at all — the CLI passes the
 environment through, so it applies to capwall's graph and the app's alike:
 
@@ -153,7 +153,7 @@ capwall's — a side effect an injected security tool does not get to choose on 
 Its reads and writes are also performed below the JS `fs` surface, so they are the one class of
 disk activity capwall would be causing that its own `fs` gate cannot see or record. Both points,
 and the cache-integrity question, are in
-[`docs/node-api-dependencies.md` § The V8 compile cache](https://github.com/williamzujkowski/capwall/blob/main/docs/node-api-dependencies.md).
+[`docs/node-api-dependencies.md` § The V8 compile cache](https://github.com/capwall/capwall/blob/main/docs/node-api-dependencies.md).
 
 ### Hardened mode (`hardened: true` / `CAPWALL_HARDENED=1`)
 
@@ -214,7 +214,7 @@ the process's HTTP client (#88 — the *view's* `createConnection` is pinned, an
 itself is closed); replacing `process.env` wholesale; `Object.defineProperty(globalThis, "fetch",
 …)`; shadowing a guarded prototype method with an own property on an instance; and climbing past
 a guarded prototype (`Object.getPrototypeOf(net.Socket.prototype).connect`). Read
-[`docs/threat-model.md` § Hardened mode](https://github.com/williamzujkowski/capwall/blob/main/docs/threat-model.md) for the full accounting
+[`docs/threat-model.md` § Hardened mode](https://github.com/capwall/capwall/blob/main/docs/threat-model.md) for the full accounting
 before turning it on, and roll it out under `observe` first.
 
 ### Attribution frame budget (`maxFrames` / `CAPWALL_MAX_FRAMES`)
@@ -245,7 +245,7 @@ Notes:
   warning on stderr and the default is used. capwall runs inside someone else's process and
   must not crash a host app over a config typo.
 - Every mediated call pays for the walk, so a very large budget costs throughput (the
-  <1ms/req target in [`AGENTS.md`](https://github.com/williamzujkowski/capwall/blob/main/AGENTS.md) § 5). Raise it to fit your deepest
+  <1ms/req target in [`AGENTS.md`](https://github.com/capwall/capwall/blob/main/AGENTS.md) § 5). Raise it to fit your deepest
   real stack, not "just in case".
 - When the walk *does* exhaust its budget, the decision handed to `onDecision` carries
   `attributionTruncated: true` and the preload prints a one-time stderr warning, so a capped
@@ -267,7 +267,7 @@ app" (issue #60). Grant it only as narrowly as an `observe` run shows you need. 
 now need nothing here at all: the one line every generated policy used to carry
 (`"env": ["WATCH_REPORT_DEPENDENCIES"]`) came from Node's own ESM loader, and env reads Node
 initiates stopped being recorded in #119. See
-[`docs/threat-model.md`](https://github.com/williamzujkowski/capwall/blob/main/docs/threat-model.md) § attribution outcomes.
+[`docs/threat-model.md`](https://github.com/capwall/capwall/blob/main/docs/threat-model.md) § attribution outcomes.
 
 ## Layout
 
@@ -325,5 +325,5 @@ are imported from there directly.
 
 ## Roadmap
 
-[`docs/roadmap.md`](https://github.com/williamzujkowski/capwall/blob/main/docs/roadmap.md) is the authoritative build order and the one
+[`docs/roadmap.md`](https://github.com/capwall/capwall/blob/main/docs/roadmap.md) is the authoritative build order and the one
 place milestone status is tracked.
