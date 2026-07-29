@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/capwall/capwall/schema.json",
+  "$id": "https://raw.githubusercontent.com/capwall/capwall/main/packages/policy-schema/schema.json",
   "title": "capwall capabilities.json",
   "description": "Per-package capability policy for the capwall runtime firewall. Authoritative field docs: docs/policy-format.md. Keep in sync with packages/policy-schema/src/index.ts.",
   "type": "object",

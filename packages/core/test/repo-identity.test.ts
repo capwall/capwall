@@ -73,7 +73,19 @@ const MANIFESTS = [
  * would report drift on every clone line in the documentation.
  */
 export function repositoryUrlsUnder(root: string): { rel: string; slug: string }[] {
-  const SKIP = new Set(["node_modules", ".git", "dist", "coverage", "dist-tarballs", ".turbo"]);
+  // `.claude` holds agent worktrees — full checkouts of OTHER branches, gitignored. Walking
+  // them reports drift from whatever those branches happen to contain, which is not this
+  // tree's problem and fails for any contributor with a scratch checkout. `.github` is NOT
+  // skipped: its issue templates carry real repository URLs that must stay in sync.
+  const SKIP = new Set([
+    "node_modules",
+    ".git",
+    ".claude",
+    "dist",
+    "coverage",
+    "dist-tarballs",
+    ".turbo",
+  ]);
   const TEXT = /\.(md|json|ts|cts|mts|js|mjs|cjs|ya?ml|txt)$/;
   const out: { rel: string; slug: string }[] = [];
 
@@ -151,7 +163,13 @@ describe("#205 — the facts that are not manifests", () => {
     // editor. It still has to name the right repository: it is the only thing in the file that
     // says where the schema comes from.
     const schema = readJson("packages/policy-schema/schema.json") as { $id: string };
-    expect(schema.$id.startsWith(`https://github.com/${SLUG}/`)).toBe(true);
+    // Accept either host form for THIS repository — `github.com/<slug>/…` (identity only) or
+    // `raw.githubusercontent.com/<slug>/…` (which actually resolves, so an editor can fetch it).
+    // A different owner or repo still fails: both prefixes embed SLUG.
+    const idIsThisRepo =
+      schema.$id.startsWith(`https://github.com/${SLUG}/`) ||
+      schema.$id.startsWith(`https://raw.githubusercontent.com/${SLUG}/`);
+    expect({ $id: schema.$id, isThisRepo: idIsThisRepo }).toEqual({ $id: schema.$id, isThisRepo: true });
   });
 
   it("docs/releasing.md's trusted-publisher table names this owner and repository", () => {
