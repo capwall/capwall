@@ -83,6 +83,7 @@ appear in the release notes.
 | `security` | patch | **Security** |
 | `perf` | patch | Performance |
 | `refactor` | patch | Changed |
+| `revert` | patch | Reverted |
 | `docs` `test` `build` `ci` `chore` `style` | patch | hidden |
 | any of the above with `!`, or a `BREAKING CHANGE:` footer | minor while the major is `0` | ⚠ Breaking |
 
@@ -90,17 +91,35 @@ appear in the release notes.
 mediating X" is a security-relevant regression for every user and has to be findable without
 reading the diff.
 
+**That table is not maintained by hand, and neither is the checker.** The accepted types are
+`release-please-config.json`'s `changelog-sections`, and `scripts/check-commit-messages.mjs` reads
+them from that file rather than keeping a list of its own — a type it accepted but release-please
+ignored would be exactly the silent drop the check exists to stop. Adding a type is a change to
+the release config; the validator follows.
+
 **The pull-request title matters more than your local commit messages.** This repository
 squash-merges, so the title becomes the subject on `main` and is the string release-please reads.
-CI lints both. Check yours before pushing:
+CI checks both. Check yours before pushing:
 
 ```bash
-pnpm lint:commits                              # every commit on origin/main..HEAD
-printf '%s' "feat(cli): add --explain" | pnpm exec commitlint
+pnpm lint:commits                                                     # origin/main..HEAD
+node scripts/check-commit-messages.mjs --message "feat(cli): add --explain"
+node scripts/check-commit-messages.mjs --all                          # the whole history, as a report
 ```
 
-There is deliberately **no git hook** — see the reasoning in `commitlint.config.js`. Subject length
-is not capped; say what changed.
+That script is **zero-dependency** — Node built-ins and nothing else. It replaced commitlint,
+which cost 68 packages of a 253-package dev tree (27%) to check that a string starts with a known
+word; in a project whose argument is that a dependency tree is a liability you cannot see, that
+was a credibility cost with no technical justification. It was not a licence or maintenance
+problem, and the script's header says so explicitly so nobody re-litigates it.
+
+There is deliberately **no git hook** — a local hook is opt-in per clone, does not survive
+`--no-verify` or a merge performed in the GitHub UI, and would be a second set of rules that can
+disagree with the one that decides the release. CI is the real one. Subject length is not capped;
+say what changed.
+
+Merge commits, `git revert` subjects and release-please's own generated release-PR title pass
+untouched — a validator that rejects the release bot's title deadlocks releases.
 
 **Do not hand-edit `CHANGELOG.md`.** release-please owns it. Anything you add lands above the
 generated section, unattributed, and reads as a second changelog. Put the sentence in the commit

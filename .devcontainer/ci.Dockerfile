@@ -25,6 +25,16 @@ ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 RUN command -v corepack >/dev/null 2>&1 || npm install -g corepack@latest
 RUN corepack enable
 
+# GIT, WHICH `node:*-bookworm-slim` DOES NOT SHIP AND A GITHUB RUNNER ALWAYS HAS. Installing it
+# makes the container MORE faithful to ci.yml, not less: `actions/checkout` cannot run without it,
+# and `scripts/check-commit-messages.mjs` — the commit-conventions gate — reads commits with
+# `git log`. Its test suite builds a throwaway repository (never this one) to prove the range
+# walk, the merge-commit skip and the base..head restriction actually work; without git those
+# cases `skipIf` themselves out, and the local matrix would go green over a gate it never ran.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends git \
+  && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY . .
 

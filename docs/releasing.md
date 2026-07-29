@@ -222,8 +222,9 @@ config rather than from a manifest. `check-release-versions.mjs` refuses it.
 
 ### Conventional commits
 
-`commitlint.config.js` holds the rules; `.github/workflows/commit-conventions.yml` runs them on
-every pull request, against **both** the PR title and the individual commits. There is
+`scripts/check-commit-messages.mjs` holds the rules and the reasoning;
+`.github/workflows/commit-conventions.yml` runs it on every pull request, against **both** the PR
+title and the individual commits — one implementation, two strings that can be wrong. There is
 deliberately **no husky / `commit-msg` hook** — a local hook is opt-in per clone, does not survive
 `--no-verify` or a merge performed in the GitHub UI, and would be a second set of rules that can
 disagree with the one that decides the release.
@@ -231,14 +232,38 @@ disagree with the one that decides the release.
 The PR title is the important one: this repository squash-merges, so the title is the subject
 that reaches `main` and the string release-please reads.
 
-Three deviations from `@commitlint/config-conventional`, each with its reasoning in the config
-file: a `security` type is added (mapped to a `### Security` changelog section, because "capwall
-stopped mediating X" has always had to be findable without reading the diff), and
-`header-max-length` / `body-max-line-length` are **off** rather than raised, because this repo's
-subjects name every issue a change closes and its bodies paste measurements and code.
+**The accepted types are read out of `release-please-config.json`, not restated in the script.**
+That file's `changelog-sections` is what decides whether a type means anything, so a list written
+down a second time could drift from it — and the drift would look like working right up until a
+release quietly dropped a change. It is also why `security:` works with no special case anywhere:
+it is in the config, so it is in the grammar. `packages/core/test/commit-messages.test.ts` proves
+the binding rather than asserting it, by adding an invented type to a throwaway config and
+checking the validator accepts it there and nowhere else.
 
-Locally: `pnpm lint:commits` runs the same commitlint over `origin/main..HEAD`. Given #3 that is
-the only place these rules are actually enforced today.
+**Nothing is capped.** No subject length (the longest in this history is 189 characters, because
+it names every issue the change closes), no body or footer line length (bodies here paste
+measurements, tables and fenced code), no scope enumeration (an allow-list would reject the first
+correctly-scoped commit for a surface that does not exist yet).
+
+**It replaced commitlint, and the reason was weight, not quality.** commitlint's closure is 68
+packages — 27% of a 253-package dev tree, measured from a clean resolve with `node_modules` *and*
+the lockfile deleted, since pnpm otherwise keeps what is already installed and the drop is
+invisible — to check that a string starts with a known word. For a tool whose entire pitch is that
+a dependency tree is a liability you cannot see, that was a cost with no technical justification.
+It was **not** a licence problem (the `argparse` transitive is pure JavaScript; `Python-2.0` is the
+permissive PSF licence, not the dead runtime) and not a maintenance problem. The script's header
+records that, so it does not get re-litigated as one.
+
+**The commits job walks `base..head`, never the whole history.** Six commits already on `main`
+predate this gate and do not parse — `node scripts/check-commit-messages.mjs --all` names them:
+`fs:`, `bench:`, `release:` and three compound types (`docs+cli:`, `docs+hygiene:`,
+`docs+hygiene+test:`). Each was a change that happened and a changelog line that did not, which is
+the evidence the gate is worth having; none can be fixed without rewriting published history, and
+a gate that is always red is a gate that gets switched off.
+
+Locally: `pnpm lint:commits` runs the same script over `origin/main..HEAD`, with no install step
+because there is nothing to install. Given #3 that is the only place these rules are actually
+enforced today.
 
 ---
 
@@ -467,7 +492,10 @@ overstated. What **was** verified, locally, against release-please 17.6.0 (the v
 - **the whole chain joins up**: release-please's updaters were applied to a copy of this tree for
   a `0.2.0` release and `check-release-versions.mjs v0.2.0` — the exact command `release.yml` runs
   before packing — passes on the result, and still fails for `v0.3.0`;
-- `commitlint` accepts and rejects the intended messages (`pnpm lint:commits`);
+- `check-commit-messages.mjs` accepts and rejects the intended messages, including every type the
+  release config declares, `!`, `BREAKING CHANGE:` footers, merge/revert/release-please subjects,
+  and the six real historical subjects that parse as nothing
+  (`packages/core/test/commit-messages.test.ts`, 36 cases, in `pnpm test`);
 - `check-release-versions.mjs` fails on each of: a lockstep break, a caret internal dep, a
   drifted release-please manifest, a package on disk that is missing from the release config, a
   removed `linked-versions` plugin, an added `node-workspace` plugin.
