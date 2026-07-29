@@ -82,6 +82,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { preflight } from "../mutation-sentinel.mjs";
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES = path.join(here, "fixtures");
 const PROJECT_ROOT = FIXTURES;
@@ -104,6 +106,27 @@ const COMPARE = opt("compare", undefined);
 
 function fail(msg) {
   process.stderr.write(`\n[startup] FAIL: ${msg}\n`);
+  process.exit(1);
+}
+
+// IS THIS TREE STILL ARMED (#184/#196)? This harness spawns children under
+// `--import packages/core/dist/preload.js`, and `dist` is gitignored — a mutant compiled into it
+// is invisible to `git status`, which is exactly how #184 cost an audit a batch of measurements.
+//
+// The premise check further down is NOT this check. It probes one thing: that each mediated arm
+// denies an `fs` read and charges it to `bench-dep-denied`. That covers the fs gate and nothing
+// else — and the arm this harness exists to price is the ESM perimeter, whose files
+// (`loader/esm-hook.ts`, `loader/esm-hooks.ts`) hold four catalogued `needsBuild: true` mutants.
+// With any of those in `dist`, the fs premise check still passes and every number printed below
+// belongs to a different program.
+//
+// The stamp half is the interlock `mutation-guard.mjs` documents: while `pnpm mutation:gate` is
+// running it rewrites src and rebuilds dist between mutants, so a harness that started mid-run
+// would sample a tree being rebuilt underneath it and report the mixture. `bench`, `canary` and
+// `ci:local` already refuse; this was the one measurement command that did not.
+const armed = preflight({ kinds: ["src", "dist"], label: "the startup benchmark" });
+if (!armed.ok) {
+  process.stderr.write(`\n${armed.message}\n`);
   process.exit(1);
 }
 

@@ -34,34 +34,41 @@ const handle = install(policy, "observe", {
 
 `install(policy, mode)` turns eight things on:
 
-1. the **CJS loader patch** — a subsequent `require("fs")`, `require("node:net")`, … returns
-   capwall's shim, and a `require` of a file outside every `node_modules` tree takes an
-   `fs.read` decision. Since #177/#189 that read is decided at **`Module.prototype.load`**, on
-   the filename Node has already resolved, rather than inside the `Module._load` wrapper
-   (`loader/module-read.ts`);
-2. the **`Module.prototype._compile` gate** (#93) — the `compile` capability, patched on the
-   prototype rather than routed through the `node:module` shim, because `_compile` is read off
-   the prototype and `process.getBuiltinModule("node:module")` reaches it either way;
-3. the **loader-hook registration gate** (#61) — a patch on `Module.register` /
-   `Module.registerHooks` **themselves** since #181, not a member gate inside the `node:module`
-   shim. `node:module`'s export *is* the `Module` class, so every CJS module in the process
-   already holds those two functions as `module.constructor`; gating the functions is what makes
-   `process.getBuiltinModule("node:module")` stop being a way around it;
-4. the **`process.dlopen` native-addon gate** (#49);
-5. the **`process.env` read guard** (a `Proxy`; skip it with `env: false`);
-6. the **global egress guard** (#80) — `globalThis.fetch`/`WebSocket`/`EventSource` against the
-   same `net` grant (skip it with `globalEgress: false`);
-7. the **Web Storage guard** (#156) — `globalThis.localStorage`'s six members take an ordinary
-   **`fs`** read/write decision on the `--localstorage-file` path, which Node otherwise reads and
-   writes below the `fs` shim. Unconditional and self-limiting: Web Storage exists only on Node
-   ≥26 behind that flag, so on every other process this patches nothing at all and there is no
-   option for it (`shims/web-storage.ts`);
-8. when `esm: true`, which the CLI sets — the **ESM loader hook**, so `import` of a mediated
-   builtin lands on the same shims.
+1. the **CJS loader patch** (`patchRequire`) — a subsequent `require("fs")`,
+   `require("node:net")`, … returns capwall's shim rather than the raw builtin;
+2. the **module-read gate** (`installModuleReadGate`, #123) — a `require` of a file outside every
+   `node_modules` tree takes an `fs.read` decision. Since #177/#189 that read is decided at
+   **`Module.prototype.load`**, on the filename Node has already resolved, rather than inside the
+   `Module._load` wrapper (`loader/module-read.ts`);
+3. the **`Module.prototype._compile` gate** (`installCompileGate`, #93) — the `compile`
+   capability, patched on the prototype rather than routed through the `node:module` shim,
+   because `_compile` is read off the prototype and `process.getBuiltinModule("node:module")`
+   reaches it either way;
+4. the **loader-hook registration gate** (`installLoaderHookGate`, #61) — a patch on
+   `Module.register` / `Module.registerHooks` **themselves** since #181, not a member gate inside
+   the `node:module` shim. `node:module`'s export *is* the `Module` class, so every CJS module in
+   the process already holds those two functions as `module.constructor`; gating the functions is
+   what makes `process.getBuiltinModule("node:module")` stop being a way around it;
+5. the **`process.dlopen` native-addon gate** (`installNativeGate`, #49);
+6. the **`process.env` read guard** (`installEnvGuard` — a `Proxy`; skip it with `env: false`);
+7. the **global egress guard** (`installGlobalEgressGuard`, #80) —
+   `globalThis.fetch`/`WebSocket`/`EventSource` against the same `net` grant (skip it with
+   `globalEgress: false`);
+8. the **Web Storage guard** (`installWebStorageGuard`, #156) — `globalThis.localStorage`'s six
+   members take an ordinary **`fs`** read/write decision on the `--localstorage-file` path, which
+   Node otherwise reads and writes below the `fs` shim. Unconditional and self-limiting: Web
+   Storage exists only on Node ≥26 behind that flag, so on every other process this patches
+   nothing at all and there is no option for it (`shims/web-storage.ts`);
 
-Plus a passive `Module._findPath` observer that records which `node_modules` entry a linked or
-workspace package was resolved through, so it gets a principal of its own rather than being the
-application (#127). It gates nothing.
+Plus, when `esm: true` (which the CLI sets), the **ESM loader hook** (`registerEsmHook`), so
+`import` of a mediated builtin lands on the same shims; and a passive `Module._findPath` observer
+(`installLinkObserver`, #127) that records which `node_modules` entry a linked or workspace
+package was resolved through, so it gets a principal of its own rather than being the
+application. The observer gates nothing.
+
+That list is checked against `install()` itself by
+`packages/core/test/process-patch-sites.test.ts`, so a ninth eager install cannot arrive without
+this section moving.
 
 Each shim attributes its calls to the owning package and evaluates them against the policy. The
 CLI installs all of this automatically in child processes via `@capwall/core/preload` (a
@@ -74,7 +81,11 @@ real builtin exactly as a fresh `require` does. A specifier a module had **alrea
 still denies under the torn-down deny-all policy, because a `const` import binding cannot be
 un-bound and serving revoked grants would be the fail-open option. This paragraph used to say
 the opposite — under the old `module.register()` perimeter the hook outlived `uninstall()` and
-ESM teardown was fail-closed rather than reversible. See
+ESM teardown was fail-closed rather than reversible.
+
+The one ESM-specific residual is a gap rather than a residue: with no hooks in the chain, a
+mediated builtin imported between the last `uninstall()` and the next `install()` is cached raw
+and stays raw (#182). See
 [`../../docs/threat-model.md`](../../docs/threat-model.md) § ESM known limits.
 
 ## Configuration

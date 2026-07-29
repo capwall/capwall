@@ -8,6 +8,13 @@
  * can resolve and every consumer's install rejects with
  * `Unsupported URL Type "workspace:"`.
  *
+ * WHAT THIS GUARD TELLS THE OPERATOR TO DO NEXT, and why it is not `pnpm publish`. This message
+ * used to end with `pnpm -r publish --access public`, which `docs/releasing.md` says must never
+ * be used for a real release: `pnpm publish` has no `--provenance` flag and no OIDC support, so
+ * it cannot do trusted publishing. Both statements were true of the tools and they told the
+ * operator opposite things at the one moment they are reading a failure message. `releasing.md`
+ * is the authority: PACK with pnpm, PUBLISH the tarball with npm.
+ *
  * That is not a recoverable mistake. npm's unpublish window is 72 hours and narrow even
  * inside it, so a single reflexive `npm publish` from a package directory would leave three
  * permanently broken versions in the `@capwall` namespace — a bad first artifact for a
@@ -19,7 +26,7 @@
  * script. The check is deliberately asymmetric: it fails only when the agent positively
  * identifies as npm/yarn, and passes when the variable is absent or unrecognised. A guard
  * that blocks an unknown-but-legitimate toolchain would be worse than the bug it prevents,
- * and `pnpm publish` in CI is the path that actually matters.
+ * and `pnpm pack` in CI is the path that actually matters.
  *
  * No dependencies, by design — a firewall that took a dependency to check its own package
  * manager would be arguing against itself.
@@ -39,10 +46,13 @@ if (isNpmOrYarn && !isPnpm) {
       `  This package depends on its siblings with pnpm's \`workspace:*\` protocol.\n` +
       `  ${tool} copies that string into the tarball verbatim, producing a package that\n` +
       `  cannot be installed from a registry — and npm publishes are effectively permanent.\n\n` +
-      `  Use pnpm instead:\n\n` +
-      `      pnpm pack                        # one package\n` +
-      `      pnpm -r --filter './packages/*' publish --access public\n\n` +
-      `  See docs/releasing.md and issue #116.\n\n`,
+      `  Pack with pnpm:\n\n` +
+      `      pnpm pack                                          # one package\n` +
+      `      pnpm -r --filter './packages/*' pack               # all of them\n\n` +
+      `  Then PUBLISH the tarball with npm, not with pnpm — pnpm publish has no\n` +
+      `  --provenance flag and no OIDC support, so it cannot do trusted publishing:\n\n` +
+      `      npm publish ./<tarball> --provenance --access public\n\n` +
+      `  See docs/releasing.md (the authority for a release) and issue #116.\n\n`,
   );
   process.exit(1);
 }

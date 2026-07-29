@@ -64,7 +64,7 @@
  * The stamp is also the interlock against the other way this bites: `mutation:gate` edits
  * `packages/core/src` IN PLACE while `ci:local` streams the working tree into its Docker context.
  * Two separate agents have corrupted runs that way. While this script is running, `ci:local`,
- * `bench` and `canary` refuse to start and say why.
+ * `bench`, `bench:startup` and `canary` refuse to start and say why.
  *
  * Nothing is committed by this script. `--list` touches no files.
  */

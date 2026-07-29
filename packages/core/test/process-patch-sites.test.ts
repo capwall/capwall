@@ -61,7 +61,7 @@ import {
 // Blanking comments and string bodies before matching is what keeps this scan off prose. It
 // lives in a helper because #139's two scans need exactly the same thing for exactly the same
 // reason; the meta-tests that prove it works are still the ones at the bottom of section 1.
-import { blankNonCode, tsFilesUnder } from "./helpers/source-scan.js";
+import { blankNonCode, REPO_ROOT, tsFilesUnder } from "./helpers/source-scan.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const SRC_ROOT = path.join(here, "..", "src");
@@ -488,5 +488,206 @@ console.log("ok");
     expect(r.stderr).toBe("");
     expect(r.stdout).toContain("ok");
     expect(r.code).toBe(0);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════════════════════
+ * 4. THE DOCUMENTS — the enumerations stay the ones the code produces (#194).
+ *
+ * #139 made the `<app>` exemption COUNT self-checking after it had been wrong in four documents
+ * at once. Two enumerations in this neighbourhood have exactly that shape and had drifted the
+ * same way: `docs/architecture.md` said **five** process-level patch sites when the registry
+ * above had nine (and named `Module.prototype.require`, which has never been patched), and
+ * `packages/core/README.md` said `install()` turns **six** things on when it installs eight.
+ *
+ * Both are derived here rather than listed. A tenth patch site, or a ninth eager install, fails
+ * these tests until the prose moves with it — which is the only mechanism this repo has found
+ * that keeps a prose enumeration true for more than a few issues.
+ *
+ * THE PRICE IS A SHAPE, AND IT IS DELIBERATE. A machine-checkable enumeration needs a stable
+ * one, so these tests constrain HOW the two passages are written, not only what they say:
+ *
+ *   - `docs/architecture.md` § Process-patch lifecycle states the count as "<word> of capwall's
+ *     controls", lists the sites in backticks in ONE paragraph, and restates the count at
+ *     "Those <word> share one rule". A site that exists only under a runtime flag
+ *     (`globalThis.localStorage`) goes in a SEPARATE paragraph — it is not in the registry these
+ *     names are checked against, so including it in the sentence makes the sentence wrong.
+ *   - `packages/core/README.md` § install() names each installer's IDENTIFIER in backticks,
+ *     one per numbered item, with the entries the list excludes named in the paragraph after it.
+ *     Without the identifiers nothing ties the prose to `install()`'s body and the count is a
+ *     hand-count again — which is the thing that drifted.
+ *
+ * That is not hypothetical friction: it fired on its first collision. #199 rewrote both passages
+ * independently and got both COUNTS right, but wrote the conditional tenth site into the
+ * enumeration sentence and named no installer identifiers, so all four assertions failed on the
+ * merge. Neither passage was false; both were unbound. Re-read the messages below as "make this
+ * checkable", not "you got the number wrong".
+ * ═════════════════════════════════════════════════════════════════════════════════════════ */
+
+const NUMBER_WORDS = [
+  "zero",
+  "one",
+  "two",
+  "three",
+  "four",
+  "five",
+  "six",
+  "seven",
+  "eight",
+  "nine",
+  "ten",
+  "eleven",
+  "twelve",
+] as const;
+
+const ARCHITECTURE_MD = path.join(REPO_ROOT, "docs", "architecture.md");
+const CORE_README = path.join(REPO_ROOT, "packages", "core", "README.md");
+const CORE_INDEX = path.join(SRC_ROOT, "index.ts");
+
+/**
+ * The sentence in `docs/architecture.md` § Process-patch lifecycle that enumerates the sites —
+ * from the phrase that introduces it to the end of its paragraph. Bounded rather than
+ * whole-file, so a `Module._load` mentioned three paragraphs down is not mistaken for an entry.
+ */
+export function processPatchParagraph(markdown: string): string {
+  const marker = "they replace a **process-level";
+  const start = markdown.indexOf(marker);
+  if (start < 0) return "";
+  const end = markdown.indexOf("\n\n", start);
+  return markdown.slice(start, end < 0 ? undefined : end);
+}
+
+/** The backticked names in that paragraph, in the document's own spelling. */
+export function namesInParagraph(paragraph: string): string[] {
+  return [...new Set([...paragraph.matchAll(/`([^`]+)`/g)].map((m) => m[1]!))].sort();
+}
+
+/**
+ * How a registered site must be spelled in prose. Derived from the registry name, so no hand
+ * mapping can go stale: an ordinary identifier is written in backticks as-is, and the one
+ * composite site (three egress globals patched as a unit) contributes its three globals.
+ */
+export function docNamesForSite(name: string): string[] {
+  if (/^[\w.$]+$/.test(name)) return [name];
+  const inner = /\(([^)]+)\)/.exec(name)?.[1] ?? "";
+  return inner.split("/").map((g) => g.trim());
+}
+
+/** A stated count, e.g. `**Nine** of capwall's controls`. Bold is allowed around the word. */
+export function statedCount(text: string, noun: string): string[] {
+  const re = new RegExp(
+    String.raw`\*{0,2}\b(${NUMBER_WORDS.join("|")})\b\*{0,2}\s+${noun}`,
+    "gi",
+  );
+  return [...new Set([...text.matchAll(re)].map((m) => m[1]!.toLowerCase()))];
+}
+
+describe("#194 — docs/architecture.md enumerates the patch sites the registry holds", () => {
+  const markdown = readFileSync(ARCHITECTURE_MD, "utf8");
+  const paragraph = processPatchParagraph(markdown);
+  const expected = [...new Set(SITES.flatMap((s) => docNamesForSite(s.name)))].sort();
+
+  it("found the paragraph at all", () => {
+    // Two empty sets are equal, so the assertions below are vacuous if the marker moved.
+    expect(paragraph, "the § Process-patch lifecycle enumeration moved or was reworded").toContain(
+      "process-level",
+    );
+    expect(expected.length).toBeGreaterThanOrEqual(9);
+  });
+
+  it("names every registered site, and nothing that is not one", () => {
+    expect(
+      namesInParagraph(paragraph),
+      `docs/architecture.md § Process-patch lifecycle lists a different set of process-level ` +
+        `patch sites than lifecycle/process-patch.ts registers. The registry:\n` +
+        SITES.map((s) => `  - ${s.name} (${s.kind})`).join("\n") +
+        `\nEvery one of those, and nothing else, must appear in backticks in the ONE paragraph ` +
+        `that begins "they replace a **process-level location**". A site that registers only ` +
+        `under a runtime flag belongs in the paragraph AFTER it — it is not in this registry. ` +
+        `Fix the document rather than this test unless a site really was added or removed; this ` +
+        `enumeration had been wrong since #93 and named a site (Module.prototype.require) that ` +
+        `has never existed.`,
+    ).toEqual(expected);
+  });
+
+  it("states a count that matches, in both places it states one", () => {
+    const n = NUMBER_WORDS[SITES.length];
+    const hint =
+      `docs/architecture.md § Process-patch lifecycle must state the site count as ` +
+      `"${n} of capwall's controls" and restate it as "Those ${n} share one rule". The shape is ` +
+      `what makes the number checkable rather than hand-counted; ${SITES.length} sites are ` +
+      `registered.`;
+    expect(statedCount(markdown, String.raw`of capwall's controls`), hint).toEqual([n]);
+    expect(statedCount(markdown, "share one rule"), hint).toEqual([n]);
+  });
+});
+
+/**
+ * The eager installs `install()` performs, read off its own body: every `handles.push(f(…))`.
+ * Comments are blanked first so a doc comment naming a guard is documentation, not a call.
+ */
+export function eagerInstallers(source: string): string[] {
+  const code = blankNonCode(source);
+  const start = code.indexOf("export function install(");
+  const body = start < 0 ? "" : code.slice(start);
+  const re = /handles\.push\(\s*([A-Za-z_$][\w$]*)\s*\(/g;
+  return [...new Set([...body.matchAll(re)].map((m) => m[1]!))].sort();
+}
+
+/**
+ * `packages/core/README.md`'s account of what `install()` turns on, split at the paragraph that
+ * introduces the two entries that are NOT in the numbered list — the conditional ESM hook and
+ * the passive link observer.
+ */
+export function readmeInstallSection(markdown: string): { numbered: string; rest: string } {
+  const start = markdown.indexOf("`install(policy, mode)` turns");
+  const end = markdown.indexOf("Each shim attributes its calls", start);
+  const section = markdown.slice(start, end < 0 ? undefined : end);
+  const split = section.indexOf("\nPlus, ");
+  return split < 0
+    ? { numbered: section, rest: "" }
+    : { numbered: section.slice(0, split), rest: section.slice(split) };
+}
+
+/** Installer identifiers named in backticks. A SHAPE, not a list, so a new guard enrolls itself. */
+export function installersNamed(text: string): string[] {
+  const re = /`(patchRequire|install[A-Z][\w$]*|register[A-Z][\w$]*)`/g;
+  return [...new Set([...text.matchAll(re)].map((m) => m[1]!))].sort();
+}
+
+describe("#194 — packages/core/README.md enumerates what install() actually installs", () => {
+  const readme = readFileSync(CORE_README, "utf8");
+  const { numbered, rest } = readmeInstallSection(readme);
+  const installers = eagerInstallers(readFileSync(CORE_INDEX, "utf8"));
+
+  it("found both the README section and install()'s body", () => {
+    expect(numbered, "the README's install() enumeration moved or was reworded").toContain("1.");
+    expect(installers, "the scan of install() found nothing").toContain("patchRequire");
+    expect(installers.length).toBeGreaterThanOrEqual(10);
+  });
+
+  it("accounts for every guard install() pushes a handle for", () => {
+    expect(
+      [...new Set([...installersNamed(numbered), ...installersNamed(rest)])].sort(),
+      `packages/core/README.md § install() does not account for every guard install() wires up. ` +
+        `install() pushes a handle for:\n` +
+        installers.map((i) => `  - ${i}`).join("\n") +
+        `\nEach must be named in backticks either in the numbered list or in the paragraph after ` +
+        `it. The README said "six things" while install() turned on eight for three issues ` +
+        `running (#93, #156, #181) — that is what this test is for.`,
+    ).toEqual(installers);
+  });
+
+  it("states a count equal to the length of its own numbered list", () => {
+    const items = [...numbered.matchAll(/^\d+\. /gm)].length;
+    expect(items, "the numbered list is empty — the section moved").toBeGreaterThan(0);
+    expect(
+      statedCount(numbered, "things on"),
+      `packages/core/README.md states a number of things install() turns on that is not the ` +
+        `number of entries in the list beneath it.`,
+    ).toEqual([NUMBER_WORDS[items]]);
+    // And the two the list deliberately excludes are the two in the paragraph after it.
+    expect(installersNamed(numbered).length).toBe(items);
+    expect(installersNamed(rest).length).toBe(installers.length - items);
   });
 });

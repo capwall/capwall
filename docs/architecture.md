@@ -133,8 +133,11 @@ rather than a copied object, because copying own keys onto `{}` would break
 an internal. The one thing its trap changes is stated over the *value* rather than as a list of
 names: `node:module` exposes itself under its own key (`Module.Module === Module`), so a trap
 forwarding values verbatim would hand a caller the raw module object through the shim — and any
-own key a future Node adds pointing back at the module would have the same shape. Everything
-else on `node:module` passes through.
+own key a future Node adds pointing back at the module would have the same shape. Stated as a
+CATEGORY rather than a key name: no own key may hand back an un-shimmed route to the shimmed
+surface. That is what stops the shim being the thing that undoes a *future* member gate, which is
+exactly how #181 happened. Everything else on `node:module` passes through. See
+[`threat-model.md`](./threat-model.md) § where the gate lives, and why it moved.
 
 `Module.prototype._compile` is gated **separately, and not by that shim** (#93). It is the one
 primitive that lets a caller choose what V8 reports as `getFileName()` on the frames of the code
@@ -166,14 +169,21 @@ by construction. Gating only: capwall cannot confine an addon once it is loaded 
 
 ### Process-patch lifecycle (`core/src/lifecycle/process-patch.ts`)
 
-Most of capwall's controls are not module shims at all — they replace a **process-level
-location**. Nine sites are registered on every platform: `Module._load`, `Module.prototype.load`
-(the module-read gate, #177/#189), `Module._findPath` (the passive link observer, #127),
-`Module.prototype._compile`, `Module.register`, `Module.registerHooks`, `process.dlopen`,
-`process.env`, and the egress globals `fetch`/`WebSocket`/`EventSource`. A tenth,
-`globalThis.localStorage` (#156), registers only where the process actually has Web Storage
-(Node ≥26 behind `--localstorage-file`), which is why it is absent from the inventory on 22 and
-24. They all share one rule, and #107 made it structural after #103 found three separate bugs
+**Nine** of capwall's controls are not module shims at all — they replace a **process-level
+location**: `Module._load`, `Module.prototype.load` (the module-read gate, #177/#189),
+`Module._findPath` (the passive link observer, #127), `Module.prototype._compile`,
+`Module.register`, `Module.registerHooks`, `process.dlopen`, `process.env`, and the egress
+globals `fetch`/`WebSocket`/`EventSource`.
+
+Those nine are registered on every platform, and that list is the registry
+`lifecycle/process-patch.ts` builds — `packages/core/test/process-patch-sites.test.ts` asserts
+this paragraph against it, the count and the names, so a tenth site cannot be registered without
+this sentence moving. A tenth already exists conditionally: `globalThis.localStorage` (#156)
+registers only where the process actually has Web Storage (Node ≥26 behind
+`--localstorage-file`), which is why it is absent from the inventory on 22 and 24;
+`web-storage.test.ts` pins that one separately.
+
+Those nine share one rule, and #107 made it structural after #103 found three separate bugs
 that were all the same defect:
 
 > **Every process-level patch capwall installs is a reference-counted relink chain, never a bare
@@ -191,14 +201,19 @@ and an `uninstall()` that could throw and strand every patch after it in the tea
 genuinely differ on one axis:
 
 - `defineRelinkedPatch` — **stacks**. Each install adds a link, every link's guard runs, and an
-  out-of-LIFO-order removal relinks around the removed layer. `Module._load` and `process.dlopen`
-  need this: two installs may hold different contexts.
+  out-of-LIFO-order removal relinks around the removed layer. Two of the nine need this —
+  `Module._load` and `process.dlopen` — because two installs may hold different contexts.
 - `defineSharedPatch` / `definePropertyPatch` — **exactly one patch per process, reference
-  counted**; the count only decides *when* the original goes back. `Module.prototype._compile`
-  requires this and breaks loudly under the other one (#100): it identifies Node's own loader by
-  the caller frame one level up, so a second layer makes the inner patch see capwall's own frame
-  and gate **every** `require` in the process. `process.env` and the egress globals require it
-  too — a stacked Proxy double-gates and double-records every read.
+  counted**; the count only decides *when* the original goes back. The other seven require it.
+  `Module.prototype._compile` breaks loudly under the other one (#100): it identifies Node's own
+  loader by the caller frame one level up, so a second layer makes the inner patch see capwall's
+  own frame and gate **every** `require` in the process. `Module.prototype.load`,
+  `Module.register` and `Module.registerHooks` each EVALUATE A POLICY and report through
+  `onDecision`, so a second link would take a second decision about one load or one registration
+  — two `DENY` lines, two trace entries, two grants out of `observe`. `process.env` and the
+  egress globals are the same shape: a stacked Proxy double-gates and double-records every read.
+  `Module._findPath` gates nothing at all (#127) and is shared because two installs would record
+  identical facts into one process-wide map and pay a second `lstat` per resolution to do it.
 
 Two names rather than one helper with a `{ stack: false }` flag, because a flag is what a future
 patch site copies from its neighbour without reading.
@@ -341,8 +356,12 @@ The implementing agent should treat these as the real work, not incidentals:
   are immutable — the CJS module-swap trick does not port directly. *Addressed in M5* by
   having the hook supply the module source up front (see Loader interception above), so the
   binding is to the shim from the start. The residuals that remain — loader-hook chain
-  ordering, pre-install capture, best-effort teardown — are enumerated in
-  [`threat-model.md`](./threat-model.md) § ESM known limits.
+  ordering, pre-install capture, and the third backstop window (#182: between the last
+  `uninstall()` and the next `install()` capwall is not in the chain, so a mediated builtin
+  imported in that gap is cached raw) — are enumerated in
+  [`threat-model.md`](./threat-model.md) § ESM known limits. Teardown is **not** among them:
+  `registerHooks()` returns a `deregister()` and the last `uninstall()` calls it (#152/#173),
+  which is what the "Teardown is real" bullet above records.
 - **Attribution through shared helpers (THE core risk).** When a call passes through a shared
   utility (`lodash`, a logger, a promise wrapper), the nearest `node_modules` frame may be
   the *helper*, not the package that *initiated* the operation. Stack-walking to find the

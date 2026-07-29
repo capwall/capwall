@@ -31,9 +31,12 @@ export function buildShimRegistry(ctx: ShimContext): ShimRegistry {
   registerChildProcessShim(reg, ctx);
   registerWorkerThreadsShim(reg, ctx);
   registerVmShim(reg, ctx);
-  // `node:module` is not a capability in the policy sense — it is mediated so that a
-  // dependency cannot register a loader hook AHEAD of capwall's and un-mediate the ESM
-  // import path process-wide (#61). See shims/module.ts for the full reasoning.
+  // `node:module` is not a capability in the policy sense, and this shim is not #61's gate:
+  // since #181 loader-hook registration is gated on `Module.register`/`Module.registerHooks`
+  // themselves, installed eagerly from `install()`. What the shim contributes is one structural
+  // rule, stated as a CATEGORY — no own key may hand back an un-shimmed route to the shimmed
+  // surface — which is defense in depth against a future member gate being undone the way #181's
+  // was. See shims/module.ts for the full reasoning.
   registerModuleShim(reg, ctx);
   // Note: the process.env read shim is NOT a require()-routed module — it is installed
   // separately via installEnvGuard() in index.ts install().

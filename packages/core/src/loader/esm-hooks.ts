@@ -422,9 +422,13 @@ export function load(url: string, context: LoadContext, nextLoad: NextLoad): Loa
       // Loud, because reaching here is never normal: in a clean run capwall's own `resolve`
       // has already rewritten every mediated specifier, so `load` sees only `capwall-esm:`
       // URLs. This is capwall's only in-band signal that something else is ahead of it in the
-      // hook chain — the situation the shim gate in shims/module.ts exists to prevent, which a
-      // hook registered before capwall (or reached via `process.getBuiltinModule`) can still
-      // create. Once per specifier so a hot import loop cannot spam the log.
+      // hook chain — the situation the loader-hook registration gate in shims/module.ts exists
+      // to prevent. Since #181 that gate is on `Module.register`/`Module.registerHooks`
+      // themselves, so every spelling of the registration call reaches it, `getBuiltinModule`
+      // included (docs/threat-model.md § where the gate lives). What still gets ahead of capwall
+      // is a hook registered BEFORE capwall installed — the gate cannot reach backwards — and
+      // that is the case this warning reports. Once per specifier so a hot import loop cannot
+      // spam the log.
       if (!reMediationWarned.has(mediated)) {
         reMediationWarned.add(mediated);
         process.stderr.write(

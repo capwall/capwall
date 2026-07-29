@@ -74,11 +74,13 @@ export const MEDIATED_MODULES = [
   "node:worker_threads",
   "vm",
   "node:vm",
-  // Not a capability surface — mediated so a dependency cannot reach `module.register` /
-  // `module.registerHooks` and register a loader hook ahead of capwall's, which would
-  // un-mediate the ESM import path for the whole process (#61). The shim passes everything
-  // else on `node:module` (`createRequire`, `builtinModules`, the `_` internals, …) straight
-  // through; see shims/module.ts.
+  // Not a capability surface, and NOT where #61's loader-hook gate lives — since #181 that gate
+  // is a patch on `Module.register` / `Module.registerHooks` themselves, installed eagerly by
+  // `install()` because `module.constructor` reaches those functions with no require at all.
+  // `node:module` stays mediated for one structural rule the shim keeps as defense in depth: no
+  // own key may hand back an un-shimmed route to the shimmed surface, so a value that IS the
+  // module object comes back as the proxy. Everything else (`createRequire`, `builtinModules`,
+  // the `_` internals, …) passes straight through; see shims/module.ts.
   "module",
   "node:module",
 ] as const;

@@ -135,6 +135,28 @@ under-reported, it is *unstable within a major*.
 capwall's wrapper is variadic and forwards `Reflect.apply(link.next, this, args)`, so none of
 this required a code change. The second-order consequence did — see § What this audit changed.
 
+### `Module.prototype.load` — the most stable shape in this table, and the newest dependency
+
+capwall acquired this one in #177 and leans on it harder than on anything else in the module
+system: it is where the #123 module-read gate now takes its decision. Its signature is the one
+the inventory calls the most stable in the table — `(filename)`, one argument, `.length` 1, on
+every binary the inventory covers, with none of the oscillation `Module._load` and
+`Module._findPath` both show across the same set.
+
+That stability is not the reason it was chosen; the reason is positional. `Module._load`
+resolves, consults `Module._cache`, and then calls `this.load(filename)` with the result, which
+sets `_extensions` up to open the file. Everything `_load` could say about *which bytes are about
+to be read* it has to reconstruct from arguments the caller supplies — and #178 is the record of
+that reconstruction being steerable. `Module.prototype.load` is handed Node's own answer. It is
+also strictly wider: `new Module(f).load(f)` reaches the read without entering `Module._load` at
+all, which is one of the four bypasses #189 closed.
+
+The wrapper is variadic and forwards `Reflect.apply(real, this, args)` on the #128 rule, so a
+second parameter appearing in some future minor costs nothing; `test/primitive-arity.test.ts`
+holds that. What it cannot absorb is Node moving the extension dispatch off this method, which
+would be the same class of event as `Module._load` losing specifier interception — see § Could it
+SUBSUME for why a `resolve` hook is not a replacement for it.
+
 ### `Module._findPath` — moved once, silently
 
 `(request, paths, isMain)` on 20.19.4; `(request, paths, isMain, conditions = getCjsConditions())`
@@ -247,7 +269,7 @@ needs no capwall code, since the CLI passes the environment through to the child
 are unaffected by it — the whole suite and the benchmark's 21 self-checks are green with the cache
 enabled. That is the recommendation, and it is documented rather than defaulted.
 
-## The one migration that mattered — done (#152)
+## The one migration that matters — done (#152)
 
 `module.registerHooks()` is the supported successor to `module.register()`, and the ESM path is
 on it. Measured on 22.23.1 / 24.18.0 / 26.5.0 when this was written, and re-measured on 22.22.3 /
@@ -281,7 +303,12 @@ interception occupies, and it is documented where `_load` is not.
    conclusion is unchanged and the argument is stronger for it.) A `resolve` hook does learn a
    filename, but it learns it for the load Node is performing at a point *before* `load` runs, and
    the CJS half must not then decide the same load twice; the arbitration between the two is what
-   `loader/module-read.ts` § WHICH OF THE GATES DECIDES A GIVEN LOAD exists to state.
+   `loader/module-read.ts` § WHICH OF THE GATES DECIDES A GIVEN LOAD exists to state. The sharper
+   form of the same point: a `resolve` hook sees the **resolution**, and the gate needs the
+   **commitment**. Routes reach the read with no resolution for a hook to have observed —
+   `new Module(f).load(f)` never enters `Module._load` at all, and #189 closed four bypasses that
+   were all this gap. A hook could gate a resolution it was asked about; it cannot gate a read
+   that never asked it anything.
 2. **The subject.** The CJS gate's subject is a **stack walk**, precisely because
    `createRequire()` lets a caller choose the `parent.filename` a hook would be handed. A
    `registerHooks` hook runs in capwall's realm now, so a walk is *possible* there — but at
@@ -443,7 +470,7 @@ be repeated when Node 27 lands:
 
 1. **Read the internals off a real binary.** For each Node under test, dump Node's shipped `lib/`
    with `process.binding("natives")` and read the actual implementation of
-   `Module._load`, `Module._findPath`, `Module._resolveFilename`, `Module.prototype._compile`,
+   `Module._load`, `Module.prototype.load`, `Module._findPath`, `Module.prototype._compile`,
    `Module._extensions[".node"]` and `resolveForCJSWithHooks` in
    `internal/modules/cjs/loader.js`. A declared signature is not the same fact as the arity Node
    passes — instrument each function and count `arguments.length` during a real `require`.
@@ -504,6 +531,6 @@ The direction of travel is, unusually, favourable, and #152 is the first instalm
 loader interception occupies, and the ESM path is now on it — from "deprecated with removal
 announced" to "documented, release candidate", with a loader thread, a `MessageChannel` policy
 copy and ~100 ms of startup retired on the way. It did **not** subsume the `Module._load` patch
-and should not be expected to; see § The one migration that mattered for the four things it does
+and should not be expected to; see § The one migration that matters for the four things it does
 not cover and the two that would get worse. `_compile`, `dlopen` and attribution stay exactly
 where they are, and this document exists so that nobody has to discover that for themselves.
