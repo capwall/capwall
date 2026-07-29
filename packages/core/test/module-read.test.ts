@@ -34,6 +34,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   decideEsmModuleRead,
+  forgetLoadedModuleUrls,
+  recordLoadedModuleUrl,
   forgetHostRootTargets,
   isHostRootTarget,
   moduleLoadNeedsDecision,
@@ -289,6 +291,52 @@ try {
   console.log("APP:app-outside-mjs:OK");
 } catch (err) {
   console.log("APP:app-outside-mjs:ERR:" + err.name);
+}
+`,
+  );
+
+  // #180's RESIDUAL, on the surviving `import` path: forge `context.parentURL`.
+  //
+  // The application registers a hook — it is the trust root and may — and Node runs the most
+  // recently registered hook FIRST, so this one is ahead of capwall's and hands capwall's
+  // `resolve` whatever context it likes via `nextResolve`. That is the reachable spelling of "an
+  // importer URL the host did not set"; the other (`vm.SourceTextModule` with a chosen
+  // identifier) needs `--experimental-vm-modules` and a `vm` grant to reach the same place.
+  //
+  // Three forgeries, chosen so no weaker check would pass all three:
+  //   evil/index.js       a REAL file in a REAL package the policy GRANTS — but not loaded in
+  //                       this run, which is why "does that file exist" is not the check;
+  //   impostor/index.js   a directory that does not exist (#180's own PoC);
+  //   app-selfload.mjs    a real APPLICATION file, not loaded in this run — the `<app>`
+  //                       exemption, which short-circuits before the decision is recorded.
+  // Plus a control: the entry itself, which Node really did load and really is the application.
+  //
+  // Inert per AGENTS.md § 8: the hook body only rewrites one field of a context object.
+  await writeFile(
+    path.join(proj, "app-forge-parenturl.mjs"),
+    `import { registerHooks } from "node:module";
+const url = (p) => new URL("file://" + p).href;
+const TARGET = ${JSON.stringify(path.join(vault, "secrets.json"))};
+const FORGERIES = ${JSON.stringify([
+      ["granted-package", path.join(proj, "node_modules", "evil", "index.js")],
+      ["nonexistent-package", path.join(proj, "node_modules", "impostor", "index.js")],
+      ["app-file", path.join(proj, "app-selfload.mjs")],
+      ["control-really-loaded", path.join(proj, "app-forge-parenturl.mjs")],
+    ])};
+let forgeAs = null;
+registerHooks({
+  resolve(spec, ctx, next) {
+    return forgeAs === null ? next(spec, ctx) : next(spec, { ...ctx, parentURL: url(forgeAs) });
+  },
+});
+for (const [name, as] of FORGERIES) {
+  forgeAs = as;
+  try {
+    const m = await import(url(TARGET) + "?" + name, { with: { type: "json" } });
+    console.log("FORGE:" + name + ":OK:" + JSON.stringify(m.default));
+  } catch (err) {
+    console.log("FORGE:" + name + ":ERR:" + err.name + ":" + (err.pkg ?? ""));
+  }
 }
 `,
   );
@@ -687,6 +735,29 @@ describe("#123 ESM — import() is not a way around fs.read either", () => {
     expect(r.stdout).toContain("APP:app-outside-mjs:OK");
     expect(r.stderr).not.toMatch(/DENY '<app>'/);
   }, 30_000);
+
+  it("#180 — a forged `parentURL` names no principal, however plausible the name", async () => {
+    // The residual #189 left open, end to end. Run under the policy that GRANTS `evil` the vault,
+    // so a forgery that worked would read the secret and print it; the control proves the run is
+    // not simply denying everything.
+    const r = await runEntry(path.join(proj, "app-forge-parenturl.mjs"), {
+      CAPWALL_MODE: "enforce",
+      CAPWALL_POLICY_FILE: vaultGrantPolicy,
+    });
+    for (const forgery of ["granted-package", "nonexistent-package", "app-file"]) {
+      expect(r.stdout, `${forgery} was accepted as an importer`).toContain(
+        `FORGE:${forgery}:ERR:CapabilityError:<unknown>`,
+      );
+    }
+    // …and exactly one import succeeded: the control. Asserted over the OK LINES rather than as
+    // "the secret never appears", because the control legitimately prints it — it really is the
+    // application reading its own file, which is the behaviour the last two lines pin.
+    expect(r.stdout.match(/^FORGE:\S+:OK:/gm)).toEqual(["FORGE:control-really-loaded:OK:"]);
+    // The control: an importer Node really did load, which really is the application, is free —
+    // the `<app>` short-circuit is kept (see loader/module-read.ts for why it is not recorded).
+    expect(r.stdout).toContain(`FORGE:control-really-loaded:OK:{"key":"${SECRET}"}`);
+    expect(r.stderr).not.toMatch(/DENY '<app>'/);
+  }, 30_000);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -1029,14 +1100,69 @@ describe("#123 the rule itself", () => {
     projectRoot: PROJECT,
   });
 
+  /**
+   * Since #180 a `file:` importer is charged only when it names a module NODE ACTUALLY LOADED, so
+   * a unit row has to say which ones those are. The seeding is not scaffolding around the
+   * assertion — it IS the mechanism: `loader/esm-hooks.ts`'s `load` hook is the only thing that
+   * writes this set in a real process, and the rows below check both of its answers.
+   */
+  const loadedImporter = (...parts: string[]): string => {
+    const url = pathToFileURL(p(...parts)).href;
+    recordLoadedModuleUrl(url);
+    return url;
+  };
+
   it("charges an ESM load to the IMPORTING module's package", () => {
     const outcome = decideEsmModuleRead(
       snapshot({}),
-      pathToFileURL(p("node_modules", "evil", "index.mjs")).href,
+      loadedImporter("node_modules", "evil", "index.mjs"),
       pathToFileURL(p("config", "secrets.json")).href,
     );
     expect(outcome?.pkg).toBe("evil");
     expect(outcome?.decision.allowed).toBe(false);
+  });
+
+  it("#180 — charges an importer NODE NEVER LOADED to <unknown>, whatever it names", () => {
+    // The residual #189 left open: on the surviving `import` path `parentURL` was trusted as-is,
+    // on the argument that the host sets it there. True, and an argument rather than a check —
+    // and the same argument had already stopped being true once, on the `require` path. #180's
+    // PoC wore `node_modules/impostor/index.js`, a directory that need not exist, and inherited
+    // whatever that name holds in the policy. It cannot now: an importer that names no loaded
+    // module is `<unknown>`, which holds nothing.
+    forgetLoadedModuleUrls();
+    const target = pathToFileURL(p("config", "secrets.json")).href;
+    const forged = pathToFileURL(p("node_modules", "impostor", "index.mjs")).href;
+    // Granted under BOTH names, so the row fails if either the forged principal or the trust root
+    // is what the gate reached for.
+    const generous = snapshot({
+      impostor: { fs: { read: ["/**"], write: [] } },
+      "<app>": { fs: { read: ["/**"], write: [] } },
+    });
+    const outcome = decideEsmModuleRead(generous, forged, target);
+    expect(outcome?.pkg).toBe("<unknown>");
+    expect(outcome?.decision.allowed).toBe(false);
+    // …and the identical call, once Node has actually loaded that module, charges it normally.
+    recordLoadedModuleUrl(forged);
+    expect(decideEsmModuleRead(generous, forged, target)?.pkg).toBe("impostor");
+  });
+
+  it("#180 — accepts the process ENTRY POINT as an importer, which a late install() never saw load", () => {
+    // The one fallback, and it is a HOST fact rather than "there is a file there": an
+    // exists-on-disk arm would let any real path inside a granted package be worn as a principal,
+    // which is most of what the check is for. A programmatic embedder that calls `install()` late
+    // has an entry point capwall's `load` hook never saw, and it is the application.
+    forgetLoadedModuleUrls();
+    forgetHostRootTargets();
+    const entry = p("late-embedder-app.mjs");
+    const target = pathToFileURL(p("config", "secrets.json")).href;
+    // Not yet a known root: `<unknown>`, deny-by-default.
+    expect(decideEsmModuleRead(snapshot({}), pathToFileURL(entry).href, target)?.pkg).toBe(
+      "<unknown>",
+    );
+    recordHostRootTarget(entry);
+    // Now it is the application, which is the trust root and takes no decision at all.
+    expect(decideEsmModuleRead(snapshot({}), pathToFileURL(entry).href, target)).toBeNull();
+    forgetHostRootTargets();
   });
 
   it("charges an importer with no filesystem identity to <unknown>, never to the trust root", () => {
@@ -1115,7 +1241,7 @@ describe("#123 the rule itself", () => {
   it("allows the ESM load when the importing package is granted", () => {
     const outcome = decideEsmModuleRead(
       snapshot({ evil: { fs: { read: [p("config", "**").split(path.sep).join("/")], write: [] } } }),
-      pathToFileURL(p("node_modules", "evil", "index.mjs")).href,
+      loadedImporter("node_modules", "evil", "index.mjs"),
       pathToFileURL(p("config", "secrets.json")).href,
     );
     expect(outcome?.decision.allowed).toBe(true);

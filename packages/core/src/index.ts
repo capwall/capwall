@@ -28,7 +28,12 @@ import { liveCtx, liveRegistry } from "./loader/live-context.js";
 import { installLinkObserver, type LinkObserverHandle } from "./loader/linked-packages.js";
 import { installNativeGate, type NativeGateHandle } from "./loader/native.js";
 import { installEnvGuard, type EnvGuardHandle } from "./shims/env.js";
-import { installCompileGate, type CompileGateHandle } from "./shims/module.js";
+import {
+  installCompileGate,
+  installLoaderHookGate,
+  type CompileGateHandle,
+  type LoaderHookGateHandle,
+} from "./shims/module.js";
 import {
   globalEgressHardeningGaps,
   installGlobalEgressGuard,
@@ -310,6 +315,7 @@ export function install(
     | GlobalEgressGuardHandle
     | WebStorageGuardHandle
     | CompileGateHandle
+    | LoaderHookGateHandle
   > = [];
   // First: this pushes `ctx` onto the install stack, so `liveCtx` below already describes THIS
   // install by the time the guards that read it are built.
@@ -342,6 +348,13 @@ export function install(
   // without ever touching it. A gate that only exists once somebody requires a mediated module
   // is not a gate. See shims/module.ts § installCompileGate.
   handles.push(installCompileGate(liveCtx));
+  // Loader-hook registration gate (#61), at `Module.register`/`Module.registerHooks` (#181).
+  // Eager and NOT registry-routed for the same reason as the `_compile` gate one line up, only
+  // more so: `node:module`'s export IS the `Module` class, so every CJS module in the process
+  // already holds these two functions as `module.constructor` without requiring anything. A gate
+  // that appeared on the first mediated require would never have covered the shortest route to
+  // it. See shims/module.ts § installLoaderHookGate.
+  handles.push(installLoaderHookGate(liveCtx));
   // Native (`.node`) addon gate (roadmap S2, #49). Always on, and deliberately not routed
   // through the require registry: `process.dlopen` is the chokepoint EVERY addon load passes
   // through, including a direct `process.dlopen(...)` that never touches the module system.

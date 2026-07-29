@@ -577,6 +577,68 @@ const SHIM_NAMESPACES: ReadonlyArray<{ specifier: string; real: Record<string, u
   { specifier: "module", real: realModule as unknown as Record<string, unknown> },
 ];
 
+/**
+ * ISSUE #181 — a shim may not hand back an un-shimmed route to the surface it shims.
+ *
+ * `node:module`'s CJS export is the `Module` class, and Node keeps a legacy self-reference on it
+ * (`Module.Module === Module`). The shim is a `Proxy` that forwarded every value verbatim, so
+ * `require("node:module").Module` and the ESM `import { Module } from "node:module"` handed back
+ * the raw class — with the raw `register`/`registerHooks` on it — through the very object whose
+ * job was to gate them. #181 fixed the CAPABILITY by moving the gate onto the two functions
+ * (shims/module.ts § installLoaderHookGate), which is what the end-to-end sweep in `esm.test.ts`
+ * asserts; this is the STRUCTURAL half, and it has to be structural because with the gate in the
+ * right place the raw class no longer BEHAVES differently.
+ *
+ * Stated over the shim's whole own-key set rather than over the name `Module`, because a denylist
+ * of names is what #181 says is not a mechanism: an alias a future Node adds must fail here.
+ */
+describe("#181 — the node:module shim hands back no un-shimmed route to itself", () => {
+  // The CJS export, which IS the `Module` class — not the ESM namespace `realModule` above, whose
+  // members are the same but which is a different object and has no self-reference. The
+  // self-reference is the whole subject here, so the object has to be the one the shim proxies.
+  const realModuleCjs = requireCjs("node:module") as unknown as Record<string, unknown>;
+
+  const moduleShim = (): Record<string, unknown> => {
+    const reg = buildShimRegistry({
+      policy: denyAll(),
+      mode: "enforce",
+      onDecision: () => {},
+      projectRoot: here,
+    });
+    return reg.get("module") as Record<string, unknown>;
+  };
+
+  it("returns the shim, not the real module object, for every own key that is a self-reference", () => {
+    const shim = moduleShim();
+    const real = realModuleCjs;
+    const selfKeys = Object.getOwnPropertyNames(real).filter((k) => real[k] === real);
+    // Node has exactly one today (`Module`). If it ever has none, this test would pass
+    // vacuously — so the premise is asserted rather than assumed.
+    expect(selfKeys, "node:module no longer exposes itself under any own key").not.toEqual([]);
+    for (const key of selfKeys) {
+      expect(shim[key], `node:module shim leaks the raw module through .${key}`).toBe(shim);
+    }
+  });
+
+  it("keeps `m.Module === m`, which is the invariant real Node has", () => {
+    const shim = moduleShim();
+    expect(shim["Module"]).toBe(shim);
+    expect(realModuleCjs["Module"]).toBe(realModuleCjs);
+  });
+
+  it("still passes everything else through untouched — this is not a denylist", () => {
+    // The category is "a value that IS the module object", and nothing wider. `createRequire` is
+    // used by real tooling and by capwall's own bootstrap; `builtinModules` is a list of strings;
+    // `isBuiltin` answers a question. Narrowing them would be a compatibility break for no gain,
+    // because none of them is a second route to a gated capability.
+    const shim = moduleShim();
+    const real = realModuleCjs;
+    for (const key of ["createRequire", "builtinModules", "isBuiltin", "_extensions", "prototype"]) {
+      expect(shim[key], `node:module.${key} should pass through untouched`).toBe(real[key]);
+    }
+  });
+});
+
 describe("#96 — every guarded function reports the REAL function's name", () => {
   it("name parity across every replaced export of every shim namespace", () => {
     const reg = buildShimRegistry({

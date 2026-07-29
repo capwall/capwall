@@ -242,6 +242,13 @@ describe("#107 — every process-level write goes through lifecycle/process-patc
  *    and double-records every read, and the second `installEnvGuard` captured the FIRST guard's
  *    proxy as the "un-proxied" environment — which handed a GRANTED `spawn` an empty child
  *    environment (#103).
+ *  - `Module.register` / `Module.registerHooks` MUST NOT either (#181). They are #61's gate, moved
+ *    off the `node:module` shim's `get` trap and onto the two function objects every route to the
+ *    capability converges on — `require("node:module").registerHooks`, `Module.registerHooks`,
+ *    `module.constructor.registerHooks`, `process.getBuiltinModule("node:module").registerHooks`.
+ *    Like `Module.prototype.load` they EVALUATE A POLICY and report through `onDecision`, so a
+ *    stacked second link would take a second decision about one registration: two `DENY` lines,
+ *    two trace entries, two grants out of `observe`.
  *  - `Module._findPath` (#127) is the one site that is not a gate at all: it OBSERVES resolutions
  *    so a symlinked `node_modules` entry can be attributed to the package it was reached through
  *    rather than to `<app>`. Shared, because two installs would record identical facts into the
@@ -255,6 +262,8 @@ const REVIEWED_SITES: ReadonlyArray<{ name: string; kind: PatchKind }> = [
   { name: "Module._load", kind: "relinked" },
   { name: "Module.prototype._compile", kind: "shared" },
   { name: "Module.prototype.load", kind: "shared" },
+  { name: "Module.register", kind: "shared" },
+  { name: "Module.registerHooks", kind: "shared" },
   { name: "process.dlopen", kind: "relinked" },
   { name: "process.env", kind: "shared" },
   { name: "globalThis egress (fetch/WebSocket/EventSource)", kind: "shared" },

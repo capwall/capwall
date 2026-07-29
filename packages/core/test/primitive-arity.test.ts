@@ -31,6 +31,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { initialize as initEsmHooks, resolve as esmResolve } from "../src/loader/esm-hooks.js";
+import { MEDIATED_MODULES } from "../src/loader/require.js";
 import { runNode, type NodeRunResult } from "./helpers/subprocess.js";
 
 const CORE_DIST = createRequire(import.meta.url).resolve("../dist/index.js");
@@ -84,6 +86,150 @@ import { install, loadPolicyFromObject } from ${CORE_URL};
 const policy = loadPolicyFromObject({ version: 1, mode: "enforce" }, { projectRoot: process.cwd() });
 const handle = install(policy, "enforce", { projectRoot: process.cwd(), globalEgress: false });
 `;
+
+/** The same install with the ESM hooks live — the half `resolve` belongs to. */
+const INSTALL_ESM = `
+import { install, loadPolicyFromObject } from ${CORE_URL};
+const policy = loadPolicyFromObject({ version: 1, mode: "enforce" }, { projectRoot: process.cwd() });
+const handle = install(policy, "enforce", { projectRoot: process.cwd(), globalEgress: false, esm: true });
+`;
+
+/**
+ * ISSUE #183 — the other half of "capwall did not change what Node does": not what reaches a
+ * primitive, but what a RESOLVER hands back.
+ *
+ * `module.registerHooks()`'s `resolve` is consulted for `require()` too, and on Node ≥24.18
+ * `require.resolve()` goes through the same chain where on 22 it does not. capwall short-circuits
+ * every mediated builtin specifier to a synthetic `capwall-esm:` URL, so on ≥24.18 the answer a
+ * caller SAW became `"capwall-esm:fs"`: `Module.isBuiltin` went false for all 24 mediated
+ * spellings and `require(require.resolve("fs"))` threw `MODULE_NOT_FOUND`. Not a security hole,
+ * and worse than one — it is the shape AGENTS.md § availability is about, where the user's fix is
+ * to remove capwall.
+ *
+ * WRITTEN AS A DIFFERENTIAL, deliberately. Each row records Node's own answer BEFORE `install()`
+ * and compares the answer under capwall against it, so the assertion is "capwall changed nothing"
+ * rather than a hard-coded string that would have to be per-version — the version split is exactly
+ * what let this sit unnoticed (22 was correct, ≥24.18 was not). It therefore needs no `skipIf` and
+ * asserts the same property on every leg of the matrix.
+ */
+describe("#183 — capwall does not change what Node's resolvers return", () => {
+  it("require.resolve() of every mediated builtin answers exactly as un-mediated Node does", async () => {
+    const r = await run(`
+import Module, { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const SPECS = ${JSON.stringify(MEDIATED_MODULES)};
+// Node's own answers, taken before capwall exists in this process.
+const before = SPECS.map((s) => require.resolve(s));
+${INSTALL_ESM}
+const after = SPECS.map((s) => require.resolve(s));
+const builtin = after.map((u) => Module.isBuiltin(u));
+// The round trip the ecosystem actually performs: resolve, then require the result.
+const roundTrip = SPECS.map((s) => {
+  try { require(require.resolve(s)); return "ok"; } catch (e) { return String(e && e.code); }
+});
+console.log(JSON.stringify({ before, after, builtin, roundTrip }));
+handle.uninstall();
+`);
+    expect(r.stderr).toBe("");
+    const out = JSON.parse(r.stdout.trim()) as {
+      before: string[];
+      after: string[];
+      builtin: boolean[];
+      roundTrip: string[];
+    };
+    // Not vacuous: the whole mediated set, both spellings of each builtin.
+    expect(out.before.length).toBe(MEDIATED_MODULES.length);
+    expect(out.after).toEqual(out.before);
+    expect(out.after.filter((u) => u.startsWith("capwall-esm:"))).toEqual([]);
+    expect(out.builtin.filter((b) => !b)).toEqual([]);
+    expect(out.roundTrip.filter((x) => x !== "ok")).toEqual([]);
+  });
+
+  it("…and the require path is still MEDIATED — the URL changed, the enforcement did not", async () => {
+    // The obligation the row above creates. `Module._load` returns the shim for every mediated
+    // specifier before Node's resolver is reached, so declining to rewrite a `require` resolution
+    // gives up nothing — but that is an argument, and this is the check.
+    const r = await run(`
+${INSTALL_ESM}
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const out = [];
+for (const spec of ["fs", "node:fs"]) {
+  for (const get of [() => require(spec), () => require(require.resolve(spec))]) {
+    try { get().readFileSync("/etc/hostname"); out.push("RAW"); }
+    catch (e) { out.push(e && e.name === "CapabilityError" ? "BLOCKED" : "ERR:" + (e && e.code)); }
+  }
+}
+console.log(JSON.stringify(out));
+handle.uninstall();
+`);
+    expect(JSON.parse(r.stdout.trim())).toEqual(["BLOCKED", "BLOCKED", "BLOCKED", "BLOCKED"]);
+  });
+
+  it("records what `import.meta.resolve` still answers — a KNOWN deviation, pinned not hidden", async () => {
+    // NOT fixed, and the test says so rather than omitting the case. Measured on 22.23.1 /
+    // 24.18.0 / 26.5.0: an `import.meta.resolve` reaches the hook with a context byte-for-byte
+    // identical to a static `import` of the same specifier, so there is no signal to branch on;
+    // the only shape that would fix it (mediating a raw `node:` URL in `load` instead) would cache
+    // `node:fs` as the synthetic module and bring back the #152 teardown asymmetry on every
+    // mediated builtin. See `loader/esm-hooks.ts` § THE SYNTHETIC URL IS AN `import`-PATH ANSWER.
+    //
+    // Pinned WITH its round trip, which is the part that keeps this cosmetic: the URL is odd but
+    // importing it works and yields the enforcing shim, where `require.resolve`'s did not.
+    const r = await run(`
+${INSTALL_ESM}
+const url = import.meta.resolve("fs");
+let mediated;
+try { (await import(url)).readFileSync("/etc/hostname"); mediated = "RAW"; }
+catch (e) { mediated = e && e.name === "CapabilityError" ? "BLOCKED" : "ERR:" + (e && e.code); }
+console.log(JSON.stringify({ url, mediated }));
+handle.uninstall();
+`);
+    expect(JSON.parse(r.stdout.trim())).toEqual({ url: "capwall-esm:fs", mediated: "BLOCKED" });
+  });
+});
+
+/**
+ * The same rule as the differential above, asserted directly on the hook — because the
+ * subprocess rows can only see it where Node routes `require.resolve` through the chain, which is
+ * **≥24.18 only**. This one runs the hook itself, so it pins the rule on every leg of the matrix
+ * and the version split stops being what decides whether the property is covered. (Safe in
+ * process: vitest isolates each test file in its own fork, and no other file imports this module.)
+ */
+describe("#183 — a `require` resolution never gets capwall's synthetic URL", () => {
+  /** Node's answer, stubbed: a bare builtin name resolves to its `node:` URL. */
+  const nextResolve = (specifier: string): { url: string } => ({
+    url: specifier.startsWith("node:") ? specifier : `node:${specifier}`,
+  });
+  const ctx = (...conditions: string[]) => ({
+    conditions,
+    importAttributes: {},
+    parentURL: pathToFileURL(path.join(process.cwd(), "importer.mjs")).href,
+  });
+
+  beforeAll(() => {
+    initEsmHooks({ bridgeUrl: "file:///bridge.js", exports: { fs: ["readFileSync"], "node:fs": ["readFileSync"] } });
+  });
+
+  it("answers Node's URL for the CJS resolver and the synthetic one for `import`", () => {
+    // Both spellings, both loaders. The `import` half is asserted alongside so a mutation that
+    // simply stopped mediating would fail here rather than looking like the #183 fix.
+    for (const spec of ["fs", "node:fs"]) {
+      expect(esmResolve(spec, ctx("require", "node"), nextResolve).url).toBe(nextResolve(spec).url);
+      expect(esmResolve(spec, ctx("node", "import"), nextResolve).url).toBe(`capwall-esm:${spec}`);
+    }
+  });
+
+  it("does not rewrite a `require` resolution that LANDS on a builtin either", () => {
+    // The slow path (#59): a specifier that does not name a builtin but resolves to one. Same
+    // rule — the answer a `require` sees is Node's.
+    const landsOnFs = (): { url: string } => ({ url: "node:fs" });
+    expect(esmResolve("#x", ctx("require", "node"), landsOnFs).url).toBe("node:fs");
+    // `node:fs` is itself a registry key, so the direct hit answers and the synthetic URL carries
+    // the `node:`-prefixed spelling — the same one the real registry produces.
+    expect(esmResolve("#x", ctx("node", "import"), landsOnFs).url).toBe("capwall-esm:node:fs");
+  });
+});
 
 describe("wrappers over Node primitives forward arguments verbatim (#128)", () => {
   it("Module.prototype._compile forwards any argument count, unchanged", async () => {

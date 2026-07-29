@@ -208,8 +208,8 @@
       "id": "esm-no-loader-thread",
       "mechanism": "#152/#153 \u2014 capwall's ESM interception uses the SYNCHRONOUS module.registerHooks(), so no module-customization thread is started (~53 ms) and no DEP0205 deprecation warning is printed. module.register() is Stability 0 with removal announced",
       "file": "packages/core/src/loader/esm-hook.ts",
-      "anchor": "    hooks = realModule.registerHooks({ resolve, load }) as RegisteredHooks;",
-      "mutation": "    hooks = realModule.registerHooks({ resolve, load }) as RegisteredHooks;\n    realModule.register(\"data:text/javascript,export function resolve(s,c,n){return n(s,c)}\", import.meta.url);",
+      "anchor": "    hooks = pristineRegisterHooks.call(realModule, { resolve, load }) as RegisteredHooks;",
+      "mutation": "    hooks = pristineRegisterHooks.call(realModule, { resolve, load }) as RegisteredHooks;\n    realModule.register(\"data:text/javascript,export function resolve(s,c,n){return n(s,c)}\", import.meta.url);",
       "tests": [
         "packages/core/test/esm-hook-graph.test.ts"
       ],
@@ -336,6 +336,66 @@
       ],
       "needsBuild": true,
       "note": "The mutation is the plausible over-reach \u2014 'record every resolved target, the CJS half will only match the real entry anyway' \u2014 and it converts the entry-point exemption from a host fact back into something a dependency writes: one denied `import(secret)` makes the subsequent `require(secret)` free. Caught by the unit rows that assert a load WITH an importer records nothing."
+    },
+    {
+      "id": "loader-hook-gate-on-the-real-registration-functions",
+      "mechanism": "#61/#181 \u2014 the loader-hook gate is a patch on `Module.register`/`Module.registerHooks` THEMSELVES, so every route to the capability converges on it: the named ESM export, `require('node:module').registerHooks`, `Module.registerHooks` reached through node:module's own self-reference, `module.constructor.registerHooks` (which needs no require at all) and `process.getBuiltinModule('node:module')`",
+      "file": "packages/core/src/shims/module.ts",
+      "anchor": "        guardRegistration(ctx, api, patched);",
+      "mutation": "        if (false) guardRegistration(ctx, api, patched);",
+      "tests": [
+        "packages/core/test/esm.test.ts"
+      ],
+      "needsBuild": true,
+      "note": "The mutation leaves the patch installed, the site registered and the shim intact \u2014 so `process-patch-sites.test.ts`'s inventory and the shim's own structural test both still pass. It is the whole of #61 at its new home: with it applied, any dependency registers a resolve+load hook that de-mediates node:fs process-wide, and an innocent third package reads a secret with no capwall line at all."
+    },
+    {
+      "id": "module-shim-returns-no-self-reference",
+      "mechanism": "#181 \u2014 the node:module shim's `get` trap never hands back the raw module object. Node keeps a legacy self-reference (`Module.Module === Module`), so a trap that forwards every value verbatim hands a caller an un-shimmed route to the surface it is shimming, through the shim",
+      "file": "packages/core/src/shims/module.ts",
+      "anchor": "      return value === target ? proxy : value;",
+      "mutation": "      return value;",
+      "tests": [
+        "packages/core/test/class-escapes.test.ts"
+      ],
+      "needsBuild": false,
+      "note": "Deliberately claimed by a STRUCTURAL test, not a behavioural one. Since #181 moved the capability gate onto the two function objects, the raw class no longer behaves differently from the proxy \u2014 so no end-to-end fixture can catch this, and the property is worth keeping anyway: it is what stops the shim being the thing that undoes the NEXT member gate, which is exactly how #181 happened."
+    },
+    {
+      "id": "esm-resolve-answers-require-with-nodes-own-url",
+      "mechanism": "#183 \u2014 capwall's synthetic `capwall-esm:` URL is an `import`-path answer only. A `require` resolution's answer is a value the caller can see (`require.resolve`) and must be able to feed back into `require`, so it gets Node's own URL \u2014 otherwise `Module.isBuiltin` answers false for all 24 mediated spellings and `require(require.resolve('fs'))` throws MODULE_NOT_FOUND",
+      "file": "packages/core/src/loader/esm-hooks.ts",
+      "anchor": "    if (!isCjsResolution(context.conditions)) return { url: PREFIX + specifier, shortCircuit: true };",
+      "mutation": "    if (true) return { url: PREFIX + specifier, shortCircuit: true };",
+      "tests": [
+        "packages/core/test/primitive-arity.test.ts"
+      ],
+      "needsBuild": false,
+      "note": "Claimed by the IN-PROCESS rows that call the hook directly, not by the subprocess differential \u2014 Node only routes `require.resolve` through the hook chain on >=24.18, so a subprocess-only claim would make this mutant survive on the floor and need a `minNodeMajor` that major-granularity cannot express (24.5.0 behaves like 22 here). Calling the hook removes the version from the question entirely."
+    },
+    {
+      "id": "esm-warns-when-an-install-follows-a-deregistration",
+      "mechanism": "#182 \u2014 the THIRD window the --import preload cannot close. #152's real deregister() means an uninstall() -> import('node:fs') -> install() cycle caches the raw node: URL in the ESM registry, and a cached URL is served without the load chain being consulted, so the #78 load-level backstop is inert for that specifier for the rest of the process. capwall cannot enumerate what was imported during the gap, so it says so once",
+      "file": "packages/core/src/loader/esm-hook.ts",
+      "anchor": "        anEraHasEnded = true;",
+      "mutation": "        anEraHasEnded = false;",
+      "tests": [
+        "packages/core/test/esm.test.ts"
+      ],
+      "needsBuild": true,
+      "note": "The mutation restores the exact defect: the window is still there and nothing says so. It is the same class as the CAPWALL_ENV=0 warning \u2014 a control that is off while the process still looks guarded \u2014 and the whole finding was the silence, so a mutant on the flag is a mutant on the finding. The claimed suite also pins the CONSEQUENCE (node:net RAW vs node:dgram REMEDIATED through one application-registered hook), so the warning cannot drift into a claim nothing backs."
+    },
+    {
+      "id": "esm-importer-must-be-a-module-node-loaded",
+      "mechanism": "#180 \u2014 on the `import` path `parentURL` is the host's record, and that is VERIFIED rather than asserted: a `file:` importer is charged to its package only when it names a module Node actually loaded (witnessed by capwall's own load hook, or by the recorded process root). Anything else is `<unknown>`, which holds nothing and is never the trust root",
+      "file": "packages/core/src/loader/module-read.ts",
+      "anchor": "      pkg = isLoadedModule(importerUrl, importerPath)",
+      "mutation": "      pkg = isLoadedModule(importerUrl, importerPath) || true",
+      "tests": [
+        "packages/core/test/module-read.test.ts"
+      ],
+      "needsBuild": true,
+      "note": "The mutation is the pre-#180 code exactly \u2014 trust `parentURL` because the host set it \u2014 and it is the plausible one, because the argument for it is correct on this path and was correct in the file's own header. It keeps every identifier referenced so the build still succeeds and the mutant is decided by the tests rather than by tsc. Caught by the rows that grant BOTH the forged principal and `<app>` and still require `<unknown>`."
     }
   ]
 }

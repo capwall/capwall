@@ -164,6 +164,21 @@ describe("#59 — a specifier that RESOLVES to a mediated builtin is mediated, h
   });
 });
 
+/**
+ * Every route the hookjack fixture walks to `register`/`registerHooks`. The list is the finding
+ * in #181: the gate used to be a wrapper on two KEYS of the `node:module` shim, and four of these
+ * five reach the same two functions without going through those keys. Asserted as a SWEEP rather
+ * than as "and also the `Module` one", because a denylist of key names is exactly what #181 says
+ * is not a gate — a future Node alias, or a sixth route, has to fail here.
+ */
+const HOOKJACK_ROUTES = [
+  "named-export",
+  "Module-class",
+  "require-Module",
+  "module-constructor",
+  "getBuiltinModule",
+] as const;
+
 describe("#61 — a dependency cannot register a loader hook ahead of capwall's", () => {
   it("refuses module.registerHooks()/register() from a dependency in enforce", async () => {
     const r = await runApp(
@@ -179,10 +194,45 @@ describe("#61 — a dependency cannot register a loader hook ahead of capwall's"
     // With the floor at ≥22.15 there is no arm to choose: `UNSUPPORTED` coming back from the
     // fixture is now a FAILURE, not a runtime fact, which is exactly the state you want the
     // #61 gate's regression test in.
-    expect(r.stdout).toContain("HOOKJACK:registerHooks:BLOCKED:esm-hookjack-dep");
-    expect(r.stdout).not.toContain("HOOKJACK:registerHooks:UNSUPPORTED");
-    expect(r.stdout).toContain("HOOKJACK:register:BLOCKED:esm-hookjack-dep");
+    expect(r.stdout).toContain("HOOKJACK:named-export:registerHooks:BLOCKED:esm-hookjack-dep");
+    expect(r.stdout).not.toContain("HOOKJACK:named-export:registerHooks:UNSUPPORTED");
+    expect(r.stdout).toContain("HOOKJACK:named-export:register:BLOCKED:esm-hookjack-dep");
     expect(r.stderr).toMatch(/DENY 'esm-hookjack-dep' module\.register/);
+  });
+
+  it("#181 — refuses it by EVERY route to the functions, not just the named export", async () => {
+    // The gate's whole value was one un-shimmed own key away: `import { Module, registerHooks }
+    // from "node:module"` refused the second identifier and handed back the first, in the same
+    // statement, and `module.constructor` gave every CJS file the same class with no `require`.
+    // Since #181 the gate is on the two function objects, so which route was used is not part of
+    // the mechanism — which is what this sweep asserts, one row per route per API.
+    const r = await runApp(
+      { CAPWALL_MODE: "enforce", CAPWALL_POLICY_FILE: denyPolicy },
+      HOOKJACK_APP,
+    );
+    for (const route of HOOKJACK_ROUTES) {
+      for (const api of ["registerHooks", "register"]) {
+        expect(r.stdout, `${route}:${api} reached the registration API ungated`).toContain(
+          `HOOKJACK:${route}:${api}:BLOCKED:esm-hookjack-dep`,
+        );
+      }
+    }
+    // No route may report UNSUPPORTED / UNREACHABLE: that would be a fixture that failed to
+    // acquire the function, which passes the sweep above without testing anything — the exact
+    // hollow shape #112 found six of.
+    expect(r.stdout).not.toMatch(/HOOKJACK:[^\n]*:(UNSUPPORTED|UNREACHABLE)/);
+  });
+
+  it("#181 — and `process.getBuiltinModule` no longer walks past it either", async () => {
+    // Called out separately because `docs/threat-model.md` named this one as the residual that
+    // "defeats this gate exactly as it defeats every other shim". It does not any more: the gate
+    // is a patch on the real function, and `getBuiltinModule` returns the real module. That is
+    // the same thing #93's prototype patch bought for `_compile`, one level up.
+    const r = await runApp(
+      { CAPWALL_MODE: "enforce", CAPWALL_POLICY_FILE: denyPolicy },
+      HOOKJACK_APP,
+    );
+    expect(r.stdout).toContain("HOOKJACK:getBuiltinModule:registerHooks:BLOCKED:esm-hookjack-dep");
   });
 
   it("keeps an innocent third package's node:fs import mediated", async () => {
@@ -200,7 +250,7 @@ describe("#61 — a dependency cannot register a loader hook ahead of capwall's"
 
   it("warns loudly instead of blocking in observe mode (observe never denies)", async () => {
     const r = await runApp({ CAPWALL_MODE: "observe" }, HOOKJACK_APP);
-    expect(r.stdout).toContain("HOOKJACK:register:REGISTERED");
+    expect(r.stdout).toContain("HOOKJACK:named-export:register:REGISTERED");
     expect(r.stderr).toMatch(/WARN 'esm-hookjack-dep' called module\.register/);
     expect(r.code).toBe(0);
   });
@@ -214,7 +264,7 @@ describe("#61 — a dependency cannot register a loader hook ahead of capwall's"
       },
       HOOKJACK_APP,
     );
-    expect(r.stdout).toContain("HOOKJACK:register:REGISTERED");
+    expect(r.stdout).toContain("HOOKJACK:named-export:register:REGISTERED");
     expect(r.stderr).toMatch(/WARN 'esm-hookjack-dep' called module\.register.*CAPWALL_ALLOW_LOADER_HOOKS=1/);
   });
 });
@@ -404,5 +454,36 @@ describe("#62 — a runtime policy swap reaches already-imported ESM specifiers"
   it("is a live policy, not a one-way ratchet — loosening applies too", () => {
     expect(out.stdout).toContain("SWAP:reloose:OK:esm fixture data");
     expect(out.code).toBe(0);
+  });
+
+  /*
+   * #182 rides on the same fixture, because it is the same cycle seen from the other side. The
+   * assertions above say what the gap import does NOT cost (mediation); these say what it does.
+   */
+  it("#182 — WARNS once when an install follows a deregistration, instead of retiring the backstop silently", () => {
+    // The finding was the silence, not the window: `uninstall()` → `import("node:fs")` →
+    // `install()` left the raw `node:` URL in the ESM registry, so the load-level backstop was
+    // dead for that specifier for the rest of the process, with no WARN, no decision and nothing
+    // in `observe`. capwall is not in the hook chain during the gap and cannot enumerate what was
+    // imported, so the warning names the CONSEQUENCE — which is still the difference between a
+    // control that is off and a control that is off and says so (`CAPWALL_ENV=0`'s rule).
+    expect(out.stderr).toMatch(/WARN capwall was uninstalled and re-installed/);
+    // Once, not once per install: the fixture installs three times in total.
+    expect(out.stderr.match(/WARN capwall was uninstalled and re-installed/g)?.length).toBe(1);
+  });
+
+  it("#182 — and the backstop really is inert for the gap-imported specifier, and only for it", () => {
+    // The consequence, demonstrated rather than asserted from the code. Both imports go through a
+    // hook the APPLICATION registered — which is allowed, it is the trust root — that
+    // short-circuits `resolve` straight to the raw `node:` URL, so capwall is reached at `load`
+    // and only the backstop can save either one. `node:net` was imported during the gap and its
+    // raw URL is cached, so the load chain is never consulted for it; `node:dgram` never was, so
+    // the same hook, the same install and the same policy re-mediate it.
+    expect(out.stdout).toContain("SWAP:backstop:node:net:RAW");
+    expect(out.stdout).toContain("SWAP:backstop:node:dgram:REMEDIATED");
+    // …and the one that survived says so on stderr, which is how an operator would see it.
+    expect(out.stderr).toContain(
+      "WARN another module-customization hook resolved 'node:dgram' straight to the raw builtin",
+    );
   });
 });
