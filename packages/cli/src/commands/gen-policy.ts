@@ -21,6 +21,14 @@ Aggregates a capwall observe trace into a policy file (default ./capabilities.js
 merging with the existing file if present.
 `;
 
+/**
+ * @param args `--from <trace.jsonl>` (required), `-o`/`--out <file>`, `-h`/`--help`. Takes no
+ *     target command — it reads a trace someone else already recorded.
+ * @returns 0 once the policy is written, 2 for a usage error (including a missing `--from`).
+ * @throws a Node fs error when the trace file cannot be read — unlike the missing-policy cases
+ *     in `enforce`/`run`, this one is not turned into an exit code — a ZodError when the
+ *     existing policy being merged into is invalid, and an fs error when the write fails.
+ */
 export async function runGenPolicy(args: string[]): Promise<number> {
   let traceFile: string | undefined;
   let outFile = "capabilities.json";

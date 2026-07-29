@@ -75,6 +75,25 @@ function splitArgs(argv: string[]): { own: string[]; target: string[] } {
   return { own: argv.slice(0, i), target: argv.slice(i + 1) };
 }
 
+/**
+ * Dispatch one capwall command. The CLI's programmatic entry point, and what the `capwall`
+ * bin runs.
+ *
+ * IMPORTING THIS MODULE RUNS `main()`. The call at the bottom of this file is unconditional and
+ * ends in `process.exit()`, which is right for a `bin` and is the thing to know before reaching
+ * for `@capwall/cli` as a library: embedding the commands means importing
+ * `./commands/<name>.js` directly, or spawning the binary. There is no "am I the entry module"
+ * guard, deliberately — adding one is a behaviour change, not a doc change.
+ *
+ * @param argv capwall's own arguments, WITHOUT the node and script paths. The target command
+ *     goes after a `--` separator and is split off here, so `["observe", "--", "node", "app.js"]`
+ *     is the shape `observe`/`enforce`/`run`/`diff` expect. Defaults to the real command line.
+ * @returns the process exit code: 0 success, 1 a denial or drift found, 2 a usage error or a
+ *     missing policy file. `explain` uses 1 for "denied", which is an answer rather than a
+ *     failure.
+ * @throws whatever a command throws — notably a ZodError from an invalid policy file. The
+ *     bottom-of-file caller formats it and exits 1; a programmatic caller must catch it itself.
+ */
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const { own, target } = splitArgs(argv);
   const [command, ...rest] = own;

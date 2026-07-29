@@ -14,12 +14,22 @@ import {
   type Policy,
 } from "@capwall/policy-schema";
 
+/** One line of the preload's JSONL trace: what a principal did, deduplicated per process. */
 export interface TraceEntry {
+  /** The principal — a package name, an install chain, or `<app>`/`<unknown>`. */
   pkg: string;
+  /** The capability-sensitive operation it performed. */
   req: CapabilityRequest;
 }
 
-/** Parse a JSONL trace file's contents. Unparseable lines are skipped. */
+/**
+ * Parse a JSONL trace file's contents. Unparseable lines are skipped.
+ *
+ * @param contents the whole trace file. Blank lines and any line that is not a JSON object with
+ *     a string `pkg` and a `req` are dropped — including the torn last line a killed process
+ *     leaves behind, which is why this is lenient rather than strict.
+ * @returns the entries in file order. Never throws.
+ */
 export function parseTrace(contents: string): TraceEntry[] {
   const entries: TraceEntry[] = [];
   for (const line of contents.split("\n")) {
@@ -74,6 +84,16 @@ function portableIpcPath(observedPath: string, projectRoot: string): string {
  * ADDITIVE — a re-run appends to an existing policy rather than replacing it, which is why
  * `docs/policy-format.md` § Generating a policy tells you to observe into a scratch file when
  * you have a reviewed policy you want to keep.
+ *
+ * @param entries what a run observed, as {@link parseTrace} returns them.
+ * @param existing the policy to merge into, MUTATED IN PLACE and returned; `null` starts a fresh
+ *     `observe`-mode document.
+ * @param projectRoot the root paths under it are rewritten relative to, so the emitted policy
+ *     is portable.
+ * @returns the merged policy: list-valued grants sorted and deduplicated, `packages` in name
+ *     order for a stable diff.
+ * @throws a ZodError only when `existing` is `null` and the fresh scaffold fails validation,
+ *     which cannot happen for the literal used here.
  */
 export function mergeTraceIntoPolicy(
   entries: TraceEntry[],
@@ -180,6 +200,13 @@ export function mergeTraceIntoPolicy(
  * --strict` is the opt-in for CI that wants dead keys gone.
  *
  * Rendered here rather than in each command so `observe` and `diff` say the same thing.
+ *
+ * @param policy the committed policy whose `packages` keys are being judged.
+ * @param entries what this run observed. An EMPTY run returns `""` — it is evidence about the
+ *     run, not about the file.
+ * @param policyFile the path to name in the message, so a reader knows which file to edit.
+ * @returns the newline-terminated warning block, or `""` when there is nothing to say. The
+ *     caller decides where it goes and whether it fails the build.
  */
 export function unmatchedKeyWarning(
   policy: Policy,
@@ -207,7 +234,18 @@ export function unmatchedKeyWarning(
   return out;
 }
 
-/** Load an existing capabilities.json as-authored (no glob normalization), or null. */
+/**
+ * Load an existing capabilities.json as-authored (no glob normalization), or null.
+ *
+ * Deliberately NOT `@capwall/core`'s `loadPolicy`: this policy is about to be merged and written
+ * back, and absolutizing its globs first would rewrite the author's `./logs/**` into a path that
+ * only works on this machine.
+ *
+ * @param file the policy path.
+ * @returns the parsed policy, or `null` when the file does not exist or cannot be read.
+ * @throws a `SyntaxError` or ZodError when the file exists but is not a valid policy — an
+ *     unreadable file is `null`, a malformed one is an error the caller must surface.
+ */
 export async function loadExistingPolicy(file: string): Promise<Policy | null> {
   let raw: string;
   try {
@@ -245,6 +283,12 @@ function schemaRefFor(projectRoot: string): string | undefined {
  * convention puts it and where a reader looks. An existing `$schema` is never rewritten: the
  * author may be pointing at a checkout, a pinned version, or a vendored copy, and silently
  * retargeting a field they set is not something a merge should do.
+ *
+ * @param file where to write. Overwritten wholesale — merging is {@link mergeTraceIntoPolicy}'s
+ *     job and must already have happened.
+ * @param policy the policy to serialize. Not mutated.
+ * @param projectRoot the root to look for an installed `schema.json` under.
+ * @throws a Node fs error when the write fails.
  */
 export async function writePolicy(
   file: string,

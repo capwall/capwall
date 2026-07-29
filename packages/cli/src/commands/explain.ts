@@ -127,6 +127,14 @@ function principalNote(policy: Policy, pkg: string, policyFile: string): string 
   );
 }
 
+/**
+ * @param args `-p`/`--policy <file>` and then the positionals `<package> <capability> [target]`.
+ *     Takes no target command — it asks the policy a question and runs nothing.
+ * @returns 0 allowed, 1 DENIED, 2 a usage error. The 1 is an answer, not a failure, which is
+ *     why it does not mean the same thing here as it does under `diff`.
+ * @throws whatever `loadPolicy` throws — including a Node fs error when the policy file is
+ *     missing, which this command does not turn into an exit code.
+ */
 export async function runExplain(args: string[]): Promise<number> {
   let policyFile = "capabilities.json";
   const positional: string[] = [];

@@ -91,6 +91,10 @@ export const ANY_HOST = "*";
  * its zero-padded / integer variants. Neither shape is ever a legitimate DNS name: the
  * rightmost label of a domain name may not be all-numeric, precisely so names and addresses
  * stay distinguishable.
+ *
+ * @param host a destination hostname as capwall guards it — for IPv6, unbracketed.
+ * @returns whether it could be read as an address. A `true` here only ever makes a wildcard
+ *     grant match fewer hosts.
  */
 export function isIpLiteral(host: string): boolean {
   if (host.includes(":")) return true;
@@ -112,6 +116,10 @@ const ALL_STARS = /^\*+$/;
  *
  * Patterns WITHOUT a `*` are accepted unconditionally. That is deliberate: they are exact
  * hostnames, they were accepted before #83, and a policy that loaded yesterday must load today.
+ *
+ * @param pattern one `net.hosts` entry.
+ * @returns `null` when the pattern is acceptable, otherwise the message to show the author.
+ *     Never throws — the schema turns a message into a load-time issue.
  */
 export function validateHostPattern(pattern: string): string | null {
   if (pattern === ANY_HOST) return null;
@@ -198,6 +206,12 @@ function compile(pattern: string): RegExp {
  * Order matters: `"*"` first (it must keep granting IP literals, as it always has), then the
  * exact comparison (no wildcard, so no IP special case is needed and none is applied), then the
  * IP guard, then the compiled glob.
+ *
+ * @param pattern one `net.hosts` entry, assumed to have passed {@link validateHostPattern}. An
+ *     invalid pattern does not throw here; it simply matches nothing useful, which is the
+ *     silent failure the schema exists to prevent.
+ * @param host the destination being decided.
+ * @returns whether the entry grants that host. ASCII-case-insensitive on both sides.
  */
 export function matchesHostPattern(pattern: string, host: string): boolean {
   if (pattern === ANY_HOST) return true;

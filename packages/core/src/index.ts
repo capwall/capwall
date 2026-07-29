@@ -49,6 +49,7 @@ import type { ShimContext } from "./shims/runtime.js";
 import type { Decision } from "./policy/evaluate.js";
 import type { Mode, Policy } from "@capwall/policy-schema";
 
+/** What {@link install} hands back: the one operation that undoes that install. */
 export interface InstallHandle {
   /**
    * Remove capwall's interception (best-effort for ESM). Primarily for tests/teardown.
@@ -69,6 +70,20 @@ export interface InstallHandle {
   uninstall(): void;
 }
 
+/**
+ * Optional third argument to {@link install}. Every field has a safe default, so
+ * `install(policy, mode)` on its own is a complete call.
+ *
+ * Defaults at a glance: `esm` off, `env` on, `globalEgress` on, `hardened` off,
+ * `attribution.maxFrames` {@link DEFAULT_MAX_FRAMES}, `projectRoot` `process.cwd()`,
+ * `onDecision` a no-op. The CLI preload turns `esm` on and reaches each of the others through a
+ * `CAPWALL_*` environment variable (see `preload.ts` for that table).
+ *
+ * Two fields are not the per-call switches they look like, and their own docs below say why:
+ * `hardened` is a ratchet for the whole process rather than a setting for this install, and
+ * `env: false` makes every `env` grant in the policy decorative while the other capabilities
+ * keep being enforced.
+ */
 export interface InstallOptions {
   /**
    * Also register the ESM loader hook (roadmap M5, implemented). Off by default for
@@ -284,6 +299,29 @@ function hardeningGaps(esm: boolean, globalEgress: boolean): string[] {
  *
  * @param policy validated policy (use {@link loadPolicy} to read a capabilities.json).
  * @param mode `"observe"` (log, never block) or `"enforce"` (deny-by-default, throw).
+ * @param options interception surfaces to enable and how to attribute calls; see
+ *     {@link InstallOptions} for the defaults and for the two fields that are not per-call
+ *     switches.
+ * @returns a handle whose `uninstall()` deactivates THIS install. Installs nest, so it is not
+ *     necessarily the last interception standing.
+ * @throws Error when `hardened: true` was asked for and any surface this install mediates
+ *     could not be frozen or pinned (#97). The partial install is rolled back before the throw,
+ *     so a caller that catches it is left with an unpatched process. No other option can make
+ *     `install()` fail.
+ * @example
+ * ```ts
+ * import { install, loadPolicy } from "@capwall/core";
+ *
+ * const policy = await loadPolicy("./capabilities.json", { projectRoot: process.cwd() });
+ * const handle = install(policy, "enforce", {
+ *   esm: true,
+ *   onDecision(pkg, decision) {
+ *     if (!decision.allowed) console.error(pkg, decision.reason);
+ *   },
+ * });
+ * // … later, in a test teardown:
+ * handle.uninstall();
+ * ```
  */
 export function install(
   policy: Policy,

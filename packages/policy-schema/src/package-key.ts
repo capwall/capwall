@@ -108,6 +108,10 @@ function splitChain(pkg: string): string[] | null {
  * vendored `evil>lodash` from reaching `lodash`'s entry (#92). `policyFor` tries the exact key
  * first, then these in order, then `default` — so a narrow `"*>lodash"` beats a broad
  * `"**>lodash"`, the same way an explicit entry beats `default`.
+ *
+ * @param pkg a principal as attribution reports it.
+ * @returns the candidate wildcard keys, most specific first; empty for a top-level name or a
+ *     sentinel. These are keys to LOOK UP, not keys that exist — the caller checks the policy.
  */
 export function widenedPackageKeys(pkg: string): string[] {
   const links = splitChain(pkg);
@@ -127,6 +131,11 @@ export function widenedPackageKeys(pkg: string): string[] {
  * editing this file: a "did this key match anything?" report that used a *different* notion of
  * matching from the enforcer would be worse than no report, because it would name keys that
  * work and clear keys that do not.
+ *
+ * @param key a `packages` key, exact or wildcard.
+ * @param pkg a principal.
+ * @returns whether the key would be consulted for that principal. It does not say the key WINS:
+ *     a more specific key may be checked first (see {@link widenedPackageKeys} for the order).
  */
 export function packageKeyMatches(key: string, pkg: string): boolean {
   return key === pkg || widenedPackageKeys(pkg).includes(key);
@@ -134,6 +143,7 @@ export function packageKeyMatches(key: string, pkg: string): boolean {
 
 /** A `packages` key that granted nothing, with the principals it was probably meant to name. */
 export interface UnmatchedPackageKey {
+  /** The key exactly as it appears in the policy document. */
   key: string;
   /** Observed principals with the same LEAF as `key` — the near-misses, most likely first. */
   suggestions: string[];
@@ -165,6 +175,11 @@ function leafOf(key: string): string {
  * bare name they read in `package.json` when the principal is an install chain, so an unmatched
  * `"inner"` next to an observed `outer>inner` is almost always that. Suggestions are drawn only
  * from principals actually seen, so they can never point at a key that would also be dead.
+ *
+ * @param keys the policy's `packages` keys.
+ * @param principals every principal observed in one run — from a trace, not from the policy.
+ * @returns one entry per dead key, in the order `keys` yielded them. Empty when every key
+ *     matched something, and empty for an empty `keys`. Both arguments are iterated once.
  */
 export function unmatchedPackageKeys(
   keys: Iterable<string>,
@@ -190,6 +205,11 @@ export function unmatchedPackageKeys(
  * Keys WITHOUT a `*` are accepted unconditionally: they are exact principal names, they were
  * accepted before this grammar existed, and a policy that loaded yesterday must load today. Only
  * a key that reaches for a wildcard can fail, and it fails loudly rather than silently.
+ *
+ * @param key one `packages` key.
+ * @returns `null` when the key is well-formed, otherwise the message to show the author. This
+ *     judges GRAMMAR only; a well-formed key that names nothing real is
+ *     {@link unmatchedPackageKeys}' question, and cannot be answered until something has run.
  */
 export function validatePackageKey(key: string): string | null {
   if (!key.includes(ONE_LINK)) return null; // exact principal — no new rejections, ever

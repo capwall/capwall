@@ -69,7 +69,9 @@ export const IPC_PSEUDO_HOST = "<ipc>";
  */
 export const UNKNOWN_IPC_PATH = "<unknown>";
 
+/** Stands for `os.tmpdir()` in an `ipc.paths` pattern. Expanded against the LOADING machine. */
 export const IPC_TMP_PLACEHOLDER = "<tmp>";
+/** Stands for `os.homedir()` in an `ipc.paths` pattern. Expanded against the LOADING machine. */
 export const IPC_HOME_PLACEHOLDER = "<home>";
 
 /** `\\.\pipe\NAME`, `\\?\pipe\NAME`, or either with `/` separators. Group 1 is NAME. */
@@ -93,6 +95,10 @@ function canonicalPipe(value: string): string | undefined {
  * resolved to an absolute `/`-separated path — the same treatment `shims/fs.ts` `coercePath`
  * gives an fs argument, so a relative `net.connect({ path: "./app.sock" })` records the same
  * string a policy can name.
+ *
+ * @param observed the destination as the dependency passed it, or {@link UNKNOWN_IPC_PATH}.
+ * @returns the canonical form. Idempotent, and {@link UNKNOWN_IPC_PATH} passes through
+ *     unchanged so an undeterminable destination is never resolved into a plausible-looking path.
  */
 export function canonicalIpcPath(observed: string): string {
   if (observed === UNKNOWN_IPC_PATH) return observed;
@@ -138,6 +144,10 @@ function hasPathPrefix(value: string, prefix: string): boolean {
  *
  * `<tmp>` is tried before `<home>` because a `TMPDIR` under the home directory is common and the
  * temp dir is the more specific (and more volatile) of the two.
+ *
+ * @param canonicalPath an already-canonical path, as {@link canonicalIpcPath} produces.
+ * @returns the placeholderized pattern, or `canonicalPath` unchanged. The inverse is
+ *     {@link expandIpcPlaceholders}.
  */
 export function placeholderizeIpcPath(canonicalPath: string): string {
   for (const [placeholder, dir] of [
@@ -152,7 +162,13 @@ export function placeholderizeIpcPath(canonicalPath: string): string {
   return canonicalPath;
 }
 
-/** Expand `<tmp>`/`<home>` against THIS machine. Applied by `loadPolicy` before glob matching. */
+/**
+ * Expand `<tmp>`/`<home>` against THIS machine. Applied by `loadPolicy` before glob matching.
+ *
+ * @param pattern an `ipc.paths` entry, which may or may not start with a placeholder.
+ * @returns the expanded pattern, or `pattern` unchanged when it starts with neither. Only a
+ *     WHOLE leading segment counts, so `<tmpish>/x` is left alone.
+ */
 export function expandIpcPlaceholders(pattern: string): string {
   for (const [placeholder, dir] of [
     [IPC_TMP_PLACEHOLDER, os.tmpdir()],
@@ -168,6 +184,11 @@ export function expandIpcPlaceholders(pattern: string): string {
 /**
  * Does an `ipc.paths` entry grant `observedPath`? Both sides are canonicalized so a pattern
  * written in any accepted named-pipe spelling matches a pipe recorded in any other.
+ *
+ * @param pattern one `ipc.paths` entry. Placeholders must already be expanded — `loadPolicy`
+ *     does that; this function does not.
+ * @param observedPath the destination of the connect being decided.
+ * @returns whether the grant covers it.
  */
 export function matchesIpcPath(pattern: string, observedPath: string): boolean {
   return matchesGlob(canonicalIpcPattern(pattern), canonicalIpcPath(observedPath));

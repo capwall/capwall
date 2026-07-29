@@ -136,7 +136,9 @@ export const PackagePolicySchema = z
 /** Top-level policy document (the shape of `capabilities.json`). */
 export const PolicySchema = z
   .object({
+    /** Optional pointer to `schema.json`, for editor validation. capwall never follows it. */
     $schema: z.string().optional(),
+    /** Policy-format version. Only `1` exists; a future format bumps it rather than guessing. */
     version: z.literal(1),
     /**
      * Enforcement mode this document declares. Deliberately OPTIONAL rather than defaulted:
@@ -168,10 +170,27 @@ export const PolicySchema = z
   })
   .strict();
 
+// The types below are INFERRED from the schemas above rather than declared, so the schema and
+// the type cannot drift. Each one's field-level documentation lives on its schema.
+
+/** A package's `fs` grant: read and write path globs. See {@link FsCapabilitySchema}. */
 export type FsCapability = z.infer<typeof FsCapabilitySchema>;
+/** A package's `net` grant: host patterns and ports. See {@link NetCapabilitySchema}. */
 export type NetCapability = z.infer<typeof NetCapabilitySchema>;
+/** A package's `ipc` grant: socket/named-pipe path globs. See {@link IpcCapabilitySchema}. */
 export type IpcCapability = z.infer<typeof IpcCapabilitySchema>;
+/**
+ * Everything one principal is granted. See {@link PackagePolicySchema} for what each field
+ * means — notably `native` and `compile`, whose docblocks explain why they are booleans.
+ */
 export type PackagePolicy = z.infer<typeof PackagePolicySchema>;
+/**
+ * A whole `capabilities.json`, validated. See {@link PolicySchema}.
+ *
+ * Produced by {@link parsePolicy} or by `@capwall/core`'s `loadPolicy`; consumed by `install()`.
+ * Constructing one as an object literal will typecheck only if every defaulted field is spelled
+ * out, so going through one of those two is the shorter path.
+ */
 export type Policy = z.infer<typeof PolicySchema>;
 
 // The `net.hosts` grammar. Validation (above) and matching (@capwall/core's evaluator) come
@@ -204,6 +223,18 @@ export type CapabilityKind =
 /**
  * Parse and validate an unknown value as a Policy. Throws a ZodError on invalid input.
  * The CLI/loader should surface these errors with the offending path.
+ *
+ * Validation is total, not advisory: an unknown top-level or capability field is an error
+ * (every schema here is `.strict()`), and so is a malformed `net.hosts` pattern or `packages`
+ * key. Note that it does NOT resolve relative `fs` globs — `@capwall/core`'s `loadPolicy` does
+ * that against a project root, and a policy parsed only through here keeps them as authored.
+ *
+ * @param input the parsed JSON of a `capabilities.json`, or any value; it is validated, never
+ *     trusted.
+ * @returns a Policy with `default` and `packages` filled in from the schema defaults, so every
+ *     field a consumer reads is present even when the document omitted it.
+ * @throws a ZodError listing each issue with the path that produced it. The grammar messages
+ *     say what to write instead rather than only that something was rejected.
  */
 export function parsePolicy(input: unknown): Policy {
   return PolicySchema.parse(input);

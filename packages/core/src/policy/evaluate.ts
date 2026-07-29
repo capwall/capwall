@@ -72,6 +72,7 @@ export type CapabilityRequest =
 
 /** The outcome of evaluating a request. `reason` is human-readable for `explain`/logs. */
 export interface Decision {
+  /** The verdict. Always `true` in observe mode, which never denies anything. */
   allowed: boolean;
   reason: string;
   /** The request as observed, for trace→policy generation in observe mode. */
@@ -131,6 +132,16 @@ function policyFor(policy: Policy, pkg: string): PackagePolicy {
  *
  * In `observe` mode this always allows (recording `observed`); in `enforce` mode it applies
  * deny-by-default against the package's grant.
+ *
+ * @param policy the loaded policy document.
+ * @param mode which of the two semantics above to apply.
+ * @param pkg the principal attribution charged the call to — a package name, an install chain
+ *     (`webpack>lodash`), or one of the `<app>` / `<unknown>` sentinels.
+ * @param req the capability-sensitive operation awaiting a verdict.
+ * @returns the verdict plus a human-readable `reason` and the request as `observed`. Pure: it
+ *     never throws, never logs, and never mutates `policy`. Enforcement — reporting to
+ *     `onDecision` and throwing a `CapabilityError` — is the shim runtime's job, not this
+ *     function's.
  */
 export function evaluate(
   policy: Policy,
@@ -163,7 +174,16 @@ function own<K extends keyof PackagePolicy>(grant: PackagePolicy, key: K): Packa
   return Object.hasOwn(grant, key) ? grant[key] : undefined;
 }
 
-/** Pure grant check (no mode). Exposed for `explain` and tests. */
+/**
+ * Pure grant check (no mode). Exposed for `explain` and tests.
+ *
+ * @param grant one package's grants — an ALREADY-RESOLVED entry, not the whole document. This
+ *     does no `packages` lookup, so wildcard keys and the `default` fallback are the caller's
+ *     problem; {@link evaluate} resolves them.
+ * @param req the operation to check.
+ * @returns whether the grant permits it. `false` for an empty grant, which is what
+ *     deny-by-default means.
+ */
 export function isGranted(grant: PackagePolicy, req: CapabilityRequest): boolean {
   switch (req.kind) {
     case "child_process":
