@@ -37,10 +37,18 @@ CI-friendly: exit 0 = no drift, 1 = drift found, 2 = usage error / policy file m
                          a stable, documented contract that parsers already read.
 `;
 
-/** One observed capability the committed policy would deny — a drift signal. */
+/**
+ * One observed capability the committed policy would deny — a drift signal.
+ *
+ * This is the shape `--json` emits, as a single array on the LAST line of stdout, and it is a
+ * documented contract that parsers already read: adding a field is safe, renaming one is not.
+ */
 export interface DriftEntry {
+  /** The principal that performed the operation. */
   pkg: string;
+  /** Which capability — `fs`, `net`, `ipc`, `env`, `native`, `compile`, … */
   kind: CapabilityRequest["kind"];
+  /** The operation rendered the way `evaluate()` renders it, e.g. `fs:write /etc/passwd`. */
   detail: string;
 }
 
@@ -76,6 +84,16 @@ function describeRequest(req: CapabilityRequest): string {
   }
 }
 
+/**
+ * @param args capwall's own flags: `-p`/`--policy <file>`, `--strict`, `--json`, `-h`/`--help`.
+ * @param target the command to observe, as split off after `--`.
+ * @returns 0 no drift, 1 drift found (or, under `--strict`, a policy key that matched nothing),
+ *     2 a usage error or a missing policy file. The TARGET's own exit code is reported on
+ *     stderr and deliberately not propagated: this command's exit code answers "did the policy
+ *     still describe this run", not "did the run succeed".
+ * @throws whatever `loadPolicy` throws on an invalid policy file, and a rejection when the
+ *     target cannot be launched.
+ */
 export async function runDiff(args: string[], target: string[]): Promise<number> {
   let policyFile = "capabilities.json";
   let json = false;

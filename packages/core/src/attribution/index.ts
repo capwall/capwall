@@ -127,6 +127,7 @@ export { CHAIN_SEP };
  */
 const CAPWALL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+/** Tuning shared by every attribution entry point. Both fields are optional. */
 export interface AttributionOptions {
   /** Absolute path of the project root, used to distinguish app code from dependencies. */
   projectRoot?: string;
@@ -230,6 +231,13 @@ function coerceMaxFrames(value: unknown): number | null {
  * channel the preload uses for decisions) so it is not silently ignored.
  *
  * `undefined`/empty means "not configured" and is not a typo — no warning, no noise.
+ *
+ * @param value the configured budget — a number, the raw string from an env var, or anything
+ *     else a caller might hand over.
+ * @param source what to name in the warning, so the operator knows which knob to fix
+ *     (`attribution.maxFrames` vs `CAPWALL_MAX_FRAMES`).
+ * @returns a positive safe integer: `value` when it coerces to one, else
+ *     {@link DEFAULT_MAX_FRAMES}. Never throws.
  */
 export function resolveMaxFrames(value: unknown, source = "attribution.maxFrames"): number {
   const coerced = coerceMaxFrames(value);
@@ -554,6 +562,11 @@ const FAST_PATH_MIN_BUDGET = 8 + FAST_PATH_FRAMES;
  * from, how many native frames it interposes, or whether it enumerates: the deeper it hides its
  * real frame, the more often the fast path DECLINES, which costs it time and changes nothing.
  * See `test/attribution-fast-path.test.ts` for the adversarial cases run against this.
+ *
+ * @param hideAbove a function currently on the stack marking where to start materializing —
+ *     see the paragraphs above on what it is and is not.
+ * @param options project root and frame budget; see {@link AttributionOptions}.
+ * @returns exactly what {@link attributeCallerDetailed} would return from the same call site.
  */
 export function attributeCallerDetailedVia(
   hideAbove: StackBoundary,
@@ -570,6 +583,10 @@ export function attributeCallerDetailedVia(
 /**
  * {@link attributeCallerDetailedVia} for callers that only want the principal — the same
  * relationship {@link attributeCaller} has to {@link attributeCallerDetailed}.
+ *
+ * @param hideAbove the shim entry point to start the capture at.
+ * @param options project root and frame budget; see {@link AttributionOptions}.
+ * @returns the principal.
  */
 export function attributeCallerVia(
   hideAbove: StackBoundary,
@@ -585,6 +602,10 @@ export function attributeCallerVia(
  *
  * Convenience wrapper over {@link attributeCallerDetailed} for callers that do not care why
  * the walk ended. Prefer the detailed form in the enforcement path.
+ *
+ * @param options project root and frame budget; see {@link AttributionOptions}.
+ * @returns the principal. Walks the CALLER's stack, so it is only meaningful when invoked
+ *     directly from the frame you want attributed.
  */
 export function attributeCaller(options: AttributionOptions = {}): string {
   return attributeCallerDetailed(options).pkg;
@@ -597,6 +618,12 @@ export function attributeCaller(options: AttributionOptions = {}): string {
  * Note the budget covers ALL captured frames, including the handful of capwall frames between
  * the shim entry point and here — raising `maxFrames` therefore buys slightly fewer usable
  * caller frames than the number suggests.
+ *
+ * @param options project root and frame budget; see {@link AttributionOptions}. An unusable
+ *     `maxFrames` is coerced to {@link DEFAULT_MAX_FRAMES} here too, silently — this is the hot
+ *     path, and {@link resolveMaxFrames} has already warned about it at install time.
+ * @returns the principal plus `budgetExhausted` and `initiatedByNode`; see {@link Attribution}.
+ *     Never throws.
  */
 export function attributeCallerDetailed(options: AttributionOptions = {}): Attribution {
   // Re-coerce even though install()/preload already validated: `attributeCaller` is a public
@@ -691,6 +718,14 @@ function packageNameOf(segments: readonly string[]): string | null {
  * chain name automatically, and `"*>lodash"` grants every nested install of `lodash` in one
  * line — see `policyFor` in `policy/evaluate.ts`, where that widening is deliberately explicit
  * because it re-opens exactly this hole for that one package.
+ *
+ * @param filePath an absolute source-file path, as a stack frame reports it.
+ * @param projectRoot the root that decides what counts as application code. Omit it and ANY
+ *     path outside a `node_modules` tree becomes {@link APP_ROOT} — the trust root — instead of
+ *     only paths under the project. Enforcement always passes it.
+ * @returns the principal: an install chain, {@link APP_ROOT}, or {@link UNATTRIBUTED}. Memoized
+ *     per `(projectRoot, filePath)`; the memo is dropped wholesale when a new symlinked
+ *     dependency is recorded, so a link seen later still changes the answer.
  */
 export function packageForPath(filePath: string, projectRoot?: string): string {
   if (memoGeneration !== linkGeneration()) {

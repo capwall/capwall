@@ -84,13 +84,19 @@ export interface CycloneDxBom {
  * derived from its `capwall:*` CBOM properties.
  */
 export interface Component {
+  /** The component's `name` — used verbatim as the `packages` key. Never empty. */
   name: string;
+  /** Carried through for reporting only; nothing in the emitted policy keys off it. */
   version?: string;
+  /** The Package URL, when the BOM declared one. Reporting only. */
   purl?: string;
+  /** The BOM's own `bom-ref` identifier, when present. Reporting only. */
   bomRef?: string;
+  /** What the `capwall:*` properties asked for, or `{}` when there were none. */
   grant: PackagePolicy;
 }
 
+/** Options for {@link sbomToPolicy}. */
 export interface SbomToPolicyOptions {
   /** Enforcement mode to stamp onto the emitted policy. Default: "observe" (safe on-ramp). */
   mode?: "observe" | "enforce";
@@ -280,6 +286,12 @@ function grantFromProperties(
  * a malformed top-level document yields an empty array (+ a warning); a malformed
  * individual component entry is skipped (+ a warning) rather than aborting the whole
  * parse. Never throws on malformed input.
+ *
+ * @param json the already-`JSON.parse`d SBOM. Untrusted — shape-checked field by field.
+ * @param warnings mutated in place: every skip and every ignored annotation is appended here.
+ *     Pass your own array to surface them; the default is discarded.
+ * @returns one entry per usable component, in BOM order. Duplicate names are NOT resolved here
+ *     — {@link sbomToPolicy} does that.
  */
 export function parseCycloneDx(json: unknown, warnings: string[] = []): Component[] {
   if (!isRecord(json)) {
@@ -342,6 +354,27 @@ export function parseCycloneDx(json: unknown, warnings: string[] = []): Componen
  * schema-valid. Never throws on malformed SBOM input — collects warnings instead (see
  * `opts.warnings`); throws only if `parsePolicy` itself rejects the assembled document,
  * which should not happen for well-formed component names.
+ *
+ * The result is a STARTER policy and is not meant to be enforced as-is. The `WILDCARD …
+ * seeded from SBOM — review before enforce` warnings mark the entries an SBOM can widen
+ * without a human having looked.
+ *
+ * @param sbom the already-`JSON.parse`d CycloneDX document. Untrusted.
+ * @param opts see {@link SbomToPolicyOptions}; pass `warnings` to find out what was skipped,
+ *     since a completely unusable SBOM still returns a valid (empty) policy rather than failing.
+ * @returns a schema-valid policy with one `packages` entry per component, sorted by name.
+ * @throws a ZodError only if the assembled document fails validation — which means a component
+ *     name the policy grammar refuses. `__proto__` is skipped with a warning rather than
+ *     reaching that point.
+ * @example
+ * ```ts
+ * const warnings: string[] = [];
+ * const policy = sbomToPolicy(JSON.parse(await readFile("bom.json", "utf8")), {
+ *   mode: "observe",
+ *   warnings,
+ * });
+ * for (const w of warnings) console.warn(w);
+ * ```
  */
 export function sbomToPolicy(sbom: unknown, opts: SbomToPolicyOptions = {}): Policy {
   const warnings = opts.warnings ?? [];

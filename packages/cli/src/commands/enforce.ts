@@ -15,6 +15,14 @@ Runs <command> in enforce mode: deny-by-default against the policy file
 (default ./capabilities.json). Generate a starter policy first with 'capwall observe'.
 `;
 
+/**
+ * @param args capwall's own flags: `-p`/`--policy <file>`, `-h`/`--help`.
+ * @param target the command to run, as split off after `--`.
+ * @returns the TARGET's exit code, or 2 for a usage error or a missing policy file. A denial
+ *     surfaces as a `CapabilityError` thrown INSIDE the target, so whether it is fatal is the
+ *     target's decision — this command has no exit code of its own for "something was denied".
+ * @throws a rejection when the target cannot be launched at all.
+ */
 export async function runEnforce(args: string[], target: string[]): Promise<number> {
   let policyFile = "capabilities.json";
   for (let i = 0; i < args.length; i++) {

@@ -93,7 +93,14 @@ function coreVersion(): string {
   }
 }
 
-/** The full `--version` output, newline-terminated. */
+/**
+ * The full `--version` output, newline-terminated.
+ *
+ * @returns two lines — the CLI's version and the `@capwall/core` that would actually be injected
+ *     into a target process. Either is `"unknown"` when its manifest could not be read, and the
+ *     core line is `"unresolved"` when `@capwall/core/preload` does not resolve at all. Never
+ *     throws: `--version` must not be the command that fails.
+ */
 export function versionReport(): string {
   return `capwall ${cliVersion()}\n@capwall/core ${coreVersion()} (injected into the target process)\n`;
 }

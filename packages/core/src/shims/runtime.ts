@@ -19,7 +19,21 @@ import { CapabilityError } from "../errors.js";
 import { hardenClass, isHardened } from "./harden.js";
 import type { Mode, Policy } from "@capwall/policy-schema";
 
-/** Callback capwall invokes on every decision (log sink in observe, collector for gen-policy). */
+/**
+ * Callback capwall invokes on every decision (log sink in observe, collector for gen-policy).
+ *
+ * It is called for ALLOWED decisions as well as denied ones, in both modes — which is what
+ * makes it the trace source `capwall gen-policy` reads, not just an error channel. It runs
+ * SYNCHRONOUSLY inside the mediated call, before that call is forwarded (or, in enforce, before
+ * the `CapabilityError` is thrown), so it is on the hot path: `install()`'s <1ms-per-call budget
+ * is spent partly here. A sink that itself touches a mediated surface will be attributed and
+ * decided like any other call; the preload avoids that by writing its trace through capwall's
+ * own captured `fs`. Throwing from a sink propagates into the caller's mediated call.
+ *
+ * @param pkg the principal charged with the call — a package name, an install chain
+ *     (`webpack>lodash`), or one of the `<app>` / `<unknown>` sentinels.
+ * @param decision the verdict, its human-readable `reason`, and the request as `observed`.
+ */
 export type DecisionSink = (pkg: string, decision: Decision) => void;
 
 export interface ShimContext {

@@ -30,8 +30,13 @@ import {
 } from "@capwall/policy-schema";
 import { canonicalIpcPattern, expandIpcPlaceholders, isCanonicalNamedPipe } from "./ipc.js";
 
+/** Options shared by {@link loadPolicy} and {@link loadPolicyFromObject}. */
 export interface LoadPolicyOptions {
-  /** Absolute project root to resolve relative fs globs against. */
+  /**
+   * Absolute project root to resolve relative fs globs against. Omit it and the policy is
+   * returned exactly as authored — relative globs stay relative and will not match the
+   * absolute paths the shims produce at call time.
+   */
   projectRoot?: string;
 }
 
@@ -90,6 +95,18 @@ function normalizePolicy(policy: Policy, projectRoot: string | undefined): Polic
 /**
  * Read a policy file from disk and validate it against the schema.
  * Throws (ZodError or fs error) on invalid/missing input; callers surface the path.
+ *
+ * The read goes through capwall's own captured `fs`, so calling this from inside a mediated
+ * process does not consume the caller's own `fs` grant and records no decision.
+ *
+ * @param filePath the `capabilities.json` to read, absolute or relative to the process cwd.
+ * @param options see {@link LoadPolicyOptions}; supply `projectRoot` unless the policy's globs
+ *     are all already absolute.
+ * @returns the validated policy, with relative `fs` and `ipc.paths` globs rewritten absolute
+ *     when `projectRoot` was given.
+ * @throws a Node fs error when the file cannot be read, a `SyntaxError` when it is not JSON,
+ *     and a ZodError when it does not satisfy the schema — including the grammar errors for a
+ *     malformed `net.hosts` pattern or `packages` key, whose messages say what to write instead.
  */
 export async function loadPolicy(
   filePath: string,
@@ -100,7 +117,14 @@ export async function loadPolicy(
   return normalizePolicy(parsePolicy(json), options.projectRoot);
 }
 
-/** Parse an already-in-memory value as a Policy (used by tests, the CLI, and the preload). */
+/**
+ * Parse an already-in-memory value as a Policy (used by tests, the CLI, and the preload).
+ *
+ * @param value the parsed JSON — or any object; it is validated, not trusted.
+ * @param options see {@link LoadPolicyOptions}.
+ * @returns the validated policy, normalized exactly as {@link loadPolicy} normalizes one.
+ * @throws a ZodError when `value` does not satisfy the schema.
+ */
 export function loadPolicyFromObject(
   value: unknown,
   options: LoadPolicyOptions = {},

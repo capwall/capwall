@@ -25,6 +25,15 @@ Runs <command> in observe mode (logs capability use, never blocks) and merges wh
 into the policy file (default ./capabilities.json). Re-runs merge, not overwrite.
 `;
 
+/**
+ * @param args capwall's own flags for this command: `-o`/`--out <file>`, `-h`/`--help`.
+ * @param target the command to run, as split off after `--`.
+ * @returns the TARGET's exit code on a completed run — observe never blocks anything, so a
+ *     non-zero code is the target's own failure and not a denial — or 2 for a usage error.
+ *     The policy is merged and written even when the target failed or was interrupted.
+ * @throws whatever writing the policy throws, and a rejection when the target cannot be
+ *     launched at all.
+ */
 export async function runObserve(args: string[], target: string[]): Promise<number> {
   let outFile = "capabilities.json";
   for (let i = 0; i < args.length; i++) {

@@ -23,6 +23,15 @@ on the command line. The policy (default ./capabilities.json) must declare a mod
 An explicit CAPWALL_MODE in the environment still overrides it.
 `;
 
+/**
+ * @param args capwall's own flags: `-p`/`--policy <file>`, `-h`/`--help`.
+ * @param target the command to run, as split off after `--`.
+ * @returns the TARGET's exit code, or 2 for a usage error, a missing policy file, a policy that
+ *     declares no `mode`, or an ambient `CAPWALL_MODE` set to something that is neither
+ *     `observe` nor `enforce` (which would take precedence and leave capwall inert).
+ * @throws whatever `loadPolicy` throws on an invalid policy file, and a rejection when the
+ *     target cannot be launched.
+ */
 export async function runRun(args: string[], target: string[]): Promise<number> {
   let policyFile = "capabilities.json";
   for (let i = 0; i < args.length; i++) {
