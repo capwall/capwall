@@ -35,14 +35,20 @@ Working end-to-end on **both** the CJS `require` and the ESM `import` paths:
 policy) → shims → policy evaluate, in both modes. Shims: `fs`; the six egress modules
 `net`/`http`/`https`/`tls`/`http2`/`dgram` (registered **separately** — one shim never covers
 another, see `docs/threat-model.md` for why that is a security property and not a style
-choice); `child_process`; `worker_threads`; `vm`; and `node:module` (gating loader-hook
-registration, #61) — all via the require registry in `core/src/shims/index.ts` — plus **five
+choice); `child_process`; `worker_threads`; `vm`; and `node:module` (mediated for a structural rule —
+no own key may hand back an un-shimmed route to the shimmed surface — **not** for the #61
+loader-hook gate, which #181 moved onto the function objects; see below) — all via the require
+registry in `core/src/shims/index.ts` — plus **six
 surfaces that are not import-routed and so are installed eagerly by `install()`**:
 `process.env` (a read allowlist via a Proxy), the `native` `.node` load gate (a
 `process.dlopen` patch, `core/src/loader/native.ts`), the **global egress guard** (#80 —
 `globalThis.fetch`/`WebSocket`/`EventSource` replaced on `globalThis`,
 `core/src/shims/global-egress.ts`), the **`Module.prototype._compile` gate** (#93 — the
-`compile` capability, `core/src/shims/module.ts`), and the **Web Storage guard** (#156 —
+`compile` capability, `core/src/shims/module.ts`), the **loader-hook registration gate** (#61,
+moved here by #181 — `Module.register`/`Module.registerHooks` patched on the function objects
+every route converges on, so `module.constructor.registerHooks` and
+`process.getBuiltinModule("node:module").registerHooks` read the gated property too;
+`core/src/shims/module.ts`), and the **Web Storage guard** (#156 —
 `globalThis.localStorage` replaced on `globalThis`, its six members taking an **`fs`** read/write
 decision on the `--localstorage-file` path Node otherwise reads and writes below the `fs` shim;
 Node ≥26 and flag-gated, so it registers no patch site at all anywhere else,
@@ -330,11 +336,15 @@ Docker with `pnpm ci:local` — a green run there is a green CI run. See
 [`docs/ci-local.md`](docs/ci-local.md). Until Actions billing is restored, treat `pnpm ci:local`
 as the gate.
 
-**The supported range is `>=22.15.0`, declared in all four manifests' `engines`.** Node 20 went
+**The supported range is `>=22.15.0`, declared in all five manifests' `engines`** — the four
+packages and the private root. Node 20 went
 EOL on 2026-04-30 and was dropped. The floor is 22.15 rather than 22.0 for one reason:
 `module.registerHooks()` landed in 22.15, and capwall wants it **without a version gate** (#152).
-Three copies of that fact have to move together — `engines` in the four manifests, the
-`node-version` matrix in both workflows, and the default in `scripts/ci-local.sh`. Node 26 is in
+Four copies of that fact have to move together — `engines` in the five manifests, the
+`node-version` matrix in both workflows, the default in `scripts/ci-local.sh`, and the
+`ci:local:<version>` shortcuts in the root manifest. `packages/core/test/node-matrix.test.ts`
+asserts all four agree, and that the stated manifest count is the number of manifests that
+actually carry `engines`. Node 26 is in
 the matrix as early warning: it becomes LTS on 2026-10-28, and it is already the leg that caught
 `module.register()`'s DEP0205 deprecation and six new globals.
 
@@ -389,8 +399,9 @@ the matrix as early warning: it becomes LTS on 2026-10-28, and it is already the
   `--import .../dist/preload.js` reproduction execute, so a deleted gate there is invisible to
   `git status` — #184 lost an audit a batch of measurements that way. `pnpm canary` proves
   enforcement end to end in ~0.5s; `pnpm mutation:status` says whether a mutation-guard run is
-  holding the tree; `pnpm mutation:recover` undoes an interrupted one. `bench`, `canary`,
-  `ci:local` and `mutation:gate` now refuse to start on a tree that is or may be mutated, so
+  holding the tree; `pnpm mutation:recover` undoes an interrupted one. `bench`, `bench:startup`,
+  `canary`, `ci:local` and `mutation:gate` now refuse to start on a tree that is or may be
+  mutated (#196 added the startup harness, the last one measuring without asking), so
   "never run `mutation:gate` and `ci:local` concurrently" is enforced rather than remembered.
 
 ## 8. Threat-model guardrails

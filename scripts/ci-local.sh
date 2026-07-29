@@ -60,8 +60,9 @@ fi
 #
 # KEEP THIS DEFAULT AND ci.yml's `node-version:` IN SYNC — the whole claim of this script is
 # "a green run here is a green CI run", and a local matrix narrower than the real one quietly
-# stops being true. `engines` in all four manifests (>=22.15.0) is the third copy of the same
-# fact; all three move together or none of them does.
+# stops being true. `engines` in all five manifests (>=22.15.0) — the four packages and the
+# private root — is the third copy of the same fact; all of them move together or none does.
+# `packages/core/test/node-matrix.test.ts` is what makes that a check rather than a request.
 if [ "$#" -gt 0 ]; then
   NODE_VERSIONS=("$@")
 else

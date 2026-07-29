@@ -67,7 +67,7 @@ Four things now enforce what used to be prose. None of them says anything when t
 | | |
 |---|---|
 | **Teardown rebuilds** | `mutation-guard.mjs` restores sources **and** re-runs `tsc` for every package it touched — from the `finally`, from a throw, and from the **SIGINT/SIGTERM** handler. Restoring sources without rebuilding was the specific hole. Ctrl-C is safe; it takes a few seconds to leave. |
-| **A run stamp** | `.capwall-mutation-guard.json` (gitignored) exists for exactly as long as the guard holds a mutation, carrying the **original bytes** of the file it changed. It is removed only after restore + rebuild + a clean re-scan. `mutation:gate`, `bench`, `canary` and `ci:local` all refuse to start while it exists, and say whether the run is alive (wait) or dead (recover). |
+| **A run stamp** | `.capwall-mutation-guard.json` (gitignored) exists for exactly as long as the guard holds a mutation, carrying the **original bytes** of the file it changed. It is removed only after restore + rebuild + a clean re-scan. `mutation:gate`, `bench`, `bench:startup`, `canary` and `ci:local` all refuse to start while it exists, and say whether the run is alive (wait) or dead (recover). |
 | **A greppable sentinel** | Every mutation carries `AUDIT MUTANT <id>` in a block comment, which survives `tsc` into `dist`. `scripts/mutation-sentinel.mjs` scans `packages/*/src` and `packages/*/dist` for it before anything trusts the tree. |
 | **A canary** | `pnpm canary` launches a child under the real `--import dist/preload.js` and asserts a granted operation is **allowed** and two ungranted ones are **denied**. `bench` runs it before measuring; `ci.Dockerfile` runs it once per Node version. If it fails, no numbers are produced. |
 
@@ -90,7 +90,8 @@ not yours: a mutation-guard run holding it.
 pnpm ci:local          # Node 22, 24 AND 26 (the ci.yml matrix)
 pnpm ci:local:24       # just Node 24, the active LTS (faster)
 pnpm ci:local:22       # just the floor
-scripts/ci-local.sh 26 # any single version
+pnpm ci:local:26       # just `current` — the early-warning leg
+scripts/ci-local.sh 25 # any single version
 CI_NODE_VERSIONS="22 24" scripts/ci-local.sh      # custom set
 CI_CPUSET=0,1 pnpm ci:local                       # pin to 2 cores — a GitHub hosted runner
 ```

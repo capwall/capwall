@@ -67,22 +67,27 @@ $ cd packages/cli && npm pack
 
   Use pnpm instead:
 
-      pnpm pack                        # one package
-      pnpm -r --filter './packages/*' publish --access public
+      pnpm pack                                          # one package
+      pnpm -r --filter './packages/*' pack               # all of them
 
-  See docs/releasing.md and issue #116.
+  Then PUBLISH the tarball with npm, not with pnpm — pnpm publish has no
+  --provenance flag and no OIDC support, so it cannot do trusted publishing:
+
+      npm publish ./<tarball> --provenance --access public
+
+  See docs/releasing.md (the authority for a release) and issue #116.
 npm error code 1
 ```
 
-**That last line of the guard's advice conflicts with this document, and the conflict is real
-rather than a wording slip.** `scripts/assert-pnpm-pack.mjs` suggests `pnpm publish`, which the
-section above says cannot be used for a real release: it has no `--provenance` flag and no OIDC
-support, so it cannot do trusted publishing. Both statements are true of the tools; they disagree
-about what the operator should do next. **This document is the authority for a release — pack
-with pnpm, publish the tarball with npm.** `pnpm publish` is fine for a scratch registry or a
+**The guard's advice used to end with `pnpm -r publish --access public`, and that conflicted
+with this document — a real conflict, not a wording slip.** `pnpm publish` has no `--provenance`
+flag and no OIDC support, so it cannot do trusted publishing; both statements were true of the
+tools, and they told the operator opposite things at the one moment they are reading a failure
+message. **This document is the authority for a release — pack with pnpm, publish the tarball
+with npm**, and the guard now says so too. `pnpm publish` is fine for a scratch registry or a
 `--dry-run`, and nowhere else. (An earlier revision of this doc elided those two lines with
-`...`, so a reader never saw the disagreement. The guard's message is the thing to fix; it is
-named here rather than quietly re-elided.)
+`...`, so a reader never saw the disagreement; it is recorded here rather than quietly
+re-elided, because the fix was to the message and not to the doc.)
 
 **2. The workflow filename is part of the trust configuration.** npm trusted publishing binds
 a package to a repository *and a specific workflow filename*. Renaming

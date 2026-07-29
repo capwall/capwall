@@ -31,7 +31,8 @@
     "mutation:status": "node scripts/mutation-sentinel.mjs --status",
     "ci:local": "bash scripts/ci-local.sh",
     "ci:local:22": "bash scripts/ci-local.sh 22",
-    "ci:local:24": "bash scripts/ci-local.sh 24"
+    "ci:local:24": "bash scripts/ci-local.sh 24",
+    "ci:local:26": "bash scripts/ci-local.sh 26"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",

@@ -10,11 +10,20 @@
  * SCOPE. Mediated on BOTH the CJS require path and the ESM import path (roadmap M4 + M5):
  * fs; the six egress modules net/http/https/tls/http2/dgram — each registered separately,
  * because one module's shim never covers another (see docs/threat-model.md); child_process;
- * worker_threads; vm; and node:module, which is mediated to keep a dependency from
- * registering a loader hook ahead of capwall's (#61) rather than as a policy capability.
- * Two capabilities are NOT require-routed and are installed directly here: process.env
- * (installEnvGuard) and `native` .node addon loads (installNativeGate, a process.dlopen
- * patch — roadmap S2, gating only, never confinement).
+ * worker_threads; vm; and node:module, which is mediated for a structural rule rather than as
+ * a policy capability (no own key may hand back an un-shimmed route to the shimmed surface).
+ *
+ * NOT REQUIRE-ROUTED, and so installed directly by `install()` below — six guards, because a
+ * gate that only appears on the first mediated require is not a gate for a surface reachable
+ * without one: `Module.prototype._compile` (installCompileGate, #93), loader-hook registration
+ * at `Module.register`/`Module.registerHooks` (installLoaderHookGate, #61/#181), `native`
+ * .node addon loads (installNativeGate, a process.dlopen patch — roadmap S2, gating only,
+ * never confinement), process.env (installEnvGuard), the global egress APIs
+ * `fetch`/`WebSocket`/`EventSource` (installGlobalEgressGuard, #80), and Web Storage
+ * (installWebStorageGuard, #156 — inert unless this Node has `localStorage`). Two further
+ * patch sites are installed here without being capabilities: the module-read gate at
+ * `Module.prototype.load` (installModuleReadGate, #123/#189) and the linked-package observer
+ * at `Module._findPath` (installLinkObserver, #127).
  */
 import {
   installModuleReadGate,
@@ -52,7 +61,7 @@ import type { Mode, Policy } from "@capwall/policy-schema";
 /** What {@link install} hands back: the one operation that undoes that install. */
 export interface InstallHandle {
   /**
-   * Remove capwall's interception (best-effort for ESM). Primarily for tests/teardown.
+   * Remove capwall's interception. Primarily for tests/teardown.
    *
    * WHAT THIS DOES AND DOES NOT UNDO (#62/#87). It restores the interception POINTS —
    * `Module._load`, `process.env`, `process.dlopen`, the egress globals — so a fresh
@@ -62,6 +71,14 @@ export interface InstallHandle {
    * Those captures follow the live policy, so once the last install is gone they see a deny-all
    * `enforce` policy and a dropped `onDecision` sink: they fail CLOSED and silently, rather than
    * continuing to serve the torn-down install's grants or writing decisions into its collector.
+   *
+   * THE ESM PATH IS NOT AN EXCEPTION (#152/#173). `module.registerHooks()` returns a
+   * `deregister()`, and the last `uninstall()` calls it, so the hooks genuinely come out and the
+   * two paths agree after teardown. What that opens instead is a WINDOW, not a residue: with no
+   * hooks in the chain, a mediated builtin ESM-imported between the last `uninstall()` and the
+   * next `install()` is cached raw for the rest of the process, and the `load`-level
+   * re-mediation backstop cannot reach it. `loader/esm-hook.ts` § THE THIRD WINDOW warns once
+   * when an install follows a deregistration, which is the moment that becomes true.
    *
    * Installs nest. `uninstall()` deactivates ONE install and re-exposes whichever is still
    * active — including for already-captured shims, which is the whole point of #87 — and works
@@ -88,8 +105,12 @@ export interface InstallOptions {
   /**
    * Also register the ESM loader hook (roadmap M5, implemented). Off by default for
    * programmatic embedders — the CLI preload sets it to `true` unless `CAPWALL_ESM=0`.
-   * Note that unregistering is best-effort: Node cannot fully remove a registered hook, so
-   * ESM teardown is fail-closed rather than reversible (docs/threat-model.md § ESM known
+   *
+   * Teardown is real, not best-effort: `module.registerHooks()` returns a `deregister()` and the
+   * last `uninstall()` calls it (#152/#173), so the ESM path unwinds the way the CJS one does.
+   * The residual is the GAP that leaves — a mediated builtin imported between the last
+   * `uninstall()` and the next `install()` is cached raw, and the `load`-level backstop is inert
+   * for it (#182, `loader/esm-hook.ts` § THE THIRD WINDOW; docs/threat-model.md § ESM known
    * limits).
    */
   esm?: boolean;
@@ -191,9 +212,23 @@ export interface InstallOptions {
  * its own keys onto a plain object would break `new Module()`, `Module.prototype`, `instanceof`
  * and every consumer that reaches an internal). `Object.freeze` on a Proxy forwards
  * `[[PreventExtensions]]` to its TARGET, so freezing it would freeze a builtin process-wide —
- * the exact side effect harden.ts refuses to take. It carries no capability grant either; it
- * gates loader-hook REGISTRATION, and that gate lives in the `get` trap, which a caller cannot
- * remove by assigning to the namespace.
+ * the exact side effect harden.ts refuses to take.
+ *
+ * AND NOTHING IS LOST BY NOT FREEZING IT (re-derived for #181/#190). Hardened mode exists to stop
+ * a dependency un-patching a guard by ASSIGNING TO A NAMESPACE capwall handed it. This namespace
+ * has no such guard on it: it carries no capability grant, and it wraps no member — the shim's
+ * only own behaviour is a `get` trap enforcing one CATEGORY rule (a value that IS the module
+ * object comes back as the proxy), and a trap is part of the Proxy rather than a property, so
+ * assigning to the namespace cannot remove it whether it is frozen or not.
+ *
+ * The #61 loader-hook gate is NOT on this namespace. Since #181 it is a `definePropertyPatch` on
+ * the two function objects themselves — `Module.register` / `Module.registerHooks`, installed
+ * eagerly below by `installLoaderHookGate` — which is strictly stronger than a namespace gate:
+ * `module.constructor`, `process.getBuiltinModule("node:module")` and the ESM named export all
+ * read through to the same patched property, none of which a namespace freeze would have reached.
+ * Its residual (a reference captured before `install()`, or a write to the real class) is the
+ * ordinary un-patching residual every process-level gate carries — `Module.prototype._compile`,
+ * `process.dlopen`, `process.env` — and hardened mode does not address it for any of them.
  */
 const UNFREEZABLE_SPECIFIERS: ReadonlySet<string> = new Set(["module", "node:module"]);
 

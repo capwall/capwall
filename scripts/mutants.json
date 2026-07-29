@@ -317,13 +317,13 @@
       "id": "esm-gate-declines-every-require-resolution",
       "mechanism": "#177/#180 \u2014 the resolve hook decides `import` and nothing else. Since #152 it is consulted for `require()` too, and on THAT path `context.parentURL` is derived from the `parent` module record handed to Module._load, i.e. from an ordinary argument. Declining every `require`-conditioned resolution is what leaves those loads to guardCjsModuleRead, whose subject is a stack walk",
       "file": "packages/core/src/loader/esm-hooks.ts",
-      "anchor": "  return conditions.includes(\"require\");",
+      "anchor": "  return isCjsResolution(conditions);",
       "mutation": "  return false;",
       "tests": [
         "packages/core/test/module-read.test.ts"
       ],
       "needsBuild": true,
-      "note": "Replaces `esm-gate-stands-down-only-for-require`, whose mechanism (a depth counter over a whole Module._load) was #179. The mutation is fail-open in TWO ways at once: the hook charges whichever principal the caller named (#180), and a `require`-conditioned resolution with no `parent` reaches the parentless branch and RECORDS the attacker's target as a process root, which then exempts it from the CJS gate as well (#177). It is also merely noisy in a third (two decisions per require), which is what `records ONE decision for one require` pins."
+      "note": "Replaces `esm-gate-stands-down-only-for-require`, whose mechanism (a depth counter over a whole Module._load) was #179. The mutation is fail-open in TWO ways at once: the hook charges whichever principal the caller named (#180), and a `require`-conditioned resolution with no `parent` reaches the parentless branch and RECORDS the attacker's target as a process root, which then exempts it from the CJS gate as well (#177). It is also merely noisy in a third (two decisions per require), which is what `records ONE decision for one require` pins. RETARGETED: the anchor was `isCjsResolution`'s body, which `resolve()` ALSO reads for the #183 synthetic-URL rule (esm-hooks.ts:310,322) \u2014 so on Node \u226524.18 that edit deleted TWO mechanisms at once and the CAUGHT verdict could not be attributed to the gate-arbitration property this mutant names. `decidedByCjsGate` is the exact site: it is read by `gateModuleRead` and nothing else, so mutating it disarms the arbitration and only the arbitration."
     },
     {
       "id": "module-read-host-root-only-from-parentless-resolution",

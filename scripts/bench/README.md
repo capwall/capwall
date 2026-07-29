@@ -373,6 +373,16 @@ arm must allow it and capwall must not speak. Without that, a preload that silen
 install (a bad path, a policy that parsed to inert, a `--import` Node quietly ignored) is timed as
 "bare node twice" and reported as a spectacular win.
 
+**And, since #196, a mutation-sentinel preflight before that** — the same
+`preflight({ kinds: ["src", "dist"] })` `bench.mjs` runs, which is what makes the #184 interlock
+("`bench`, `bench:startup`, `canary` and `ci:local` refuse to start on a mutated tree") true of
+this harness rather than only of the others. The premise check is not a substitute for it: it
+probes the `fs` gate and nothing else, while the arm this harness exists to price is the ESM
+perimeter, whose two files hold four catalogued `needsBuild: true` mutants. Demonstrated rather
+than argued — with `esm-load-remediation-backstop` compiled into `dist`, the pre-#196 harness
+printed `all 3 premise checks PASS` and a full table of numbers for a capwall whose `load`-level
+re-mediation backstop had been deleted; the harness refuses outright and names the file and line.
+
 Two measurement choices worth knowing before quoting a number out of it:
 
 - **The clock is read inside the child**, on the first line of the target's entry point, not
