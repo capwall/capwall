@@ -1,0 +1,93 @@
+# Open (and keep updating) the release PR; on merge, tag it.
+#
+# READ docs/releasing.md § How a release happens BEFORE TOUCHING THIS FILE.
+#
+# THIS WORKFLOW DOES NOT PUBLISH ANYTHING. It writes versions and CHANGELOG.md into a PR, and
+# when that PR is merged it creates one tag, `vMAJOR.MINOR.PATCH`. The tag is what starts
+# `.github/workflows/release.yml`, which is the workflow npm's trusted publisher is bound to by
+# FILENAME. Do not move the publish step in here to "save a workflow" — that reconfiguration is
+# manual, per package, on npmjs.com.
+#
+# FOUR THINGS ABOUT THE CONFIGURATION ARE LOAD-BEARING AND NONE OF THEM ARE VISIBLE IN THIS FILE
+# (they live in release-please-config.json; the reasoning is in docs/releasing.md):
+#
+#  1. LOCKSTEP IS STRUCTURAL: there is ONE release-please package (the repo root) and it writes
+#     all five `version` fields through `extra-files`. The documented alternative — five packages
+#     plus the `linked-versions` plugin — was dry-run and rejected: the plugin groups by
+#     component, and the root's component is empty precisely because its tag has no component
+#     prefix, so it was silently versioned on its own. docs/releasing.md has the evidence.
+#  2. ONE TAG, NOT FIVE. `include-component-in-tag: false`, so the tag is `v0.2.0` and not
+#     `capwall-v0.2.0`. release.yml listens on `v*`.
+#  3. `bump-minor-pre-major: true` IS NOT A STYLE CHOICE. Without it a `feat!:` on 0.x cuts
+#     **1.0.0** — release-please's default. docs/releasing.md § Why 0.1.0 argues at length that
+#     1.0.0 is a promise this project cannot keep yet.
+#  4. THE PUBLISH SET IS NOT HERE AND MUST NOT BE. @capwall/sbom-import is versioned in lockstep
+#     and deliberately NOT published; that single list lives in scripts/check-release-versions.mjs
+#     (`--publish-list`) and release.yml reads it from there.
+#
+# EVERY `uses:` IS PINNED TO A COMMIT SHA (issue #168) — see ci.yml's header for how to resolve
+# and round-trip a pin. UNVERIFIED: Actions is billing-blocked (#3), so this workflow has never
+# run. `pnpm ci:local` does not run actions. See docs/releasing.md § What is still unverified.
+
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release branch, the tag and the GitHub release
+      pull-requests: write # open and update the release PR
+    env:
+      # A tag pushed with the default GITHUB_TOKEN DOES NOT TRIGGER OTHER WORKFLOWS. That is
+      # GitHub's recursion guard, and it is the failure mode this whole file exists to avoid:
+      # release-please would tag v0.2.0 and release.yml would simply never start, so nothing
+      # would be published and nothing would be red. With RELEASE_PLEASE_TOKEN set (a
+      # fine-grained PAT or GitHub App token — see docs/releasing.md § HUMAN CHECKLIST step 5)
+      # the tag is pushed as that identity and release.yml fires normally.
+      HAS_RELEASE_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN != '' }}
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # Not decoration. If the fallback token was used, the tag exists and the publish did not
+      # start, and the only signal anyone gets is silence. Say so where a human will read it.
+      - name: Summarise what happened
+        if: always()
+        env:
+          RELEASES_CREATED: ${{ steps.release.outputs.releases_created }}
+          TAG_NAME: ${{ steps.release.outputs.tag_name }}
+          PR_NUMBER: ${{ steps.release.outputs.pr && fromJSON(steps.release.outputs.pr).number || '' }}
+        run: |
+          {
+            echo "## release-please"
+            if [ "${RELEASES_CREATED}" = "true" ]; then
+              echo "Tagged \`${TAG_NAME}\`."
+              if [ "${HAS_RELEASE_TOKEN}" != "true" ]; then
+                echo ""
+                echo "> **The tag was pushed with the default \`GITHUB_TOKEN\`, so \`release.yml\` did NOT start.**"
+                echo "> Nothing has been published. Either set the \`RELEASE_PLEASE_TOKEN\` secret"
+                echo "> (docs/releasing.md § HUMAN CHECKLIST step 5) and re-push the tag, or run the"
+                echo "> **Release** workflow by hand with \`dry_run = false\`."
+              fi
+            elif [ -n "${PR_NUMBER}" ]; then
+              echo "Release PR #${PR_NUMBER} is open/updated. Merging it cuts the release."
+            else
+              echo "No releasable commits since the last release."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

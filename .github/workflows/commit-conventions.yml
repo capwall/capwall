@@ -1,0 +1,85 @@
+# Conventional-commit enforcement. THIS IS A RELEASE GATE, NOT A STYLE GATE.
+#
+# release-please reads `main`'s commit messages to decide the next version and to write every line
+# of CHANGELOG.md. A message that does not parse is not "untidy" — it is a change that silently
+# does not appear in the release notes, and, if it was the only change, a release that is never
+# proposed at all. commitlint.config.js carries the rules and the reasoning.
+#
+# TWO JOBS, BECAUSE TWO DIFFERENT STRINGS CAN BE WRONG:
+#
+#  * `pr-title` — this repository squash-merges, so THE PR TITLE IS THE COMMIT MESSAGE that
+#    reaches `main`. It is the one release-please will actually read, and it is not checked by
+#    anything that looks at commits. `types: [edited]` matters: a title fixed after the first run
+#    has to be re-checked, and a title *broken* after a green run has to go red again.
+#  * `commits` — the individual commits on the branch. Belt and braces if the merge strategy ever
+#    changes, and it is where a contributor finds out before the PR exists.
+#
+# NO THIRD-PARTY PR-TITLE ACTION. The obvious one (amannn/action-semantic-pull-request) would be a
+# second implementation of the rules that can disagree with commitlint.config.js, and a new
+# third-party action in the CI of a supply-chain-security tool. Piping the title into the repo's
+# own commitlint costs three lines and has neither problem.
+#
+# THE TITLE GOES THROUGH `env:`, NEVER INTO THE `run:` STRING. `${{ github.event.pull_request.title }}`
+# interpolated directly into a shell script is script injection from anyone who can open a PR.
+#
+# EVERY `uses:` IS PINNED TO A COMMIT SHA (issue #168) — see ci.yml's header for how to resolve and
+# round-trip a pin. UNVERIFIED: Actions is billing-blocked (#3), so this has never run in Actions.
+# `pnpm lint:commits` runs the same commitlint against the same config locally.
+
+name: Commit conventions
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-title:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile=false
+
+      - name: Lint the pull-request title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          printf '%s\n' "$PR_TITLE" | pnpm exec commitlint --verbose
+
+  commits:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 — commitlint walks base..head, and a shallow clone has no base to walk to.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile=false
+
+      - name: Lint the commits on this branch
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: pnpm exec commitlint --from "$BASE_SHA" --to "$HEAD_SHA" --verbose

@@ -1,0 +1,35 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "84b205f98597ce94f1c59f95fc18df19bcd07abd",
+  "release-type": "node",
+  "bump-minor-pre-major": true,
+  "bump-patch-for-minor-pre-major": false,
+  "include-component-in-tag": false,
+  "changelog-path": "CHANGELOG.md",
+  "pull-request-header": "Automated release PR. Merging it tags `v<version>`, which is what starts `.github/workflows/release.yml` (pack with pnpm, publish with npm + OIDC). Read `docs/releasing.md` before merging — the publish set is **not** every package in this repo.",
+  "changelog-sections": [
+    { "type": "security", "section": "Security" },
+    { "type": "feat", "section": "Added" },
+    { "type": "fix", "section": "Fixed" },
+    { "type": "perf", "section": "Performance" },
+    { "type": "refactor", "section": "Changed" },
+    { "type": "revert", "section": "Reverted" },
+    { "type": "docs", "section": "Documentation", "hidden": true },
+    { "type": "test", "section": "Tests", "hidden": true },
+    { "type": "build", "section": "Build", "hidden": true },
+    { "type": "ci", "section": "CI", "hidden": true },
+    { "type": "chore", "section": "Chores", "hidden": true },
+    { "type": "style", "section": "Style", "hidden": true }
+  ],
+  "packages": {
+    ".": {
+      "extra-files": [
+        { "type": "json", "path": "packages/policy-schema/package.json", "jsonpath": "$.version" },
+        { "type": "json", "path": "packages/core/package.json", "jsonpath": "$.version" },
+        { "type": "json", "path": "packages/sbom-import/package.json", "jsonpath": "$.version" },
+        { "type": "json", "path": "packages/cli/package.json", "jsonpath": "$.version" }
+      ]
+    }
+  },
+  "plugins": []
+}
