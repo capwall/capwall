@@ -36,6 +36,26 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
+# ── the mutation interlock (issue #184) ──────────────────────────────────────────────────────
+#
+# THIS IS NOT A DIRTY-TREE CHECK, and deliberately so. Streaming uncommitted edits into the
+# context is the documented POINT of this script (see the header) — refusing to start on a dirty
+# tree would break the ordinary "am I about to break CI?" loop, and a gate people route around
+# protects nothing (#149). What it refuses is the ONE state in which the working tree is not the
+# operator's: `pnpm mutation:gate` deleting a security mechanism from packages/core/src IN PLACE
+# while this script tars that same tree into the Docker context. Two separate agents have
+# corrupted runs exactly that way, and the rule against it lived in prose and was enforced by
+# nothing.
+#
+# `scripts/mutation-sentinel.mjs` answers both halves: a live-or-dead mutation-guard stamp, and
+# the `AUDIT MUTANT` sentinel anywhere in packages/*/src or packages/*/dist. `dist` is scanned
+# even though it is NOT part of the build context — the container rebuilds it — because a green
+# `ci:local` is read as "this tree is sound", and a tree whose dist is disarmed is not, whatever
+# the container says. It prints nothing and costs ~50 ms when the tree is clean.
+if ! node scripts/mutation-sentinel.mjs --scan src,dist --label "pnpm ci:local"; then
+  exit 1
+fi
+
 # Node versions: CLI args > $CI_NODE_VERSIONS > the ci.yml matrix (22, 24, 26).
 #
 # KEEP THIS DEFAULT AND ci.yml's `node-version:` IN SYNC — the whole claim of this script is

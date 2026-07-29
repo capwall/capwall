@@ -40,6 +40,39 @@ Run it when you touch a guard, a gate, the pinning, or the attribution rules —
 when you add one. `pnpm mutation:gate --only <id>` runs a single entry; `--list` prints the
 catalog.
 
+#### Never run `mutation:gate` and `ci:local` at the same time — and you no longer have to remember
+
+`mutation:gate` deletes a security mechanism from `packages/core/src` **in place** for the
+duration of each mutant, and compiles it into `packages/core/dist` for the mutants marked
+`needsBuild`. `ci:local` tars that same working tree into its Docker context; `bench` imports that
+same `dist`. Running them together has corrupted runs for two separate agents.
+
+Issue #184 is the sharper version of the same problem: `dist/` is **gitignored**, so a mutated
+enforcement artifact is invisible to `git status` and `git diff`, and it is what the CLI,
+`examples/`, and every `--import .../dist/preload.js` reproduction actually execute. An ESM audit
+lost a batch of measurements to a `dist/loader/module-read.js` carrying `if (1) return;` against a
+clean-looking tree — a PoC "proved" a bypass that was not there. It cuts the other way too: a fix
+can "prove" a bypass is closed when it is not.
+
+Four things now enforce what used to be prose. None of them says anything when the tree is fine.
+
+| | |
+|---|---|
+| **Teardown rebuilds** | `mutation-guard.mjs` restores sources **and** re-runs `tsc` for every package it touched — from the `finally`, from a throw, and from the **SIGINT/SIGTERM** handler. Restoring sources without rebuilding was the specific hole. Ctrl-C is safe; it takes a few seconds to leave. |
+| **A run stamp** | `.capwall-mutation-guard.json` (gitignored) exists for exactly as long as the guard holds a mutation, carrying the **original bytes** of the file it changed. It is removed only after restore + rebuild + a clean re-scan. `mutation:gate`, `bench`, `canary` and `ci:local` all refuse to start while it exists, and say whether the run is alive (wait) or dead (recover). |
+| **A greppable sentinel** | Every mutation carries `AUDIT MUTANT <id>` in a block comment, which survives `tsc` into `dist`. `scripts/mutation-sentinel.mjs` scans `packages/*/src` and `packages/*/dist` for it before anything trusts the tree. |
+| **A canary** | `pnpm canary` launches a child under the real `--import dist/preload.js` and asserts a granted operation is **allowed** and two ungranted ones are **denied**. `bench` runs it before measuring; `ci.Dockerfile` runs it once per Node version. If it fails, no numbers are produced. |
+
+```bash
+pnpm mutation:status     # what the stamp says, and whether any sentinel is present
+pnpm mutation:recover    # restore the recorded bytes, rebuild, re-scan, clear the stamp
+pnpm canary              # is the dist/ in this tree actually enforcing?
+```
+
+`ci:local` deliberately does **not** refuse a dirty tree in general — streaming your uncommitted
+edits into the container is the point of it. It refuses the one state in which the working tree is
+not yours: a mutation-guard run holding it.
+
 ## The CI-faithful path (Docker matrix)
 
 `.github/workflows/ci.yml` runs on **Node 22, 24 and 26**. To reproduce that matrix — clean install, every Node version, all gates — in Docker:
