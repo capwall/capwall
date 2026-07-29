@@ -9,7 +9,7 @@ The `capwall` command-line interface — the primary way users drive the observe
 >
 > Not published to npm yet (staged at `0.1.0`) — run it as
 > `node <clone>/packages/cli/dist/index.js` after `pnpm install && pnpm build`. See the root
-> [`README.md`](../../README.md) § Quickstart.
+> [`README.md`](../../README.md) § Install.
 
 ## Commands
 
@@ -44,12 +44,17 @@ capwall --version               Print this CLI's version AND the @capwall/core v
 Common flags: `-p, --policy <path>` for `enforce`/`run`/`diff`/`explain` and `-o, --out <path>`
 for `observe`/`gen-policy` (both default to `./capabilities.json`). `diff` also takes
 `--json`, which writes the drift as a compact JSON array of `{pkg, kind, detail}` as the
-**last** line of stdout (the target's own stdout is inherited and may precede it). The project
-root is the CLI's working directory.
+**last** line of stdout (the target's own stdout is inherited and may precede it), and
+`--strict`, which additionally exits 1 when a policy key matched no package in this run. The
+project root is the CLI's working directory.
 
 `diff` is the CI-facing command: exit **0** = no drift, **1** = drift found, **2** = usage
-error or missing policy file. See [`docs/ci-local.md` § Drift detection in
-CI](../../docs/ci-local.md).
+error or missing policy file. It reports drift in **both** directions (#118) —
+observed-but-not-granted, and declared-but-never-matched. See [`docs/ci-local.md` § Drift
+detection in CI](../../docs/ci-local.md).
+
+**The full reference — every flag, exit code and `explain` capability spelling — is
+[`docs/cli.md`](../../docs/cli.md).** This README is the orientation.
 
 `observe`, `enforce` and `diff` name the mode themselves (they set `CAPWALL_MODE`, which
 outranks everything); `run` takes it from the policy document. Full precedence table:

@@ -37,9 +37,12 @@ in-process fix.
 
 **capwall's enforcement mechanism is built on Node.js module-system internals that are
 undocumented, unsupported, and in one case formally deprecated with removal announced.**
-`Module._load` is the CJS interception point; `Module.prototype._compile` is the `compile` gate;
-`process.dlopen` is the `native` gate; `Module._findPath` and `Module._resolveFilename` feed
-attribution and the module-read gate; `module.registerHooks()` is the entire ESM path. Of those,
+`Module._load` is the CJS interception point; `Module.prototype.load` is the module-read gate
+(#123, moved there by #178 — `Module._resolveFilename` used to appear on this list and is no
+longer called anywhere); `Module.prototype._compile` is the `compile` gate; `process.dlopen` is
+the `native` gate; `Module.register`/`Module.registerHooks` are the loader-hook gate;
+`Module._findPath` feeds linked-package attribution; `module.registerHooks()` is the entire ESM
+path. Of those,
 only `module.registerHooks()` appears in Node's API documentation at all — and it is **Stability
 1.2, release candidate**, so it may still change in a minor. The rest have no deprecation code
 because they have no support commitment to deprecate. Until #152 that row was
@@ -70,7 +73,7 @@ load-time gate on `.node` addons that is module-system-independent (it patches
 rather than at a capability call: `compile` (#93, a direct `Module.prototype._compile`) and, since
 #123, an `fs.read` decision on a `require`/`import` of a file **outside every `node_modules`
 tree** — the module system was previously a second, completely un-gated route to the same bytes
-`fs` guards. See § The module system as a read channel. **Five** surfaces are mediated **outside**
+`fs` guards. See § The module system as a read channel. **Six** surfaces are mediated **outside**
 both module systems,
 because they never route through one: `process.env` (a `Proxy` on the live object), the `native`
 gate above, the `Module.prototype._compile` gate (#93 — a prototype patch, installed eagerly by
@@ -78,9 +81,11 @@ gate above, the `Module.prototype._compile` gate (#93 — a prototype patch, ins
 and `process.getBuiltinModule("node:module")` reaches it without touching the shim), the
 loader-hook registration gate (#61/#181 — a patch on `Module.register`/`Module.registerHooks`
 themselves, for the same reason one level up: `module.constructor` hands every CommonJS file the
-`Module` class with no `require` at all), and Node's
+`Module` class with no `require` at all), Node's
 **global egress APIs** — `globalThis.fetch`/`WebSocket`/`EventSource`,
-replaced on `globalThis` since #80 (see "Global egress surfaces" below). ESM interception uses
+replaced on `globalThis` since #80 (see "Global egress surfaces" below) — and
+**`globalThis.localStorage`** (#156, Node ≥26 behind `--localstorage-file`, taking an `fs`
+read/write decision on its backing file; see "Web Storage" below). ESM interception uses
 **synchronous `module.registerHooks()` hooks** (`loader/esm-hook.ts` + `esm-hooks.ts` +
 `esm-runtime.ts`) that rewrite mediated builtin specifiers to a synthetic module re-exporting the
 same shims the CJS path uses; it covers **static AND dynamic** `import` (`import { readFile } from
@@ -135,15 +140,28 @@ be revoked.
 - **A FRESH access after the last `uninstall()` is genuinely un-mediated on the CJS path**, because
   the interception points (`Module._load`, `process.env`, `process.dlopen`, the egress globals)
   really are restored. Fail-closed is about stale captures, not about leaving a torn-down process
-  deny-all. The ESM path differs — see the next section.
+  deny-all. **The ESM path agrees with this since #152**: `module.registerHooks()` returns a
+  `deregister()` that the last `uninstall()` calls, so a fresh `import` is un-mediated too. See
+  § ESM known limits, which used to record the opposite.
 - **Installs nest**, innermost wins, and they unwind in **any** order, not only LIFO (#22 for the
   `Module._load` chain, #87 for the policy stack). Unwinding one install re-exposes the one below
   it, including for already-captured shims.
-- **Each process-global replacement is installed exactly ONCE, reference-counted** — `Module._load`,
-  `process.dlopen`, the `process.env` proxy, the egress globals, and the
-  `Module.prototype._compile` gate. Every guard
-  reads the live context, so one patch already tracks whichever install is in force; the count
-  only decides when to put the original back. Stacking them was a real defect found by the #90
+- **Every process-global replacement has a reference-counted lifecycle, in one of two shapes.**
+  Nine sites are registered on every platform — `Module._load`, `Module.prototype.load` (the
+  module-read gate), `Module.prototype._compile`, `Module.register`, `Module.registerHooks`,
+  `Module._findPath` (the passive linked-package observer, #127), `process.dlopen`, the
+  `process.env` proxy, and the egress globals — and a tenth, `globalThis.localStorage`, registers
+  only where the process has Web Storage (Node ≥26; it is registered lazily on the first install
+  that finds it, so the inventory below carries no "the site declined" escape hatch). **Seven are
+  `defineSharedPatch`: installed exactly ONCE, reference-counted.** Every guard reads the live
+  context, so one patch already tracks whichever install is in force; the count only decides when
+  to put the original back. **Two — `Module._load` and `process.dlopen` — STACK
+  (`defineRelinkedPatch`): each install adds a link and every link's guard runs**, because two
+  installs may route to different shim registries, and an out-of-LIFO-order removal relinks around
+  the removed layer. The distinction is an enforcement property rather than a style choice: the
+  `_compile` gate identifies Node's own loader by the caller frame one level up, so a second
+  stacked layer would make the inner patch see capwall's own frame and gate **every** `require` in
+  the process (#100). Stacking the shared sites was a real defect found by the #90
   composition matrix: a second env guard proxied the FIRST guard's proxy and registered it as the
   "un-proxied" environment, so a **granted** `spawn` under nested installs launched its child with
   a completely empty environment, and an out-of-LIFO-order `uninstall()` left capwall's proxy on
@@ -151,10 +169,13 @@ be revoked.
   above. Restoring an egress global is also best-effort in one direction: if code outside capwall
   made it non-configurable in the meantime, `uninstall()` skips it rather than throwing, because
   an escaping `TypeError` there would abort teardown and strand every other patch.
-  #90 found the bugs; **#107 made the rule structural.** All five patch sites now go through one
-  reference-counted relink chain, `core/src/lifecycle/process-patch.ts`, which is the only file in
+  #90 found the bugs; **#107 made the rule structural.** Every patch site now goes through
+  `core/src/lifecycle/process-patch.ts`, which is the only file in
   the whole workspace permitted to write a process global — asserted by a source scan in
-  `test/process-patch-sites.test.ts`, so a sixth patch site cannot be added off to the side. The
+  `test/process-patch-sites.test.ts`, so a further patch site cannot be added off to the side.
+  That test also pins the site inventory *with each site's shape*, and runs every registered site
+  through the nested / out-of-order / double-uninstall sequence automatically, so a new site is
+  enrolled by the act of registering it. The
   scan covers **`packages/*​/src`** since #125, not core alone: the other three packages get the
   stricter rule of *no* process-global write at all, because the lifecycle helper is not on
   `@capwall/core`'s `exports` map and they could not use it even if they had a reason to. See
@@ -1574,6 +1595,11 @@ of enforcement **for the whole process** (the un-patching bullet above). Hardene
   `Object.defineProperty(globalThis, "fetch", …)` still un-gates them; that is the deliberate
   price of a restorable global, and it is the same class of escape as climbing past a guarded
   prototype.
+- The **guarded `globalThis.localStorage` view** (#156), in a process that has Web Storage at all
+  (Node ≥26 behind `--localstorage-file`): pinned and frozen on the same ratchet as the egress
+  globals — on every install, not just the first, so a hardened install stacked on an un-hardened
+  one still gets its pin. It stays `configurable` for the same restorability reason and carries
+  the same consequence. On 22 and 24 there is no such surface and nothing to freeze.
 
 **It applies to `import` as well as `require`,** and that is now asserted rather than assumed.
 The #86 sibling audit found it had NOT: the ESM path built its shims from a context onto which
@@ -1591,8 +1617,9 @@ failure rather than a silence.
 **`hardened: true` now FAILS LOUDLY when capwall cannot apply it (#97).** A security option that
 is accepted and silently not applied is worse than one that is refused, so `install()` verifies
 the post-condition after wiring everything up: the shim namespaces it just built must be frozen
-(on the CJS registry always, and on the ESM registry when `esm: true`), and the egress globals it
-just replaced must be non-writable. If any is not, the partial install is **rolled back** and
+(on the CJS registry always, and on the ESM registry when `esm: true`), and the globals it just
+replaced — the egress three, plus `localStorage` where this process has it — must be
+non-writable. If any is not, the partial install is **rolled back** and
 `install()` throws, naming the surfaces. The check observes rather than predicts — it inspects
 only objects capwall itself created, on only the paths that call is mediating — so it cannot
 produce a spurious startup throw for an option capwall *did* honor. What it does catch is the
@@ -2011,10 +2038,15 @@ then requires. Gating the literal `require` specifier alone would have left the 
 call open and made the gate decorative.
 
 Being a `process.dlopen` patch rather than a loader hook also makes it module-system-independent
-for free: it is on whether or not the ESM hook is registered, and it does not care that Node
-itself refuses `import("./foo.node")` outright (`ERR_UNKNOWN_FILE_EXTENSION` — the only route
-from ESM is `createRequire`, which lands back in the CJS `.node` extension handler and so back
-here).
+for free: it is on whether or not the ESM hook is registered, and it does not care **how** an
+addon is reached from ESM. That last point is why the shape has aged well. An earlier revision of
+this paragraph said Node refuses `import("./foo.node")` outright with
+`ERR_UNKNOWN_FILE_EXTENSION`, leaving `createRequire` as the only ESM route; that is true of
+Node 22 and of unflagged ≤24, but Node 24.18 grew `--experimental-addon-modules` and on **Node
+26.5 the import resolves with no flag at all** (see
+[`node-api-dependencies.md`](./node-api-dependencies.md) § `process.dlopen`). Coverage did not have
+to change for that: Node's own addon translator loads the binary through `process.dlopen`, so a
+direct `import`, a `createRequire` round-trip and a plain `require` all land back here.
 
 Because those resolvers call `require` from their own source file, the nearest stack frame is
 the resolver, not the package whose addon is loading. A `.node` load is therefore charged to

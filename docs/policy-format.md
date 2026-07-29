@@ -95,14 +95,16 @@ guessing. Two ways to cover a nested install:
 }
 ```
 
-**This is the same wildcard grammar `net.hosts` uses** (§ net), over `>` instead of `.` — one
-grammar to learn, not two:
+**This is nearly the same wildcard grammar `net.hosts` uses** (§ net), over `>` instead of `.`.
+The `**` half is identical; the two differ deliberately on where a single `*` may sit, and the
+row below says so rather than letting "one grammar to learn" paper over it:
 
 | | `net.hosts` | `packages` |
 |---|---|---|
 | one leading component | `"*.internal"` matches `api.internal` | `"*>lodash"` matches `webpack>lodash` |
 | one or more | `"**.internal"` also matches `a.b.internal` | `"**>lodash"` also matches `a>b>lodash` |
-| wildcard only in the first component | yes | yes |
+| `**` only in the first component | yes (`a.**.b` is a load-time error) | yes (`evil>**>x` is not a form) |
+| a single `*` in a later component | **yes, allowed** — `api.*.internal` and `a.*.b` are valid host patterns | **no** — a `*` must be the whole first link; `evil>*` and `lod*` are load-time errors |
 | matches the bare right-hand side | no (`internal`) | no (top-level `lodash`) |
 
 So "lodash everywhere" is the two keys `"lodash"` and `"**>lodash"`. The wildcard is deliberately
@@ -153,6 +155,14 @@ Besides real package names, `packages` accepts two sentinels:
 
 `<unknown>` is gated like any dependency — deny-by-default in `enforce` — so a legitimate
 setup that produces path-less frames needs an explicit grant.
+
+**`capwall explain` does not model the five `<app>` exemptions, and will tell you the opposite of
+what the runtime does.** `capwall explain "<app>" compile` and `capwall explain "<app>" env FOO`
+both answer `DENY … deny-by-default` and exit 1, while both operations are in fact allowed at
+runtime with no grant at all. `explain` evaluates the policy document; the exemptions live in the
+gates, ahead of `evaluate()`, which is exactly why they are worth knowing about. Read an
+`<app>` answer from `explain` as "what the policy says", not "what will happen" — for the five
+gates above, those are different questions.
 
 Until issue #119 every generated policy contained one of these, because Node's own ESM loader
 reads `WATCH_REPORT_DEPENDENCIES` from a path-less stack on every run:
