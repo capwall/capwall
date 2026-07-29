@@ -488,5 +488,5 @@ needs to be able to search for.
 - **Provenance attestations**, if `0.1.0` has to be published manually — provenance requires a
   trusted CI publisher and GitHub Actions is billing-blocked (#3). See `docs/releasing.md`.
 
-[Unreleased]: https://github.com/williamzujkowski/capwall/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/williamzujkowski/capwall/releases/tag/v0.1.0
+[Unreleased]: https://github.com/capwall/capwall/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/capwall/capwall/releases/tag/v0.1.0

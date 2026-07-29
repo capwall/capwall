@@ -1,6 +1,6 @@
 # Running CI locally
 
-GitHub Actions is currently billing-blocked ([issue #3](https://github.com/williamzujkowski/capwall/issues/3)), so PRs get no automated CI. Until that's fixed, use these to run the **exact same gates** locally.
+GitHub Actions is currently billing-blocked ([issue #3](https://github.com/capwall/capwall/issues/3)), so PRs get no automated CI. Until that's fixed, use these to run the **exact same gates** locally.
 
 ## The fast path (no container)
 

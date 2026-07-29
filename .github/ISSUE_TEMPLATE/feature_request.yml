@@ -38,7 +38,7 @@ body:
     attributes:
       label: Where this sits in the threat model
       description: >-
-        Does it close something [docs/threat-model.md](https://github.com/williamzujkowski/capwall/blob/main/docs/threat-model.md)
+        Does it close something [docs/threat-model.md](https://github.com/capwall/capwall/blob/main/docs/threat-model.md)
         currently lists as out of scope? If so, say which bullet — several of them are out of scope
         for reasons that will not change (primordials are SES's job).
 
@@ -55,5 +55,5 @@ body:
     attributes:
       label: Before you file
       options:
-        - label: "I checked [docs/roadmap.md](https://github.com/williamzujkowski/capwall/blob/main/docs/roadmap.md) and the open issues"
+        - label: "I checked [docs/roadmap.md](https://github.com/capwall/capwall/blob/main/docs/roadmap.md) and the open issues"
         - label: "This does not require a new runtime dependency (or I have said why it must)"

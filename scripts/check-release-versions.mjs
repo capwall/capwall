@@ -227,7 +227,7 @@ for (const p of PUBLISHED) {
         `${escaping.length > shown.length ? ", ..." : ""}\n` +
         `    npmjs.com renders this file with no repository above it, so each one 404s there\n` +
         `    while still working on GitHub. Use an absolute URL:\n` +
-        `    https://github.com/williamzujkowski/capwall/blob/main/<path>`,
+        `    https://github.com/capwall/capwall/blob/main/<path>`,
     );
   }
 

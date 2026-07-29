@@ -19,7 +19,7 @@ import { versionReport } from "./version.js";
 // repo-relative `docs/policy-format.md` names nothing, and the CLI banner is the one place a
 // reader who installed the package meets this project's documentation. `roadmap.md` used to be
 // here and is gone: it is the internal build-order tracker, not something to send a user to.
-const DOCS = "https://github.com/williamzujkowski/capwall";
+const DOCS = "https://github.com/capwall/capwall";
 
 const USAGE = `capwall — runtime per-package capability firewall for Node.js
 

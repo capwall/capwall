@@ -131,7 +131,7 @@ refuses it with an explanation.
 
 ```bash
 corepack enable                                # provides the pnpm this repo pins
-git clone https://github.com/williamzujkowski/capwall.git ~/src/capwall
+git clone https://github.com/capwall/capwall.git ~/src/capwall
 cd ~/src/capwall && pnpm install && pnpm build
 
 # The CLI is then ~/src/capwall/packages/cli/dist/index.js. Run it by path, or alias it:

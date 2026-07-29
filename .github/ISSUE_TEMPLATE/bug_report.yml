@@ -8,7 +8,7 @@ body:
         **If this is a capability bypass — a dependency doing something the policy does not grant,
         a call charged to the wrong package, or an operation that succeeds with no decision
         recorded — stop and use the private channel in
-        [SECURITY.md](https://github.com/williamzujkowski/capwall/blob/main/SECURITY.md).**
+        [SECURITY.md](https://github.com/capwall/capwall/blob/main/SECURITY.md).**
         A public issue describing a working bypass is a zero-day with a README.
 
   - type: textarea
@@ -69,4 +69,4 @@ body:
       label: Before you file
       options:
         - label: "`pnpm canary` passes on this tree (if running from a clone) — `dist/` is gitignored, so a stale or broken build is invisible to `git status`"
-        - label: "I checked [docs/threat-model.md](https://github.com/williamzujkowski/capwall/blob/main/docs/threat-model.md) § What capwall does NOT stop"
+        - label: "I checked [docs/threat-model.md](https://github.com/capwall/capwall/blob/main/docs/threat-model.md) § What capwall does NOT stop"

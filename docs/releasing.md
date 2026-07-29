@@ -870,7 +870,7 @@ node scripts/check-release-versions.mjs --publish-list   # the authoritative lis
 
     | Field | Value |
     |---|---|
-    | Organization or user | `williamzujkowski` |
+    | Organization or user | `capwall` |
     | Repository | `capwall` |
     | Workflow filename | `release.yml` |
     | Environment | `npm-publish` if you created it in step 9, otherwise leave blank |
@@ -878,6 +878,14 @@ node scripts/check-release-versions.mjs --publish-list   # the authoritative lis
     The workflow filename is the bare name, not a path. It must match
     `.github/workflows/release.yml` exactly — **not** `release-please.yml`, which publishes
     nothing.
+
+    **The organisation is `capwall`, the GitHub org the repository moved to — not the personal
+    account it was created under.** npm binds a trusted publisher to a literal `<owner>/<repo>`
+    and to nothing else: GitHub's post-transfer redirect moves *browsers*, not the OIDC subject
+    claim, so a publisher still bound to the old owner does not error, it simply never matches
+    and every publish falls back to asking for a token. That is the quiet failure this table
+    exists to prevent, and `packages/core/test/repo-identity.test.ts` now checks these two rows
+    against the root manifest's `repository.url` so the next rename cannot leave them behind.
 
 13. On the same settings page set **Publishing access** to *Require two-factor authentication
     or an automation token*. Do **not** leave a long-lived automation token in repository
