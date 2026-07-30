@@ -50,3 +50,6 @@ scripts/bench/fixtures/node_modules/bench-dep/.bench-scratch/
 # the signal — bench, canary and ci:local refuse to start while it exists — so it must never be
 # committed, and `pnpm mutation:recover` is what removes it.
 .capwall-mutation-guard.json
+
+# Working-state handoff notes — scratch, not project documentation
+HANDOFF.md
