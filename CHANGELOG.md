@@ -29,6 +29,15 @@ Generated sections are inserted above them.
 > independent of the package version and does not move with it. A capwall `0.2.0` still reads
 > `"version": 1` policies.
 
+## [0.1.1](https://github.com/capwall/capwall/compare/v0.1.0...v0.1.1) (2026-07-31)
+
+
+### Fixed
+
+* **ci:** drop the pnpm version input that v6 refuses alongside packageManager ([2eee187](https://github.com/capwall/capwall/commit/2eee1874eda0a8abc83231a287fb2668f05a34b5))
+* **docs:** six drifted enumerations and stale gate-location reasoning ([#192](https://github.com/capwall/capwall/issues/192)-[#197](https://github.com/capwall/capwall/issues/197)) ([#200](https://github.com/capwall/capwall/issues/200)) ([17ae3a5](https://github.com/capwall/capwall/commit/17ae3a542df306de12629b99558e1fb3d1f66b53))
+* **release:** repair the READMEs 0.1.0 would have shipped, guard them, and document a rehearsed manual-publish path ([#3](https://github.com/capwall/capwall/issues/3)) ([#203](https://github.com/capwall/capwall/issues/203)) ([ed4de6c](https://github.com/capwall/capwall/commit/ed4de6c4a8f8fef0b8b69d28e4746c8bbb22442d))
+
 ## [Unreleased]
 
 ### Security
