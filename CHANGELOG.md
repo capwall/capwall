@@ -29,6 +29,13 @@ Generated sections are inserted above them.
 > independent of the package version and does not move with it. A capwall `0.2.0` still reads
 > `"version": 1` policies.
 
+## [0.2.0](https://github.com/capwall/capwall/compare/v0.1.1...v0.2.0) (2026-07-31)
+
+
+### Added
+
+* **release:** reconcile tags against the npm registry in both directions ([#210](https://github.com/capwall/capwall/issues/210)) ([a4a0867](https://github.com/capwall/capwall/commit/a4a0867da41205b445a5b7dabd47738c9b1a3a8b))
+
 ## [0.1.1](https://github.com/capwall/capwall/compare/v0.1.0...v0.1.1) (2026-07-31)
 
 
