@@ -3,19 +3,22 @@
 How the four packages get to npm, and — kept deliberately separate below — the steps only a
 person with account access can do.
 
-Nothing has been published yet. The manifests are staged at `0.1.0` and `CHANGELOG.md` carries
-its entry, but neither `@capwall/cli` nor `@capwall/core` exists on the registry. The first
-release is therefore the one that sets all the precedents, and it is the one that cannot be
-undone: **npm's unpublish window is 72 hours and narrow even inside it.** A broken first
-version sits in the `@capwall` namespace forever, which is a poor opening argument for a
-supply-chain security tool.
+`@capwall/policy-schema`, `@capwall/core` and `@capwall/cli` are published, at both `0.1.0` and
+`0.1.1`. `@capwall/sbom-import` is built, tested and versioned in lockstep with the other four
+but deliberately not published — see § What is published. `0.1.0` was the first release and set
+the precedents: **npm's unpublish window is 72 hours and narrow even inside it**, so a broken
+first version sits in the `@capwall` namespace forever, which is why it was rehearsed end to end
+before being cut rather than trusted on the first try.
 
 **There are two publish paths in this file and they are not interchangeable.** The OIDC path
-(release-please → tag → `release.yml` → `npm publish --provenance`) is described first and is the
-norm from `0.1.1` onwards. It needs GitHub Actions, which is billing-blocked (#3). The one-time
-route to `0.1.0` is § THE FIRST MANUAL PUBLISH below — a paste-ready sequence run from a
-workstation with a granular token, rehearsed end to end against the real tarballs. Read that
-section, not this one, if you are about to publish today.
+(release-please → tag → `release.yml` → `npm publish --provenance`) is described first and is
+the norm from `0.1.1` onwards — it is what actually published `0.1.1`, via a manual
+`workflow_dispatch` rather than the tag alone (§ How a release happens explains why, and issue
+#207 tracks the open decision about it). § THE FIRST MANUAL PUBLISH below is what published
+`0.1.0` — a paste-ready sequence run from a workstation with a granular token, rehearsed end to
+end against the real tarballs before it was used for real. Read that section for the historical
+record of how `0.1.0` shipped, and as the manual fallback if trusted publishing ever needs to be
+bootstrapped again; the OIDC path above it is the one to use for the next release.
 
 Everything a machine can check about a release is checked by
 `scripts/check-release-versions.mjs` (lockstep, pins, publish set, changelog, shipped READMEs, and that
@@ -132,6 +135,15 @@ nothing. The two workflows are separate on purpose and the seam between them is 
             ▼                                 npm publish --provenance
      three packages on npm
 ```
+
+**The tag does not reliably start `release.yml` by itself.** A tag created by a workflow using
+the default `GITHUB_TOKEN` — which is what release-please uses unless `RELEASE_PLEASE_TOKEN` is
+configured (§ HUMAN CHECKLIST step 5) — does not trigger other workflows; this is documented
+GitHub behavior, not a bug here. `v0.1.1` needed a manual `workflow_dispatch` for exactly this
+reason: merging the release PR created the tag, but `release.yml` did not start on its own, and
+had to be run by hand. See § HUMAN CHECKLIST step 17 for the operational detail, and issue #207,
+which tracks the open decision of whether to close this gap (adding the token) or keep the
+manual dispatch as the accepted norm — it has not been decided either way yet.
 
 Nobody edits a version by hand any more, and nobody writes a changelog entry by hand any more.
 The commit message *is* the changelog entry, which is why
@@ -269,8 +281,9 @@ the evidence the gate is worth having; none can be fixed without rewriting publi
 a gate that is always red is a gate that gets switched off.
 
 Locally: `pnpm lint:commits` runs the same script over `origin/main..HEAD`, with no install step
-because there is nothing to install. Given #3 that is the only place these rules are actually
-enforced today.
+because there is nothing to install. `commit-conventions.yml` enforces the same rules in Actions
+on every pull request now; running it locally first is what catches a bad title before that
+round trip.
 
 ---
 
@@ -337,9 +350,9 @@ top of `CHANGELOG.md` too, because otherwise the first `0.2.0` makes someone bum
 
 ## What is published
 
-**Nothing is on the registry yet.** This table is the declared *publish set* — which packages
-`0.1.0` will upload when it is cut — not a statement of what npm currently serves. `npm view
-@capwall/cli` is a 404 today.
+**`@capwall/policy-schema`, `@capwall/core` and `@capwall/cli` are on the registry**, at both
+`0.1.0` and `0.1.1`. This table is the declared *publish set*. `npm view @capwall/sbom-import` is
+still a 404 — held back deliberately, not because nothing has shipped yet.
 
 | package | in the publish set | why |
 |---|---|---|
@@ -349,7 +362,7 @@ top of `CHANGELOG.md` too, because otherwise the first `0.2.0` makes someone bum
 | `@capwall/sbom-import` | **held back** | see below |
 
 `@capwall/sbom-import` (roadmap S1) is built, tested, versioned in lockstep and released
-in-repo, but does **not** go to the registry in `0.1.0`. No CLI subcommand exposes it; it is
+in-repo, but does **not** go to the registry. No CLI subcommand exposes it; it is
 reachable only as a library that nothing in the product imports. Publishing it would put a
 package on npm with no entry point and — because of lockstep — republish it on every release
 forever, adding permanent registry surface and a provenance attestation for something with no
@@ -468,10 +481,10 @@ Blocking — a broken or dangerous first artifact:
 | | |
 |---|---|
 | #116 | `npm pack` ships `workspace:*`. **Fixed**: `prepack` guard + the pack-with-pnpm workflow. |
-| #113 | Repo is private. Trusted publishing requires a public repo; the README's only install path is a clone. |
+| #113 | Repo was private. Trusted publishing requires a public repo; the README's only install path was a clone. **Fixed and closed**: the repo was transferred to `capwall/capwall` and made public. |
 | #115 | No versions, no CHANGELOG, no publish set. **Fixed**: all packages staged at `0.1.0`, `CHANGELOG.md` written, publish set declared once; all enforced by `check-release-versions.mjs`, and versions now owned by release-please. |
 | #126 | Maps shipped without sources. **Fixed**: `"files": ["dist", "src"]`, enforced by `check-tarball-sources.mjs`. Done before the first publish on purpose — `files` decides what a reader can audit, and changing it later silently changes that answer. |
-| #3 | Actions is billing-blocked. OIDC publishing *runs in Actions*, so this gates the whole path — **and it gates release-please too**, which is a workflow like any other. |
+| #3 | Actions was billing-blocked. OIDC publishing *runs in Actions*, so this gated the whole path — **and it gated release-please too**, which is a workflow like any other. **Fixed and closed**: making the repo public (#113) gives it unlimited standard-runner minutes, which is what unblocked this — nobody had to "restore billing" as a separate step. |
 
 Not blocking, and all four have since **landed** rather than waiting for `0.1.1`: #124
 (`packages/policy-schema/README.md` exists; `cli/src/trace.ts` writes the `$schema` pointer),
@@ -479,10 +492,15 @@ Not blocking, and all four have since **landed** rather than waiting for `0.1.1`
 unmatched policy keys, and `diff --strict` fails on them), #122 (the root `preinstall` guard
 refuses an `npm install`). Nothing on this list is outstanding for `0.1.0`.
 
-## What is still unverified until #3 is resolved
+## What CI running now proves
 
 Stated plainly, because "the release config is verified" is exactly the claim that must not be
-overstated. What **was** verified, locally, against release-please 17.6.0 (the version bundled by
+overstated — and because "Actions ran" is a different, narrower claim than "the pinned SHAs are
+the right ones" (see ci.yml's header). This section records both: what was checked locally before
+`0.1.0` ever shipped, and what running for real in Actions has since confirmed or, in one case,
+disproved a hope rather than a claim.
+
+What **was** verified, locally, against release-please 17.6.0 (the version bundled by
 `googleapis/release-please-action@v5.0.0`):
 
 - the config parses and resolves, run as a real `release-please release-pr --dry-run` against this
@@ -534,58 +552,74 @@ step in `release.yml`'s `publish` job, run verbatim outside Actions:
 - publishing out of order is a real failure and not a stylistic one: with only the `cli` tarball
   available, `npm i` dies with `404 '@capwall/core@0.1.0' is not in this registry`.
 
-What **cannot** be verified without pushing to GitHub and running Actions:
+All six of the following were, at one point, items that could not be verified without pushing to
+GitHub and running Actions. They have now been checked for real, not dry-run:
 
-1. **That `release-please.yml` opens a PR at all.** A dry run proves what release-please would
-   compute; it does not prove that the action's permissions (`contents: write`,
-   `pull-requests: write`) and the repository's "Allow GitHub Actions to create and approve pull
-   requests" setting let it write. Proof: the first push to `main` after this merges should
-   produce a release PR (or the "no releasable commits" summary line).
-2. **That the tag actually starts `release.yml`.** This is the one with a known failure mode: a
-   tag pushed with the default `GITHUB_TOKEN` **does not trigger other workflows**, by design.
-   Proof: after the first release PR is merged, `release.yml` appears in the Actions tab within a
-   minute. If it does not, the `RELEASE_PLEASE_TOKEN` secret is missing — checklist step 5.
-3. **The pinned action SHAs.** `googleapis/release-please-action@v5.0.0` has never run here, for
-   the same reason every other pin in `ci.yml` has never run (see its header).
-4. **Everything downstream of the tag** that was already unverified: OIDC trusted publishing,
-   provenance attachment, and the `verify` matrix in Actions rather than in `pnpm ci:local`.
-5. **`--provenance` itself — including in the workflow's own dry run.** The rehearsal ran
-   `npm publish ./<tarball> --provenance --access public --dry-run` and it exits **0**, printing
-   nothing about provenance: with `--dry-run`, npm never reaches the step that mints an
-   attestation. So `dry_run = true` proves the pack, the assertions, the manifest and the file
-   list — and proves *nothing at all* about provenance, the OIDC token exchange, or the
-   `id-token: write` permission. The first evidence that provenance works will be the first real
-   publish; check it with `npm audit signatures` immediately afterwards rather than assuming a
-   green dry run covered it.
-6. **`actions/upload-artifact`.** The only step with no local equivalent at all.
+1. **That `release-please.yml` opens a PR at all.** Verified: it opened release PR #206 on
+   `main`. The action's permissions and the repository's "Allow GitHub Actions to create and
+   approve pull requests" setting do let it write.
+2. **That the tag actually starts `release.yml`.** **Disproved, as predicted.** This was
+   documented as the one step with a known failure mode — a tag pushed with the default
+   `GITHUB_TOKEN` does not trigger other workflows, by design — and that is exactly what
+   happened: merging PR #206 created tag `v0.1.1`, and `release.yml` did not start on its own.
+   The release went out via a manual `workflow_dispatch` instead. Whether to close this gap with
+   a `RELEASE_PLEASE_TOKEN` (checklist step 5) or keep the manual dispatch as the accepted norm
+   is the open decision tracked in issue #207 — see § How a release happens.
+3. **The pinned action SHAs.** Now exercised: `ci.yml` is green on the full Node 22/24/26 matrix
+   on `main` and on a release-please PR branch; `release-please.yml` ran on `main` (PR #206, tag
+   `v0.1.1`); `commit-conventions.yml` ran on a PR branch; `release.yml`'s verify (22/24/26) and
+   publish jobs both went green (run 30600809316). That proves these pins resolve and the actions
+   work end to end — it does not prove the SHAs are the only right choice, or that a moved tag on
+   one of them is impossible (see ci.yml's header).
+4. **Everything downstream of the tag.** Verified by the same run: OIDC trusted publishing
+   worked, provenance was attached, and the `verify` matrix ran in Actions rather than only in
+   `pnpm ci:local`. `release.yml` published `@capwall/policy-schema`, `@capwall/core` and
+   `@capwall/cli` at `0.1.1`.
+5. **`--provenance` itself.** Verified by the real publish, not just the dry run that could not
+   reach this step: `npm audit signatures` reports verified signatures and verified attestations
+   for `0.1.1`, and the attestation binds to
+   `git+https://github.com/capwall/capwall@refs/tags/v0.1.1`, built by
+   `.github/workflows/release.yml` on a GitHub-hosted runner. `0.1.0` — published manually, see
+   § THE FIRST MANUAL PUBLISH — carries no such attestation; the contrast is the proof that this
+   step is doing something real rather than always no-op succeeding.
+6. **`actions/upload-artifact`.** Exercised as part of the same green `release.yml` run; it had
+   no local equivalent to rehearse it with beforehand.
 
 ---
 
 ## Ordering constraint (read before scheduling anything)
 
-npm trusted publishing runs **inside GitHub Actions**, which is currently billing-blocked
-(#3). The steps are strictly ordered and the middle one cannot be skipped:
+npm trusted publishing runs **inside GitHub Actions**. The steps were strictly ordered and the
+middle one could not be skipped — this is the order it actually happened in, and the order to
+repeat for `@capwall/sbom-import` whenever it joins the publish set:
 
-1. **Actions billing restored** (#3) — nothing else in this list works without it, including
-   release-please.
-2. **Repo made public** (#113).
+1. **Actions unblocked** — the repo was transferred to `capwall/capwall` and made public; public
+   repos get unlimited standard-runner minutes, so the billing block (#3, closed) no longer
+   applied. Nothing else in this list works without it, including release-please.
+2. **Repo made public** (#113, closed).
 3. **These workflows merged to `main`** — the trusted-publisher form on npmjs.com asks for a
-   workflow filename, so `release.yml` has to exist and be on the default branch first.
-4. **Human configures the trusted publisher, per package, on npmjs.com** — see the checklist.
-5. **Merge the release PR → tag → publish.**
+   workflow filename, so `release.yml` had to exist and be on the default branch first.
+4. **Human configured the trusted publisher, per package, on npmjs.com** — see the checklist.
+5. **Merge the release PR → tag → publish.** In practice the tag alone did not start
+   `release.yml` — see § How a release happens and issue #207 — so this step needed a manual
+   `workflow_dispatch`.
 
 ---
 
 # THE FIRST MANUAL PUBLISH (granular token, no Actions)
 
-**This is the alternative to the OIDC path above, and it is the only one that works today.**
-Everything from § How a release happens down to here describes the OIDC path, which is the norm
-from `0.1.1` onwards. This section is the one-time route to `0.1.0`, written to be pasted.
+**This is what actually published `0.1.0`.** Everything from § How a release happens down to
+here describes the OIDC path, which is the norm from `0.1.1` onwards and is what published it —
+through `release.yml`, via trusted publishing, with SLSA provenance attached. This section is the
+one-time route that was used for `0.1.0`, kept here as the record of how it shipped and as the
+manual fallback if trusted publishing ever needs to be bootstrapped again — a new package joining
+the publish set, a lost credential, or Actions itself being unavailable.
 
-Why it exists: step 4 of the ordering constraint requires the package to *already exist* on npm
-for some flows, and #3 may take a while. So publish `0.1.0` manually from a workstation with a
-granular access token, then configure trusted publishing (§ HUMAN CHECKLIST C) and let every
-release after that run through release-please and Actions.
+Why it existed: step 4 of the ordering constraint needs the package to *already exist* on npm for
+some flows, and Actions was billing-blocked (issue #3, closed) at the time. So `0.1.0` was
+published manually from a workstation with a granular access token, trusted publishing was then
+configured (§ HUMAN CHECKLIST C), and every release from `0.1.1` on has run through release-please
+and Actions.
 
 This is also the path that cuts `v0.1.0` itself. `.release-please-manifest.json` says `0.1.0`, so
 release-please treats it as the baseline and proposes `0.1.1` / `0.2.0` for the *next* release —
@@ -766,10 +800,10 @@ which npm never prints, so grepping for it found nothing.)
 
 **One thing: the provenance attestation.** `--provenance` requires a trusted CI publisher —
 npm reads an OIDC token that only GitHub Actions can mint — so a workstation publish cannot
-attach one however the flag is spelled. `0.1.0` would therefore carry no attestation, `npm audit
-signatures` would not vouch for it, and "the supply-chain firewall shipped without provenance"
-is a fair thing for a reviewer to notice. A manual publish also puts a write-capable credential
-on a laptop, which is the other half of the same argument.
+attach one however the flag is spelled. `0.1.0` therefore carries no attestation — confirmed:
+`npm audit signatures` does not vouch for it — and "the supply-chain firewall shipped without
+provenance" is a fair thing for a reviewer to notice about that one version. A manual publish
+also puts a write-capable credential on a laptop, which is the other half of the same argument.
 
 Nothing else is lost. The tarball bytes are identical either way — the same `pnpm pack` produces
 them, and `npm publish <tarball>` uploads a finished archive without re-reading anything.
@@ -783,9 +817,12 @@ C) while it is fresh, and let the first real change — whatever it is — be `0
 provenance through Actions. Every version anyone actually installs will be attested; exactly one
 early version will not, and `CHANGELOG.md` can say so in a line.
 
-The one thing that would change this answer is #3 being resolved in days rather than weeks. If
-Actions comes back before you have published, delete the token, do nothing manual, and take the
-OIDC path — it is strictly better and this whole section becomes unnecessary.
+**This is exactly what happened.** `0.1.0` was published manually and carries no attestation;
+`0.1.1` was published from CI via OIDC trusted publishing and does — the attestation binds to
+`git+https://github.com/capwall/capwall@refs/tags/v0.1.1`, built by
+`.github/workflows/release.yml` on a GitHub-hosted runner, and `npm audit signatures` reports
+verified signatures and verified attestations for it. Exactly one early version carries no
+provenance, as predicted; every version from `0.1.1` on does.
 
 ---
 
@@ -795,11 +832,15 @@ Everything below needs account access. Nothing above this line does. Work top to
 
 ### A. GitHub — one time
 
-1. **Restore Actions billing** (issue #3). Settings → Billing. Until this is done, no workflow
-   runs at all: no CI, no release-please PR, no OIDC publish.
-2. **Make the repository public.** Settings → General → Danger Zone → Change visibility →
-   Public. The tree is MIT and the "malicious" fixtures only `console.log`, but **re-run the
-   licence audit rather than trusting this line**: it once read "all 123 dependencies are
+1. **Actions billing.** **Done, and not by restoring anything.** The repo was transferred to
+   `capwall/capwall` and made public (step 2); public repos get unlimited standard-runner
+   minutes, so the billing block (issue #3, closed) no longer applies — there was no separate
+   "restore billing" action to take. Until that transfer happened, no workflow ran at all: no CI,
+   no release-please PR, no OIDC publish.
+2. **Make the repository public.** **Done** — the repo is `capwall/capwall`, public. Settings →
+   General → Danger Zone → Change visibility → Public. The tree is MIT and the "malicious"
+   fixtures only `console.log`, but **re-run the licence audit rather than trusting this line**
+   if the dependency tree has moved since: it once read "all 123 dependencies are
    MIT/ISC/BSD-3-Clause/Apache-2.0" and the lockfile has since grown past 180 entries (vitest 4 /
    vite 8). The rule is not one blanket gate — it is scoped by whether the dependency ships:
    ```bash
@@ -827,6 +868,10 @@ Everything below needs account access. Nothing above this line does. Work top to
      `RELEASE_PLEASE_TOKEN`.
    - Without it, `release-please.yml` still works and says so in its job summary; the tag just has
      to be re-pushed by a human, or `release.yml` run by hand with `dry_run = false`.
+   - **Confirmed by `v0.1.1`:** the tag alone did not start `release.yml` — the release needed a
+     manual `workflow_dispatch` (§ HUMAN CHECKLIST step 17). Whether to add this token, versus
+     keeping the manual dispatch as the accepted norm, is the open decision tracked in issue
+     #207; it has not been decided either way yet.
 6. **Allow Actions to open pull requests.** Settings → Actions → General → Workflow permissions →
    tick *Allow GitHub Actions to create and approve pull requests*. release-please cannot open the
    release PR otherwise. (A `RELEASE_PLEASE_TOKEN` from step 5 sidesteps this, but tick it anyway

@@ -5,9 +5,9 @@ run your target in a **child process** with `@capwall/core/preload` injected thr
 `NODE_OPTIONS=--import`, so capwall installs before the target's entry point and before any
 dependency can capture a raw builtin.
 
-> **Not published to npm yet** (staged at `0.1.0`). Run it as
-> `node <clone>/packages/cli/dist/index.js …` after `pnpm install && pnpm build`, or alias it.
-> See the root [README](../README.md) § Install.
+> Install with `npm i -D @capwall/cli` — see the root [README](../README.md) § Install. To run
+> it from a clone instead: `node <clone>/packages/cli/dist/index.js …` after
+> `pnpm install && pnpm build`, or alias it.
 
 The **project root is the CLI's working directory** — relative policy globs and dependency-vs-app
 attribution are resolved against it.

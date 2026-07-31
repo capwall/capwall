@@ -130,11 +130,11 @@ matching, internal deps declared `workspace:*` so they publish as exact pins, a 
 `CHANGELOG.md` section, the declared publish set, and that release-please's config still has the
 shape lockstep depends on. `scripts/check-tarball-sources.mjs` opens the packed tarballs and
 asserts every source map resolves inside its own tarball (#126), the packaging defect no other
-gate can see. All four are at `0.1.0`; **read version numbers from `package.json`, never hardcode
-one.**
+gate can see. All four move together in lockstep; **read version numbers from `package.json`,
+never hardcode one.**
 
-**`@capwall/sbom-import` is deliberately not published** in the first release — nothing
-consumes it, so it would land on npm as an unreachable library. It stays in lockstep in-repo.
+**`@capwall/sbom-import` is deliberately not published** — nothing consumes it, so it would land
+on npm as an unreachable library. It stays in lockstep in-repo.
 The publish set is declared once, in `check-release-versions.mjs` (`--publish-list`); the
 workflow reads it from there. See `docs/releasing.md` § What is published.
 
@@ -344,11 +344,14 @@ A feature is done only when **all** of:
 - Once `enforce` exists: the `malicious-dep-demo` fixture is **blocked in `enforce` mode**
   and **allowed (only logged) in `observe` mode**.
 
-**GitHub Actions is billing-blocked (issue #3), so there is no automated CI.** Reproduce the
-full `ci.yml` matrix (Node **22, 24 and 26**, clean install → build → typecheck → test → lint) in
-Docker with `pnpm ci:local` — a green run there is a green CI run. See
-[`docs/ci-local.md`](docs/ci-local.md). Until Actions billing is restored, treat `pnpm ci:local`
-as the gate.
+**GitHub Actions now runs** — the repo was transferred to `capwall/capwall` and made public,
+which gives it unlimited standard-runner minutes, so the billing block (issue #3) no longer
+applies and is closed. `ci.yml` is green on the full Node 22/24/26 matrix, on `main` and on a
+release-please PR branch. That does not retire `pnpm ci:local`: it is still the local pre-push
+gate and the only thing that reproduces the matrix before you push, in Docker, against your
+uncommitted edits. Reproduce the full `ci.yml` matrix (Node **22, 24 and 26**, clean install →
+build → typecheck → test → lint) with `pnpm ci:local` — a green run there is still a green CI
+run, and now Actions checks it again on the PR. See [`docs/ci-local.md`](docs/ci-local.md).
 
 **The supported range is `>=22.15.0`, declared in all five manifests' `engines`** — the four
 packages and the private root. Node 20 went
@@ -392,10 +395,11 @@ the matrix as early warning: it becomes LTS on 2026-10-28, and it is already the
   on a busy machine at any threshold that still catches a regression. Gate on a RATIO against
   a reference co-sampled in the same interleaved loop — `scripts/bench/bench.mjs` against a
   CPU calibration, `install-lifecycle.test.ts` against the same call unmediated.
-- **A security test must be able to FAIL.** `pnpm test` is the only gate that runs (#3), so a
-  test that passes for the wrong reason is worse than a missing one — it is a green light
-  nobody re-examines. Issue #112 found six, including a "ReDoS hardening" test that passed
-  with the hardening deleted. Two rules follow, and both are mechanically checkable:
+- **A security test must be able to FAIL.** A test that passes for the wrong reason is worse
+  than a missing one — it is a green light nobody re-examines, whether that light comes from
+  `pnpm test` locally or from `ci.yml` in Actions. Issue #112 found six, including a "ReDoS
+  hardening" test that passed with the hardening deleted. Two rules follow, and both are
+  mechanically checkable:
   - **No silent `if (…) return;` in a test body.** Use `it.skipIf(...)`, which the reporter
     shows. A body that returns after doing nothing reports green with zero assertions, so an
     environment where it never runs looks exactly like coverage. Same for `if (cond) { expect

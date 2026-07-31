@@ -16,13 +16,19 @@
 #
 #   gh api repos/<owner>/<repo>/git/matching-refs/tags/<vX.Y.Z> --jq '.[].ref'
 #
-# NONE OF THE ACTION VERSIONS BELOW HAVE BEEN EXERCISED. GitHub Actions is billing-blocked
-# (issue #3), so no workflow in this repository has run since long before these were bumped.
-# `pnpm ci:local` reproduces the STEPS in a container; it never touches `checkout`,
-# `setup-node`, `pnpm/action-setup` or `upload-artifact`. A green local matrix says nothing
-# about the four lines below. They were chosen by reading each project's release notes for the
-# majors crossed — see the PR for #168 — which is exactly the "read, not measured" standard
-# #153 and #157 exist to reject, and is the best available until #3 is unblocked.
+# ALL FOUR ACTION VERSIONS BELOW HAVE NOW BEEN EXERCISED. GitHub Actions was billing-blocked
+# (issue #3, closed) until the repo was transferred to `capwall/capwall` and made public —
+# public repos get unlimited standard-runner minutes, so the block no longer applies. This
+# workflow is green on the full Node 22/24/26 matrix, on `main` and on a release-please PR
+# branch. `pnpm ci:local` reproduces the STEPS in a container; it never touches `checkout`,
+# `setup-node`, `pnpm/action-setup` or `upload-artifact` — a green local matrix still says
+# nothing about the four lines below, but a green run of THIS workflow now does: it proves
+# these pins RESOLVE and the actions WORK end to end. It does not prove the pinned SHAs are the
+# right ones, and it does not make a moved tag impossible — the action repository's owner can
+# still move a tag, which is exactly why every `uses:` here is a SHA and not a version. They
+# were chosen by reading each project's release notes for the majors crossed — see the PR for
+# #168 — which is exactly the "read, not measured" standard #153 and #157 exist to reject;
+# running green confirms they work, not that reading was measuring.
 
 name: CI
 

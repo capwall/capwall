@@ -26,8 +26,11 @@
 #     (`--publish-list`) and release.yml reads it from there.
 #
 # EVERY `uses:` IS PINNED TO A COMMIT SHA (issue #168) — see ci.yml's header for how to resolve
-# and round-trip a pin. UNVERIFIED: Actions is billing-blocked (#3), so this workflow has never
-# run. `pnpm ci:local` does not run actions. See docs/releasing.md § What is still unverified.
+# and round-trip a pin. This workflow has now run successfully on `main`: it opened release PR
+# #206 and, when that PR was merged, created tag `v0.1.1`. That exercises these pins the same
+# way ci.yml's do — it proves they resolve and work, not that the SHAs are the only right
+# choice (see ci.yml's header). `pnpm ci:local` does not run actions, only steps, and was never
+# a substitute for this. See docs/releasing.md § What CI running now proves.
 
 name: Release Please
 
