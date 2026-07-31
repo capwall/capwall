@@ -1,0 +1,93 @@
+# Did every tagged release actually reach npm? Ask on a schedule, because nothing else asks.
+#
+# WHY THIS WORKFLOW EXISTS. `.github/workflows/release.yml` fires on `push: tags: v*`, but a tag
+# created with the default `GITHUB_TOKEN` — which is what release-please uses unless
+# `RELEASE_PLEASE_TOKEN` is configured, see docs/releasing.md § HUMAN CHECKLIST step 5 — does not
+# trigger other workflows. That is deliberate GitHub behaviour to prevent workflow recursion, not
+# a bug, and it is documented in advance in release.yml's header note 5 and docs/releasing.md §
+# HUMAN CHECKLIST step 17. It happened for real on `v0.1.1`: release-please merged the release
+# PR, created the tag, and cut the GitHub release, and `release.yml` never started on its own.
+# Nothing reached npm until someone ran `gh workflow run release.yml --ref v0.1.1 -f
+# dry_run=false` by hand. Issue #207 tracks the open decision of whether to close the gap with
+# the token or keep the manual dispatch as the accepted norm — either way, the silence in
+# between is what this workflow is for.
+#
+# THE DANGER IS NOT THE MANUAL STEP. IT IS THAT THE FAILURE IS SILENT AND LOOKS LIKE SUCCESS. The
+# tag exists, the GitHub Release exists, CHANGELOG.md is dated — every gate that already runs in
+# `release.yml` (check-release-versions.mjs, check-tarball-sources.mjs) is green regardless,
+# because all of it checks state that exists whether or not `npm publish` ever ran. Only the
+# registry knows, and nobody looks at the registry unless something makes them. This workflow is
+# what looks, on a cadence, so the gap cannot sit unnoticed between one release and the next
+# person who happens to check by hand.
+#
+# WHY SCHEDULE AND NOT A TAG TRIGGER. A workflow that fires on `push: tags: v*` has EXACTLY the
+# failure mode this file exists to catch: a tag pushed with the default `GITHUB_TOKEN` would not
+# start it either. Publishing is not sub-second, so there is no useful trigger closer to "right
+# after a release" that is not itself vulnerable to the same silent non-start. Daily is the right
+# grain — this is a slow-moving condition (a release either published or it didn't, and it
+# doesn't un-happen), not one that needs minute-level latency.
+#
+# READ-ONLY, ON PURPOSE. This workflow queries the npm registry and reads git tags; it must never
+# be able to publish anything. `contents: read` only — no `id-token: write`, which is what
+# release.yml holds for OIDC trusted publishing. A workflow that can both notice a gap and close
+# it is a bigger attack surface than the gap itself.
+#
+# EVERY `uses:` IS PINNED TO A COMMIT SHA (issue #168) — see ci.yml's header for how to resolve
+# and round-trip a pin, and do not resolve new ones here: these are the exact pins already
+# exercised by ci.yml and release.yml.
+
+name: Release Published Check
+
+on:
+  schedule:
+    # 06:17 UTC — an arbitrary off-the-hour minute, not midnight, so this does not compete with
+    # every other repository's cron for the same instant.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 AND fetch-tags: true. The default checkout is a shallow, tag-less clone —
+      # scripts/check-release-published.mjs reads `git tag --list 'v*'`, and a shallow checkout
+      # would make it see zero tags and report a false "nothing to check" every single day
+      # rather than the thing it exists to catch. Verified: with the default depth this job's
+      # own `git tag --list` step below prints nothing; with these two set, it lists every
+      # release tag in the repository.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Confirm tag history is actually present
+        run: git tag --list 'v*'
+
+      # Exit 2 is INCONCLUSIVE — the registry could not be queried — and is deliberately not the
+      # same as exit 1. Retry it once, because the alternative is worse than it looks: a daily
+      # cron that red-lights on every transient DNS blip teaches the one person who reads it to
+      # ignore it, and an alert nobody reads is indistinguishable from no alert at all. That is
+      # alert fatigue as a security failure, not an inconvenience.
+      #
+      # A second inconclusive result still FAILS. It is never converted into a pass — the script's
+      # whole point is that "could not check" and "checked, fine" are different answers, and this
+      # step must not be the place that quietly merges them.
+      - name: Check every tagged release reached npm
+        run: |
+          set +e
+          node scripts/check-release-published.mjs
+          status=$?
+          if [ "$status" -eq 2 ]; then
+            echo "::warning::registry query was inconclusive; retrying once in 30s"
+            sleep 30
+            node scripts/check-release-published.mjs
+            status=$?
+          fi
+          exit "$status"
