@@ -26,6 +26,12 @@ release-please's own config still says what this file says it says) and
 `scripts/check-tarball-sources.mjs` (what is actually inside the tarballs). Both run in the
 release workflow before anything is uploaded. Read them; they carry the reasoning inline.
 
+A third script, `scripts/check-release-published.mjs` (`pnpm check:published`), checks the one
+thing the other two can't: what the **registry** actually has. It reconciles both directions —
+every tag against npm (a release that silently never shipped, #207) and every published version
+against the tags (a version nobody here authorised, or an unrecorded manual publish, #209). It
+runs on its own schedule, after the fact — see § D step 19.
+
 ---
 
 ## The two things that make this repo unusual
@@ -973,7 +979,9 @@ node scripts/check-release-versions.mjs --publish-list   # the authoritative lis
     generated notes. Watch the Actions tab: `release.yml` must start within about a minute. **If
     it does not, step 5 was skipped** — re-push the tag by hand
     (`git push --delete origin vX.Y.Z && git tag -f vX.Y.Z <sha> && git push origin vX.Y.Z`) or run
-    *Release* by hand with `dry_run = false`.
+    *Release* by hand with `dry_run = false`. This is exactly what happened on `v0.1.1` — see
+    issue #207 — and it is silent: the tag and the GitHub release exist either way, so watching
+    the Actions tab is the only thing that catches it at this step.
 18. If you created the `npm-publish` environment, approve the run when GitHub asks.
 19. **Verify the result** before announcing anything:
     ```bash
@@ -982,6 +990,18 @@ node scripts/check-release-versions.mjs --publish-list   # the authoritative lis
     # provenance should be present:
     npm audit signatures --registry https://registry.npmjs.org
     ```
+    `scripts/check-release-published.mjs` (`pnpm check:published`) automates exactly this check —
+    every `vX.Y.Z` tag against every package in the publish set, on the real registry — and
+    distinguishes a genuinely missing version from a registry it simply couldn't reach.
+    `.github/workflows/release-published-check.yml` runs it daily (read-only, `contents: read`
+    only, no publish capability) so a `v0.1.1`-style silent gap is caught even if step 17 was
+    watched and missed, or nobody was watching at all. See issue #207.
+
+    It also checks the **reverse** direction, which matters more: a version on npm that no tag
+    accounts for. From the registry alone that is indistinguishable from a publish using a stolen
+    token, so it fails until someone reconciles it. `0.1.0` is currently in the script's
+    `UNTAGGED_BY_RECORD` — an attested record naming the commit and the evidence, not a mute
+    button. See issue #209.
     Then the real test — install it as a stranger would, in an empty directory:
     ```bash
     mkdir /tmp/capwall-smoke && cd /tmp/capwall-smoke && npm init -y

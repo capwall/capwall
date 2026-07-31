@@ -23,6 +23,7 @@
     "test": "pnpm -r run test",
     "lint": "oxlint",
     "lint:commits": "node scripts/check-commit-messages.mjs",
+    "check:published": "node scripts/check-release-published.mjs",
     "bench": "node scripts/bench/bench.mjs",
     "bench:gate": "node scripts/bench/bench.mjs --quick",
     "bench:startup": "node scripts/bench/startup.mjs",
