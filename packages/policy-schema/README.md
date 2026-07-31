@@ -9,11 +9,16 @@ user-supplied policy file against `PolicySchema`. The authoritative field-by-fie
 documentation is [`docs/policy-format.md`](https://github.com/capwall/capwall/blob/main/docs/policy-format.md)
 — this README is the orientation, not the reference.
 
-> **Not published to npm yet** (staged at `0.1.0`, in lockstep with the other three
-> packages — see [`docs/releasing.md`](https://github.com/capwall/capwall/blob/main/docs/releasing.md)).
-> See the root
-> [README](https://github.com/capwall/capwall#readme) § Install for the
-> run-from-a-clone path.
+> Installed as a dependency of [`@capwall/core`](https://www.npmjs.com/package/@capwall/core)
+> and [`@capwall/cli`](https://www.npmjs.com/package/@capwall/cli); you rarely need it
+> directly. If you are writing a tool that reads or emits a `capabilities.json`:
+>
+> ```bash
+> npm i -D @capwall/policy-schema
+> ```
+>
+> All four packages release in lockstep at one version — see
+> [`docs/releasing.md`](https://github.com/capwall/capwall/blob/main/docs/releasing.md).
 
 ## Point your editor at the schema
 

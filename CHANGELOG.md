@@ -388,7 +388,7 @@ Generated sections are inserted above them.
   correct in each case; the comments are what a future fixed-arity wrapper would have been written
   from. `test/primitive-arity.test.ts` now covers `Module._findPath` as well.
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-07-30
 
 First public release. Nothing was published before this, so everything below is new; the
 entries are grouped by what the thing does rather than by what changed.

@@ -29,7 +29,7 @@
   },
   "scripts": {
     "prepack": "node ../../scripts/assert-pnpm-pack.mjs",
-    "build": "tsc -p tsconfig.json",
+    "build": "rm -rf dist && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "vitest run"
   },

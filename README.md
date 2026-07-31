@@ -118,11 +118,14 @@ And in CI, `capwall diff` names the drift and exits non-zero:
 
 ## Install
 
-> **Nothing is published to npm yet.** Neither `@capwall/cli` nor `@capwall/core` exists on the
-> registry — the manifests are staged at `0.1.0` but nothing has been uploaded, so
-> `pnpm add -D @capwall/cli` will 404 today. Build it from a clone; every command shown above
-> is exactly what you would run against a published build, and the whole loop works from a
-> clone right now.
+```bash
+npm i -D @capwall/cli          # or: pnpm add -D @capwall/cli
+npx capwall observe -- node your-app.js
+```
+
+That is the whole install. Everything above runs against it.
+
+### Or from a clone
 
 Requirements: **Node ≥ 22.15** (tested on 22, 24 and 26) and **pnpm ≥ 11** — required, not a
 preference. capwall is a pnpm workspace with no npm `workspaces` field, so `npm install` at the

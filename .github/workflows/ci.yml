@@ -55,14 +55,14 @@ jobs:
       # is `packageManager: pnpm@11.17.0`. The v4 pin here predates pnpm 11 entirely, so this
       # is the one bump in this file with a concrete reason beyond currency.
       #
-      # `version: 11` is kept rather than dropped. The action can read `packageManager` from
-      # the root package.json when `version` is omitted, but that makes the installed pnpm an
-      # implicit consequence of a field two files away; stating it keeps the workflow readable
-      # on its own. Both are the same 11.x today.
+      # `version:` is deliberately ABSENT. v6 REFUSES to run when pnpm is specified both here
+      # and as `packageManager` in the root package.json — it errors with "Multiple versions of
+      # pnpm specified" rather than picking one. An earlier revision of this comment argued for
+      # stating the version here for readability; that reasoning was written against v4 and v6
+      # falsified it. `packageManager` is now the single source, which is also what keeps the
+      # runner's pnpm identical to the one `corepack` gives a contributor locally.
       - name: Install pnpm
         uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
-        with:
-          version: 11
 
       # ORDER IS LOAD-BEARING: pnpm must be on PATH before setup-node runs, or `cache: pnpm`
       # cannot find a store to key against. It already is, and stays that way here.

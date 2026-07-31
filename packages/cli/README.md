@@ -7,9 +7,14 @@ The `capwall` command-line interface — the primary way users drive the observe
 > with `@capwall/core/preload` injected via `NODE_OPTIONS --import`. Milestone status is
 > tracked in one place, [`docs/roadmap.md`](https://github.com/capwall/capwall/blob/main/docs/roadmap.md).
 >
-> Not published to npm yet (staged at `0.1.0`) — run it as
-> `node <clone>/packages/cli/dist/index.js` after `pnpm install && pnpm build`. See the root
-> [`README.md`](https://github.com/capwall/capwall/blob/main/README.md) § Install.
+> ```bash
+> npm i -D @capwall/cli      # or: pnpm add -D @capwall/cli
+> npx capwall observe -- node your-app.js
+> ```
+>
+> Requires **Node ≥ 22.15** (tested on 22, 24 and 26). See the root
+> [README](https://github.com/capwall/capwall#readme) for the full observe → review →
+> enforce loop.
 
 ## Commands
 
