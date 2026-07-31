@@ -26,9 +26,12 @@
 #  4. EVERY `uses:` IS PINNED TO A COMMIT SHA (issue #168). ci.yml's header has the reasoning
 #     and the two `gh api` commands that resolve and round-trip a pin. It matters more here
 #     than there: this is the workflow that holds `id-token: write` and publishes to npm, so a
-#     moved tag on any of these four actions is code with an OIDC token in reach. The versions
-#     themselves are UNVERIFIED — Actions is billing-blocked (#3) and `pnpm ci:local` does not
-#     run actions, only steps. Rehearse with `dry_run` before trusting any of it.
+#     moved tag on any of these four actions is code with an OIDC token in reach. This workflow
+#     has now run — verify (22/24/26) + publish all green (run 30600809316), publishing
+#     `@capwall/policy-schema`, `@capwall/core` and `@capwall/cli` at `0.1.1` via OIDC trusted
+#     publishing with SLSA provenance attached. That proves these pins resolve and work, not
+#     that the SHAs are the only right choice — see ci.yml's header. Rehearse with `dry_run`
+#     before trusting a change to any of them.
 #
 #  5. THE TAG COMES FROM release-please, NOT FROM A HUMAN. `.github/workflows/release-please.yml`
 #     opens the release PR (versions + CHANGELOG.md) and, when it is merged, creates the `vX.Y.Z`

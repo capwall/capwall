@@ -26,9 +26,8 @@ What to expect:
 | First assessment (in scope / documented residual / not a bug) | within 14 days |
 | Fix or a public statement of why there will not be one | best effort, and you will be told which |
 
-This is a single-maintainer project with no funding and, at the time of writing, **no CI**
-(GitHub Actions is billing-blocked — issue #3). Those timelines are honest intentions, not an
-SLA. There is no bug bounty.
+This is a single-maintainer project with no funding. Those timelines are honest intentions, not
+an SLA. There is no bug bounty.
 
 Coordinated disclosure is the default: please give the fix a chance to ship before publishing.
 If you want credit in the advisory and the changelog, say so; if you want to stay anonymous,
@@ -36,9 +35,11 @@ say that instead.
 
 ## What versions are supported
 
-Nothing has been published to npm yet. When it is, only the **latest** `0.x` release will
-receive fixes — `0.y.z` means the surface may still move, and there is no installed base to
-maintain a branch for. See [`docs/releasing.md`](docs/releasing.md).
+`@capwall/policy-schema`, `@capwall/core` and `@capwall/cli` are published on npm
+(`@capwall/sbom-import` remains deliberately unpublished — see `docs/releasing.md` § What is
+published). Only the **latest** `0.x` release receives fixes — `0.y.z` means the surface may
+still move, and there is no installed base large enough to justify maintaining a branch. See
+[`docs/releasing.md`](docs/releasing.md) for exactly which versions are current.
 
 ## What is in scope
 

@@ -38,8 +38,9 @@
 # rather than a command.
 #
 # EVERY `uses:` IS PINNED TO A COMMIT SHA (issue #168) — see ci.yml's header for how to resolve and
-# round-trip a pin. UNVERIFIED: Actions is billing-blocked (#3), so this has never run in Actions.
-# `pnpm lint:commits` runs the same script locally.
+# round-trip a pin. This workflow has now run successfully on a PR branch, which proves these pins
+# resolve and work — not that the SHAs are the only right choice; see ci.yml's header for what a
+# green run does and does not prove. `pnpm lint:commits` runs the same script locally.
 
 name: Commit conventions
 

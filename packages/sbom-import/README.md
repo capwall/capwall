@@ -9,11 +9,12 @@ switching to `enforce`.
 Roadmap: S1 (see `docs/roadmap.md`). No new runtime dependency — CycloneDX SBOMs are just
 JSON; the parser is `JSON.parse` + defensive shape-checking (see AGENTS.md § 5).
 
-> **Nothing in this repo is published to npm yet** (everything is staged at `0.1.0`), and this
-> package is additionally **excluded from the first release on purpose**: nothing consumes it, so
-> it would land on the registry as an unreachable library. It stays in version lockstep in-repo.
-> The publish set is declared once, in `scripts/check-release-versions.mjs`
-> (`--publish-list`) — see [`docs/releasing.md`](../../docs/releasing.md) § What is published.
+> **This package is not on npm — deliberately.** `@capwall/policy-schema`, `@capwall/core` and
+> `@capwall/cli` are published; `@capwall/sbom-import` is **excluded from the publish set on
+> purpose**: nothing consumes it, so it would land on the registry as an unreachable library. It
+> stays in version lockstep in-repo. The publish set is declared once, in
+> `scripts/check-release-versions.mjs` (`--publish-list`) — see
+> [`docs/releasing.md`](../../docs/releasing.md) § What is published.
 
 ## API
 

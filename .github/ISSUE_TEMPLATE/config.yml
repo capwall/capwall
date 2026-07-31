@@ -21,5 +21,6 @@ contact_links:
   - name: How to build, test and contribute
     url: https://github.com/capwall/capwall/blob/main/CONTRIBUTING.md
     about: >-
-      pnpm is required, `pnpm ci:local` is the real gate (Actions is billing-blocked), and commit
-      messages are enforced because they write the changelog.
+      pnpm is required, `pnpm ci:local` is the pre-push gate that reproduces the real `ci.yml`
+      matrix (Actions also runs it on the PR now), and commit messages are enforced because they
+      write the changelog.

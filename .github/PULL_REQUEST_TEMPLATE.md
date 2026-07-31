@@ -23,8 +23,9 @@ Closes #
 
 ## Gates run
 
-**There is no CI ([#3](https://github.com/capwall/capwall/issues/3)) — nobody can run
-these for you.** Tick what you actually ran, and say which Node versions.
+**CI runs on this PR** (`ci.yml`, `commit-conventions.yml`), but that does not run these for you
+locally first — a red Actions run costs a round trip. Tick what you actually ran, and say which
+Node versions.
 
 - [ ] `pnpm build && pnpm typecheck && pnpm test && pnpm lint`
 - [ ] `pnpm bench:gate`

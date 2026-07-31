@@ -4,11 +4,13 @@
 # more configuration and a third-party app installed on the repository, which is a strange thing to
 # add to a supply-chain security tool to save reading a diff.
 #
-# NOTHING HERE CAN BE VERIFIED WHILE ACTIONS IS BILLING-BLOCKED (#3). Dependabot itself still runs
-# — it is not Actions — but the pull requests it opens will have NO CI on them, so every one has to
-# be taken through `pnpm ci:local` by hand before it is merged. That is the reason for the low
-# limits and the monthly cadence below: an unreviewable PR queue is worse than a slightly stale
-# lockfile.
+# `ci.yml` AND `commit-conventions.yml` NOW RUN ON THE PULL REQUESTS DEPENDABOT OPENS — the
+# billing block (#3) is closed: the repo was transferred to `capwall/capwall` and made public,
+# and public repos get unlimited standard-runner minutes. That does not retire the manual pass:
+# CI does not run `pnpm ci:local` itself (see docs/ci-local.md for what the difference is), and it
+# checks none of the three licence rules below, so every Dependabot PR still needs a human to run
+# `ci:local` and read the diff before merging it. That is the reason for the low limits and the
+# monthly cadence below: an unreviewable PR queue is worse than a slightly stale lockfile.
 #
 # THREE LICENCE RULES, NOT ONE, apply to anything Dependabot proposes — AGENTS.md § 5. In
 # decreasing severity: non-compete / source-available is refused at any depth; runtime deps are

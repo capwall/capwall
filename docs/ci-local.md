@@ -1,6 +1,11 @@
 # Running CI locally
 
-GitHub Actions is currently billing-blocked ([issue #3](https://github.com/capwall/capwall/issues/3)), so PRs get no automated CI. Until that's fixed, use these to run the **exact same gates** locally.
+GitHub Actions now runs on every pull request — the repo was transferred to `capwall/capwall`
+and made public, which gives it unlimited standard-runner minutes, so the billing block
+([issue #3](https://github.com/capwall/capwall/issues/3)) no longer applies and is closed. That
+does not make these gates redundant: Actions checks what you already pushed, and `ci:local` is
+what checks it first, against your uncommitted working tree, in the same container the matrix
+runs in. Use these to run the **exact same gates** locally, before Actions ever sees the push.
 
 ## The fast path (no container)
 
@@ -114,11 +119,14 @@ when it is missing. `ci.yml` is unaffected — `pnpm/action-setup` installs pnpm
 surface.** `ci:local` runs the *steps* in a container: install, build, typecheck, test, lint,
 canary, bench:gate. It never runs `actions/checkout`, `actions/setup-node`, `pnpm/action-setup` or
 `actions/upload-artifact` — it checks out nothing, installs no toolchain through an action, and
-uploads no artifact. So a green matrix here says exactly nothing about the `uses:` lines in the
-workflows — **three in `ci.yml`, seven in `release.yml`, four distinct actions between them** —
-which since #168 are SHA-pinned and, while Actions billing is blocked (#3), entirely unexercised.
-"A green run here is a green CI run" is a claim about capwall's code, not about the workflow
-files.
+uploads no artifact. So a green matrix here still says nothing, on its own, about the `uses:`
+lines in the workflows — **three in `ci.yml`, seven in `release.yml`, four distinct actions
+between them** — which since #168 are SHA-pinned. Those pins ARE now exercised: Actions runs on
+every push and pull request (the billing block, issue #3, no longer applies now that the repo is
+public), and `ci.yml`'s own header records what a green Actions run does and does not prove. "A
+green run here is a green CI run" is still a claim about capwall's code, not about the workflow
+files — that part did not change, Actions running just means both claims can now be checked
+independently instead of only one of them.
 
 Each version builds `.devcontainer/ci.Dockerfile` and runs, in order: `pnpm install --frozen-lockfile=false` → `build` → `typecheck` → `test` → `lint` → **`canary`** → `bench:gate`. **A green build == a green CI run for that Node version.** The script exits non-zero if any gate fails on any version, so it can gate a merge.
 

@@ -26,11 +26,14 @@ clearly than it fails now. `npm pack` inside a package is refused for the same f
 Node **>= 22.15.0**. The floor is 22.15 rather than 22.0 because `module.registerHooks()` landed
 there and capwall wants it without a version gate.
 
-## 2. `pnpm ci:local` is the gate, because there is no CI
+## 2. `pnpm ci:local` before you push — Actions runs too, but it runs after
 
-**GitHub Actions is billing-blocked ([#3](https://github.com/capwall/capwall/issues/3)),
-so nothing runs on your pull request.** Not the tests, not the lint, not the matrix. A green
-checkmark you did not produce yourself does not exist here.
+**GitHub Actions now runs on every pull request** — the repo was transferred to
+`capwall/capwall` and made public, which gives it unlimited standard-runner minutes, so the
+billing block ([#3](https://github.com/capwall/capwall/issues/3)) no longer applies and is
+closed. `ci.yml` is green on the full Node 22/24/26 matrix. That is a check on what you already
+pushed, not a substitute for running the gates yourself first: a red Actions run costs a round
+trip, and `ci:local` is what catches it before that.
 
 While iterating:
 
@@ -38,8 +41,9 @@ While iterating:
 pnpm build && pnpm typecheck && pnpm test && pnpm lint && pnpm bench:gate
 ```
 
-Before you ask for review — this is the one that stands in for CI, and it reproduces the real
-`ci.yml` matrix (Node 22, 24 and 26, clean install, in Docker):
+Before you ask for review — this is the one that reproduces the real `ci.yml` matrix (Node 22,
+24 and 26, clean install, in Docker) against your working tree, including uncommitted edits,
+before Actions ever sees it:
 
 ```bash
 pnpm ci:local
