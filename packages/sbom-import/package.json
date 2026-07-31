@@ -1,6 +1,6 @@
 {
   "name": "@capwall/sbom-import",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Import a CycloneDX SBOM / CBOM into a starter capwall capabilities.json policy.",
   "license": "MIT",
   "author": "William Zujkowski",
