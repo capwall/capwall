@@ -38,8 +38,8 @@
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
-    "oxlint": "1.76.0",
+    "oxlint": "1.80.0",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.11"
   }
 }
