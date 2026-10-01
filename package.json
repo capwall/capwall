@@ -37,8 +37,8 @@
     "ci:local:26": "bash scripts/ci-local.sh 26"
   },
   "devDependencies": {
-    "@types/node": "^22.15.0",
-    "oxlint": "1.76.0",
+    "@types/node": "^22.20.4",
+    "oxlint": "1.85.0",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   }
