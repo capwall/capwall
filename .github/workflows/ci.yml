@@ -68,7 +68,7 @@ jobs:
       # falsified it. `packageManager` is now the single source, which is also what keeps the
       # runner's pnpm identical to the one `corepack` gives a contributor locally.
       - name: Install pnpm
-        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
 
       # ORDER IS LOAD-BEARING: pnpm must be on PATH before setup-node runs, or `cache: pnpm`
       # cannot find a store to key against. It already is, and stays that way here.
@@ -79,7 +79,7 @@ jobs:
       # either change, which is why this line is not being replaced by the newer implicit
       # behaviour — implicit caching that silently changed scope once can change it again.
       - name: Setup Node ${{ matrix.node-version }}
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: pnpm
